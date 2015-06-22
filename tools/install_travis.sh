@@ -26,6 +26,7 @@ for PKG in *.deb; do
     dpkg-deb -x $PKG $LOCAL
 done
 
+echo usr/include
 pip install h5py
 
 # install the version of swig that for some reason we have to use
