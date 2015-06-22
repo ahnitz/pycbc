@@ -1,7 +1,7 @@
 language: python
 cache:
   - apt
-sudo: true
+sudo: false
 before_install:
   - "./tools/install_travis.sh"
 install: "source $TRAVIS_BUILD_DIR/source; python setup.py install"
