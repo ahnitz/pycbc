@@ -1,6 +1,7 @@
 language: python
 cache:
-  - apt
+  directories:
+    - $HOME/.ccache
 sudo: false
 before_install:
   - "./tools/install_travis.sh"

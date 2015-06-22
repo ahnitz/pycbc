@@ -4,6 +4,10 @@
 LOCAL=$PWD
 mkdir -p $LOCAL/src
 
+export LD_LIBRARY_PATH=$LOCAL/lib:$LOCAL/lib64:$LOCAL/usr/lib:$LOCAL/usr/lib64
+export PKG_CONFIG_PATH=$LOCAL/lib/pkgconfig
+export PATH=$PATH:$LOCAL/bin:$LOCAL/usr/bin
+
 apt-get download \
 libfftw3-3 \
 libfftw3-dev \
@@ -25,14 +29,10 @@ done
 wget http://downloads.sourceforge.net/project/swig/swig/swig-2.0.11/swig-2.0.11.tar.gz
 tar -xvf swig-2.0.11.tar.gz
 cd swig-2.0.11; ./configure --prefix=$LOCAL; make -j; make install; cd ..
+ln -s 
 
 pip install numpy >= 1.6.4
 SWIG_FEATURES="-cpperraswarn -includeall -I/usr/include/openssl" pip install M2Crypto
-
-
-export LD_LIBRARY_PATH=$LOCAL/lib:$LOCAL/lib64:$LOCAL/usr/lib:$LOCAL/usr/lib64
-export PKG_CONFIG_PATH=$LOCAL/lib/pkgconfig
-export PATH=$PATH:$LOCAL/bin:$LOCAL/usr/bin
 
 # Install metaio
 wget https://www.lsc-group.phys.uwm.edu/daswg/download/software/source/metaio-8.2.tar.gz
