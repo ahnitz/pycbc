@@ -5,11 +5,19 @@ LOCAL=$PWD
 mkdir -p $LOCAL/src
 
 apt-get download \
+libfftw3 \
 libfftw3-dev \
+libhdf5-serial \
 libhdf5-serial-dev \
+liblapack \
 liblapack-dev \
 gfortran \
+libgsl0 \
 libgsl0-dev
+
+for PKG in *.deb; do
+    dpkg-deb -x $PKG $LOCAL
+done
 
 ls
 exit 0
@@ -24,9 +32,9 @@ pip install cython
 SWIG_FEATURES="-cpperraswarn -includeall -I/usr/include/openssl" pip install M2Crypto
 
 
-export LD_LIBRARY_PATH=$LOCAL/lib:$LOCAL/lib64
+export LD_LIBRARY_PATH=$LOCAL/lib:$LOCAL/lib64:$LOCAL/usr/lib:$LOCAL/usr/lib64
 export PKG_CONFIG_PATH=$LOCAL/lib/pkgconfig
-export PATH=$PATH:$LOCAL/bin
+export PATH=$PATH:$LOCAL/bin:$LOCAL/usr/bin
 
 # Install metaio
 wget https://www.lsc-group.phys.uwm.edu/daswg/download/software/source/metaio-8.2.tar.gz
