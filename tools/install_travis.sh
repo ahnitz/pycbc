@@ -7,6 +7,7 @@ mkdir -p $LOCAL/src
 export LD_LIBRARY_PATH=$LOCAL/lib:$LOCAL/lib64:$LOCAL/usr/lib:$LOCAL/usr/lib64
 export PKG_CONFIG_PATH=$LOCAL/lib/pkgconfig:$LOCAL/usr/lib/pkgconfig
 export PATH=$PATH:$LOCAL/bin:$LOCAL/usr/bin
+export CFLAGS="-I/$LOCAL/include"
 
 apt-get download \
 libfftw3-3 \
@@ -24,6 +25,8 @@ libgsl0-dev
 for PKG in *.deb; do
     dpkg-deb -x $PKG $LOCAL
 done
+
+pip install h5py
 
 # install the version of swig that for some reason we have to use
 wget http://downloads.sourceforge.net/project/swig/swig/swig-2.0.11/swig-2.0.11.tar.gz
