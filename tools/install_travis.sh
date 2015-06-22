@@ -4,12 +4,15 @@
 LOCAL=$PWD
 mkdir -p $LOCAL/src
 
-sudo apt-get install \
+apt-get download \
 libfftw3-dev \
 libhdf5-serial-dev \
 liblapack-dev \
 gfortran \
 libgsl0-dev
+
+ls
+exit 0
 
 # install the version of swig that for some reason we have to use
 wget http://downloads.sourceforge.net/project/swig/swig/swig-2.0.11/swig-2.0.11.tar.gz
@@ -27,7 +30,7 @@ export PATH=$PATH:$LOCAL/bin
 
 # Install metaio
 wget https://www.lsc-group.phys.uwm.edu/daswg/download/software/source/metaio-8.2.tar.gz
-tar -zxvf metaio-8.2.tar.gz
+tar -xvf metaio-8.2.tar.gz
 cd metaio-8.2; CPPFLAGS=-std=gnu99 ./configure --prefix=$LOCAL; make -j; make install; cd ..
 
 # install framel
