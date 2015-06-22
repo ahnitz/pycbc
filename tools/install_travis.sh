@@ -62,7 +62,7 @@ echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $TRAVIS_BUILD_DIR/source
 echo "export PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> $TRAVIS_BUILD_DIR/source
 echo "export PATH=$PATH" >> $TRAVIS_BUILD_DIR/source
 echo "export HDF5_DIR=$HDF5_DIR" >> $TRAVIS_BUILD_DIR/source
-echo source $LOCAL/etc/glue-user-env.sh >> $TRAVIS_BUILD_DIR/source
+echo "export LAPACK_SRC=$PATH/usr" >> $TRAVIS_BUILD_DIR/source
 echo source $LOCAL/etc/lal-user-env.sh >> $TRAVIS_BUILD_DIR/source
 echo $PWD
 chmod 755 $TRAVIS_BUILD_DIR/source
