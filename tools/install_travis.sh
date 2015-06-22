@@ -11,14 +11,15 @@ liblapack-dev \
 gfortran \
 libgsl0-dev
 
-pip install numpy >= 1.6.4
-pip install cython
-SWIG_FEATURES="-cpperraswarn -includeall -I/usr/include/openssl" pip install M2Crypto
-
 # install the version of swig that for some reason we have to use
 wget http://downloads.sourceforge.net/project/swig/swig/swig-2.0.11/swig-2.0.11.tar.gz
 tar -xvf swig-2.0.11.tar.gz
 cd swig-2.0.11; ./configure --prefix=$LOCAL; make -j; make install; cd ..
+
+pip install numpy >= 1.6.4
+pip install cython
+SWIG_FEATURES="-cpperraswarn -includeall -I/usr/include/openssl" pip install M2Crypto
+
 
 export LD_LIBRARY_PATH=$LOCAL/lib:$LOCAL/lib64
 export PKG_CONFIG_PATH=$LOCAL/lib/pkgconfig
