@@ -5,7 +5,7 @@ LOCAL=$PWD
 mkdir -p $LOCAL/src
 
 export LD_LIBRARY_PATH=$LOCAL/lib:$LOCAL/lib64:$LOCAL/usr/lib:$LOCAL/usr/lib64
-export PKG_CONFIG_PATH=$LOCAL/lib/pkgconfig
+export PKG_CONFIG_PATH=$LOCAL/lib/pkgconfig:$LOCAL/usr/lib/pkgconfig
 export PATH=$PATH:$LOCAL/bin:$LOCAL/usr/bin
 
 apt-get download \
@@ -43,6 +43,9 @@ cd metaio-8.2; CPPFLAGS=-std=gnu99 ./configure --prefix=$LOCAL; make -j; make in
 wget http://lappweb.in2p3.fr/virgo/FrameL/v8r26.tar.gz
 tar -xvf v8r26.tar.gz 
 cd v8r26; autoreconf; ./configure --prefix=$LOCAL;make -j; make install; cd ..
+
+cd usr/lib/pkgconfig
+sed -i "s|usr|$LOCAL/usr|g" gsl.pc
 
 # Install lalsuite itself
 cd $LOCAL/src/
