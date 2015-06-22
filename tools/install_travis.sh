@@ -9,7 +9,7 @@ libfftw3-3 \
 libfftw3-dev \
 libhdf5-serial-1.8.4 \
 libhdf5-serial-dev \
-liblapack3 \
+liblapack3gf \
 liblapack-dev \
 gfortran \
 libgsl0ldbl \
