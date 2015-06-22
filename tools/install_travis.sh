@@ -5,14 +5,14 @@ LOCAL=$PWD
 mkdir -p $LOCAL/src
 
 apt-get download \
-libfftw3 \
+libfftw3-3 \
 libfftw3-dev \
-libhdf5-serial \
+libhdf5-serial-1.8.4 \
 libhdf5-serial-dev \
-liblapack \
+liblapack3 \
 liblapack-dev \
 gfortran \
-libgsl0 \
+libgsl0ldbl \
 libgsl0-dev
 
 for PKG in *.deb; do
@@ -28,7 +28,6 @@ tar -xvf swig-2.0.11.tar.gz
 cd swig-2.0.11; ./configure --prefix=$LOCAL; make -j; make install; cd ..
 
 pip install numpy >= 1.6.4
-pip install cython
 SWIG_FEATURES="-cpperraswarn -includeall -I/usr/include/openssl" pip install M2Crypto
 
 
