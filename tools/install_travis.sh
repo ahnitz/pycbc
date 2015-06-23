@@ -30,6 +30,7 @@ done
 
 echo usr/include
 pip install h5py
+pip install scipy>=0.13.1 --use-wheel
 
 # install the version of swig that for some reason we have to use
 wget http://downloads.sourceforge.net/project/swig/swig/swig-2.0.11/swig-2.0.11.tar.gz
