@@ -21,6 +21,7 @@ libblas-dev \
 liblapack3gf \
 liblapack-dev \
 gfortran \
+gfortran-4.7 \
 libgsl0ldbl \
 libgsl0-dev
 
@@ -30,8 +31,6 @@ done
 
 echo usr/include
 pip install h5py
-pip install "scipy>=0.13.1" --use-wheel --verbose
-pip install "matplotlib>=1.3.1" --use-wheel --verbose
 
 # install the version of swig that for some reason we have to use
 wget http://downloads.sourceforge.net/project/swig/swig/swig-2.0.11/swig-2.0.11.tar.gz
