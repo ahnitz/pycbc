@@ -20,14 +20,15 @@ libblas3gf \
 libblas-dev \
 liblapack3gf \
 liblapack-dev \
-gfortran \
-gfortran-4.7 \
 libgsl0ldbl \
 libgsl0-dev
 
 for PKG in *.deb; do
     dpkg-deb -x $PKG $LOCAL
 done
+
+wget http://gfortran.com/download/x86_64/gfortran-fetch-and-install.sh
+sh gfortran-fetch-and-install.sh -d $PWD 4.7
 
 echo usr/include
 pip install h5py
