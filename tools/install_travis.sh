@@ -6,8 +6,10 @@ mkdir -p $LOCAL/src
 
 export LD_LIBRARY_PATH=$LOCAL/lib:$LOCAL/lib64:$LOCAL/usr/lib:$LOCAL/usr/lib64
 export PKG_CONFIG_PATH=$LOCAL/lib/pkgconfig:$LOCAL/usr/lib/pkgconfig
-export PATH=/usr/lib/ccache/bin:$PATH:$LOCAL/bin:$LOCAL/usr/bin
+export PATH=/usr/lib/ccache:$PATH:$LOCAL/bin:$LOCAL/usr/bin
 export HDF5_DIR=$LOCAL/usr
+
+ls /usr/lib/ccache
 
 apt-get download \
 libfftw3-3 \
