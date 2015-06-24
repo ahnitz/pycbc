@@ -9,14 +9,17 @@ libfftw3-dev \
 python-decorator \
 python-jinja2 \
 python-h5py \
-python-matplotlib \
 python-decorator \
 libhdf5-serial-dev \
 liblapack-dev \
-python-scipy \
-python-numpy \
 gfortran \
 libgsl0-dev
+
+wget http://mirrors.xmission.com/ubuntu/pool/main/p/python-numpy/python-numpy_1.8.1-1ubuntu1_amd64.deb
+sudo dpkg -i python-numpy_1.8.1-1ubuntu1_amd64.deb
+sudo apt-get install -f
+
+exit 0
 
 # install the version of swig that for some reason we have to use
 wget http://downloads.sourceforge.net/project/swig/swig/swig-2.0.11/swig-2.0.11.tar.gz
