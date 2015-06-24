@@ -48,11 +48,12 @@ cd v8r26; autoreconf; ./configure --prefix=$LOCAL;make -j; make install; cd ..
 cd $LOCAL/src/
 git clone https://github.com/ahnitz/lalsuite.git
 cd lalsuite
-./00boot; ./configure --prefix=$LOCAL --enable-swig-python; make -j; make install; cd ..
+./00boot; ./configure --prefix=$LOCAL --enable-swig-python; make -j; make install;
 source $LOCAL/etc/lal-user-env.sh
 
 echo source $LOCAL/etc/glue-user-env.sh >> $TRAVIS_BUILD_DIR/source
 echo source $LOCAL/etc/lal-user-env.sh >> $TRAVIS_BUILD_DIR/source
+cd $LOCAL
 echo $PWD
 chmod 755 $TRAVIS_BUILD_DIR/source
 
