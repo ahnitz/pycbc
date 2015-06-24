@@ -56,4 +56,4 @@ echo source $LOCAL/etc/lal-user-env.sh >> $TRAVIS_BUILD_DIR/source
 echo $PWD
 chmod 755 $TRAVIS_BUILD_DIR/source
 
-cd pycbc; python setup.py install
+python setup.py install
