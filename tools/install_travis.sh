@@ -3,7 +3,7 @@
 
 LOCAL=$PWD
 mkdir -p $LOCAL/src
-
+ls
 sudo apt-get install \
 libfftw3-dev \
 python-decorator \
@@ -48,7 +48,7 @@ cd v8r26; autoreconf; ./configure --prefix=$LOCAL;make -j; make install; cd ..
 cd $LOCAL/src/
 git clone https://github.com/ahnitz/lalsuite.git
 cd lalsuite
-./00boot; ./configure --prefix=$LOCAL --enable-swig-python; make -j; make install
+./00boot; ./configure --prefix=$LOCAL --enable-swig-python; make -j; make install; cd ..
 source $LOCAL/etc/lal-user-env.sh
 
 echo source $LOCAL/etc/glue-user-env.sh >> $TRAVIS_BUILD_DIR/source
