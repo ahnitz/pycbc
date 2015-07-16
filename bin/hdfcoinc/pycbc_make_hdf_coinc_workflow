@@ -218,7 +218,8 @@ for ifo, files in zip(*ind_insps.categorize_by_attr('ifo')):
     insp_segs[ifo] = glue.segments.segmentlist([f.segment for f in files])
     full_segs.append(pycbc.events.segments_to_file(insp_segs[ifo], fname, name, ifo=ifo))
 
-    insp_data_segs[ifo] = glue.segments.segmentlist([f.metadata['data_seg'] for f in files])
+    tags, groups = files.categorize_by_attr('segment')
+    insp_data_segs[ifo] = glue.segments.segmentlist([g[0].metadata['data_seg'] for g in groups])
     data_seg = pycbc.events.segments_to_file(insp_data_segs[ifo],
                    'segments/%s-INSP_DATA.xml' % ifo, 'INSPIRAL_DATA', ifo=ifo)
 
