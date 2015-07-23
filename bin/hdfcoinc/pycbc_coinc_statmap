@@ -10,8 +10,8 @@ from pycbc.events import veto, coinc
 import pycbc.version, pycbc.pnutils
 
 def apply_bank_statistic(data, name, bank_file):
-    bank = h5py.File(bank_file)
     if name == 'mchirp_bin':
+        bank = h5py.File(bank_file)
         b = [0, 1, 2, 3, 4]
         data = mchirp_bin(data, bank, b)           
     return data
