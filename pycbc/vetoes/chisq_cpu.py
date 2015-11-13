@@ -61,9 +61,7 @@ point_chisq_code = """
         int bstart = bins[r];
         int bend = bins[r+1];
         int blen = bend - bstart;
-        
-        TYPE* outr = (TYPE*) malloc(sizeof(TYPE)*n);
-        TYPE* outi = (TYPE*) malloc(sizeof(TYPE)*n);
+
         for (int i=0; i<n; i++){
             outr[i] = 0;
             outi[i] = 0;
@@ -139,8 +137,6 @@ point_chisq_code = """
         for (unsigned int i=0; i<n; i++){
             chisq[i] += outr[i]*outr[i] + outi[i]*outi[i];
         }
-        free(outr);
-        free(outi);
     }    
 """
 
@@ -165,8 +161,10 @@ def shift_sum(v1, shifts, bins):
     
     # Create some output memory
     chisq =  numpy.zeros(n, dtype=real_type)
+    outr = numpy.zeros(n, dtype=real_type)
+    outi = numpy.zeros(n, dtype=real_type)
     
-    inline(code, ['v1', 'n', 'chisq', 'slen', 'shifts', 'bins', 'blen'],
+    inline(code, ['v1', 'n', 'chisq', 'outr', 'outi', 'slen', 'shifts', 'bins', 'blen'],
                     extra_compile_args=[WEAVE_FLAGS + '-march=native -O3 -w'] + omp_flags,
                     libraries=omp_libs
           )
