@@ -79,6 +79,8 @@ parser.add_argument("--chisq-bins", default=0, help=
                     "allowed, ex. "
                     "'10./math.sqrt((params.mass1+params.mass2)/100.)'. "
                     "Non-integer values will be rounded down.")
+parser.add_argument("--save-chisq-bins", action='store_true',
+                    help='write each chisq bin to the output file')
 parser.add_argument("--chisq-threshold", type=float, default=0,
                     help="FIXME: ADD")
 parser.add_argument("--chisq-delta", type=float, default=0, help="FIXME: ADD")
@@ -205,38 +207,6 @@ with ctx:
     psds = associate_psd(strain_segments, gwstrain, segments,
                   opt.psd_recalculate_segments, flen, delta_f, flow)
 
-    # storage for values and types to be passed to event manager
-    out_types = {
-        'time_index'     : int,
-        'snr'            : complex64,
-        'chisq'          : float32,
-        'chisq_dof'      : int,
-        'bank_chisq'     : float32,
-        'bank_chisq_dof' : int,
-        'cont_chisq'     : float32
-                }
-    out_vals = {
-        'time_index'     : None,
-        'snr'            : None,
-        'chisq'          : None,
-        'chisq_dof'      : None,
-        'bank_chisq'     : None,
-        'bank_chisq_dof' : None,
-        'cont_chisq'     : None
-               }
-    names = sorted(out_vals.keys())
-
-    event_mgr = events.EventManager(
-            opt, names, [out_types[n] for n in names], psd=psds[0],
-            gating_info=gwstrain.gating_info)
-
-    if len(strain_segments.segment_slices) == 0:
-        logging.info("--filter-inj-only specified and no injections in analysis time")
-        event_mgr.finalize_template_events()
-        event_mgr.write_events(opt.output)
-        logging.info("Finished")
-        sys.exit(0)
-
     template_mem = zeros(tlen, dtype = complex64)
     cluster_window = int(opt.cluster_window * gwstrain.sample_rate)
 
@@ -259,7 +229,31 @@ with ctx:
                                           phase_order=opt.order,
                                           approximant=opt.approximant)
 
-    power_chisq = vetoes.SingleDetPowerChisq(opt.chisq_bins, opt.chisq_snr_threshold)
+    power_chisq = vetoes.SingleDetPowerChisq(opt.chisq_bins, opt.chisq_snr_threshold, save_bins=args.save_chisq_bins)
+
+    # storage for values and types to be passed to event manager
+    out_vals = {
+        'time_index'     : int,
+        'snr'            : complex64,
+        'bank_chisq'     : float32,
+        'bank_chisq_dof' : int,
+        'cont_chisq'     : float32
+                }
+    out_vals.update(power_chisq.returns)
+                
+    names = sorted(out_vals.keys())
+
+    event_mgr = events.EventManager(
+            opt, names, [out_vals[n] for n in names], psd=psds[0],
+            gating_info=gwstrain.gating_info)
+
+    if len(strain_segments.segment_slices) == 0:
+        logging.info("--filter-inj-only specified and no injections in analysis time")
+        event_mgr.finalize_template_events()
+        event_mgr.write_events(opt.output)
+        logging.info("Finished")
+        sys.exit(0)
+
     autochisq = vetoes.SingleDetAutoChisq(opt.autochi_stride,
                                  opt.autochi_number_points,
                                  onesided=opt.autochi_onesided,
@@ -267,6 +261,7 @@ with ctx:
                                  reverse_template=opt.autochi_reverse_template,
                                  take_maximum_value=opt.autochi_max_valued,
                                  maximal_value_dof=opt.autochi_max_valued_dof)
+
 
     logging.info("Overwhitening frequency-domain data segments")
     for seg in segments:

@@ -317,6 +317,12 @@ class SingleDetPowerChisq(object):
         self.snr_threshold = snr_threshold
         self._bin_cache = {}
         self.return_bins = return_bins
+        
+        self.returns = {'chisq': numpy.complex64,
+                        'chisq_dof': numpy.uint32}
+        
+        if return_bins:
+            self.returns.update({'chisq_bin_value': numpy.object})
 
     @staticmethod
     def parse_option(row, arg):
