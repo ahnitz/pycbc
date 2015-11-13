@@ -179,4 +179,7 @@ def shift_sum(v1, shifts, bins, return_bins=True):
                     libraries=omp_libs
           )
 
+    if return_bins:
+        return chisq, bin_values
+
     return  chisq

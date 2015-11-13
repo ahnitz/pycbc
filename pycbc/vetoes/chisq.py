@@ -102,7 +102,7 @@ def shift_sum(v1, shifts, bins):
     """
     pass
 
-def power_chisq_at_points_from_precomputed(corr, snr, snr_norm, bins, indices):
+def power_chisq_at_points_from_precomputed(corr, snr, snr_norm, bins, indices, return_bins=False):
     """Calculate the chisq timeseries from precomputed values for only select points.
 
     This function calculates the chisq at each point by explicitly time shifting
@@ -129,8 +129,14 @@ def power_chisq_at_points_from_precomputed(corr, snr, snr_norm, bins, indices):
     """
     logging.info('doing fast point chisq')
     num_bins = len(bins) - 1
-    chisq = shift_sum(corr, indices, bins)
-    return (chisq * num_bins - (snr.conj() * snr).real) * (snr_norm ** 2.0)
+    
+    if return_bins is False:
+        chisq = shift_sum(corr, indices, bins)
+        return (chisq * num_bins - (snr.conj() * snr).real) * (snr_norm ** 2.0)
+    else:
+        chisq, bin_values = shift_sum(corr, indices, bins, return_bins=True)
+        return ((chisq * num_bins - (snr.conj() * snr).real) * (snr_norm ** 2.0),
+                bin_values)
 
 _q_l = None
 _qtilde_l = None
@@ -300,7 +306,7 @@ class SingleDetPowerChisq(object):
     """Class that handles precomputation and memory management for efficiently
     running the power chisq in a single detector inspiral analysis.
     """
-    def __init__(self, num_bins=0, snr_threshold=None):
+    def __init__(self, num_bins=0, snr_threshold=None, return_bins=False):
         if not (num_bins == "0" or num_bins == 0):
             self.do = True
             self.column_name = "chisq"
@@ -310,6 +316,7 @@ class SingleDetPowerChisq(object):
             self.do = False
         self.snr_threshold = snr_threshold
         self._bin_cache = {}
+        self.return_bins = return_bins
 
     @staticmethod
     def parse_option(row, arg):
@@ -372,12 +379,19 @@ class SingleDetPowerChisq(object):
                 chisq = power_chisq_at_points_from_precomputed(corr,
                                      above_snrv, snr_norm, bins, above_indices)
 
+            if self.return_bins:
+                chisq = chisq[0]
+                bin_values = chisq[1]
+
             if self.snr_threshold:
                 if num_above > 0:
                     rchisq[above] = chisq
             else:
                 rchisq = chisq
-
-            return rchisq, numpy.repeat(dof, len(indices))# dof * numpy.ones_like(indices)
+            
+            if self.return_bins:
+                return rchisq, numpy.repeat(dof, len(indices)), bin_values
+            else:
+                return rchisq, numpy.repeat(dof, len(indices))
         else:
             return None, None
