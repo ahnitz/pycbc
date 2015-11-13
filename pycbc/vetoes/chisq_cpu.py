@@ -22,7 +22,7 @@
 # =============================================================================
 #
 import numpy, pycbc
-from pycbc.types import real_same_precision_as
+from pycbc.types import real_same_precision_as, complex_same_precision_as
 from scipy.weave import inline
 from pycbc import WEAVE_FLAGS
 
@@ -60,7 +60,7 @@ point_chisq_code = """
     for (unsigned int r=0; r<blen; r++){     
         int bstart = bins[r];
         int bend = bins[r+1];
-        int blen = bend - bstart;
+        int chunk_length = bend - bstart;
 
         for (int i=0; i<n; i++){
             outr[i] = 0;
@@ -69,8 +69,8 @@ point_chisq_code = """
     
         #pragma omp parallel for
         for (unsigned int k=0; k<num_parallel_regions; k++){
-            unsigned int start = blen * k / num_parallel_regions + bstart;
-            unsigned int end = blen * (k + 1) / num_parallel_regions + bstart;
+            unsigned int start = chunk_length * k / num_parallel_regions + bstart;
+            unsigned int end = chunk_length * (k + 1) / num_parallel_regions + bstart;
         
             //start the cumulative rotations at the offset point
             TYPE* pr = (TYPE*) malloc(sizeof(TYPE)*n);
@@ -136,6 +136,9 @@ point_chisq_code = """
         
         for (unsigned int i=0; i<n; i++){
             chisq[i] += outr[i]*outr[i] + outi[i]*outi[i];
+            if (save_bins){
+                bin_values[r + i * blen] = std::complex<float>(outr[i], outi[i]);
+            }
         }
     }    
 """
@@ -143,7 +146,7 @@ point_chisq_code = """
 point_chisq_code_single = point_chisq_code.replace('TYPE', 'float')
 point_chisq_code_double = point_chisq_code.replace('TYPE', 'double')
 
-def shift_sum(v1, shifts, bins):
+def shift_sum(v1, shifts, bins, return_bins=True):
     real_type = real_same_precision_as(v1)
     shifts = numpy.array(shifts, dtype=real_type)
     
@@ -164,9 +167,16 @@ def shift_sum(v1, shifts, bins):
     outr = numpy.zeros(n, dtype=real_type)
     outi = numpy.zeros(n, dtype=real_type)
     
-    inline(code, ['v1', 'n', 'chisq', 'outr', 'outi', 'slen', 'shifts', 'bins', 'blen'],
+    extra = []
+    save_bins = int(0)
+    if return_bins:
+        save_bins = int(1)
+        bin_values = numpy.zeros(n * blen, dtype=numpy.complex64)
+        extra =  ['save_bins', 'bin_values']
+        
+    inline(code, ['v1', 'n', 'chisq', 'outr', 'outi', 'slen', 'shifts', 'bins', 'blen'] + extra,
                     extra_compile_args=[WEAVE_FLAGS + '-march=native -O3 -w'] + omp_flags,
                     libraries=omp_libs
           )
-          
+
     return  chisq
