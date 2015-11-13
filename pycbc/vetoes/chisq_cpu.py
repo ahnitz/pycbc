@@ -136,9 +136,11 @@ point_chisq_code = """
         
         for (unsigned int i=0; i<n; i++){
             chisq[i] += outr[i]*outr[i] + outi[i]*outi[i];
+            
             if (save_bins){
                 bin_values[r + i * blen] = std::complex<float>(outr[i], outi[i]);
             }
+            
         }
     }    
 """
@@ -146,7 +148,7 @@ point_chisq_code = """
 point_chisq_code_single = point_chisq_code.replace('TYPE', 'float')
 point_chisq_code_double = point_chisq_code.replace('TYPE', 'double')
 
-def shift_sum(v1, shifts, bins, return_bins=True):
+def shift_sum(v1, shifts, bins, return_bins=False):
     real_type = real_same_precision_as(v1)
     shifts = numpy.array(shifts, dtype=real_type)
     
@@ -167,12 +169,12 @@ def shift_sum(v1, shifts, bins, return_bins=True):
     outr = numpy.zeros(n, dtype=real_type)
     outi = numpy.zeros(n, dtype=real_type)
     
-    extra = []
     save_bins = int(0)
+    bin_values = v1
+    extra =  ['save_bins', 'bin_values']
     if return_bins:
         save_bins = int(1)
         bin_values = numpy.zeros(n * blen, dtype=numpy.complex64)
-        extra =  ['save_bins', 'bin_values']
         
     inline(code, ['v1', 'n', 'chisq', 'outr', 'outi', 'slen', 'shifts', 'bins', 'blen'] + extra,
                     extra_compile_args=[WEAVE_FLAGS + '-march=native -O3 -w'] + omp_flags,
