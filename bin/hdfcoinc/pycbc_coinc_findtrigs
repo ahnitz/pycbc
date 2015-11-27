@@ -3,6 +3,9 @@ import h5py, argparse, logging, numpy, numpy.random
 from pycbc import events, detector
 from pycbc.events import veto, coinc
 import pycbc.version
+import lal
+from pycbc.coherent import likelihood, fstat, sky
+from scipy.misc import logsumexp
        
 parser = argparse.ArgumentParser()
 parser.add_argument("--verbose", action="count")
@@ -21,6 +24,8 @@ parser.add_argument("--template-bank",
 parser.add_argument("--ranking-statistic", help="The ranking statistic to use", default='newsnr')
 parser.add_argument("--coinc-threshold", type=float, default=0.0,
                     help="Seconds to add to time-of-flight coincidence window")
+parser.add_argument("--newsnr-threshold", type=float, default=0.0,
+                    help="Only keep events with a newsnr greater than this value")
 parser.add_argument("--timeslide-interval", type=float, default=0,
                     help="Inverval between timeslides in seconds.")
 parser.add_argument("--decimation-factor", type=int,
@@ -48,6 +53,8 @@ def get_statistic(option, files):
         return NewSNRCutStatistic(files)
     elif option == 'phasetd_newsnr':
         return PhaseTDStatistic(files)
+    elif option == 'likelihood_newsnr':
+        return LikelihoodStatistic(files)
     elif option == 'max_cont_trad_newsnr':
         return MaxContTradNewSNRStatistic(files)
     else:
@@ -59,6 +66,25 @@ def parse_template_range(num_templates, rangestr):
     tmin =  int(num_templates / float(pieces) * part)
     tmax =  int(num_templates / float(pieces) * (part+1))
     return tmin, tmax    
+
+def generate_sky_rings(dt_points=180, ring_points=300):
+    t_gps = 1000000000.0
+    t_gmst = lal.GreenwichMeanSiderealTime(t_gps)
+    sky_line = sky.MaxTimeDelayLine3("H1", "L1", 0.9, 0.0, t_gps, n=dt_points)
+    dt_ring = numpy.array([y.get_time_delay("H1", "L1", t_gps) for y in sky_line])
+    f_plus_cross = []
+    for i, pt in enumerate(sky_line):
+        dt = pt.get_time_delay("H1", "L1", t_gps)
+        ring = sky.ISOTimeDelayLine(["H1", "L1"], pt.longitude, pt.latitude, 
+                                    t_gps, ring_points)
+        f_pc = numpy.zeros([len(ring),2,2])
+        for j, r in enumerate(ring):
+            f_pc[j] = numpy.array([numpy.array(lal.ComputeDetAMResponse(
+                detector.Detector(ifo).response,
+                r.longitude, r.latitude, 0., t_gmst))
+                for ifo in ["H1", "L1"]])
+        f_plus_cross.append(f_pc)
+    return dt_ring, f_plus_cross
 
 class Stat(object):
     def __init__(self, files):
@@ -152,6 +178,43 @@ class PhaseTDStatistic(NewSNRStatistic):
         cstat = (s1[:,0]**2.0 + s2[:,0]**2.0 + m) / 2.0          
         cstat[m == 0] = 1  
         return cstat
+
+class LikelihoodStatistic(NewSNRStatistic):
+    def single(self, trigs):
+        newsnr = NewSNRStatistic.single(self, trigs)
+        return numpy.array((newsnr, trigs['end_time'],
+             trigs['snr'], trigs['coa_phase'], 
+             numpy.sqrt(trigs['sigmasq']))).transpose()
+
+    def coinc(self, s1, s2, slide, step):
+        """ Calculate the coincident statistic.
+        """
+        td = s1[:,1] - s2[:,1] - slide * step
+        z = numpy.array([s1[:,2] * numpy.exp(1j * s1[:,3]), 
+            s2[:,2] * numpy.exp(1j * s2[:,3])])
+        sigma = numpy.array([s1[:,4], s2[:,4]])
+        dmax = numpy.linalg.norm(sigma)/8/numpy.sqrt(2)
+        cstat = numpy.zeros_like(td)
+        snr = numpy.linalg.norm(z, axis=0)
+        newsnrsq = s1[:,0]**2 + s2[:,0]**2
+        loud = numpy.sqrt(newsnrsq) > args.newsnr_threshold
+        logging.info('Coincident Trigs above threshold: %s' % (sum(loud)))
+
+        
+        for c in loud.nonzero()[0]:
+            i = (abs(dt_ring - td[c])).argmin()
+            f_pc = f_plus_cross[i]
+            lik = numpy.zeros(len(f_pc))
+            for j, f in enumerate(f_pc):
+                f_sig = f * sigma[:,c]
+                a = fstat.snr_f_to_a(z[:,c], f_sig)
+                fp, fc, chi = fstat.dominant_polarization(f_sig)
+                D, cosi, psi, phi = fstat.a_to_params(a)
+                a_dp = fstat.params_to_a(D, cosi, psi - chi, phi)
+                lik[j] = likelihood.like_approx(a_dp, fp, fc, dmax)[0]
+            cstat[c] = logsumexp(lik) - numpy.log(len(f_pc)) - snr[c]**2/2 + newsnrsq[c]/2
+        return cstat 
+        
 
 class MaxContTradNewSNRStatistic(NewSNRStatistic):
     def single(self, trigs):
@@ -278,6 +341,9 @@ if args.strict_coinc_time:
     trigs0.valid = veto.segments_to_start_end(trigs0.segs)
     trigs1.valid = veto.segments_to_start_end(trigs1.segs)
 
+if args.ranking_statistic == "likelihood_newsnr":
+    dt_ring, f_plus_cross = generate_sky_rings()
+ 
 rank_method = get_statistic(args.ranking_statistic, args.statistic_files)
 det0, det1 = detector.Detector(trigs0.ifo), detector.Detector(trigs1.ifo)
 time_window = det0.light_travel_time_to_detector(det1) + args.coinc_threshold
@@ -362,11 +428,7 @@ logging.info('saving coincident triggers')
 f = h5py.File(args.output_file, 'w')
 if len(data['stat']) > 0:
     for key in data:
-        var = data[key][cid] if args.cluster_window else data[key]        
-        f.create_dataset(key, data=var, 
-                              compression='gzip',
-                              compression_opts=9,
-                              shuffle=True)
+        f[key] = data[key][cid] if args.cluster_window else data[key]
             
 f['segments/coinc/start'], f['segments/coinc/end'] = veto.segments_to_start_end(coinc_segs)
 
