@@ -119,7 +119,7 @@ class PhaseTDStatistic(NewSNRStatistic):
         """ Calculate the coincident statistic.
         """
         td = s1[:,2] - s2[:,2] - slide * step
-        pd = s1[:,1] - s2[:,1]
+        pd = (s1[:,1] - s2[:,1]) % (numpy.pi * 2)
         rd = numpy.log(s1[:,0] / s2[:,0])
         md = (s1[:,0]**2.0 + s2[:,0]**2.0) ** 0.5
 

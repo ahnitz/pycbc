@@ -25,7 +25,7 @@ d1 = pycbc.detector.Detector(str(args.ifos[0]))
 d2 = pycbc.detector.Detector(str(args.ifos[1]))
 maxdt = d1.light_travel_time_to_detector(d2)
 tbins = numpy.linspace(- maxdt, maxdt, num=int(args.sample_rate * 2 * maxdt))
-pbins = numpy.linspace(-2.0 * numpy.pi, 2.0 * numpy.pi, num=50)
+pbins = numpy.linspace(0, 2.0 * numpy.pi, num=50)
 rbins = numpy.linspace(-3.5, 3.5, num=20)
 mbins = numpy.logspace(numpy.log(args.snr_threshold * 2 ** 0.5), numpy.log(20), num=20, base=numpy.e)
 
@@ -94,7 +94,7 @@ def generate_samples(size):
     s2 = (sp2**2.0 + sc2**2.0)**0.5
 
     td = td[t]
-    phase_diff = (numpy.arctan2(sp1, sc1) - numpy.arctan2(sp2, sc2))
+    phase_diff = (numpy.arctan2(sp1, sc1) - numpy.arctan2(sp2, sc2)) % (numpy.pi * 2)
     ratio = numpy.log(s1 / s2)
     mag = (s1**2.0 + s2**2.0)**0.5
     
@@ -104,7 +104,7 @@ def generate_samples(size):
 fiddle = 3
 core_size = int(args.sample_size / args.cores) / fiddle
 chunk_data = [core_size] * args.cores * fiddle
-print chunk_data
+
 if args.cores == 1:
     h = map(generate_hist, chunk_data)
 else:
