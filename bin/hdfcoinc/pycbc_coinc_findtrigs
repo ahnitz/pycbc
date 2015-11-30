@@ -101,7 +101,15 @@ class PhaseTDStatistic(NewSNRStatistic):
     def __init__(self, files):
         NewSNRStatistic.__init__(self, files)
         self.hist = self.files['phasetd_newsnr']['map'][:]
-        self.hist = numpy.log(self.hist / float(self.hist.max())) * 2.0
+        top = float(self.hist.max())     
+
+        #normalize so that peak has no effect on newsnr
+        self.hist = self.hist / top
+
+        #set 0 to smallest value
+        self.hist[self.hist == 0] = 1.0 / top
+
+        self.hist = numpy.log(self.hist) * 2.0
 
     def single(self, trigs):
         newsnr = NewSNRStatistic.single(self, trigs)
@@ -138,7 +146,6 @@ class PhaseTDStatistic(NewSNRStatistic):
         mv[mv >= len(mbins) - 1] = len(mbins) - 2
         
         m = self.hist[tv, pv, rv, mv]
-        m[m < 1] = 1
         
         cstat = (s1[:,0]**2.0 + s2[:,0]**2.0 + m)**0.5  
          
