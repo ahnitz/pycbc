@@ -59,6 +59,7 @@ def generate_samples(size):
     dec = numpy.arccos(uniform(-1., 1., size=size)) - numpy.pi/2
     pol = uniform(0, 2 * numpy.pi, size=size)
     dist = power(3, size) / args.snr_threshold
+    
 
     # Calculate the expected time offset, and fp,fc for both detectors
     fp1, fc1, fp2, fc2, td = [], [], [], [], []
@@ -77,12 +78,20 @@ def generate_samples(size):
     # Scale fp fc to a volumentric distribution of SNRs
     # add on gaussian errors in SNR
     f = 100
-    dist = power(3, size * f) / args.snr_threshold
-    sp1 = numpy.resize(fp1, len(dist)) / dist + normal(0, scale=1.0, size=size * f)
-    sp2 = numpy.resize(fp2, len(dist)) / dist + normal(0, scale=1.0, size=size * f)
-    sc1 = numpy.resize(fc1, len(dist)) / dist + normal(0, scale=1.0, size=size * f)
-    sc2 = numpy.resize(fc2, len(dist)) / dist + normal(0, scale=1.0, size=size * f)
-    td = numpy.resize(td, size * f) + normal(0, scale=1.0 / args.sample_rate, size=size * f)
+    fsize = f * size
+    dist = power(3, fsize) / args.snr_threshold
+    
+    inc = uniform(0, 2 * numpy.pi, size=fsize)
+    ip = numpy.cos(inc)
+    ic = 0.5 * (1.0 + ip * ip)
+    
+    print ip.mean(), ic.mean()
+    
+    sp1 = numpy.resize(fp1, len(dist)) / dist * ip + normal(0, scale=1.0, size=fsize) 
+    sp2 = numpy.resize(fp2, len(dist)) / dist * ip + normal(0, scale=1.0, size=fsize) 
+    sc1 = numpy.resize(fc1, len(dist)) / dist * ic + normal(0, scale=1.0, size=fsize) 
+    sc2 = numpy.resize(fc2, len(dist)) / dist * ic + normal(0, scale=1.0, size=fsize)
+    td = numpy.resize(td, fsize) + normal(0, scale=1.0 / args.sample_rate, size=fsize)
 
     # Remove points below the SNR threshold
     t = sp1**2.0 + sc1**2.0 > args.snr_threshold ** 2.0
