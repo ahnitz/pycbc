@@ -76,11 +76,13 @@ def generate_samples(size):
 
     # Scale fp fc to a volumentric distribution of SNRs
     # add on gaussian errors in SNR
-    sp1 = numpy.array(fp1) / dist + normal(0, scale=1.0, size=size)
-    sp2 = numpy.array(fp2) / dist + normal(0, scale=1.0, size=size)
-    sc1 = numpy.array(fc1) / dist + normal(0, scale=1.0, size=size)
-    sc2 = numpy.array(fc2) / dist + normal(0, scale=1.0, size=size)
-    td = numpy.array(td) + normal(0, scale=1.0 / args.sample_rate, size=size)
+    f = 100
+    dist = power(3, size * f) / args.snr_threshold
+    sp1 = numpy.resize(fp1, len(dist)) / dist + normal(0, scale=1.0, size=size * f)
+    sp2 = numpy.resize(fp2, len(dist)) / dist + normal(0, scale=1.0, size=size * f)
+    sc1 = numpy.resize(fc1, len(dist)) / dist + normal(0, scale=1.0, size=size * f)
+    sc2 = numpy.resize(fc2, len(dist)) / dist + normal(0, scale=1.0, size=size * f)
+    td = numpy.resize(td, size * f) + normal(0, scale=1.0 / args.sample_rate, size=size * f)
 
     # Remove points below the SNR threshold
     t = sp1**2.0 + sc1**2.0 > args.snr_threshold ** 2.0
