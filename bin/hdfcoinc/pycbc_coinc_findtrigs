@@ -113,15 +113,17 @@ class PhaseTDStatistic(NewSNRStatistic):
 
     def single(self, trigs):
         newsnr = NewSNRStatistic.single(self, trigs)
-        return numpy.array((newsnr, trigs['coa_phase'], trigs['end_time'])).transpose()
+        return numpy.array((newsnr, trigs['coa_phase'], trigs['end_time'], trigs['sigmasq'])).transpose()
 
     def coinc(self, s1, s2, slide, step):
         """ Calculate the coincident statistic.
         """
         td = s1[:,2] - s2[:,2] - slide * step
         pd = (s1[:,1] - s2[:,1]) % (numpy.pi * 2)
-        rd = numpy.log(s1[:,0] / s2[:,0])
+        rd = numpy.log(s1[:,0] / s2[:,0] * s2[:3] / s1[:3])
         md = (s1[:,0]**2.0 + s2[:,0]**2.0) ** 0.5
+
+        
 
         # These are the bin boundaries stored in the hdf file        
         tbins = self.files['phasetd_newsnr']['tbins'][:]
