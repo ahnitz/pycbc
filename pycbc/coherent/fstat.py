@@ -172,8 +172,8 @@ def snr_f_to_a(z, f_sig):
     m = zeros((2, 2))
     for f in f_sig:
         m += outer(f, f)
-    s_h = inner(z, f_sig.transpose())
-    a_max = inner(s_h, linalg.inv(m))
+    s_h = dot(z, f_sig)
+    a_max = dot(s_h, linalg.inv(m))
     a = array([1.0, a_max[0].real, a_max[1].real, a_max[0].imag, a_max[1].imag])
     return a
 
