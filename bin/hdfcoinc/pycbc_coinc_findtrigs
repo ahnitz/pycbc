@@ -206,12 +206,16 @@ class LikelihoodStatistic(NewSNRStatistic):
             f_pc = f_plus_cross[i]
             lik = numpy.zeros(len(f_pc))
             for j, f in enumerate(f_pc):
-                f_sig = f * sigma[:,c]
+                f_sig = f * sigma[:,c].reshape([2,1])
                 a = fstat.snr_f_to_a(z[:,c], f_sig)
                 fp, fc, chi = fstat.dominant_polarization(f_sig)
                 D, cosi, psi, phi = fstat.a_to_params(a)
                 a_dp = fstat.params_to_a(D, cosi, psi - chi, phi)
                 lik[j] = likelihood.like_approx(a_dp, fp, fc, dmax)[0]
+                if abs(fstat.expected_snr(a_dp, fp, fc) - snr[c]) > 1e-4:
+                    print("Error for event %d, sky point %d" % (c, j))
+                    print("Original SNR: %.4e; New SNR: %.4e" % 
+                        (snr[c], fstat.expected_snr(a_dp, fp, fc)))
             cstat[c] = logsumexp(lik) - numpy.log(len(f_pc)) - snr[c]**2/2 + newsnrsq[c]/2
         return cstat 
         
