@@ -182,37 +182,6 @@ def GeographicToEquatorial(input, gpstime):
 
     return output
 
-def EquatorialToGalactic(input):
-    """
-    Convert the SkyPosition object input from the inherited 'equatorial'
-    system to  to 'galactic'.
-    """
-
-    # intermediates. */
-    a    = -lal.LAL_ALPHAGAL + input.longitude
-    sinD = np.sin(input.latitude)
-    cosD = np.cos(input.latitude)
-    sinA = np.sin(a)
-    cosA = np.cos(a)
-
-    # components. */
-    sinB = cosD*np.cos(lal.LAL_DELTAGAL)*cosA\
-                + sinD*np.sin(lal.LAL_DELTAGAL)
-    sinL = sinD*np.cos(lal.LAL_DELTAGAL)\
-                - cosD*cosA*np.sin(lal.LAL_DELTAGAL)
-    cosL = cosD*sinA
-
-    # output
-    output = SkyPosition()
-    output.system    = 'galactic'
-    output.latitude  = np.arcsin(sinB)
-    output.longitude = np.arctan2(sinL, cosL) + lal.LAL_LGAL
-    output.probability = input.probability
-    output.solid_angle = input.solid_angle
-    output.normalize()
-
-    return output
-
 def EquatorialToGeographic(input, gpstime):
     """
     Convert the SkyPosition object input from the inherited 'equatorial'

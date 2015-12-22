@@ -44,19 +44,6 @@ def a_to_params(a):
     return d, cosi, psi, phi
 
 
-def a_to_circular(a):
-    """
-    Calculate the circular F-stat A parameters given in Whelan et al 2013
-    :param a: array of f-stat params, entry zero assumed to be d0
-    """
-    a_circ = zeros(5)
-    a_circ[0] = a[0]
-    a_circ[1] = 0.5 * (a[1] + a[4])
-    a_circ[2] = 0.5 * (a[2] - a[3])
-    a_circ[3] = 0.5 * (a[1] - a[4])
-    a_circ[4] = - 0.5 * (a[2] + a[3])
-    return a_circ
-
 # The following functions calculate SNRs, likelihoods, etc for a signal, given a network.
 # They all work in the dominant polarization (i.e. assuming that the network is described
 # by F+, Fx and they're orthogonal)
