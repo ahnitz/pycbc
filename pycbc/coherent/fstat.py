@@ -70,22 +70,6 @@ def a_to_circ_amp(a):
     return ar_hat, al_hat
 
 
-def phase_diff(a):
-    """
-    Calculate the phase difference (not sure what of)
-    :param a: array of f-stat params, entry zero assumed to be d0
-    """
-    return arctan2(a[1] * a[4] - a[2] * a[3], a[1] * a[2] + a[3] * a[4])
-
-
-def amp_ratio(a):
-    """
-    Calculate the amplitude ratio
-    :param a: array of f-stat params, entry zero assumed to be d0
-    """
-    return sqrt((a[1] ** 2 + a[3] ** 2) / (a[2] ** 2 + a[4] ** 2))
-
-
 # The following functions calculate SNRs, likelihoods, etc for a signal, given a network.
 # They all work in the dominant polarization (i.e. assuming that the network is described
 # by F+, Fx and they're orthogonal)
@@ -102,33 +86,6 @@ def expected_snr(a, f_plus, f_cross):
     return sqrt(snrsq)
 
 
-def set_snr(a, f_plus, f_cross, snr):
-    """
-    rescale distance to give desired SNR, return rescaled as and distance
-    :param a: the F-stat A parameters
-    :param f_plus: F_plus sensitivity
-    :param f_cross: F_cross sensitivity
-    :param snr: the desired SNR
-    """
-    s = expected_snr(a, f_plus, f_cross)
-    a_scale = a * snr / s
-    a_scale[0] = a[0]
-    d_scale = a_to_params(a_scale)[0]
-    return a_scale, d_scale
-
-
-def lost_snrsq(a_hat, a, f_plus, f_cross):
-    """
-    Calculate the difference in SNRSQ between the true parameters a_hat
-    and the template a, network sensitivity f_plus, f_cross
-    :param a_hat: the observed F-stat A parameters
-    :param a: the "template" F-stat A parameters
-    :param f_plus: sensitivity to plus polarization
-    :param f_cross: sensitivity to cross polarization
-    """
-    f = array([0, f_plus, f_cross, f_plus, f_cross])
-    snrsq = sum(f ** 2 * (a_hat - a) ** 2)
-    return snrsq
 
 
 def circ_project(a, f_plus, f_cross, hand):
