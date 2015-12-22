@@ -107,9 +107,11 @@ class PhaseTDStatistic(NewSNRStatistic):
         self.hist = self.hist / top
 
         #set 0 to smallest value
-        self.hist[self.hist == 0] = 1.0 / top
+        self.m = (self.hist == 0)
+        self.hist[self.m] = 1.0 / top
 
         self.hist = numpy.log(self.hist) * 2.0
+        self.hist[self.m] = 0
 
     def single(self, trigs):
         newsnr = NewSNRStatistic.single(self, trigs)
@@ -147,8 +149,8 @@ class PhaseTDStatistic(NewSNRStatistic):
         
         m = self.hist[tv, pv, rv, mv]
         
-        cstat = (s1[:,0]**2.0 + s2[:,0]**2.0 + m)**0.5  
-         
+        cstat = (s1[:,0]**2.0 + s2[:,0]**2.0 + m)**0.5          
+        cstat[m == 0] = 1  
         return cstat
 
 class MaxContTradNewSNRStatistic(NewSNRStatistic):
