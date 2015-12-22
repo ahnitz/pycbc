@@ -57,19 +57,6 @@ def a_to_circular(a):
     a_circ[4] = - 0.5 * (a[2] + a[3])
     return a_circ
 
-
-def a_to_circ_amp(a):
-    """
-    Calculate the amplitudes of left/right circularly polarized waveforms
-    from the F-stat A parameters
-    :param a: array of f-stat params, entry zero assumed to be d0
-    """
-    a_circ = a_to_circular(a)
-    ar_hat = sqrt(a_circ[1] ** 2 + a_circ[2] ** 2)
-    al_hat = sqrt(a_circ[3] ** 2 + a_circ[4] ** 2)
-    return ar_hat, al_hat
-
-
 # The following functions calculate SNRs, likelihoods, etc for a signal, given a network.
 # They all work in the dominant polarization (i.e. assuming that the network is described
 # by F+, Fx and they're orthogonal)
@@ -84,9 +71,6 @@ def expected_snr(a, f_plus, f_cross):
     f = array([0, f_plus, f_cross, f_plus, f_cross])
     snrsq = sum(f ** 2 * a ** 2)
     return sqrt(snrsq)
-
-
-
 
 def circ_project(a, f_plus, f_cross, hand):
     """
@@ -133,21 +117,6 @@ def snr_f_to_a(z, f_sig):
     a_max = dot(s_h, linalg.inv(m))
     a = array([1.0, a_max[0].real, a_max[1].real, a_max[0].imag, a_max[1].imag])
     return a
-
-def a_f_to_snr(a, f_plus, f_cross):
-    """
-    Given the F-stat a parameters and f_plus, f_cross for a detector, calculate the SNR.
-    From the Harry-Fairhurst paper, the waveform is $h = A^{\mu} h_{\mu}$ where 
-    $h_1 = F_{+} h_{0}$, $h_2 = F_{\times} h_{0}$, $h_{3} = F_{+} h_{\pi/2}$, 
-    $h_{4} = F_{\times} h_{\pi/2}$ and $z = (s | h_{0}) + i (s | h_{\pi/2})$.  
-    Given the $A^{\mu}$, the expected SNR is:
-    $z = F_{+} A^{1} + F_{\times} A^{2} + i( F_{+} A^{3} + F_{\times} A^{4})$
-    :param a: F-stat parameters
-    :param f_plus: Sensitivity to plus polarization
-    :param f_cross: Sensitivity to cross polarization
-    """
-    z = f_plus * (a[1] + 1j * a[3]) + f_cross * (a[2] + 1j * a[4]) 
-    return z
 
 # Calculate the dominant polarization F+, Fx and the angle between this and the original frame.
 
