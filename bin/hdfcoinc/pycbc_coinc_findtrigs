@@ -181,9 +181,6 @@ class PhaseTDStatistic(NewSNRStatistic):
         rd = numpy.log(s1[:,4] / s2[:,4])
         md = (s1[:,4]**2.0 + s2[:,4]**2.0) ** 0.5
 
-        rd[:] = 1
-        md[:] = 2**0.5 * 7
-
         # These are the bin boundaries stored in the hdf file        
         tbins = self.files['phasetd_newsnr']['tbins'][:]
         pbins = self.files['phasetd_newsnr']['pbins'][:]
@@ -191,10 +188,10 @@ class PhaseTDStatistic(NewSNRStatistic):
         mbins = self.files['phasetd_newsnr']['mbins'][:]
 
         # Find which bin each coinc falls into        
-        tv = numpy.searchsorted(tbins, td) 
-        pv = numpy.searchsorted(pbins, pd)
-        rv = numpy.searchsorted(rbins, rd) 
-        mv = numpy.searchsorted(mbins, md)         
+        tv = numpy.searchsorted(tbins, td) - 1 
+        pv = numpy.searchsorted(pbins, pd) - 1
+        rv = numpy.searchsorted(rbins, rd) - 1
+        mv = numpy.searchsorted(mbins, md) - 1     
 
         # The following just enforces that the point fits into the bin boundaries        
         tv[tv < 0] = 0
@@ -215,9 +212,10 @@ class PhaseTDStatistic(NewSNRStatistic):
         t1 = (tbins[tv] + tbins[tv+1]) / 2.0
         p1 = (pbins[pv] + pbins[pv+1]) / 2.0
 
-        m2 = numpy.array([get_fac(t, p, 7,7) for t, p in zip(t1[cstat>1], p1[cstat>1])])
 
-        #print cstat[cstat > 1], td[cstat>1], pd[cstat>1], m[cstat>1], m2
+        m2 = numpy.array([get_fac(t, p, x1, x2) for t, p, x1, x2 in zip(t1[cstat>1], p1[cstat>1], s1[:,4][cstat>1], s2[:,4][cstat>1])])
+
+        print td[cstat>1], pd[cstat>1], m[cstat>1], m2
         cstat[cstat>1] += m2 - m[cstat>1]
         return cstat
 
@@ -233,9 +231,6 @@ class LikelihoodStatistic(NewSNRStatistic):
         """
         td = s1[:,1] - s2[:,1] - slide * step
         pd = (s1[:,3] - s2[:,3]) % (numpy.pi * 2)
-
-        s1[:,2][:] = 7
-        s2[:,2][:] = 7
 
         snrsq = s1[:,2]**2.0  + s2[:,2]**2.0
 
@@ -276,7 +271,7 @@ class LikelihoodStatistic(NewSNRStatistic):
             m[c] = logsumexp(lik) - numpy.log(len(f_pc)) - snrsq[c]/2.0
             cstat[c] = m[c] + newsnrsq[c]/2
 
-        #print td[loud], pd[loud], m[loud]
+        print td[loud], pd[loud], m[loud]
         return cstat 
         
 
