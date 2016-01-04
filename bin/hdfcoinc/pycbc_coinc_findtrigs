@@ -123,6 +123,35 @@ class NewSNRCutStatistic(Stat):
         cstat[s2==-1] = 0
         return cstat
 
+def get_fac(td, dp, s1, s2):
+    # complex snrs
+    z = numpy.array([s1, 
+        s2 * numpy.exp(1j * dp)])
+
+    #print td, z
+
+    sigma = numpy.array([[1], [1]])
+    dmax = numpy.linalg.norm(sigma) / 8 / numpy.sqrt(2)
+
+    csnr = numpy.linalg.norm(z, axis=0)
+    snrsq = s1**2.0 + s2**2.0
+
+    i = (abs(dt_ring - td)).argmin()
+    f_pc = f_plus_cross[i]
+    lik = numpy.zeros(len(f_pc))
+    for j, f in enumerate(f_pc):
+        f_sig = f        
+        a = fstat.snr_f_to_a(z, f_sig)
+        fp, fc, chi = fstat.dominant_polarization(f_sig)
+        D, cosi, psi, phi = fstat.a_to_params(a)
+        a_dp = fstat.params_to_a(D, cosi, psi - chi, phi)
+        lik[j] = likelihood.like_approx(a_dp, fp, fc, dmax)[0]
+#        print lik[j], a_dp, fp, fc, dmax
+    val = logsumexp(lik) - numpy.log(len(f_pc)) - snrsq/2.0
+    return val
+   
+
+
 class PhaseTDStatistic(NewSNRStatistic):
     def __init__(self, files):
         NewSNRStatistic.__init__(self, files)
@@ -130,13 +159,14 @@ class PhaseTDStatistic(NewSNRStatistic):
         top = float(self.hist.max())     
 
         #normalize so that peak has no effect on newsnr
-        self.hist = self.hist / top
+        self.hist = self.hist 
 
         #set 0 to smallest value
         self.m = (self.hist == 0)
-        self.hist[self.m] = 1.0 / top
 
-        self.hist = numpy.log(self.hist) * 2.0
+        self.hist = numpy.log(self.hist) 
+        #print self.hist.min(), self.hist.max()
+
         self.hist[self.m] = 0
 
     def single(self, trigs):
@@ -148,8 +178,11 @@ class PhaseTDStatistic(NewSNRStatistic):
         """
         td = s1[:,2] - s2[:,2] - slide * step
         pd = (s1[:,1] - s2[:,1]) % (numpy.pi * 2)
-        rd = numpy.log(s1[:,4] / s2[:,4] * s2[:,3] / s1[:,3])
+        rd = numpy.log(s1[:,4] / s2[:,4])
         md = (s1[:,4]**2.0 + s2[:,4]**2.0) ** 0.5
+
+        rd[:] = 1
+        md[:] = 2**0.5 * 7
 
         # These are the bin boundaries stored in the hdf file        
         tbins = self.files['phasetd_newsnr']['tbins'][:]
@@ -158,10 +191,10 @@ class PhaseTDStatistic(NewSNRStatistic):
         mbins = self.files['phasetd_newsnr']['mbins'][:]
 
         # Find which bin each coinc falls into        
-        tv = numpy.searchsorted(tbins, td) - 1 
-        pv = numpy.searchsorted(pbins, pd) - 1
-        rv = numpy.searchsorted(rbins, rd) - 1 
-        mv = numpy.searchsorted(mbins, md) - 1        
+        tv = numpy.searchsorted(tbins, td) 
+        pv = numpy.searchsorted(pbins, pd)
+        rv = numpy.searchsorted(rbins, rd) 
+        mv = numpy.searchsorted(mbins, md)         
 
         # The following just enforces that the point fits into the bin boundaries        
         tv[tv < 0] = 0
@@ -175,8 +208,17 @@ class PhaseTDStatistic(NewSNRStatistic):
         
         m = self.hist[tv, pv, rv, mv]
         
-        cstat = (s1[:,0]**2.0 + s2[:,0]**2.0 + m) / 2.0          
+        cstat = (s1[:,0]**2.0 + s2[:,0]**2.0 ) / 2.0 + m
         cstat[m == 0] = 1  
+        cstat[s1[:,0]**2.0 + s2[:,0]**2.0 < args.newsnr_threshold ** 2.0] = 1
+
+        t1 = (tbins[tv] + tbins[tv+1]) / 2.0
+        p1 = (pbins[pv] + pbins[pv+1]) / 2.0
+
+        m2 = numpy.array([get_fac(t, p, 7,7) for t, p in zip(t1[cstat>1], p1[cstat>1])])
+
+        #print cstat[cstat > 1], td[cstat>1], pd[cstat>1], m[cstat>1], m2
+        cstat[cstat>1] += m2 - m[cstat>1]
         return cstat
 
 class LikelihoodStatistic(NewSNRStatistic):
@@ -190,33 +232,51 @@ class LikelihoodStatistic(NewSNRStatistic):
         """ Calculate the coincident statistic.
         """
         td = s1[:,1] - s2[:,1] - slide * step
-        z = numpy.array([s1[:,2] * numpy.exp(1j * s1[:,3]), 
-            s2[:,2] * numpy.exp(1j * s2[:,3])])
+        pd = (s1[:,3] - s2[:,3]) % (numpy.pi * 2)
+
+        s1[:,2][:] = 7
+        s2[:,2][:] = 7
+
+        snrsq = s1[:,2]**2.0  + s2[:,2]**2.0
+
+        z = numpy.array([s1[:,2], 
+            s2[:,2] * numpy.exp(1j * pd)])
+
+
+#        z = numpy.array([s1[:,2] * numpy.exp(1j * s1[:,3]), 
+#            s2[:,2] * numpy.exp(1j * s2[:,3])])
+
+        #sigma = numpy.array([s1[:,4], s2[:,4]])
         sigma = numpy.array([s1[:,4], s2[:,4]])
-        dmax = numpy.linalg.norm(sigma)/8/numpy.sqrt(2)
+        sigma[0][:] = 1
+        sigma[1][:] = 1
+
+        dmax = numpy.linalg.norm(sigma) /8 /numpy.sqrt(2)
+        dmax = .125
         cstat = numpy.ones_like(td, dtype=float)
+        m = cstat * 1
         snr = numpy.linalg.norm(z, axis=0)
         newsnrsq = s1[:,0]**2 + s2[:,0]**2
         loud = numpy.sqrt(newsnrsq) > args.newsnr_threshold
         logging.info('Coincident Trigs above threshold: %s' % (sum(loud)))
-
         
         for c in loud.nonzero()[0]:
+            #print td[c], z[0][c], z[1][c]
             i = (abs(dt_ring - td[c])).argmin()
             f_pc = f_plus_cross[i]
             lik = numpy.zeros(len(f_pc))
             for j, f in enumerate(f_pc):
-                f_sig = f * sigma[:,c].reshape([2,1])
+                f_sig = f
                 a = fstat.snr_f_to_a(z[:,c], f_sig)
                 fp, fc, chi = fstat.dominant_polarization(f_sig)
                 D, cosi, psi, phi = fstat.a_to_params(a)
                 a_dp = fstat.params_to_a(D, cosi, psi - chi, phi)
                 lik[j] = likelihood.like_approx(a_dp, fp, fc, dmax)[0]
-                if abs(fstat.expected_snr(a_dp, fp, fc) - snr[c]) > 1e-4:
-                    print("Error for event %d, sky point %d" % (c, j))
-                    print("Original SNR: %.4e; New SNR: %.4e" % 
-                        (snr[c], fstat.expected_snr(a_dp, fp, fc)))
-            cstat[c] = logsumexp(lik) - numpy.log(len(f_pc)) - snr[c]**2/2 + newsnrsq[c]/2
+#                print lik[j], a_dp, fp, fc, dmax
+            m[c] = logsumexp(lik) - numpy.log(len(f_pc)) - snrsq[c]/2.0
+            cstat[c] = m[c] + newsnrsq[c]/2
+
+        #print td[loud], pd[loud], m[loud]
         return cstat 
         
 
@@ -345,10 +405,9 @@ if args.strict_coinc_time:
     trigs0.valid = veto.segments_to_start_end(trigs0.segs)
     trigs1.valid = veto.segments_to_start_end(trigs1.segs)
 
-if args.ranking_statistic == "likelihood_newsnr":
-    global dt_ring
-    global f_plus_cross
-    dt_ring, f_plus_cross = generate_sky_rings()
+global dt_ring
+global f_plus_cross
+dt_ring, f_plus_cross = generate_sky_rings()
  
 rank_method = get_statistic(args.ranking_statistic, args.statistic_files)
 det0, det1 = detector.Detector(trigs0.ifo), detector.Detector(trigs1.ifo)
