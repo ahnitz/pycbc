@@ -248,7 +248,7 @@ class LikelihoodStatistic(NewSNRStatistic):
 #        sigma[0][:] = 1
 #        sigma[1][:] = 1
 
-        dmax = numpy.linalg.norm(sigma) /8 /numpy.sqrt(2)
+        dmax = numpy.linalg.norm(sigma, axis=0) /8 /numpy.sqrt(2)
 #        dmax = .125
         cstat = numpy.ones_like(td, dtype=float)
         m = cstat * 1
@@ -268,7 +268,7 @@ class LikelihoodStatistic(NewSNRStatistic):
                 fp, fc, chi = fstat.dominant_polarization(f_sig)
                 D, cosi, psi, phi = fstat.a_to_params(a)
                 a_dp = fstat.params_to_a(D, cosi, psi - chi, phi)
-                lik[j] = likelihood.like_approx(a_dp, fp, fc, dmax)[0]
+                lik[j] = likelihood.like_approx(a_dp, fp, fc, dmax[c])[0]
 #                print lik[j], a_dp, fp, fc, dmax
             m[c] = logsumexp(lik) - numpy.log(len(f_pc)) - snrsq[c]/2.0
             cstat[c] = m[c] + newsnrsq[c]/2
