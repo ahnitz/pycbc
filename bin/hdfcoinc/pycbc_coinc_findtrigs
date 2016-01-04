@@ -213,10 +213,12 @@ class PhaseTDStatistic(NewSNRStatistic):
         p1 = (pbins[pv] + pbins[pv+1]) / 2.0
 
 
-        m2 = numpy.array([get_fac(t, p, x1, x2) for t, p, x1, x2 in zip(t1[cstat>1], p1[cstat>1], s1[:,4][cstat>1], s2[:,4][cstat>1])])
+        #m2 = numpy.array([get_fac(t, p, x1, x2) for t, p, x1, x2 in zip(t1[cstat>1], p1[cstat>1], s1[:,4][cstat>1], s2[:,4][cstat>1])])
 
-        print td[cstat>1], pd[cstat>1], m[cstat>1], m2
-        cstat[cstat>1] += m2 - m[cstat>1]
+        print s1[:,2][cstat>1], cstat[cstat>1], td[cstat>1], pd[cstat>1], m[cstat>1]
+        print s1[:,3][cstat>1], s2[:,3][cstat>1] 
+
+       #cstat[cstat>1] += m2 - m[cstat>1]
         return cstat
 
 class LikelihoodStatistic(NewSNRStatistic):
@@ -243,11 +245,11 @@ class LikelihoodStatistic(NewSNRStatistic):
 
         #sigma = numpy.array([s1[:,4], s2[:,4]])
         sigma = numpy.array([s1[:,4], s2[:,4]])
-        sigma[0][:] = 1
-        sigma[1][:] = 1
+#        sigma[0][:] = 1
+#        sigma[1][:] = 1
 
         dmax = numpy.linalg.norm(sigma) /8 /numpy.sqrt(2)
-        dmax = .125
+#        dmax = .125
         cstat = numpy.ones_like(td, dtype=float)
         m = cstat * 1
         snr = numpy.linalg.norm(z, axis=0)
@@ -261,7 +263,7 @@ class LikelihoodStatistic(NewSNRStatistic):
             f_pc = f_plus_cross[i]
             lik = numpy.zeros(len(f_pc))
             for j, f in enumerate(f_pc):
-                f_sig = f
+                f_sig = f * sigma[:,c].reshape((2, 1))
                 a = fstat.snr_f_to_a(z[:,c], f_sig)
                 fp, fc, chi = fstat.dominant_polarization(f_sig)
                 D, cosi, psi, phi = fstat.a_to_params(a)
@@ -271,7 +273,7 @@ class LikelihoodStatistic(NewSNRStatistic):
             m[c] = logsumexp(lik) - numpy.log(len(f_pc)) - snrsq[c]/2.0
             cstat[c] = m[c] + newsnrsq[c]/2
 
-        print td[loud], pd[loud], m[loud]
+        print cstat[loud], td[loud], pd[loud], m[loud]
         return cstat 
         
 
