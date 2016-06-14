@@ -1229,8 +1229,177 @@ def quadratic_interpolate_peak(left, middle, right):
     peak_value = middle + 0.25 * (left - right) * bin_offset
     return bin_offset, peak_value
 
+class LiveBatchMatchedFilter(object):
+    def __init__(self, templates, snr_threshold, chisq_bins, maxelements=2**27):
+        self.snr_threshold = snr_threshold
+
+        from pycbc import vetoes
+        self.power_chisq = vetoes.SingleDetPowerChisq(chisq_bins, None)
+
+        durations = numpy.array([1.0 / t.delta_f for t in templates])
+
+        lsort = durations.argsort()
+        durations = durations[lsort]
+        templates = [templates[li] for li in lsort]
+
+        # Figure out how to chunk together the templates into groups to process
+        sizes, counts = numpy.unique(durations, return_counts=True)
+        tsamples = [(len(t) - 1) * 2 for t in templates]
+        grabs = maxelements / numpy.unique(tsamples) 
+
+        chunks = numpy.array([])
+        num = 0
+        for count, grab in zip(counts, grabs):
+            chunks = numpy.append(chunks, numpy.arange(num, count + num, grab))
+            chunks = numpy.append(chunks, [count + num])
+            num += count
+        chunks = numpy.unique(chunks).astype(numpy.uint32)
+
+        # We now have how many templates to grab at a time.
+        self.chunks = chunks[1:] - chunks[0:-1]
+
+        self.out_mem = {}
+        self.cout_mem = {}
+        self.ifts = {}
+        chunk_durations = [durations[i] for i in chunks[:-1]]
+        self.chunk_tsamples = [tsamples[int(i)] for i in chunks[:-1]]
+        samples = self.chunk_tsamples * self.chunks
+ 
+        # Create workspace memory for correlate and snr      
+        mem_ids = [(a, b) for a, b in zip(chunk_durations, self.chunks)]
+        mem_types = set(zip(mem_ids, samples))
+
+        self.tgroups, self.mids = [], []
+        for i, size in mem_types:
+            dur, count = i
+            self.out_mem[i] = zeros(size, dtype=numpy.complex64)
+            self.cout_mem[i] = zeros(size, dtype=numpy.complex64)
+            self.ifts[i] = IFFT(self.cout_mem[i], self.out_mem[i],
+                                nbatch=count,
+                                size=len(self.cout_mem[i]) / count)
+
+        # Split the templates into their processing groups
+        for dur, count in mem_ids:
+            tgroup = templates[0:count]
+            self.tgroups.append(tgroup)
+            self.mids.append((dur, count))
+            templates = templates[count:]
+
+        # Associate the snr and corr memory block to each template
+        self.corr = []
+        for i, tgroup in enumerate(self.tgroups):
+            psize = self.chunk_tsamples[i]
+            s = 0
+            e = psize
+            mid = self.mids[i]
+            for htilde in tgroup:
+                htilde.out = self.out_mem[mid][s:e]
+                htilde.cout = self.cout_mem[mid][s:e]
+                s += psize
+                e += psize
+            self.corr.append(BatchCorrelator(tgroup, [t.cout for t in tgroup], len(tgroup[0])))
+            
+
+    def set_data(self, data):
+        self.data = data
+        self.block_id = 0
+
+    def combine_results(self, results):
+        result = {}
+        for key in results[0]:
+            result[key] = numpy.concatenate([r[key] for r in results])
+        return result
+
+    def process_data(self, data_reader):
+        self.set_data(data_reader)
+        return self.process_all()
+
+    def process_all(self):
+        """ Process every batch group and return as single result
+        """
+        results = []
+        while 1:
+            result = self.process_batch()
+            if result is None: break
+            results.append(result)
+
+        return self.combine_results(results)
+
+    def process_batch(self):
+        """ Process only a single batch group of data
+        """  
+   
+        if self.block_id == len(self.tgroups):
+            return None
+
+        tgroup = self.tgroups[self.block_id]
+        psize = self.chunk_tsamples[self.block_id]
+        mid = self.mids[self.block_id]
+        stilde = self.data.overwhitened_data(tgroup[0].delta_f)
+        psd = stilde.psd 
+
+        valid_end = int(psize - self.data.trim_padding)
+        valid_start = int(valid_end - self.data.blocksize * self.data.sample_rate)
+
+        seg = slice(valid_start, valid_end)
+        
+        self.corr[self.block_id].execute(stilde)
+        self.ifts[mid].execute()
+
+        snr = numpy.zeros(len(tgroup), dtype=numpy.complex64)
+        chisq = numpy.zeros(len(tgroup), dtype=numpy.float32)
+        time = numpy.zeros(len(tgroup), dtype=numpy.float64)
+        dof = numpy.zeros(len(tgroup), dtype=numpy.float64)
+        templates = numpy.zeros(len(tgroup), dtype=numpy.uint64)
+        sigmasq = numpy.zeros(len(tgroup), dtype=numpy.float32)
+
+        result = {}
+        tkeys = tgroup[0].params.dtype.names
+        for key in tkeys:
+            result[key] = []
+
+        i = 0
+        for htilde in tgroup:
+            # Find peaks
+            m, l = htilde.out[seg].abs_max_loc()
+            time[i] = self.data.start_time + float(l) / self.data.sample_rate            
+
+            l += valid_start
+            # If nothing is above threshold we can exit this template
+            sgm = htilde.sigmasq(psd)
+            norm = 4.0 * htilde.delta_f / (sgm ** 0.5)
+            if m * norm < self.snr_threshold:
+                continue    
+     
+            # calculate chisq
+            snrv = numpy.array([htilde.out[l]])
+            chisq[i], dof[i] = self.power_chisq.values(htilde.cout, snrv, norm, psd, [l], htilde)
+            chisq[i] /= dof[i]
+            snr[i] = snrv[0] * norm
+            sigmasq[i] = sgm
+            
+            templates[i] = htilde.id
+            for key in tkeys:
+                result[key].append(htilde.params[key])
+
+            i += 1
+        
+        result['snr'] = abs(snr[0:i])
+        result['coa_phase'] = numpy.angle(snr[0:i])
+        result['chisq'] = chisq[0:i]
+        result['chisq_dof'] = dof[0:i] / 2 + 1
+        result['end_time'] = time[0:i]
+        result['template_hash'] = templates[0:i]
+        result['sigmasq'] = sigmasq[0:i]
+
+        for key in tkeys:
+            result[key] = numpy.array(result[key])
+
+        self.block_id += 1
+        return result     
+
 __all__ = ['match', 'matched_filter', 'sigmasq', 'sigma', 'get_cutoff_indices',
            'sigmasq_series', 'make_frequency_series', 'overlap', 'overlap_cplx',
-           'matched_filter_core', 'correlate', 'MatchedFilterControl',
+           'matched_filter_core', 'correlate', 'MatchedFilterControl', 'LiveBatchMatchedFilter',
            'MatchedFilterSkyMaxControl', 'compute_max_snr_over_sky_loc_stat']
 
