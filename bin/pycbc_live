@@ -71,6 +71,7 @@ parser.add_argument('--snr-threshold', type=float)
 parser.add_argument('--channel-name', action=MultiDetOptionAction, nargs='+')
 parser.add_argument('--state-channel', action=MultiDetOptionAction, nargs='+')
 parser.add_argument('--frame-src', action=MultiDetOptionAction, nargs='+')
+parser.add_argument('--force-update-cache', action='store_true')
 parser.add_argument('--highpass-frequency', type=float,
                         help="Frequency to apply highpass filtering")
 parser.add_argument('--highpass-reduction', type=float,
@@ -146,7 +147,8 @@ with ctx:
                             autogating_threshold=args.autogating_threshold,
                             autogating_cluster=args.autogating_cluster,
                             autogating_window=args.autogating_window,
-                            autogating_pad=args.autogating_pad)
+                            autogating_pad=args.autogating_pad,
+                            force_update_cache=args.force_update_cache)
 
     logging.info('%s: Starting... ', evnt.rank)
 

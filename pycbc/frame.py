@@ -391,7 +391,8 @@ class DataBuffer(object):
     def __init__(self, frame_src, 
                        channel_name,
                        start_time,
-                       max_buffer=2048):
+                       max_buffer=2048, 
+                       force_update_cache=True):
         """ Create a rolling buffer of frame data
 
         Parameters
@@ -409,6 +410,7 @@ class DataBuffer(object):
         self.frame_src = frame_src
         self.channel_name = channel_name
         self.read_pos = start_time
+        self.force_update_cache = force_update_cache
 
         self.update_cache()
         self.channel_type, self.sample_rate = self._retrieve_metadata(self.stream, self.channel_name)
@@ -526,7 +528,8 @@ class DataBuffer(object):
         data: TimeSeries
             TimeSeries containg 'blocksize' seconds of frame data
         """
-        self.update_cache()
+        if self.force_update_cache:
+            self.update_cache()
         
         try:
             return DataBuffer.advance(self, blocksize)

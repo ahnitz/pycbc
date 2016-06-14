@@ -1067,6 +1067,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                        autogating_pad=0.25,
                        state_channel=None,
                        dyn_range_fac=pycbc.DYN_RANGE_FAC,
+                       force_update_cache=True,
                  ):
         """ Class to produce overwhitened strain incrementally
 
@@ -1115,7 +1116,8 @@ class StrainBuffer(pycbc.frame.DataBuffer):
             Scale factor to apply to strain
         """ 
         super(StrainBuffer, self).__init__(frame_src, channel_name, start_time,
-                                           max_buffer=max_buffer)
+                                           max_buffer=max_buffer,
+                                           force_update_cache=force_update_cache)
 
         self.low_frequency_cutoff = low_frequency_cutoff
 
