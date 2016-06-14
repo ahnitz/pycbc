@@ -7,14 +7,24 @@ from time import time
 import os.path
 from mpi4py import MPI as mpi
 
+def makedir(path):
+    """
+    Make the analysis directory path and any parent directories that don't
+    already exist. Will do nothing if path already exists.
+    """
+    if not os.path.exists(path) and path is not None:
+        os.makedirs(path)
+
 class LiveEventManager(object):
-    def __init__(self, output_path):
+    def __init__(self, output_path, use_date_prefix=False):
         self.path = output_path
         
         # Figure out what we are supposed to process within the pool of MPI processes
         self.comm = mpi.COMM_WORLD
         self.size = self.comm.Get_size()
         self.rank = self.comm.Get_rank()
+
+        self.use_date_prefix=use_date_prefix
 
     def commit_results(self, results):
         self.comm.gather(results, root=0)
@@ -41,9 +51,18 @@ class LiveEventManager(object):
         else:
             raise TypeError("Not root process")
 
-    def dump(self, results, name, store_psd=False):
+    def dump(self, results, name, store_psd=False, time_index=None):
         """ Save the results from this time block to an output file """
-        fname = os.path.join(self.path, name) + '.hdf'
+        if self.use_date_prefix:
+            import lal
+            tm = lal.GPSToUTC(int(time_index))
+            subdir = '%s_%s_%s' % (tm[0], tm[1], tm[2])
+            makedir(os.path.join(self.path, subdir))
+            fname = os.path.join(self.path, subdir, name) + '.hdf'
+        else:
+            makedir(self.path)
+            fname = os.path.join(self.path, name) + '.hdf'
+
         f = h5py.File(fname, 'w')
         for ifo in results:
             for k in results[ifo]:
@@ -93,6 +112,7 @@ parser.add_argument('--autogating-window', type=float, default=0.5)
 parser.add_argument('--autogating-cluster', type=float, default=.25)
 parser.add_argument('--start-time', type=int, default=0)
 parser.add_argument('--output-path')
+parser.add_argument('--day-hour-output-prefix', action='store_true')
 parser.add_argument('--end-time', type=int, default=numpy.inf)
 parser.add_argument('--store-psd', action='store_true')
 parser.add_argument('--approximant')
@@ -115,7 +135,7 @@ bank = waveform.LiveFilterBank(args.bank_file, flow, sr, total_pad,
                                approximant=args.approximant)
 
 ifos = args.channel_name.keys()
-evnt = LiveEventManager(args.output_path)
+evnt = LiveEventManager(args.output_path, use_date_prefix=args.day_hour_output_prefix)
 
 # I'm not the root, so do some actually filtering.
 with ctx:
@@ -185,7 +205,9 @@ with ctx:
                 psds[ifo] = data_reader[ifo].psd
 
             results, valid_end = evnt.gather_results()
-            evnt.dump(results, '%s-Live-%s-%s' % (''.join(ifos), data_end() - args.analysis_chunk, valid_pad),
+    
+            prefix = '%s-Live-%s-%s' % (''.join(ifos), data_end() - args.analysis_chunk, valid_pad)
+            evnt.dump(results, prefix, time_index=data_end(),
                       store_psd=False if args.store_psd is False else psds,
                      )     
 
