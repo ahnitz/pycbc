@@ -1,0 +1,201 @@
+#!/usr/bin/env python
+import argparse, numpy, numpy.random, pycbc, logging, cProfile, h5py
+from pycbc import fft, version, waveform, types, filter as pfilter, scheme, psd as pypsd, noise, vetoes, strain, frame
+from pycbc.types import MultiDetOptionAction, zeros
+from pycbc.filter import LiveBatchMatchedFilter
+from time import time
+import os.path
+from mpi4py import MPI as mpi
+
+class LiveEventManager(object):
+    def __init__(self, output_path):
+        self.path = output_path
+        
+        # Figure out what we are supposed to process within the pool of MPI processes
+        self.comm = mpi.COMM_WORLD
+        self.size = self.comm.Get_size()
+        self.rank = self.comm.Get_rank()
+
+    def commit_results(self, results):
+        self.comm.gather(results, root=0)
+
+    def barrier(self):
+        self.comm.Barrier()
+
+    def gather_results(self):
+        """ Collect results from the mpi subprocesses and collate them into
+        contiguous sets of arrays.
+        """
+
+        if self.rank == 0:
+            all_results = self.comm.gather(None, root=0)
+            data_ends = [a[1] for a in all_results if a is not None]
+            results = [a[0] for a in all_results if a is not None]    
+        
+            combined = {}
+            for ifo in results[0]:
+                combined[ifo] = {}
+                for key in results[0][ifo]:
+                    combined[ifo][key] = numpy.concatenate([r[ifo][key] for r in results])
+            return combined, data_ends[0]
+        else:
+            raise TypeError("Not root process")
+
+    def dump(self, results, name, store_psd=False):
+        """ Save the results from this time block to an output file """
+        fname = os.path.join(self.path, name) + '.hdf'
+        f = h5py.File(fname, 'w')
+        for ifo in results:
+            for k in results[ifo]:
+                f['%s/%s' % (ifo, k)] = results[ifo][k]
+        f.close()
+
+        if store_psd:
+            for ifo in store_psd:
+                if store_psd[ifo] is not None:
+                    store_psd[ifo].save(fname, group='%s/psd' % ifo)
+
+    def ingest(self, ifo, results):
+        pass
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--verbose', action='store_true')
+parser.add_argument('--version', action='version', version=version.git_verbose_msg)
+parser.add_argument('--bank-file', help="Template bank xml file")
+parser.add_argument('--low-frequency-cutoff', help="low frequency cutoff", type=int)
+parser.add_argument('--sample-rate', help="output sample rate", type=int)
+parser.add_argument('--chisq-bins', help="Number of chisq bins")
+parser.add_argument('--analysis-chunk', type=int,
+                        help="Amount of data to produce triggers in a  block")
+parser.add_argument('--snr-threshold', type=float)
+parser.add_argument('--channel-name', action=MultiDetOptionAction, nargs='+')
+parser.add_argument('--state-channel', action=MultiDetOptionAction, nargs='+')
+parser.add_argument('--frame-src', action=MultiDetOptionAction, nargs='+')
+parser.add_argument('--highpass-frequency', type=float,
+                        help="Frequency to apply highpass filtering")
+parser.add_argument('--highpass-reduction', type=float,
+                        help="DB to reduce low frequencies")
+parser.add_argument('--highpass-bandwidth', type=float,
+                        help="Width of the highpass turnover region in Hz")
+parser.add_argument('--psd-recalculate-every', type=int, default=1)
+parser.add_argument('--psd-samples', type=int, 
+                        help="Number of PSD segments to use in the rolling estimate")
+parser.add_argument('--psd-segment-length', type=int, 
+                        help="Length in seconds of each PSD segment")
+parser.add_argument('--psd-inverse-length', type=float, 
+                        help="Lenght in time for the equivelant FIR filter")
+parser.add_argument('--trim-padding', type=float, default=0.25,
+                        help="Padding around the overwhitened analysis block")
+parser.add_argument('--autogating-threshold', type=float, default=100)
+parser.add_argument('--autogating-pad', type=float, default=.25)
+parser.add_argument('--autogating-window', type=float, default=0.5)
+parser.add_argument('--autogating-cluster', type=float, default=.25)
+parser.add_argument('--start-time', type=int, default=0)
+parser.add_argument('--output-path')
+parser.add_argument('--end-time', type=int, default=numpy.inf)
+parser.add_argument('--store-psd', action='store_true')
+parser.add_argument('--approximant')
+parser.add_argument('--sync', action='store_true')
+scheme.insert_processing_option_group(parser)
+fft.insert_fft_option_group(parser)
+args = parser.parse_args()
+scheme.verify_processing_options(args, parser)
+pycbc.init_logging(args.verbose)
+
+ctx = scheme.from_cli(args)
+
+sr = args.sample_rate
+flow = args.low_frequency_cutoff
+
+# Approximant guess of the total padding
+valid_pad = args.analysis_chunk
+total_pad = args.trim_padding * 2 + valid_pad
+bank = waveform.LiveFilterBank(args.bank_file, flow, sr, total_pad,
+                               approximant=args.approximant)
+
+ifos = args.channel_name.keys()
+evnt = LiveEventManager(args.output_path)
+
+# I'm not the root, so do some actually filtering.
+with ctx:
+    fft.from_cli(args)
+    maxlen = args.psd_segment_length * (args.psd_samples / 2 + 1)
+    if evnt.rank > 0:
+        waveforms = list(bank[evnt.rank-1::evnt.size-1])
+        lengths = numpy.array([1.0 / waveform.delta_f for waveform in waveforms])
+        psd_len = args.psd_segment_length * (args.psd_samples / 2 + 1)
+        maxlen = max(lengths.max(), psd_len)
+        mf = LiveBatchMatchedFilter(waveforms, args.snr_threshold, args.chisq_bins)
+
+
+    data_reader = {}
+    for ifo in ifos:
+        data_reader[ifo] = pycbc.strain.StrainBuffer([args.frame_src[ifo]], 
+                            '%s:%s' % (ifo, args.channel_name[ifo]),
+                            args.start_time, max_buffer=maxlen * 2,
+                            state_channel ='%s:%s' % (ifo, args.state_channel[ifo]),
+                            sample_rate=args.sample_rate,
+                            low_frequency_cutoff=args.low_frequency_cutoff,
+                            highpass_frequency=args.highpass_frequency,
+                            highpass_reduction=args.highpass_reduction,
+                            highpass_bandwidth=args.highpass_bandwidth,
+                            psd_samples=args.psd_samples,
+                            trim_padding=args.trim_padding,
+                            psd_segment_length=args.psd_segment_length,
+                            psd_inverse_length=args.psd_inverse_length,
+                            autogating_threshold=args.autogating_threshold,
+                            autogating_cluster=args.autogating_cluster,
+                            autogating_window=args.autogating_window,
+                            autogating_pad=args.autogating_pad)
+
+    logging.info('%s: Starting... ', evnt.rank)
+
+    pr = cProfile.Profile()
+    pr.enable()
+
+    # get more data
+    data_end = lambda: data_reader[data_reader.keys()[0]].end_time
+    i = 0
+    while data_end() < args.end_time:
+        if args.sync: evnt.barrier()
+        t1 = time()
+        logging.info('%s: Analyzing up to %s', evnt.rank, data_end())
+        results = {}
+
+        for ifo in ifos:
+            status = data_reader[ifo].advance(valid_pad)
+
+            if status is True:
+                if i % args.psd_recalculate_every == 0:
+                    data_reader[ifo].recalculate_psd()    
+
+                logging.info('%s: Filtering: %s', evnt.rank, ifo)
+                if evnt.rank > 0:
+                    results[ifo] = mf.process_data(data_reader[ifo])
+            else:
+                logging.info('Insufficient data for analysis')
+
+        if evnt.rank > 0:
+            evnt.commit_results((results, data_end()))
+        else:
+            psds = {}
+            for ifo in data_reader:
+                psds[ifo] = data_reader[ifo].psd
+
+            results, valid_end = evnt.gather_results()
+            evnt.dump(results, '%s-Live-%s-%s' % (''.join(ifos), data_end() - args.analysis_chunk, valid_pad),
+                      store_psd=False if args.store_psd is False else psds,
+                     )     
+
+        if args.sync: evnt.barrier()
+        tdiff = time() - t1
+        logging.info('%s: Took %1.2f, duty factor of %.2f', evnt.rank, tdiff, tdiff / valid_pad)
+        i += 1
+
+if args.fftw_output_float_wisdom_file:
+    fft.fftw.export_single_wisdom_to_filename(args.fftw_output_float_wisdom_file)
+
+if args.fftw_output_double_wisdom_file:
+    fft.fftw.export_double_wisdom_to_filename(args.fftw_output_double_wisdom_file)
+
+pr.dump_stats('log')
