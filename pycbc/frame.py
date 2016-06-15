@@ -533,7 +533,7 @@ class DataBuffer(object):
         
         try:
             return DataBuffer.advance(self, blocksize)
-        except ValueError:
+        except RuntimeError:
             if lal.GPSTimeNow() > timeout + self.raw_buffer.end_time:
                 # The frame is not there and it should be by now, so we give up
                 # and treat it as zeros
