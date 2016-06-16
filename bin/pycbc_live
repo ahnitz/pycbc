@@ -45,8 +45,15 @@ class LiveEventManager(object):
             combined = {}
             for ifo in results[0]:
                 combined[ifo] = {}
+
+                # check if any of the results returned invalid 
+                for r in results:
+                    if r[ifo] is False:
+                        return {}, data_ends[0]
+
                 for key in results[0][ifo]:
                     combined[ifo][key] = numpy.concatenate([r[ifo][key] for r in results])
+
             return combined, data_ends[0]
         else:
             raise TypeError("Not root process")
@@ -86,7 +93,10 @@ parser.add_argument('--sample-rate', help="output sample rate", type=int)
 parser.add_argument('--chisq-bins', help="Number of chisq bins")
 parser.add_argument('--analysis-chunk', type=int,
                         help="Amount of data to produce triggers in a  block")
+
 parser.add_argument('--snr-threshold', type=float)
+parser.add_argument('--snr-abort-threshold', type=float)
+
 parser.add_argument('--channel-name', action=MultiDetOptionAction, nargs='+')
 parser.add_argument('--state-channel', action=MultiDetOptionAction, nargs='+')
 parser.add_argument('--frame-src', action=MultiDetOptionAction, nargs='+')
@@ -106,14 +116,15 @@ parser.add_argument('--psd-inverse-length', type=float,
                         help="Lenght in time for the equivelant FIR filter")
 parser.add_argument('--trim-padding', type=float, default=0.25,
                         help="Padding around the overwhitened analysis block")
+
 parser.add_argument('--autogating-threshold', type=float, default=100)
 parser.add_argument('--autogating-pad', type=float, default=.25)
 parser.add_argument('--autogating-window', type=float, default=0.5)
 parser.add_argument('--autogating-cluster', type=float, default=.25)
 parser.add_argument('--start-time', type=int, default=0)
+parser.add_argument('--end-time', type=int, default=numpy.inf)
 parser.add_argument('--output-path')
 parser.add_argument('--day-hour-output-prefix', action='store_true')
-parser.add_argument('--end-time', type=int, default=numpy.inf)
 parser.add_argument('--store-psd', action='store_true')
 parser.add_argument('--approximant')
 parser.add_argument('--sync', action='store_true')
@@ -146,7 +157,8 @@ with ctx:
         lengths = numpy.array([1.0 / waveform.delta_f for waveform in waveforms])
         psd_len = args.psd_segment_length * (args.psd_samples / 2 + 1)
         maxlen = max(lengths.max(), psd_len)
-        mf = LiveBatchMatchedFilter(waveforms, args.snr_threshold, args.chisq_bins)
+        mf = LiveBatchMatchedFilter(waveforms, args.snr_threshold, args.chisq_bins,
+                                     snr_abort_threshold=args.snr_abort_threshold)
 
 
     data_reader = {}

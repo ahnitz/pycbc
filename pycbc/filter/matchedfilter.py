@@ -1230,8 +1230,10 @@ def quadratic_interpolate_peak(left, middle, right):
     return bin_offset, peak_value
 
 class LiveBatchMatchedFilter(object):
-    def __init__(self, templates, snr_threshold, chisq_bins, maxelements=2**27):
+    def __init__(self, templates, snr_threshold, chisq_bins, maxelements=2**27,
+                 snr_abort_threshold=None):
         self.snr_threshold = snr_threshold
+        self.snr_abort_threshold = snr_abort_threshold
 
         from pycbc import vetoes
         self.power_chisq = vetoes.SingleDetPowerChisq(chisq_bins, None)
@@ -1320,6 +1322,7 @@ class LiveBatchMatchedFilter(object):
         results = []
         while 1:
             result = self.process_batch()
+            if result is False: return False
             if result is None: break
             results.append(result)
 
@@ -1368,8 +1371,14 @@ class LiveBatchMatchedFilter(object):
             # If nothing is above threshold we can exit this template
             sgm = htilde.sigmasq(psd)
             norm = 4.0 * htilde.delta_f / (sgm ** 0.5)
+
             if m * norm < self.snr_threshold:
                 continue    
+
+            # We have an SNR so high that we will drop the entire analysis 
+            # of this chunk of time!
+            if self.snr_abort_threshold is not None and m * norm > self.snr_abort_threshold:
+                return False
      
             # calculate chisq
             snrv = numpy.array([htilde.out[l]])
