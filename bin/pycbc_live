@@ -49,7 +49,10 @@ class LiveEventManager(object):
                 # check if any of the results returned invalid 
                 for r in results:
                     if r[ifo] is False:
-                        return {}, data_ends[0]
+                        combined[ifo] = {}
+                        break
+                except break:
+                    continue
 
                 for key in results[0][ifo]:
                     combined[ifo][key] = numpy.concatenate([r[ifo][key] for r in results])
