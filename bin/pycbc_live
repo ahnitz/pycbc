@@ -46,12 +46,13 @@ class LiveEventManager(object):
             for ifo in results[0]:
                 combined[ifo] = {}
 
-                # check if any of the results returned invalid 
-                for r in results:
-                    if r[ifo] is False:
-                        combined[ifo] = {}
-                        break
-                except break:
+                # check if any of the results returned invalid
+                try: 
+                    for r in results:
+                        if r[ifo] is False:
+                            combined[ifo] = {}
+                            raise ValueError
+                except ValueError:
                     continue
 
                 for key in results[0][ifo]:
@@ -131,6 +132,8 @@ parser.add_argument('--day-hour-output-prefix', action='store_true')
 parser.add_argument('--store-psd', action='store_true')
 parser.add_argument('--approximant')
 parser.add_argument('--sync', action='store_true')
+parser.add_argument('--increment', type=int, default=8)
+parser.add_argument('--max-batch-size', type=int, default=2**27)
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
 args = parser.parse_args()
@@ -146,7 +149,7 @@ flow = args.low_frequency_cutoff
 valid_pad = args.analysis_chunk
 total_pad = args.trim_padding * 2 + valid_pad
 bank = waveform.LiveFilterBank(args.bank_file, flow, sr, total_pad,
-                               approximant=args.approximant)
+                               approximant=args.approximant, increment=args.increment)
 
 ifos = args.channel_name.keys()
 evnt = LiveEventManager(args.output_path, use_date_prefix=args.day_hour_output_prefix)
@@ -161,7 +164,8 @@ with ctx:
         psd_len = args.psd_segment_length * (args.psd_samples / 2 + 1)
         maxlen = max(lengths.max(), psd_len)
         mf = LiveBatchMatchedFilter(waveforms, args.snr_threshold, args.chisq_bins,
-                                     snr_abort_threshold=args.snr_abort_threshold)
+                                     snr_abort_threshold=args.snr_abort_threshold, 
+                                     maxelements=args.max_batch_size)
 
 
     data_reader = {}

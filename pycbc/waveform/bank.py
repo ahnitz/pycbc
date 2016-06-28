@@ -148,9 +148,10 @@ class TemplateBank(object):
 
 class LiveFilterBank(TemplateBank):
     def __init__(self, filename, f_lower, sample_rate, minimum_buffer,
-                       approximant=None,
+                       approximant=None, increment=8,
                        **kwds):
 
+        self.increment = increment
         self.f_lower = f_lower
         self.filename = filename
         self.sample_rate = sample_rate
@@ -162,7 +163,7 @@ class LiveFilterBank(TemplateBank):
         self.table = sorted(self.table, key=lambda t: mass1_mass2_to_mchirp_eta(t.mass1, t.mass2)[0])        
 
     def round_up(self, num):
-        inc = 8
+        inc = self.increment
         size = numpy.ceil(num / self.sample_rate / inc) * self.sample_rate * inc
         return size
 
