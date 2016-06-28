@@ -1288,7 +1288,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         self.strain[len(self.strain) - csize + self.corruption:] = 0
         self.strain.start_time += blocksize
        
-    def advance(self, blocksize):
+    def advance(self, blocksize, timeout=10):
         """ Add blocksize seconds more to the buffer, push blocksize seconds
         from the beginning.
 
@@ -1302,7 +1302,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         status: boolean
             Returns True if this block is analyzable.         
         """
-        ts = super(StrainBuffer, self).attempt_advance(blocksize)
+        ts = super(StrainBuffer, self).attempt_advance(blocksize, timeout=timeout)
 
         # We have given up so there is no time series
         if ts is None:

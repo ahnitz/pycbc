@@ -125,6 +125,7 @@ parser.add_argument('--autogating-threshold', type=float, default=100)
 parser.add_argument('--autogating-pad', type=float, default=.25)
 parser.add_argument('--autogating-window', type=float, default=0.5)
 parser.add_argument('--autogating-cluster', type=float, default=.25)
+parser.add_argument('--frame-read-timeout', type=float, default=30)
 parser.add_argument('--start-time', type=int, default=0)
 parser.add_argument('--end-time', type=int, default=numpy.inf)
 parser.add_argument('--output-path')
@@ -204,7 +205,7 @@ with ctx:
         results = {}
 
         for ifo in ifos:
-            status = data_reader[ifo].advance(valid_pad)
+            status = data_reader[ifo].advance(valid_pad, timeout=args.frame_read_timeout)
 
             if status is True:
                 if i % args.psd_recalculate_every == 0:
