@@ -1354,7 +1354,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         if len(glitch_times) > 0:
             logging.info('Autogating at %s', ', '.join(['%.3f' % gt for gt in glitch_times]))
 
-        #strain = gate_data(strain, gate_params)
+            strain = gate_data(strain, gate_params)
 
         ###### Stitch into continuous stream
         self.strain.roll(-sample_step)
