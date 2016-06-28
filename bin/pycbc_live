@@ -32,6 +32,9 @@ class LiveEventManager(object):
     def barrier(self):
         self.comm.Barrier()
 
+    def barrier_status(self, status):
+        return self.comm.allreduce(status, op=mpi.LAND)
+
     def gather_results(self):
         """ Collect results from the mpi subprocesses and collate them into
         contiguous sets of arrays.
@@ -133,6 +136,7 @@ parser.add_argument('--day-hour-output-prefix', action='store_true')
 parser.add_argument('--store-psd', action='store_true')
 parser.add_argument('--approximant')
 parser.add_argument('--sync', action='store_true')
+parser.add_argument('--sync-frame-status', action='store_true')
 parser.add_argument('--increment', type=int, default=8)
 parser.add_argument('--max-batch-size', type=int, default=2**27)
 scheme.insert_processing_option_group(parser)
@@ -206,6 +210,12 @@ with ctx:
 
         for ifo in ifos:
             status = data_reader[ifo].advance(valid_pad, timeout=args.frame_read_timeout)
+
+            # We fail the frame file if *any* of the processes
+            # failed to get it for whatever reason
+            # this ensures the data is synchronized
+            if args.sync_frame_status:
+                status = evnt.barrier_status(status)
 
             if status is True:
                 if i % args.psd_recalculate_every == 0:
