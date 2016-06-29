@@ -1390,7 +1390,7 @@ class LiveBatchMatchedFilter(object):
             snr[i] = snrv[0] * norm
 
             # ignore result if newsnr if sub-threshold
-            if self.newsnr_threshold and self.newsnr_threshold > newsnr(snr[i], chisq[i]):
+            if self.newsnr_threshold and self.newsnr_threshold > newsnr(abs(snr[i]), chisq[i]):
                 continue
 
             sigmasq[i] = sgm
