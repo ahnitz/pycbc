@@ -1176,6 +1176,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         
         # time to ignore output of frame (for initial buffering)
         self.add_hard_count()
+        self.taper_immediate_strain = True
 
     @property
     def start_time(self):
@@ -1287,6 +1288,9 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         # We should roll this off at some point too...
         self.strain[len(self.strain) - csize + self.corruption:] = 0
         self.strain.start_time += blocksize
+        
+        # The next time we need strain will need to be tapered
+        self.taper_immediate_strain = True
        
     def advance(self, blocksize, timeout=10):
         """ Add blocksize seconds more to the buffer, push blocksize seconds
@@ -1353,12 +1357,21 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         gate_params = [[gt, self.autogating_window, self.autogating_pad] for gt in glitch_times]
         if len(glitch_times) > 0:
             logging.info('Autogating at %s', ', '.join(['%.3f' % gt for gt in glitch_times]))
-
             strain = gate_data(strain, gate_params)
+
+        # remove corruption at begginning 
+        strain = strain[self.corruption:]
+        
+        # taper begginning if needed
+        if self.taper_immediate_strain:
+            logging.info("tapering start of strain block")
+            strain = gate_data(strain, [(strain.start_time, 0., self.autogating_pad)])
+            self.taper_immediate_strain = False
+
 
         ###### Stitch into continuous stream
         self.strain.roll(-sample_step)
-        self.strain[len(self.strain) - csize + self.corruption:] = strain[self.corruption:]
+        self.strain[len(self.strain) - csize + self.corruption:] = strain[:]
         self.strain.start_time += blocksize
 
         if self.psd is None and self.wait_duration <=0:
