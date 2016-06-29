@@ -1,8 +1,9 @@
 doc-warnings: true
 test-warnings: no
-strictness: medium
+strictness: veryhigh
 autodetect: yes
 ignore-patterns:
+    - */__init__.py
     - examples/*
     - test/*
     - docs/*
