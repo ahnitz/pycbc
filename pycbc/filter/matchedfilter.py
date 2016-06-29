@@ -1404,7 +1404,7 @@ class LiveBatchMatchedFilter(object):
         result['snr'] = abs(snr[0:i])
         result['coa_phase'] = numpy.angle(snr[0:i])
         result['chisq'] = chisq[0:i]
-        result['chisq_dof'] = dof[0:i] / 2 + 1
+        result['chisq_dof'] = dof[0:i]
         result['end_time'] = time[0:i]
         result['template_hash'] = templates[0:i]
         result['sigmasq'] = sigmasq[0:i]
