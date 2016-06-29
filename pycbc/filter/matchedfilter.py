@@ -1232,9 +1232,10 @@ def quadratic_interpolate_peak(left, middle, right):
 class LiveBatchMatchedFilter(object):
     def __init__(self, templates, snr_threshold, chisq_bins,
                  maxelements=2**27,
-                 snr_abort_threshold=None):
+                 snr_abort_threshold=None, newsnr_threshold=None):
         self.snr_threshold = snr_threshold
         self.snr_abort_threshold = snr_abort_threshold
+        self.newsnr_threshold = newsnr_threshold
 
         from pycbc import vetoes
         self.power_chisq = vetoes.SingleDetPowerChisq(chisq_bins, None)
@@ -1332,6 +1333,7 @@ class LiveBatchMatchedFilter(object):
     def process_batch(self):
         """ Process only a single batch group of data
         """  
+        from pycbc.events import newsnr
    
         if self.block_id == len(self.tgroups):
             return None
@@ -1386,6 +1388,10 @@ class LiveBatchMatchedFilter(object):
             chisq[i], dof[i] = self.power_chisq.values(htilde.cout, snrv, norm, psd, [l], htilde)
             chisq[i] /= dof[i]
             snr[i] = snrv[0] * norm
+
+            if self.newsnr_threshold and self.newsnr_threshold > newsnr(snr[i], chisq[i]):
+                continue
+
             sigmasq[i] = sgm
             
             templates[i] = htilde.id

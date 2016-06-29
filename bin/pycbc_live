@@ -138,6 +138,7 @@ parser.add_argument('--approximant')
 parser.add_argument('--sync', action='store_true')
 parser.add_argument('--sync-frame-status', action='store_true')
 parser.add_argument('--increment', type=int, default=8)
+parser.add_argument('--newsnr-threshold', type=float, default=0)
 parser.add_argument('--max-batch-size', type=int, default=2**27)
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
@@ -170,6 +171,7 @@ with ctx:
         maxlen = max(lengths.max(), psd_len)
         mf = LiveBatchMatchedFilter(waveforms, args.snr_threshold, args.chisq_bins,
                                      snr_abort_threshold=args.snr_abort_threshold, 
+                                     newsnr_threshold=args.newsnr_threshold,
                                      maxelements=args.max_batch_size)
 
 
