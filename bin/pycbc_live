@@ -84,7 +84,7 @@ class LiveEventManager(object):
 
         if store_loudest_index:
             for ifo in results:
-                if 'snr' in results:
+                if 'snr' in results[ifo]:
                     f[ifo]['loudest'] = numpy.argsort(results[ifo]['snr'])[::-1][0:store_loudest_index]
 
         f.close()
