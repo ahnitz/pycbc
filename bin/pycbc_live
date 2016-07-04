@@ -120,7 +120,8 @@ parser.add_argument('--highpass-reduction', type=float,
                         help="DB to reduce low frequencies")
 parser.add_argument('--highpass-bandwidth', type=float,
                         help="Width of the highpass turnover region in Hz")
-parser.add_argument('--psd-recalculate-every', type=int, default=1)
+parser.add_argument('--psd-recalculate-difference', type=float, default=.01)
+parser.add_argument('--psd-abort-difference', type=float, default=.20)
 parser.add_argument('--psd-samples', type=int, 
                         help="Number of PSD segments to use in the rolling estimate")
 parser.add_argument('--psd-segment-length', type=int, 
@@ -201,6 +202,8 @@ with ctx:
                             autogating_cluster=args.autogating_cluster,
                             autogating_window=args.autogating_window,
                             autogating_pad=args.autogating_pad,
+                            psd_abort_difference=args.psd_abort_difference,
+                            psd_recalculate_difference=args.psd_recalculate_difference,
                             force_update_cache=args.force_update_cache)
 
     logging.info('%s: Starting... ', evnt.rank)
@@ -220,16 +223,16 @@ with ctx:
         for ifo in ifos:
             status = data_reader[ifo].advance(valid_pad, timeout=args.frame_read_timeout)
 
+            if status is True:
+                status = data_reader[ifo].recalculate_psd()
+
             # We fail the frame file if *any* of the processes
             # failed to get it for whatever reason
             # this ensures the data is synchronized
             if args.sync_frame_status:
                 status = evnt.barrier_status(status)
-
+    
             if status is True:
-                if i % args.psd_recalculate_every == 0:
-                    data_reader[ifo].recalculate_psd()    
-
                 logging.info('%s: Filtering: %s', evnt.rank, ifo)
                 if evnt.rank > 0:
                     results[ifo] = mf.process_data(data_reader[ifo])

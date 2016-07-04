@@ -1067,6 +1067,8 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                        autogating_pad=0.25,
                        state_channel=None,
                        dyn_range_fac=pycbc.DYN_RANGE_FAC,
+                       psd_abort_difference=None,
+                       psd_recalculate_difference=None,
                        force_update_cache=True,
                  ):
         """ Class to produce overwhitened strain incrementally
@@ -1140,6 +1142,8 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         self.sample_rate = sample_rate
         self.dyn_range_fac = dyn_range_fac
 
+        self.psd_abort_difference = psd_abort_difference
+        self.psd_recalculate_difference = psd_recalculate_difference
         self.psd_segment_length = psd_segment_length
         self.psd_samples = psd_samples
         self.psd_inverse_length = psd_inverse_length
@@ -1208,9 +1212,30 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         seg_len = self.sample_rate * self.psd_segment_length
         e = len(self.strain)
         s = e - ((self.psd_samples + 1) * self.psd_segment_length / 2) * self.sample_rate
-        self.psd = pycbc.psd.welch(self.strain[s:e], seg_len=seg_len, 
-                                                     seg_stride=seg_len / 2)        
-        self.psds = {}          
+        psd = pycbc.psd.welch(self.strain[s:e], seg_len=seg_len, seg_stride=seg_len / 2)
+
+        from pycbc.waveform.spa_tmplt import spa_distance
+        psd.dist = spa_distance(psd, 1.4, 1.4, self.low_frequency_cutoff) * pycbc.DYN_RANGE_FAC
+
+        # If the new psd is similar to the old one, don't replace it
+        if self.psd and self.psd_recalculate_difference:
+            if abs(self.psd.dist - psd.dist) / self.psd.dist < self.psd_recalculate_difference:
+                logging.info("Skipping Recalculation of PSD, %s-%s", self.psd.dist, psd.dist)
+                return True
+        
+        # If the new psd is *really* different than the old one, return an error
+        if self.psd and self.psd_abort_difference:
+            if abs(self.psd.dist - psd.dist) / self.psd.dist > self.psd_abort_difference:
+                logging.info("PSD is CRAZY, aborting!!!!, %s-%s", self.psd.dist, psd.dist)
+                self.psd = psd
+                self.psds = {}  
+                return False
+
+        # If the new estimate replaces the current one, invalide the ineterpolate PSDs
+        self.psd = psd
+        self.psds = {}     
+        logging.info("Recalculating PSD, %s", psd.dist)  
+        return True   
 
     def overwhitened_data(self, delta_f):
         """ Return overwhitened data
