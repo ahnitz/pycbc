@@ -60,6 +60,13 @@ _fr_type_map = {
         lal.CreateUINT4Sequence,
         lalframe.FrameAddUINT4TimeSeriesProcData
     ],
+    lal.I4_TYPE_CODE: [
+        lalframe.FrStreamReadINT4TimeSeries, numpy.int32,
+        lal.CreateINT4TimeSeries,
+        lalframe.FrStreamGetINT4TimeSeriesMetadata,
+        lal.CreateINT4Sequence,
+        lalframe.FrameAddINT4TimeSeriesProcData
+    ],
 }
 
 def _read_channel(channel, stream, start, duration):
@@ -481,7 +488,7 @@ class DataBuffer(object):
             return TimeSeries(data.data.data, delta_t=data.deltaT,
                               epoch=self.read_pos, 
                               dtype=dtype)     
-        except:
+        except Exception as e:
             raise RuntimeError('Cannot read requested frame data') 
 
     def null_advance(self, blocksize):
