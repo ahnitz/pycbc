@@ -1070,6 +1070,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                        psd_abort_difference=None,
                        psd_recalculate_difference=None,
                        force_update_cache=True,
+                       increment_update_cache=None,
                  ):
         """ Class to produce overwhitened strain incrementally
 
@@ -1119,14 +1120,18 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         """ 
         super(StrainBuffer, self).__init__(frame_src, channel_name, start_time,
                                            max_buffer=max_buffer,
-                                           force_update_cache=force_update_cache)
+                                           force_update_cache=force_update_cache,
+                                           increment_update_cache=increment_update_cache)
 
         self.low_frequency_cutoff = low_frequency_cutoff
 
         # We could similarly add a dq vector here when that becomes available.
         self.state_channel = state_channel
         if 'None' not in self.state_channel:
-            self.state = pycbc.frame.StatusBuffer(frame_src, state_channel, start_time, max_buffer)
+            self.state = pycbc.frame.StatusBuffer(frame_src, state_channel, start_time,
+                                           max_buffer=max_buffer,
+                                           force_update_cache=force_update_cache,
+                                           increment_update_cache=increment_update_cache)
         else:
             self.state = None
 

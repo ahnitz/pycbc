@@ -399,7 +399,8 @@ class DataBuffer(object):
                        channel_name,
                        start_time,
                        max_buffer=2048, 
-                       force_update_cache=True):
+                       force_update_cache=True,
+                       increment_update_cache=None):
         """ Create a rolling buffer of frame data
 
         Parameters
@@ -418,6 +419,7 @@ class DataBuffer(object):
         self.channel_name = channel_name
         self.read_pos = start_time
         self.force_update_cache = force_update_cache
+        self.increment_update_cache = increment_update_cache
 
         self.update_cache()
         self.channel_type, self.sample_rate = self._retrieve_metadata(self.stream, self.channel_name)
@@ -518,6 +520,13 @@ class DataBuffer(object):
         self.read_pos += blocksize
         self.raw_buffer.start_time += blocksize
         return ts
+        
+    def update_cache_by_increment(self, blocksize):
+        start = self.raw_buffer.end_time
+        end = start + blocksize
+        
+        files = glob.glob(self.frame_src)
+        exit()
 
     def attempt_advance(self, blocksize, timeout=10):
         """ Attempt to advance the frame buffer. Retry upon failure, except
@@ -537,6 +546,9 @@ class DataBuffer(object):
         """
         if self.force_update_cache:
             self.update_cache()
+            
+        if self.increment_update_cache:
+            self.update_cache_by_increment()
         
         try:
             return DataBuffer.advance(self, blocksize)
@@ -548,6 +560,7 @@ class DataBuffer(object):
                 return None
             else:
                 # I am too early to give up on this frame, so we should try again
+                time.sleep(.1)
                 return self.attempt_advance(blocksize, timeout=timeout)
 
 # Status flags for the calibration state vector 
@@ -574,7 +587,9 @@ class StatusBuffer(DataBuffer):
                        channel_name,
                        start_time,
                        max_buffer=2048,
-                       valid_mask=HOFT_OK | SCIENCE_INTENT):
+                       valid_mask=HOFT_OK | SCIENCE_INTENT,
+                       force_update_cache=False,
+                       increment_update_cache=None):
         """ Create a rolling buffer of status data from a frame
 
         Parameters
@@ -591,7 +606,10 @@ class StatusBuffer(DataBuffer):
         valid_mask: {int, HOFT_OK | SCIENCE_INTENT}, Optional
             Set of flags that must be on to indicate valid frame data.
         """
-        DataBuffer.__init__(self, frame_src, channel_name, start_time, max_buffer) 
+        DataBuffer.__init__(self, frame_src, channel_name, start_time,
+                                 max_buffer=max_buffer,
+                                 force_update_cache=force_update_cache,
+                                 increment_update_cache=increment_update_cache) 
         self.valid_mask = valid_mask
 
     def check_valid(self, values):

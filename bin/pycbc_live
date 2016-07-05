@@ -148,6 +148,7 @@ parser.add_argument('--increment', type=int, default=8)
 parser.add_argument('--newsnr-threshold', type=float, default=0)
 parser.add_argument('--max-batch-size', type=int, default=2**27)
 parser.add_argument('--store-loudest-index', type=int, default=0)
+parser.add_argument('--increment-update-cache')
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
 args = parser.parse_args()
@@ -204,7 +205,8 @@ with ctx:
                             autogating_pad=args.autogating_pad,
                             psd_abort_difference=args.psd_abort_difference,
                             psd_recalculate_difference=args.psd_recalculate_difference,
-                            force_update_cache=args.force_update_cache)
+                            force_update_cache=args.force_update_cache,
+                            increment_update_cache=args.increment_update_cache)
 
     logging.info('%s: Starting... ', evnt.rank)
 
