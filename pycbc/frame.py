@@ -73,6 +73,7 @@ def _read_channel(channel, stream, start, duration):
     channel_type = lalframe.FrStreamGetTimeSeriesType(channel, stream)
     read_func = _fr_type_map[channel_type][0]
     d_type = _fr_type_map[channel_type][1]
+    print stream, channel, start, duration
     data = read_func(stream, channel, start, duration, 0)
     return TimeSeries(data.data.data, delta_t=data.deltaT, epoch=start, 
                       dtype=d_type)
@@ -204,6 +205,7 @@ def read_frame(location, channels, start_time=None,
             all_data.append(channel_data)
         return all_data
     else:
+        print channels, stream, start_time, duration
         return _read_channel(channels, stream, start_time, duration)
         
 def datafind_connection(server=None):
@@ -422,13 +424,13 @@ class DataBuffer(object):
         self.increment_update_cache = increment_update_cache
 
         self.update_cache()
-        self.channel_type, self.sample_rate = self._retrieve_metadata(self.stream, self.channel_name)
+        self.channel_type, self.raw_sample_rate = self._retrieve_metadata(self.stream, self.channel_name)
 
-        raw_size = self.sample_rate * max_buffer
+        raw_size = self.raw_sample_rate * max_buffer
         self.raw_buffer = TimeSeries(zeros(raw_size, dtype=numpy.float64),
                                      copy=False,
                                      epoch=start_time - max_buffer,
-                                     delta_t=1.0/self.sample_rate)
+                                     delta_t=1.0/self.raw_sample_rate)
 
     def update_cache(self):
         """ Reset the lal cache. This can be used to update the cache if the 
@@ -486,7 +488,10 @@ class DataBuffer(object):
         try:
             read_func = _fr_type_map[self.channel_type][0]
             dtype = _fr_type_map[self.channel_type][1]
-            data = read_func(self.stream, self.channel_name, self.read_pos, blocksize, 0)
+            print dtype, self.read_pos, blocksize, self.raw_sample_rate, self.raw_buffer.sample_rate
+            
+            print self.stream, self.channel_name, self.read_pos, blocksize
+            data = read_func(self.stream, self.channel_name, self.read_pos, int(blocksize), 0)
             return TimeSeries(data.data.data, delta_t=data.deltaT,
                               epoch=self.read_pos, 
                               dtype=dtype)     
@@ -501,7 +506,7 @@ class DataBuffer(object):
         blocksize: int
             The number of seconds to attempt to read from the channel
         """
-        self.raw_buffer.roll(-int(blocksize * self.sample_rate))       
+        self.raw_buffer.roll(-int(blocksize * self.raw_sample_rate))       
         self.raw_buffer.start_time += blocksize
 
     def advance(self, blocksize):
@@ -533,7 +538,7 @@ class DataBuffer(object):
             self.ref = int(fname[2])
             self.dur = int(fname[3])
         
-        fstart = int(self.ref + numpy.floor((start - self.ref) / float(self.dur)))
+        fstart = int(self.ref + numpy.floor((start - self.ref) / float(self.dur)) * self.dur)
         starts = numpy.arange(fstart, end, self.dur).astype(numpy.int)
         
         keys = []
@@ -545,7 +550,7 @@ class DataBuffer(object):
                 
             name = '%s/%s-%s-%s.gwf' % (pattern, self.beg, s, self.dur)
             keys.append(name)
-        
+        print keys, start, end
         cache = locations_to_cache(keys)
         stream = lalframe.FrStreamCacheOpen(cache)
         self.stream = stream
@@ -578,10 +583,12 @@ class DataBuffer(object):
             if lal.GPSTimeNow() > timeout + self.raw_buffer.end_time:
                 # The frame is not there and it should be by now, so we give up
                 # and treat it as zeros
+                logging.info('Frame missing, giving up...')
                 self.null_advance(blocksize)
                 return None
             else:
                 # I am too early to give up on this frame, so we should try again
+                logging.info('Frame missing, waiting a bit more...')
                 time.sleep(.1)
                 return self.attempt_advance(blocksize, timeout=timeout)
 
@@ -669,7 +676,7 @@ class StatusBuffer(DataBuffer):
         """
         s = self.raw_buffer.start_time - start_time
         e = s + duration
-        values = self.raw_buffer[s * self.sample_rate: e * self.sample_rate]
+        values = self.raw_buffer[s * self.raw_sample_rate: e * self.raw_sample_rate]
         return self.check_valid(values)
 
     def advance(self, blocksize):
@@ -686,6 +693,9 @@ class StatusBuffer(DataBuffer):
         status: boolean
             Returns True if all of the status information if valid, False if any is not.  
         """
+        if self.increment_update_cache:
+            self.update_cache_by_increment(blocksize)
+
         return self.check_valid(DataBuffer.advance(self, blocksize))
         
 

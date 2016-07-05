@@ -248,8 +248,10 @@ with ctx:
             for ifo in data_reader:
                 psds[ifo] = data_reader[ifo].psd
 
-            results, valid_end = evnt.gather_results()
-    
+            if evnt.size > 1:
+                results, valid_end = evnt.gather_results()
+            
+            print results
             prefix = '%s-Live-%s-%s' % (''.join(ifos), data_end() - args.analysis_chunk, valid_pad)
             evnt.dump(results, prefix, time_index=data_end(),
                       store_psd=False if args.store_psd is False else psds,
