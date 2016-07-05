@@ -548,7 +548,7 @@ class DataBuffer(object):
                 return None
             else:
                 # I am too early to give up on this frame, so we should try again
-                return self.attempt_advance(self, blocksize, timeout=timeout)
+                return self.attempt_advance(blocksize, timeout=timeout)
 
 # Status flags for the calibration state vector 
 HOFT_OK = 1
