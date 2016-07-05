@@ -522,11 +522,33 @@ class DataBuffer(object):
         return ts
         
     def update_cache_by_increment(self, blocksize):
-        start = self.raw_buffer.end_time
-        end = start + blocksize
+        start = float(self.raw_buffer.end_time)
+        end = float(start + blocksize)
         
-        files = glob.glob(self.frame_src)
-        exit()
+        if not hasattr(self, 'dur'):       
+            fname = glob.glob(self.frame_src[0])[0]
+            fname = os.path.splitext(os.path.basename(fname))[0].split('-')
+            
+            self.beg = '-'.join([fname[0], fname[1]])
+            self.ref = int(fname[2])
+            self.dur = int(fname[3])
+        
+        fstart = int(self.ref + numpy.floor((start - self.ref) / float(self.dur)))
+        starts = numpy.arange(fstart, end, self.dur).astype(numpy.int)
+        
+        keys = []
+        for s in starts:
+            pattern = self.increment_update_cache
+            if 'GPS' in pattern:
+                n = int(pattern[int(pattern.index('GPS') + 3)])
+                pattern = pattern.replace('GPS%s' % n, str(s)[0:n])
+                
+            name = '%s/%s-%s-%s.gwf' % (pattern, self.beg, s, self.dur)
+            keys.append(name)
+        
+        cache = locations_to_cache(keys)
+        stream = lalframe.FrStreamCacheOpen(cache)
+        self.stream = stream
 
     def attempt_advance(self, blocksize, timeout=10):
         """ Attempt to advance the frame buffer. Retry upon failure, except
@@ -546,11 +568,11 @@ class DataBuffer(object):
         """
         if self.force_update_cache:
             self.update_cache()
-            
-        if self.increment_update_cache:
-            self.update_cache_by_increment()
         
         try:
+            if self.increment_update_cache:
+                self.update_cache_by_increment(blocksize)
+        
             return DataBuffer.advance(self, blocksize)
         except RuntimeError:
             if lal.GPSTimeNow() > timeout + self.raw_buffer.end_time:
