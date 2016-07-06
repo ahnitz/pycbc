@@ -73,7 +73,6 @@ def _read_channel(channel, stream, start, duration):
     channel_type = lalframe.FrStreamGetTimeSeriesType(channel, stream)
     read_func = _fr_type_map[channel_type][0]
     d_type = _fr_type_map[channel_type][1]
-    print stream, channel, start, duration
     data = read_func(stream, channel, start, duration, 0)
     return TimeSeries(data.data.data, delta_t=data.deltaT, epoch=start, 
                       dtype=d_type)
@@ -205,7 +204,6 @@ def read_frame(location, channels, start_time=None,
             all_data.append(channel_data)
         return all_data
     else:
-        print channels, stream, start_time, duration
         return _read_channel(channels, stream, start_time, duration)
         
 def datafind_connection(server=None):
@@ -488,9 +486,6 @@ class DataBuffer(object):
         try:
             read_func = _fr_type_map[self.channel_type][0]
             dtype = _fr_type_map[self.channel_type][1]
-            print dtype, self.read_pos, blocksize, self.raw_sample_rate, self.raw_buffer.sample_rate
-            
-            print self.stream, self.channel_name, self.read_pos, blocksize
             data = read_func(self.stream, self.channel_name, self.read_pos, int(blocksize), 0)
             return TimeSeries(data.data.data, delta_t=data.deltaT,
                               epoch=self.read_pos, 
@@ -550,7 +545,6 @@ class DataBuffer(object):
                 
             name = '%s/%s-%s-%s.gwf' % (pattern, self.beg, s, self.dur)
             keys.append(name)
-        print keys, start, end
         cache = locations_to_cache(keys)
         stream = lalframe.FrStreamCacheOpen(cache)
         self.stream = stream

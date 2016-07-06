@@ -148,6 +148,8 @@ parser.add_argument('--increment', type=int, default=8)
 parser.add_argument('--newsnr-threshold', type=float, default=0)
 parser.add_argument('--max-batch-size', type=int, default=2**27)
 parser.add_argument('--store-loudest-index', type=int, default=0)
+parser.add_argument('--max-psd-abort-distance', type=float, default=numpy.inf)
+parser.add_argument('--min-psd-abort-distance', type=float, default=-numpy.inf)
 parser.add_argument('--increment-update-cache', action=MultiDetOptionAction, nargs='+')
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
@@ -228,6 +230,12 @@ with ctx:
             if status is True:
                 status = data_reader[ifo].recalculate_psd()
 
+            if data_reader[ifo].psd is not None:
+                dist = data_reader[ifo].psd.dist
+                if dist < args.min_psd_abort_distance or dist > args.max_psd_abort_distance:
+                    logging.info("PSD outside acceptable sensitivity %s - %s, have %s", args.min_psd_abort_distance, args.max_psd_abort_distance, dist)
+                    status = False               
+
             # We fail the frame file if *any* of the processes
             # failed to get it for whatever reason
             # this ensures the data is synchronized
@@ -251,7 +259,6 @@ with ctx:
             if evnt.size > 1:
                 results, valid_end = evnt.gather_results()
             
-            print results
             prefix = '%s-Live-%s-%s' % (''.join(ifos), data_end() - args.analysis_chunk, valid_pad)
             evnt.dump(results, prefix, time_index=data_end(),
                       store_psd=False if args.store_psd is False else psds,
