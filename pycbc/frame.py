@@ -583,7 +583,7 @@ class DataBuffer(object):
             else:
                 # I am too early to give up on this frame, so we should try again
                 logging.info('Frame missing, waiting a bit more...')
-                time.sleep(.1)
+                time.sleep(1)
                 return self.attempt_advance(blocksize, timeout=timeout)
 
 # Status flags for the calibration state vector 
