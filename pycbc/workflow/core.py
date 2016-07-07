@@ -123,7 +123,7 @@ class Executable(pegasus_workflow.Executable):
     # file will be retained, but a warning given
     current_retention_level = KEEP_BUT_RAISE_WARNING
     def __init__(self, cp, name, 
-                       universe=None, ifos=None, out_dir=None, tags=[]):
+                       universe=None, ifos=None, out_dir=None, tags=None):
         """
         Initialize the Executable class.
 
@@ -146,6 +146,8 @@ class Executable(pegasus_workflow.Executable):
         tags : list of strings
             A list of strings that is used to identify this job.
         """
+        if tags is None:
+            tags = []
         tags = [tag.upper() for tag in tags]
         self.tags = tags
         if isinstance(ifos, (str, unicode)):
@@ -559,7 +561,7 @@ class Node(pegasus_workflow.Node):
 
         return [exe_path] + arglist
         
-    def new_output_file_opt(self, valid_seg, extension, option_name, tags=[],
+    def new_output_file_opt(self, valid_seg, extension, option_name, tags=None,
                             store_file=None, use_tmp_subdirs=False):
         """
         This function will create a workflow.File object corresponding to the given
@@ -584,6 +586,8 @@ class Node(pegasus_workflow.Node):
             in the specified output location if True. If false file will be
             removed when no longer needed in the workflow.
         """
+        if tags is None:
+            tags = []
         
         # Changing this from set(tags) to enforce order. It might make sense
         # for all jobs to have file names with tags in the same order.
@@ -634,7 +638,7 @@ class Node(pegasus_workflow.Node):
             self._add_output(outfile)
 
     def new_multiifo_output_list_opt(self, opt, ifos, analysis_time, extension,
-                                     tags=[], store_file=None,
+                                     tags=None, store_file=None,
                                      use_tmp_subdirs=False):
         """ Add an option that determines a list of outputs from multiple
             detectors. Files will be supplied as --opt ifo1:input1 ifo2:input2
@@ -642,6 +646,8 @@ class Node(pegasus_workflow.Node):
             File names are created internally from the provided extension and
             analysis time.
         """
+        if tags is None:
+            tags = []
         all_tags = copy.deepcopy(self.executable.tags)
         for tag in tags:
             if tag not in all_tags:
