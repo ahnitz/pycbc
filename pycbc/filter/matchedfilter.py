@@ -1334,6 +1334,15 @@ class LiveBatchMatchedFilter(object):
             veto_info += veto
 
         result = self.combine_results(results)
+        
+        if self.max_triggers_in_batch:
+            sort = result['snr'].argsort()[::-1][:self.max_triggers_in_batch]
+            for key in result:
+                result[key] = result[key][sort]
+            
+            tmp = veto_info
+            veto_info = [tmp[i] for i in sort]
+        
         result = self._process_vetoes(result, veto_info)
         return result
 

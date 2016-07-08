@@ -151,6 +151,7 @@ parser.add_argument('--store-loudest-index', type=int, default=0)
 parser.add_argument('--max-psd-abort-distance', type=float, default=numpy.inf)
 parser.add_argument('--min-psd-abort-distance', type=float, default=-numpy.inf)
 parser.add_argument('--increment-update-cache', action=MultiDetOptionAction, nargs='+')
+parser.add_argument('--max-triggers-in-batch', type=int)
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
 args = parser.parse_args()
@@ -186,6 +187,7 @@ with ctx:
         mf = LiveBatchMatchedFilter(waveforms, args.snr_threshold, args.chisq_bins,
                                      snr_abort_threshold=args.snr_abort_threshold, 
                                      newsnr_threshold=args.newsnr_threshold,
+                                     max_triggers_in_batch=args.max_triggers_in_batch,
                                      maxelements=args.max_batch_size)
 
 
