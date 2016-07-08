@@ -501,7 +501,8 @@ class DataBuffer(object):
         blocksize: int
             The number of seconds to attempt to read from the channel
         """
-        self.raw_buffer.roll(-int(blocksize * self.raw_sample_rate))       
+        self.raw_buffer.roll(-int(blocksize * self.raw_sample_rate))
+        self.read_pos += blocksize       
         self.raw_buffer.start_time += blocksize
 
     def advance(self, blocksize):
@@ -544,10 +545,16 @@ class DataBuffer(object):
                 pattern = pattern.replace('GPS%s' % n, str(s)[0:n])
                 
             name = '%s/%s-%s-%s.gwf' % (pattern, self.beg, s, self.dur)
+            # check that file actually exists, else abort now
+            if not os.path.exists(name):
+                logging.info("%s does not seem to exist yet" % name)
+                raise RuntimeError
+
             keys.append(name)
         cache = locations_to_cache(keys)
         stream = lalframe.FrStreamCacheOpen(cache)
         self.stream = stream
+        self.channel_type, self.raw_sample_rate = self._retrieve_metadata(self.stream, self.channel_name)
 
     def attempt_advance(self, blocksize, timeout=10):
         """ Attempt to advance the frame buffer. Retry upon failure, except
@@ -571,14 +578,15 @@ class DataBuffer(object):
         try:
             if self.increment_update_cache:
                 self.update_cache_by_increment(blocksize)
-        
+
             return DataBuffer.advance(self, blocksize)
+
         except RuntimeError:
             if lal.GPSTimeNow() > timeout + self.raw_buffer.end_time:
                 # The frame is not there and it should be by now, so we give up
                 # and treat it as zeros
                 logging.info('Frame missing, giving up...')
-                self.null_advance(blocksize)
+                DataBuffer.null_advance(self, blocksize)
                 return None
             else:
                 # I am too early to give up on this frame, so we should try again

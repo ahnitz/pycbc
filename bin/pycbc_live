@@ -155,7 +155,9 @@ scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
 args = parser.parse_args()
 scheme.verify_processing_options(args, parser)
-pycbc.init_logging(args.verbose)
+
+import platform
+pycbc.init_logging(args.verbose, format="%(asctime)s: %(message)s" + ": %s: " % platform.node())
 
 ctx = scheme.from_cli(args)
 
@@ -170,6 +172,7 @@ bank = waveform.LiveFilterBank(args.bank_file, flow, sr, total_pad,
 
 ifos = args.channel_name.keys()
 evnt = LiveEventManager(args.output_path, use_date_prefix=args.day_hour_output_prefix)
+
 
 # I'm not the root, so do some actually filtering.
 with ctx:
