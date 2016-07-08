@@ -1232,10 +1232,13 @@ def quadratic_interpolate_peak(left, middle, right):
 class LiveBatchMatchedFilter(object):
     def __init__(self, templates, snr_threshold, chisq_bins,
                  maxelements=2**27,
-                 snr_abort_threshold=None, newsnr_threshold=None):
+                 snr_abort_threshold=None,
+                 newsnr_threshold=None,
+                 max_triggers_in_batch=None):
         self.snr_threshold = snr_threshold
         self.snr_abort_threshold = snr_abort_threshold
         self.newsnr_threshold = newsnr_threshold
+        self.max_triggers_in_batch = max_triggers_in_batch
 
         from pycbc import vetoes
         self.power_chisq = vetoes.SingleDetPowerChisq(chisq_bins, None)
@@ -1322,21 +1325,52 @@ class LiveBatchMatchedFilter(object):
         """ Process every batch group and return as single result
         """
         results = []
+        veto_info = []
         while 1:
-            result = self.process_batch()
+            result, veto = self._process_batch()
             if result is False: return False
             if result is None: break
             results.append(result)
+            veto_info += veto
 
-        return self.combine_results(results)
+        result = self.combine_results(results)
+        result = self._process_vetoes(result, veto_info)
+        return result
 
-    def process_batch(self):
+    def _process_vetoes(self, results, veto_info):
+        """ Calculate signal based vetoes
+        """  
+        chisq = numpy.array(numpy.zeros(len(veto_info)), numpy.float32, ndmin=1)
+        dof = numpy.array(numpy.zeros(len(veto_info)), numpy.uint32, ndmin=1)
+        results['chisq'] = chisq
+        results['chisq_dof'] = dof
+        
+        keep = []
+        for i, (snrv, norm, l, htilde, stilde) in enumerate(veto_info): 
+            correlate(htilde, stilde, htilde.cout)
+            c, d = self.power_chisq.values(htilde.cout, snrv, norm, stilde.psd, [l], htilde)
+            chisq[i] = c[0] / d[0]
+            dof[i] = d[0]
+            
+            if self.newsnr_threshold:
+                newsnr = pycbc.events.newsnr(results['snr'][i], chisq[i])
+                if newsnr >= self.newsnr_threshold:
+                    keep.append(i)
+                    
+        if self.newsnr_threshold:
+            keep = numpy.array(keep, dtype=numpy.uint32)
+            for key in results:
+                results[key] = results[key][keep]
+                
+        return results 
+
+    def _process_batch(self):
         """ Process only a single batch group of data
         """  
         from pycbc.events import newsnr
    
         if self.block_id == len(self.tgroups):
-            return None
+            return None, None
 
         tgroup = self.tgroups[self.block_id]
         psize = self.chunk_tsamples[self.block_id]
@@ -1353,9 +1387,7 @@ class LiveBatchMatchedFilter(object):
         self.ifts[mid].execute()
 
         snr = numpy.zeros(len(tgroup), dtype=numpy.complex64)
-        chisq = numpy.zeros(len(tgroup), dtype=numpy.float32)
         time = numpy.zeros(len(tgroup), dtype=numpy.float64)
-        dof = numpy.zeros(len(tgroup), dtype=numpy.float64)
         templates = numpy.zeros(len(tgroup), dtype=numpy.uint64)
         sigmasq = numpy.zeros(len(tgroup), dtype=numpy.float32)
 
@@ -1364,47 +1396,42 @@ class LiveBatchMatchedFilter(object):
         for key in tkeys:
             result[key] = []
 
+        veto_info = []
+
+        # Find the peaks in our SNR times series from the various templates
         i = 0
         for htilde in tgroup:
-            # Find peaks
             m, l = htilde.out[seg].abs_max_loc()
             time[i] = self.data.start_time + float(l) / self.data.sample_rate            
 
             l += valid_start
-            # If nothing is above threshold we can exit this template
             sgm = htilde.sigmasq(psd)
             norm = 4.0 * htilde.delta_f / (sgm ** 0.5)
 
-            if m * norm < self.snr_threshold:
+            # If nothing is above threshold we can exit this template
+            s = m * norm
+            if s < self.snr_threshold:
                 continue    
 
             # We have an SNR so high that we will drop the entire analysis 
             # of this chunk of time!
-            if self.snr_abort_threshold is not None and m * norm > self.snr_abort_threshold:
+            if self.snr_abort_threshold is not None and s > self.snr_abort_threshold:
+                logging.info("We are seeing some *really* high SNRs, lets"
+                             "assume they aren't signals and just give up")
                 return False
      
-            # calculate chisq
             snrv = numpy.array([htilde.out[l]])
-            chisq[i], dof[i] = self.power_chisq.values(htilde.cout, snrv, norm, psd, [l], htilde)
-            chisq[i] /= dof[i]
+            veto_info.append((snrv, norm, l, htilde, stilde))
+     
             snr[i] = snrv[0] * norm
-
-            # ignore result if newsnr if sub-threshold
-            if self.newsnr_threshold and self.newsnr_threshold > newsnr(abs(snr[i]), chisq[i]):
-                continue
-
             sigmasq[i] = sgm
-            
             templates[i] = htilde.id
             for key in tkeys:
                 result[key].append(htilde.params[key])
-
             i += 1
         
         result['snr'] = abs(snr[0:i])
         result['coa_phase'] = numpy.angle(snr[0:i])
-        result['chisq'] = chisq[0:i]
-        result['chisq_dof'] = dof[0:i]
         result['end_time'] = time[0:i]
         result['template_hash'] = templates[0:i]
         result['sigmasq'] = sigmasq[0:i]
@@ -1413,7 +1440,7 @@ class LiveBatchMatchedFilter(object):
             result[key] = numpy.array(result[key])
 
         self.block_id += 1
-        return result     
+        return result, veto_info  
 
 __all__ = ['match', 'matched_filter', 'sigmasq', 'sigma', 'get_cutoff_indices',
            'sigmasq_series', 'make_frequency_series', 'overlap', 'overlap_cplx',
