@@ -61,12 +61,21 @@ def sigma_cached(self, psd):
             self._sigmasq[key] = psd.sigmasq_vec[self.approximant][self.end_idx] * self.sigma_scale
 
         else:
+            if not hasattr(self, 'sigma_view'):
+                from pycbc.filter.matchedfilter import get_cutoff_indices
+                N = (len(self) -1) * 2
+                kmin, kmax = get_cutoff_indices(self.f_lower, self.end_frequency, self.delta_f, N)
+                self.sslice = slice(kmin, kmax)
+                self.sigma_view = self[self.sslice].squared_norm() * 4.0 * self.delta_f
+        
             if not hasattr(psd, 'invsqrt'):
-                psd.invsqrt = 1.0 / psd ** 0.5
+                psd.invsqrt = 1.0 / psd[self.sslice]
+                
+            return self.sigma_view.inner(psd.invsqrt)
 
-            self._sigmasq[key] = sigmasq(self * psd.invsqrt,
-                                            low_frequency_cutoff=self.f_lower, 
-                                            high_frequency_cutoff=self.end_frequency)                    
+            #self._sigmasq[key] = sigmasq(self * psd.invsqrt,
+            #                                low_frequency_cutoff=self.f_lower, 
+            #                                high_frequency_cutoff=self.end_frequency)                    
     return self._sigmasq[key]
     
 # dummy class needed for loading LIGOLW files
