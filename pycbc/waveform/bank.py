@@ -49,13 +49,16 @@ def sigma_cached(self, psd):
             if self.approximant not in psd.sigmasq_vec:
                 psd.sigmasq_vec[self.approximant] = pycbc.waveform.get_waveform_filter_norm(
                      self.approximant, psd, len(psd), psd.delta_f, self.f_lower)
+    
+            if not hasattr(self, 'sigma_scale'):                
+                # Get an amplitude normalization (mass dependant constant norm)
+                amp_norm = pycbc.waveform.get_template_amplitude_norm(
+                                     self.params, approximant=self.approximant)
+                amp_norm = 1 if amp_norm is None else amp_norm
+                self.sigma_scale = (DYN_RANGE_FAC * amp_norm) ** 2.0
                 
-            # Get an amplitude normalization (mass dependant constant norm)
-            amp_norm = pycbc.waveform.get_template_amplitude_norm(
-                                 self.params, approximant=self.approximant)
-            amp_norm = 1 if amp_norm is None else amp_norm
-            scale = DYN_RANGE_FAC * amp_norm
-            self._sigmasq[key] = psd.sigmasq_vec[self.approximant][self.end_idx] * (scale) **2
+                
+            self._sigmasq[key] = psd.sigmasq_vec[self.approximant][self.end_idx] * self.sigma_scale
 
         else:
             if not hasattr(psd, 'invsqrt'):
