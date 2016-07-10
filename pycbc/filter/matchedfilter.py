@@ -1400,6 +1400,8 @@ class LiveBatchMatchedFilter(object):
         templates = numpy.zeros(len(tgroup), dtype=numpy.uint64)
         sigmasq = numpy.zeros(len(tgroup), dtype=numpy.float32)
 
+        time[:] = self.data.start_time
+
         result = {}
         tkeys = tgroup[0].params.dtype.names
         for key in tkeys:
@@ -1411,7 +1413,7 @@ class LiveBatchMatchedFilter(object):
         i = 0
         for htilde in tgroup:
             m, l = htilde.out[seg].abs_max_loc()
-            time[i] = self.data.start_time + float(l) / self.data.sample_rate            
+            time[i] += float(l) / self.data.sample_rate            
 
             l += valid_start
             sgm = htilde.sigmasq(psd)
@@ -1435,8 +1437,13 @@ class LiveBatchMatchedFilter(object):
             snr[i] = snrv[0] * norm
             sigmasq[i] = sgm
             templates[i] = htilde.id
-            for key in tkeys:
-                result[key].append(htilde.params[key])
+            if not hasattr(htilde, 'dict_params'):
+                htilde.dict_params = {}
+                for key in tkeys:
+                    htilde.dict_params[key] = htilde.params[key]
+            
+            for key in tkeys:            
+                result[key].append(htilde.dict_params[key])
             i += 1
         
         result['snr'] = abs(snr[0:i])
