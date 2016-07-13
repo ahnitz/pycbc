@@ -24,7 +24,7 @@
 """ This modules contains functions for calculating and manipulating
 coincident triggers.
 """
-import numpy, logging, h5py, pycbc.pnutils, copy
+import numpy, logging, h5py, pycbc.pnutils, copy, lal
 from itertools import izip
 from scipy.interpolate import interp1d
 
@@ -326,9 +326,9 @@ def cluster_coincs(stat, time1, time2, timeslide_id, slide, window, argmax=numpy
     logging.info('done clustering coinc triggers: %s triggers remaining' % len(indices))
     return time_sorting[indices]
 
-class CoincTimeslideBackgroundEstimator(object):
-    def __init__(self, background_statistic, stat_files, ifos, 
-                 ifar_limit=100):
+class LiveCoincTimeslideBackgroundEstimator(object):
+    def __init__(self, num_templates, analysis_block, background_statistic, stat_files, ifos, 
+                 ifar_limit=100, timeslide_interval=.050):
 
         from . import stat
         self.stat_calculator = stat.get_statistic(background_statistic, stat_files)
@@ -337,9 +337,12 @@ class CoincTimeslideBackgroundEstimator(object):
         if len(self.ifos) != 2:
             raise ValueError("Only a two ifo analysis is supported at this time")
 
-        self.singles_buffer = 
+        self.lookback_time = (ifar_limit * lal.YRJUL_SI * timeslide_interval) ** 0.5
+        self.buffer_size = numpy.ceil(self.lookback_time / analysis_block)
+        print self.buffer_size
+           
 
-    def add_singles(self, results, time):
+    def add_singles(self, results):
         # FIXME Currently configured to use pycbc live output where chisq is the
         # reduced chisq and chisq_dof is the actual DOF
 

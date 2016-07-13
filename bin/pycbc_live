@@ -6,7 +6,7 @@ from pycbc.filter import LiveBatchMatchedFilter
 from time import time
 import os.path
 from mpi4py import MPI as mpi
-from pycbc.events.coinc import CoincTimeslideBackgroundEstimator
+from pycbc.events.coinc import LiveCoincTimeslideBackgroundEstimator
 
 def makedir(path):
     """
@@ -228,7 +228,10 @@ with ctx:
                             force_update_cache=args.force_update_cache,
                             increment_update_cache=args.increment_update_cache[ifo])
 
-    estimator = CoincTimeslideBackgroundEstimator(args.background_statistic, 
+    estimator = LiveCoincTimeslideBackgroundEstimator(
+                                    len(bank),
+                                    args.analysis_chunk,
+                                    args.background_statistic, 
                                     args.background_statistic_files, 
                                     ifos=ifos)
 
@@ -282,7 +285,7 @@ with ctx:
             if evnt.size > 1:
                 results, valid_end = evnt.gather_results()
         
-            estimator.add_singles(results, args.analysis_chunk)
+            estimator.add_singles(results)
     
             prefix = '%s-Live-%s-%s' % (''.join(ifos), data_end() - args.analysis_chunk, valid_pad)
             evnt.dump(results, prefix, time_index=data_end(),
