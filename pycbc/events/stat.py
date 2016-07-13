@@ -24,6 +24,9 @@
 """ This modules contains functions for calculating the coincident 
 statistic values
 """
+import h5py
+import numpy
+from . import events
 
 def get_statistic(option, files):
     if option == 'newsnr':
