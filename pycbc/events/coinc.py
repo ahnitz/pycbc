@@ -326,3 +326,11 @@ def cluster_coincs(stat, time1, time2, timeslide_id, slide, window, argmax=numpy
     logging.info('done clustering coinc triggers: %s triggers remaining' % len(indices))
     return time_sorting[indices]
 
+class CoincBackgroundEstimator(object):
+    def __init__(self, background_statistic):
+        from . import stat
+        stat_calculator = stat.get_statistic(background_statistic)
+
+    def add_singles(self, trigs, time):
+        single_stat = self.stat_calculator.single(trigs)
+        

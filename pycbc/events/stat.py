@@ -37,13 +37,6 @@ def get_statistic(option, files):
     else:
         raise ValueError('%s is not an available detection statistic' % option)
 
-def parse_template_range(num_templates, rangestr):
-    part = int(rangestr.split('/')[0])
-    pieces = int(rangestr.split('/')[1])
-    tmin =  int(num_templates / float(pieces) * part)
-    tmax =  int(num_templates / float(pieces) * (part+1))
-    return tmin, tmax    
-
 class Stat(object):
     def __init__(self, files):
         self.files = {}
@@ -93,7 +86,8 @@ class PhaseTDStatistic(NewSNRStatistic):
 
     def single(self, trigs):
         newsnr = NewSNRStatistic.single(self, trigs)
-        return numpy.array((newsnr, trigs['coa_phase'], trigs['end_time'], trigs['sigmasq']**0.5, trigs['snr'])).transpose()
+        return numpy.array((newsnr, trigs['coa_phase'], trigs['end_time'],
+                            trigs['sigmasq']**0.5, trigs['snr'])).transpose()
 
     def coinc(self, s1, s2, slide, step):
         """ Calculate the coincident statistic.
