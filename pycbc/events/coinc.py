@@ -482,13 +482,6 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # insert new coincs into coinc buffer
         # increment the timeout buffers       
 
-        # If we have zerolag coincs
-        # assign FAR / FAP by search sorting the coinc buffer
-        # if louder than max far, look at extrapolation background. If the local estimate
-        # agrees within XX %s of the extrapolated ,use the extrapolated to assign a better
-        # FAR, else only > 100 yrs, etc
-        # return list of coinc, stat, and single values
-
         # (higher level code submits to gracedb in aynchronous submission function, multiprocessing?)
 
             
