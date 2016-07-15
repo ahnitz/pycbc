@@ -375,6 +375,16 @@ class MultiRingBuffer(object):
         else:
             return numpy.concatenate([buffer_part[start:], buffer_part[:end]])
 
+class SortedExpireBuffer(object):
+    def __init__(self, expiration, initial_size=2**20):
+        self.expiration = expiration
+
+    def add(self, values):
+        pass
+
+    def greater(self, value):
+        pass
+
 class LiveCoincTimeslideBackgroundEstimator(object):
     def __init__(self, num_templates, analysis_block, background_statistic, stat_files, ifos, 
                  ifar_limit=100,
@@ -405,6 +415,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             self.singles[ifo] = MultiRingBuffer(num_templates,
                                                 self.buffer_size,
                                                 dtype=self.singles_dtype)
+        self.coincs = SortedExpireBuffer(self.buffer_size)
 
     def add_singles(self, results):
         # convert to single detector trigger values 
@@ -472,6 +483,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 cstat = cstat[cidx]
                 offsets = offsets[cidx]
 
+                self.coincs.add(cstat[offsets != 0])
                 if (offsets == 0).sum() > 0:
                     print "FOUND A COINC", cstat[offsets == 0]
 
