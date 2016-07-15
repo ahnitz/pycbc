@@ -1449,7 +1449,7 @@ class LiveBatchMatchedFilter(object):
         result['snr'] = abs(snr[0:i])
         result['coa_phase'] = numpy.angle(snr[0:i])
         result['end_time'] = time[0:i]
-        result['template_hash'] = templates[0:i]
+        result['template_id'] = templates[0:i]
         result['sigmasq'] = sigmasq[0:i]
 
         for key in tkeys:

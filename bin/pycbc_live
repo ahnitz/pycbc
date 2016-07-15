@@ -163,6 +163,7 @@ parser.add_argument('--enable-profiling', action='store_true',
                     help="Dump out profiling information from MPI process 1 at"
                          " the end of program executrion")
 
+parser.add_argument('--enable-background-estimation', default=False, action='store_true')
 parser.add_argument('--background-statistic', default='newsnr')
 parser.add_argument('--background-statistic-files', nargs='+', default=[])
 scheme.insert_processing_option_group(parser)
@@ -227,8 +228,8 @@ with ctx:
                             psd_recalculate_difference=args.psd_recalculate_difference,
                             force_update_cache=args.force_update_cache,
                             increment_update_cache=args.increment_update_cache[ifo])
-
-    estimator = LiveCoincTimeslideBackgroundEstimator(
+    if args.enable_background_estimation:
+        estimator = LiveCoincTimeslideBackgroundEstimator(
                                     len(bank),
                                     args.analysis_chunk,
                                     args.background_statistic, 
@@ -285,7 +286,8 @@ with ctx:
             if evnt.size > 1:
                 results, valid_end = evnt.gather_results()
         
-            estimator.add_singles(results)
+            if args.enable_background_estimation:
+                estimator.add_singles(results)
     
             prefix = '%s-Live-%s-%s' % (''.join(ifos), data_end() - args.analysis_chunk, valid_pad)
             evnt.dump(results, prefix, time_index=data_end(),

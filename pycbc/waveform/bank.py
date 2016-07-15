@@ -71,11 +71,7 @@ def sigma_cached(self, psd):
             if not hasattr(psd, 'invsqrt'):
                 psd.invsqrt = 1.0 / psd[self.sslice]
                 
-            return self.sigma_view.inner(psd.invsqrt)
-
-            #self._sigmasq[key] = sigmasq(self * psd.invsqrt,
-            #                                low_frequency_cutoff=self.f_lower, 
-            #                                high_frequency_cutoff=self.end_frequency)                    
+            return self.sigma_view.inner(psd.invsqrt)                 
     return self._sigmasq[key]
     
 # dummy class needed for loading LIGOLW files
@@ -172,7 +168,12 @@ class LiveFilterBank(TemplateBank):
         super(LiveFilterBank, self).__init__(filename, approximant=approximant, **kwds)
 
         from pycbc.pnutils import mass1_mass2_to_mchirp_eta
-        self.table = sorted(self.table, key=lambda t: mass1_mass2_to_mchirp_eta(t.mass1, t.mass2)[0])        
+        self.table = sorted(self.table, key=lambda t: mass1_mass2_to_mchirp_eta(t.mass1, t.mass2)[0])
+
+        self.hash_lookup = {}
+        for i, p in enumerate(self.table):
+            hash_value =  hash((p.mass1, p.mass2, p.spin1z, p.spin2z))
+            self.hash_lookup[hash_value] = i
 
     def round_up(self, num):
         inc = self.increment
@@ -183,6 +184,9 @@ class LiveFilterBank(TemplateBank):
         instance = copy(self)
         instance.table = self.table[sindex]
         return instance
+
+    def id_from_hash(self, hash_value):
+        return self.hash_lookup[hash_value]        
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -242,8 +246,8 @@ class LiveFilterBank(TemplateBank):
         htilde.sigmasq = types.MethodType(sigma_cached, htilde)
         htilde._sigmasq = {}
 
-        htilde.id = hash((htilde.params.mass1, htilde.params.mass2, 
-                          htilde.params.spin1z, htilde.params.spin2z))
+        htilde.id = self.id_from_hash(hash((htilde.params.mass1, htilde.params.mass2, 
+                          htilde.params.spin1z, htilde.params.spin2z)))
         return htilde
 
 class FilterBank(TemplateBank):

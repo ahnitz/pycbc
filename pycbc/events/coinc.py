@@ -380,10 +380,10 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                  ifar_limit=100,
                  timeslide_interval=.050,
                  coinc_threshold=0.005):
-
         from pycbc import detector
         from . import stat
         self.stat_calculator = stat.get_statistic(background_statistic, stat_files)
+        self.timeslide_interval = timeslide_interval
 
         self.ifos = ifos
         if len(self.ifos) != 2:
@@ -399,15 +399,17 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # from each template separately. The ring buffer naturally expires
         # old triggers when they wraparound.
         self.singles = {}
+        self.singles_dtype = [('time', numpy.float64), ('stat', numpy.float32)]
         for ifo in self.ifos:
-            self.singles[ifo] = {}
-            for i in range(num_templates):
-                self.singles[ifo][i] = RingBuffer(self.buffer_size)
+            self.singles[ifo] = MultiRingBuffer(num_templates,
+                                                self.buffer_size,
+                                                dtype=self.singles_dtype)
 
     def add_singles(self, results):
         # convert to single detector trigger values 
-        # FIXME Currently configured to use pycbc live output where chisq is the
-        # reduced chisq and chisq_dof is the actual DOF
+        # FIXME Currently configured to use pycbc live output 
+        # where chisq is the reduced chisq and chisq_dof is the actual DOF
+        singles_data = {}
         for ifo in results:
             trigs = results[ifo]
             trigs = copy.copy(trigs)
@@ -418,31 +420,52 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 single_stat = self.stat_calculator.single(trigs)
             else:
                 single_stat = numpy.array([], ndmin=1, dtype=numpy.float32)
-
-            print single_stat
       
-        # apply single detector clustering if requested (to keep number low)
-        # or additional single detector thresholding / statistic checks / etc
-        # Nothing here yet!
+            # apply single detector clustering if requested (to keep number low)
+            # or additional single detector thresholding / statistic checks / etc
+            # Nothing here yet!
+
+            # prepare teh data that will go in the single detector buffers
+            data = numpy.array(numpy.zeros(len(single_stat), dtype=self.singles_dtype), ndmin=1)
+            data['stat'] = single_stat
+            data['time'] = trigs['end_time']
+            singles_data[ifo] = (trigs['template_id'], data)
 
         # add each single detector trigger to the ring buffer associated with 
         # the template it was found in.
+        for ifo in results:
+            self.singles[ifo].add(*singles_data[ifo])
+            
+        # for each single detector trigger find the allowed coincidences
+        for ifo in results:
+            trigs = results[ifo]
+            for trig_stat, trig_time, template in zip(singles_data[ifo][1]['stat'], trigs['end_time'], trigs['template_id']):
+                oifo = self.ifos[1] if self.ifos[0] == ifo else self.ifos[0]
+                times = self.singles[oifo].data(template)['time']
+                stats = self.singles[oifo].data(template)['stat']
+                _, idx, slide = time_coincidence(numpy.array(trig_time, ndmin=1),
+                                                   times, self.time_window,
+                                                   self.timeslide_interval)
+                c = self.stat_calculator.coinc(trig_stat, stats, slide, self.timeslide_interval)
+
+                if (slide == 0).sum() > 0:
+                    idx = idx[slide == 0]
+                    print "FOUND COINCIDENCE", ifo, times[idx], stats[idx], trig_stat, trig_time
 
 
-        # for each single detector trigger find the allowed coincidences  (keep zerolag separate)
-            # calculate coinc statistic using stat class !
-            # pick "loudest coinc" in analysis chunk for each timeslide
-            # we store timeout vector for each coincident trigger
-            # delete triggers with the oldest timeout (random set if prepopulating the list)
-            # insert new coincs into coinc buffer
-            # increment the timeout buffers       
+        # calculate coinc statistic using stat class !
+        # pick "loudest coinc" in analysis chunk for each timeslide
+        # we store timeout vector for each coincident trigger
+        # delete triggers with the oldest timeout (random set if prepopulating the list)
+        # insert new coincs into coinc buffer
+        # increment the timeout buffers       
 
         # If we have zerolag coincs
-            # assign FAR / FAP by search sorting the coinc buffer
-            # if louder than max far, look at extrapolation background. If the local estimate
-            # agrees within XX %s of the extrapolated ,use the extrapolated to assign a better
-            # FAR, else only > 100 yrs, etc
-            # return list of coinc, stat, and single values
+        # assign FAR / FAP by search sorting the coinc buffer
+        # if louder than max far, look at extrapolation background. If the local estimate
+        # agrees within XX %s of the extrapolated ,use the extrapolated to assign a better
+        # FAR, else only > 100 yrs, etc
+        # return list of coinc, stat, and single values
 
         # (higher level code submits to gracedb in aynchronous submission function, multiprocessing?)
 
