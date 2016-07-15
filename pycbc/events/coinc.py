@@ -469,10 +469,11 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 cidx = cluster_coincs(cstat, ctime0, ctime1, offsets, 
                                           self.timeslide_interval,
                                           self.analysis_block)
-                print cidx
                 cstat = cstat[cidx]
                 offsets = offsets[cidx]
-                print cstat, offsets
+
+                if (offsets == 0).sum() > 0:
+                    print "FOUND A COINC", cstat[offsets == 0]
 
         # calculate coinc statistic using stat class !
         # pick "loudest coinc" in analysis chunk for each timeslide
