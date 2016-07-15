@@ -444,13 +444,16 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 times = self.singles[oifo].data(template)['time']
                 stats = self.singles[oifo].data(template)['stat']
                 _, idx, slide = time_coincidence(numpy.array(trig_time, ndmin=1),
-                                                   times, self.time_window,
-                                                   self.timeslide_interval)
-                c = self.stat_calculator.coinc(trig_stat, stats, slide, self.timeslide_interval)
+                                                 times, self.time_window,
+                                                 self.timeslide_interval)
+                c = self.stat_calculator.coinc(trig_stat, stats[idx],
+                                               slide, self.timeslide_interval)
+
+                cidx = cluster_coincs(c, t0, time2, timeslide_id, slide, window, argmax=numpy.argmax)
 
                 if (slide == 0).sum() > 0:
                     idx = idx[slide == 0]
-                    print "FOUND COINCIDENCE", ifo, times[idx], stats[idx], trig_stat, trig_time
+                    print "FOUND COINCIDENCE", c[slide == 0], ifo, times[idx], stats[idx], trig_stat, trig_time
 
 
         # calculate coinc statistic using stat class !
