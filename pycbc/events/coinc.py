@@ -382,6 +382,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                  coinc_threshold=0.005):
         from pycbc import detector
         from . import stat
+        self.analysis_block = analysis_block
         self.stat_calculator = stat.get_statistic(background_statistic, stat_files)
         self.timeslide_interval = timeslide_interval
 
@@ -437,9 +438,12 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             self.singles[ifo].add(*singles_data[ifo])
             
         # for each single detector trigger find the allowed coincidences
+        cstat = []
+        offsets = []
+        ctimes = {self.ifos[0]:[], self.ifos[1]:[]}
         for ifo in results:
             trigs = results[ifo]
-            for trig_stat, trig_time, template in zip(singles_data[ifo][1]['stat'], trigs['end_time'], trigs['template_id']):
+            for i, (trig_stat, trig_time, template) in enumerate(zip(singles_data[ifo][1]['stat'], trigs['end_time'], trigs['template_id'])):
                 oifo = self.ifos[1] if self.ifos[0] == ifo else self.ifos[0]
                 times = self.singles[oifo].data(template)['time']
                 stats = self.singles[oifo].data(template)['stat']
@@ -449,12 +453,26 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 c = self.stat_calculator.coinc(trig_stat, stats[idx],
                                                slide, self.timeslide_interval)
 
-                cidx = cluster_coincs(c, t0, time2, timeslide_id, slide, window, argmax=numpy.argmax)
+                offsets.append(slide)
+                cstat.append(c)
+                ctimes[oifo].append(times[idx])
+                ctimes[ifo].append(numpy.zeros(len(c), dtype=numpy.float64))
+                ctimes[ifo][-1].fill(trig_time)
 
-                if (slide == 0).sum() > 0:
-                    idx = idx[slide == 0]
-                    print "FOUND COINCIDENCE", c[slide == 0], ifo, times[idx], stats[idx], trig_stat, trig_time
-
+        # cluster the triggers we've found (both zerolag and non handled together)
+        if len(cstat) > 0:
+            cstat = numpy.concatenate(cstat)
+            if len(cstat) > 0:
+                offsets = numpy.concatenate(offsets)
+                ctime0 = numpy.concatenate(ctimes[self.ifos[0]])
+                ctime1 = numpy.concatenate(ctimes[self.ifos[1]])
+                cidx = cluster_coincs(cstat, ctime0, ctime1, offsets, 
+                                          self.timeslide_interval,
+                                          self.analysis_block)
+                print cidx
+                cstat = cstat[cidx]
+                offsets = offsets[cidx]
+                print cstat, offsets
 
         # calculate coinc statistic using stat class !
         # pick "loudest coinc" in analysis chunk for each timeslide
