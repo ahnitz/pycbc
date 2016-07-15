@@ -326,10 +326,62 @@ def cluster_coincs(stat, time1, time2, timeslide_id, slide, window, argmax=numpy
     logging.info('done clustering coinc triggers: %s triggers remaining' % len(indices))
     return time_sorting[indices]
 
+class MultiRingBuffer(object):
+    def __init__(self, num_rings, max_length, dtype=numpy.float32):
+        self.max_length = max_length
+        self.pad_count = self.max_length + 2
+        self.buffer = numpy.zeros((num_rings, self.pad_count), dtype=dtype)
+
+        self.buffer_expire = numpy.zeros((num_rings, self.pad_count), dtype=numpy.int32) 
+        self.buffer_expire -= self.max_length * 2
+
+        self.start = numpy.zeros(num_rings, dtype=numpy.uint32)
+        self.index = numpy.zeros(num_rings, dtype=numpy.uint32)
+        self.ladder = numpy.arange(0, num_rings, dtype=numpy.uint32)    
+
+        self.size = 0
+        self.expire = 0
+
+    def __len__(self):
+        return self.size
+
+    def size_increment(self):
+        if self.size < self.max_length:
+            self.size += 1
+        self.expire += 1
+
+        idx = self.buffer_expire[self.ladder, self.start] < self.expire - self.max_length
+        self.start[numpy.logical_and(idx, self.start != self.index)] += 1
+        self.start[self.start == self.pad_count] = 0
+
+    def add(self, indices, values):
+        index = self.index[indices]
+
+        self.buffer[indices, index] = values
+        self.buffer_expire[indices, index] = self.expire
+
+        index += 1
+        index[index == self.pad_count] = 0
+        self.index[indices] = index
+        self.size_increment()
+    
+    def data(self, buffer_index):
+        buffer_part = self.buffer[buffer_index]
+        start = self.start[buffer_index]
+        end = self.index[buffer_index]
+        
+        if start <= end:
+            return buffer_part[start:end]
+        else:
+            return numpy.concatenate([buffer_part[start:], buffer_part[:end]])
+
 class LiveCoincTimeslideBackgroundEstimator(object):
     def __init__(self, num_templates, analysis_block, background_statistic, stat_files, ifos, 
-                 ifar_limit=100, timeslide_interval=.050):
+                 ifar_limit=100,
+                 timeslide_interval=.050,
+                 coinc_threshold=0.005):
 
+        from pycbc import detector
         from . import stat
         self.stat_calculator = stat.get_statistic(background_statistic, stat_files)
 
@@ -338,14 +390,24 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             raise ValueError("Only a two ifo analysis is supported at this time")
 
         self.lookback_time = (ifar_limit * lal.YRJUL_SI * timeslide_interval) ** 0.5
-        self.buffer_size = numpy.ceil(self.lookback_time / analysis_block)
-        print self.buffer_size
-           
+        self.buffer_size = int(numpy.ceil(self.lookback_time / analysis_block))
+
+        det0, det1 = detector.Detector(ifos[0]), detector.Detector(ifos[1])
+        self.time_window = det0.light_travel_time_to_detector(det1) + coinc_threshold
+
+        # Preallocate ring buffers to hold all the single detector triggers
+        # from each template separately. The ring buffer naturally expires
+        # old triggers when they wraparound.
+        self.singles = {}
+        for ifo in self.ifos:
+            self.singles[ifo] = {}
+            for i in range(num_templates):
+                self.singles[ifo][i] = RingBuffer(self.buffer_size)
 
     def add_singles(self, results):
+        # convert to single detector trigger values 
         # FIXME Currently configured to use pycbc live output where chisq is the
         # reduced chisq and chisq_dof is the actual DOF
-
         for ifo in results:
             trigs = results[ifo]
             trigs = copy.copy(trigs)
@@ -356,6 +418,33 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 single_stat = self.stat_calculator.single(trigs)
             else:
                 single_stat = numpy.array([], ndmin=1, dtype=numpy.float32)
+
+            print single_stat
+      
+        # apply single detector clustering if requested (to keep number low)
+        # or additional single detector thresholding / statistic checks / etc
+        # Nothing here yet!
+
+        # add each single detector trigger to the ring buffer associated with 
+        # the template it was found in.
+
+
+        # for each single detector trigger find the allowed coincidences  (keep zerolag separate)
+            # calculate coinc statistic using stat class !
+            # pick "loudest coinc" in analysis chunk for each timeslide
+            # we store timeout vector for each coincident trigger
+            # delete triggers with the oldest timeout (random set if prepopulating the list)
+            # insert new coincs into coinc buffer
+            # increment the timeout buffers       
+
+        # If we have zerolag coincs
+            # assign FAR / FAP by search sorting the coinc buffer
+            # if louder than max far, look at extrapolation background. If the local estimate
+            # agrees within XX %s of the extrapolated ,use the extrapolated to assign a better
+            # FAR, else only > 100 yrs, etc
+            # return list of coinc, stat, and single values
+
+        # (higher level code submits to gracedb in aynchronous submission function, multiprocessing?)
 
             
 
