@@ -421,6 +421,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # convert to single detector trigger values 
         # FIXME Currently configured to use pycbc live output 
         # where chisq is the reduced chisq and chisq_dof is the actual DOF
+        logging.info("adding singles to the background estimate...")
         singles_data = {}
         for ifo in results:
             trigs = results[ifo]
@@ -473,6 +474,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # cluster the triggers we've found (both zerolag and non handled together)
         if len(cstat) > 0:
             cstat = numpy.concatenate(cstat)
+            logging.info('%s background and zerolag coincs', len(cstat))
             if len(cstat) > 0:
                 offsets = numpy.concatenate(offsets)
                 ctime0 = numpy.concatenate(ctimes[self.ifos[0]])
