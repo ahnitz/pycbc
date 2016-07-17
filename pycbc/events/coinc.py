@@ -376,14 +376,24 @@ class MultiRingBuffer(object):
             return numpy.concatenate([buffer_part[start:], buffer_part[:end]])
 
 class SortedExpireBuffer(object):
-    def __init__(self, expiration, initial_size=2**20):
+    def __init__(self, expiration, initial_size=2**20, dtype=numpy.float32):
         self.expiration = expiration
+        self.buffer = numpy.zeros(initial_size, dtype=dtype)
+        self.timer = numpy.zeros(initial_size, dtype=numpy.int32) - 1
+        self.index = 0
+        self.time = 0
 
     def add(self, values):
-        pass
-
-    def greater(self, value):
-        pass
+        self.time += 1
+        self.buffer[self.index:self.index+len(values)] = values
+        self.index += len(values)
+        
+    def num_greater(self, value):
+        return (self.buffer > value).sum()
+        
+    @property    
+    def data(self):
+        return self.buffer[:self.index]
 
 class LiveCoincTimeslideBackgroundEstimator(object):
     def __init__(self, num_templates, analysis_block, background_statistic, stat_files, ifos, 
@@ -416,6 +426,13 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                                                 self.buffer_size,
                                                 dtype=self.singles_dtype)
         self.coincs = SortedExpireBuffer(self.buffer_size)
+
+    @property
+    def background_time(self):
+        time = 1.0 / self.timeslide_interval
+        for ifo in self.singles:
+            time *= len(self.singles[ifo]) * self.analysis_block
+        return time
 
     def add_singles(self, results):
         # convert to single detector trigger values 
@@ -487,8 +504,10 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
                 self.coincs.add(cstat[offsets != 0])
                 if (offsets == 0).sum() > 0:
-                    print "FOUND A COINC", cstat[offsets == 0]
-
+                    print "FOUND A COINC", cstat[offsets == 0], self.coincs.num_greater(cstat[offsets==0][0])
+        
+        print self.background_time, self.coincs.buffer.max()
+        
         # calculate coinc statistic using stat class !
         # pick "loudest coinc" in analysis chunk for each timeslide
         # we store timeout vector for each coincident trigger
