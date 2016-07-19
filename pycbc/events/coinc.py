@@ -448,6 +448,12 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             time *= len(self.singles[ifo]) * self.analysis_block
         return time
 
+    def ifar(self, coinc_stat):
+        """ Return the far that would be associated with the coincident given.
+        """
+        n = self.coincs.num_greater(coinc_stat)
+        return self.background_time / lal.YRJUL_SI / (n + 1)
+
     def add_singles(self, results):
         # convert to single detector trigger values 
         # FIXME Currently configured to use pycbc live output 
@@ -464,20 +470,16 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 single_stat = self.stat_calculator.single(trigs)
             else:
                 single_stat = numpy.array([], ndmin=1, dtype=numpy.float32)
-      
-            # apply single detector clustering if requested (to keep number low)
-            # or additional single detector thresholding / statistic checks / etc
-            # Nothing here yet!
 
-            # prepare teh data that will go in the single detector buffers
-            data = numpy.array(numpy.zeros(len(single_stat), dtype=self.singles_dtype), ndmin=1)
+            # prepare the data that will go in the single detector buffers
+            data = numpy.array(numpy.zeros(len(single_stat),
+                               dtype=self.singles_dtype), ndmin=1)
             data['stat'] = single_stat
             data['time'] = trigs['end_time']
             singles_data[ifo] = (trigs['template_id'], data)
 
-        # add each single detector trigger to the ring buffer associated with 
-        # the template it was found in.
-        for ifo in results:
+            # add each single detector trigger to the ring buffer associated with 
+            # the template it was found in.
             self.singles[ifo].add(*singles_data[ifo])
             
         # for each single detector trigger find the allowed coincidences
@@ -518,18 +520,10 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
                 self.coincs.add(cstat[offsets != 0])
                 if (offsets == 0).sum() > 0:
-                    print "FOUND A COINC", cstat[offsets == 0], self.coincs.num_greater(cstat[offsets==0][0])
+                    print "FOUND A COINC", cstat[offsets == 0]
+                    print "FAR", cstat[offsets == 0]
         
-        print self.background_time, self.coincs.buffer.max()
-        
-        # calculate coinc statistic using stat class !
-        # pick "loudest coinc" in analysis chunk for each timeslide
-        # we store timeout vector for each coincident trigger
-        # delete triggers with the oldest timeout (random set if prepopulating the list)
-        # insert new coincs into coinc buffer
-        # increment the timeout buffers       
-
-        # (higher level code submits to gracedb in aynchronous submission function, multiprocessing?)
+        print self.background_time, self.coincs.buffer.max(), self.ifar(cstat[offsets==0][0])
 
             
 
