@@ -413,12 +413,13 @@ class LiveCoincTimeslideBackgroundEstimator(object):
     def __init__(self, num_templates, analysis_block, background_statistic, stat_files, ifos, 
                  ifar_limit=100,
                  timeslide_interval=.035,
-                 coinc_threshold=0.002):
+                 coinc_threshold=0.002, return_background=False):
         from pycbc import detector
         from . import stat
         self.analysis_block = analysis_block
         self.stat_calculator = stat.get_statistic(background_statistic, stat_files)
         self.timeslide_interval = timeslide_interval
+        self.return_background = return_background
 
         self.ifos = ifos
         if len(self.ifos) != 2:
@@ -478,7 +479,8 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             data['time'] = trigs['end_time']
             singles_data[ifo] = (trigs['template_id'], data)
 
-            # add each single detector trigger to the ring buffer associated with 
+            # add each single detector trigger to the 
+            # ring buffer associated with 
             # the template it was found in.
             self.singles[ifo].add(*singles_data[ifo])
             
@@ -488,7 +490,11 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         ctimes = {self.ifos[0]:[], self.ifos[1]:[]}
         for ifo in results:
             trigs = results[ifo]
-            for i, (trig_stat, trig_time, template) in enumerate(zip(singles_data[ifo][1]['stat'], trigs['end_time'], trigs['template_id'])):
+            for i in range(len(trigs['end_time'])):
+                trig_stat = singles_data[ifo][1]['stat'][i]
+                trig_time = trigs['end_time'][i]
+                template = trigs['template_id'][i]
+
                 oifo = self.ifos[1] if self.ifos[0] == ifo else self.ifos[0]
                 times = self.singles[oifo].data(template)['time']
                 stats = self.singles[oifo].data(template)['stat']
@@ -497,14 +503,15 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                                                  self.timeslide_interval)
                 c = self.stat_calculator.coinc(trig_stat, stats[idx],
                                                slide, self.timeslide_interval)
-
                 offsets.append(slide)
                 cstat.append(c)
                 ctimes[oifo].append(times[idx])
                 ctimes[ifo].append(numpy.zeros(len(c), dtype=numpy.float64))
                 ctimes[ifo][-1].fill(trig_time)
 
-        # cluster the triggers we've found (both zerolag and non handled together)
+        # cluster the triggers we've found
+        # (both zerolag and non handled together)
+        num_zerolag = 0
         if len(cstat) > 0:
             cstat = numpy.concatenate(cstat)
             logging.info('%s background and zerolag coincs', len(cstat))
@@ -518,13 +525,32 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 cstat = cstat[cidx]
                 offsets = offsets[cidx]
 
-                self.coincs.add(cstat[offsets != 0])
-                if (offsets == 0).sum() > 0:
-                    print "FOUND A COINC", cstat[offsets == 0]
-                    print "FAR", cstat[offsets == 0]
-        
-        print self.background_time, self.coincs.buffer.max(), self.ifar(cstat[offsets==0][0])
+                zerolag_idx = (offsets == 0)
+                bkg_idx = (offsets != 0)
 
+                self.coincs.add(cstat[bkg_idx])
+                num_zerolag = zerolag_idx.sum()
+
+        coinc_results = {}
+        # Collect coinc results for saving
+        if num_zerolag > 0:
+            zerolag_results = {}
+            ifar = numpy.array([self.ifar(c) for c in cstat[offsets==0]],
+                            dtype=numpy.float32)
+            tid0 = numpy.array([numpy.where(t == results[self.ifos[0]]['end_time'])[0]
+                                for t in ctime0[zerolag_idx]])                    
+            tid1 = numpy.array([numpy.where(t == results[self.ifos[1]]['end_time'])[0]
+                                for t in ctime1[zerolag_idx]])  
+            zerolag_results['foreground/ifar'] = ifar
+            zerolag_results['foreground/stat'] = cstat[zerolag_idx]
+            zerolag_results['foreground/%s/end_time' % self.ifos[0]] = ctime0
+            zerolag_results['foreground/%s/end_time' % self.ifos[1]] = ctime1
+            zerolag_results['foreground/%s/end_time' % self.ifos[0]] = tid0
+            zerolag_results['foreground/%s/end_time' % self.ifos[1]] = tid1
+            coinc_results.update(zerolag_results)
+
+        if self.return_background:
+            coinc_results['background/stat'] = self.coincs.data
             
+        return coinc_results
 
-        

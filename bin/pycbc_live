@@ -66,7 +66,8 @@ class LiveEventManager(object):
         else:
             raise TypeError("Not root process")
 
-    def dump(self, results, name, store_psd=False, time_index=None, store_loudest_index=False):
+    def dump(self, results, name, store_psd=False, time_index=None,
+                   store_loudest_index=False, raw_results=None):
         """ Save the results from this time block to an output file """
         if self.use_date_prefix:
             import lal
@@ -82,6 +83,9 @@ class LiveEventManager(object):
         for ifo in results:
             for k in results[ifo]:
                 f['%s/%s' % (ifo, k)] = results[ifo][k]
+
+        for key in raw_results:
+            f[key] = raw_results[key]
 
         if store_loudest_index:
             for ifo in results:
@@ -166,6 +170,7 @@ parser.add_argument('--enable-profiling', action='store_true',
 parser.add_argument('--enable-background-estimation', default=False, action='store_true')
 parser.add_argument('--background-statistic', default='newsnr')
 parser.add_argument('--background-statistic-files', nargs='+', default=[])
+parser.add_argument('--store-background', action='store_true')
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
 args = parser.parse_args()
@@ -234,6 +239,7 @@ with ctx:
                                     args.analysis_chunk,
                                     args.background_statistic, 
                                     args.background_statistic_files, 
+                                    return_background=args.store_background,
                                     ifos=ifos)
 
     logging.info('%s: Starting... ', evnt.rank)
@@ -286,13 +292,15 @@ with ctx:
             if evnt.size > 1:
                 results, valid_end = evnt.gather_results()
         
+            coinc_results = {}
             if args.enable_background_estimation:
-                estimator.add_singles(results)
+                coinc_results = estimator.add_singles(results)
     
             prefix = '%s-Live-%s-%s' % (''.join(ifos), data_end() - args.analysis_chunk, valid_pad)
             evnt.dump(results, prefix, time_index=data_end(),
                       store_psd=False if args.store_psd is False else psds,
                       store_loudest_index=args.store_loudest_index,
+                      raw_results=coinc_results,
                      )     
 
         if args.sync: evnt.barrier()
