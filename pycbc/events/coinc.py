@@ -375,21 +375,35 @@ class MultiRingBuffer(object):
         else:
             return numpy.concatenate([buffer_part[start:], buffer_part[:end]])
 
-class SortedExpireBuffer(object):
+class ExpireBuffer(object):
     def __init__(self, expiration, initial_size=2**20, dtype=numpy.float32):
         self.expiration = expiration
         self.buffer = numpy.zeros(initial_size, dtype=dtype)
-        self.timer = numpy.zeros(initial_size, dtype=numpy.int32) - 1
+        self.timer = numpy.zeros(initial_size, dtype=numpy.int32)
         self.index = 0
-        self.time = 0
+        self.time = expiration + 1
 
     def add(self, values):
         self.time += 1
+
+        # Resize the internal buffer if we need more space
+        if self.index + len(values) >= len(self.buffer):
+            newlen = len(self.buffer) * 2
+            self.timer.resize(newlen)
+            self.buffer.resize(newlen)
+
         self.buffer[self.index:self.index+len(values)] = values
+        self.timer[self.index:self.index+len(values)] = self.time
         self.index += len(values)
+
+        # Remove the expired old elements
+        keep = self.timer[:self.index] > self.time - self.expiration
+        self.index = keep.sum()
+        self.buffer[:self.index] = self.buffer[keep]
+        self.timer[:self.index] = self.timer[keep]
         
     def num_greater(self, value):
-        return (self.buffer > value).sum()
+        return (self.buffer[:self.index] > value).sum()
         
     @property    
     def data(self):
@@ -398,8 +412,8 @@ class SortedExpireBuffer(object):
 class LiveCoincTimeslideBackgroundEstimator(object):
     def __init__(self, num_templates, analysis_block, background_statistic, stat_files, ifos, 
                  ifar_limit=100,
-                 timeslide_interval=.050,
-                 coinc_threshold=0.005):
+                 timeslide_interval=.035,
+                 coinc_threshold=0.002):
         from pycbc import detector
         from . import stat
         self.analysis_block = analysis_block
@@ -425,7 +439,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             self.singles[ifo] = MultiRingBuffer(num_templates,
                                                 self.buffer_size,
                                                 dtype=self.singles_dtype)
-        self.coincs = SortedExpireBuffer(self.buffer_size)
+        self.coincs = ExpireBuffer(expiration=self.buffer_size)
 
     @property
     def background_time(self):
