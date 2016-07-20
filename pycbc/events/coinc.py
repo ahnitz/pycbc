@@ -517,8 +517,8 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             logging.info('%s background and zerolag coincs', len(cstat))
             if len(cstat) > 0:
                 offsets = numpy.concatenate(offsets)
-                ctime0 = numpy.concatenate(ctimes[self.ifos[0]])
-                ctime1 = numpy.concatenate(ctimes[self.ifos[1]])
+                ctime0 = numpy.concatenate(ctimes[self.ifos[0]]).astype(numpy.float64)
+                ctime1 = numpy.concatenate(ctimes[self.ifos[1]]).astype(numpy.float64)
                 cidx = cluster_coincs(cstat, ctime0, ctime1, offsets, 
                                           self.timeslide_interval,
                                           self.analysis_block)
@@ -538,19 +538,20 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             ifar = numpy.array([self.ifar(c) for c in cstat[offsets==0]],
                             dtype=numpy.float32)
             tid0 = numpy.array([numpy.where(t == results[self.ifos[0]]['end_time'])[0]
-                                for t in ctime0[zerolag_idx]])                    
+                                for t in ctime0[zerolag_idx]], dtype=numpy.uint32)                    
             tid1 = numpy.array([numpy.where(t == results[self.ifos[1]]['end_time'])[0]
-                                for t in ctime1[zerolag_idx]])  
+                                for t in ctime1[zerolag_idx]], dtype=numpy.uint32)
             zerolag_results['foreground/ifar'] = ifar
             zerolag_results['foreground/stat'] = cstat[zerolag_idx]
             zerolag_results['foreground/%s/end_time' % self.ifos[0]] = ctime0
             zerolag_results['foreground/%s/end_time' % self.ifos[1]] = ctime1
-            zerolag_results['foreground/%s/end_time' % self.ifos[0]] = tid0
-            zerolag_results['foreground/%s/end_time' % self.ifos[1]] = tid1
+            zerolag_results['foreground/%s/trigger_id1' % self.ifos[0]] = tid0
+            zerolag_results['foreground/%s/trigger_id2' % self.ifos[1]] = tid1
             coinc_results.update(zerolag_results)
 
         if self.return_background:
             coinc_results['background/stat'] = self.coincs.data
+            coinc_results['background/time'] = numpy.array([self.background_time])
             
         return coinc_results
 
