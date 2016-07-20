@@ -1413,9 +1413,7 @@ class LiveBatchMatchedFilter(object):
         i = 0
         for htilde in tgroup:
             m, l = htilde.out[seg].abs_max_loc()
-            time[i] += float(l) / self.data.sample_rate            
 
-            l += valid_start
             sgm = htilde.sigmasq(psd)
             norm = 4.0 * htilde.delta_f / (sgm ** 0.5)
 
@@ -1423,6 +1421,9 @@ class LiveBatchMatchedFilter(object):
             s = m * norm
             if s < self.snr_threshold:
                 continue    
+
+            time[i] += float(l) / self.data.sample_rate            
+            l += valid_start
 
             # We have an SNR so high that we will drop the entire analysis 
             # of this chunk of time!
