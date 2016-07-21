@@ -1430,7 +1430,7 @@ class LiveBatchMatchedFilter(object):
             if self.snr_abort_threshold is not None and s > self.snr_abort_threshold:
                 logging.info("We are seeing some *really* high SNRs, lets"
                              "assume they aren't signals and just give up")
-                return False, _
+                return False, []
      
             snrv = numpy.array([htilde.out[l]])
             veto_info.append((snrv, norm, l, htilde, stilde))
