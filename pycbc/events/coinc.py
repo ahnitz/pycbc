@@ -524,6 +524,8 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                                           self.analysis_block)
                 cstat = cstat[cidx]
                 offsets = offsets[cidx]
+                ctime0 = ctime0[cidx]
+                ctime1 = ctime1[cidx]
 
                 zerolag_idx = (offsets == 0)
                 bkg_idx = (offsets != 0)
@@ -535,16 +537,18 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # Collect coinc results for saving
         if num_zerolag > 0:
             zerolag_results = {}
-            ifar = numpy.array([self.ifar(c) for c in cstat[offsets==0]],
-                            dtype=numpy.float32)
+            zerolag_ctime0 = ctime0[zerolag_idx]
+            zerolag_ctime1 = ctime1[zerolag_idx]
+            zerolag_cstat = cstat[zerolag_idx]
+            ifar = numpy.array([self.ifar(c) for c in zerolag_cstat], dtype=numpy.float32)
             tid0 = numpy.array([numpy.where(t == results[self.ifos[0]]['end_time'])[0]
-                                for t in ctime0[zerolag_idx]], dtype=numpy.uint32)                    
+                                for t in zerolag_ctime0], dtype=numpy.uint32)                    
             tid1 = numpy.array([numpy.where(t == results[self.ifos[1]]['end_time'])[0]
-                                for t in ctime1[zerolag_idx]], dtype=numpy.uint32)
+                                for t in zerolag_ctime1], dtype=numpy.uint32)
             zerolag_results['foreground/ifar'] = ifar
-            zerolag_results['foreground/stat'] = cstat[zerolag_idx]
-            zerolag_results['foreground/%s/end_time' % self.ifos[0]] = ctime0
-            zerolag_results['foreground/%s/end_time' % self.ifos[1]] = ctime1
+            zerolag_results['foreground/stat'] = zerolag_cstat
+            zerolag_results['foreground/%s/end_time' % self.ifos[0]] = zerolag_ctime0
+            zerolag_results['foreground/%s/end_time' % self.ifos[1]] = zerolag_ctime1
             zerolag_results['foreground/%s/trigger_id1' % self.ifos[0]] = tid0
             zerolag_results['foreground/%s/trigger_id2' % self.ifos[1]] = tid1
             coinc_results.update(zerolag_results)
