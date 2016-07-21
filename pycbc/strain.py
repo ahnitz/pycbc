@@ -1376,19 +1376,6 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         strain = pycbc.filter.resample_to_delta_t(strain, 
                                            1.0/self.sample_rate, method='ldas')
 
-        ###### Apply gating
-        glitch_times = detect_loud_glitches(strain + 0.,
-               threshold=self.autogating_threshold,
-               cluster_window=self.autogating_cluster,
-               low_freq_cutoff=self.highpass_frequency,
-               high_freq_cutoff= self.sample_rate / 2,
-               corrupt_time=self.corruption / float(self.sample_rate))
-            
-        gate_params = [[gt, self.autogating_window, self.autogating_pad] for gt in glitch_times]
-        if len(glitch_times) > 0:
-            logging.info('Autogating at %s', ', '.join(['%.3f' % gt for gt in glitch_times]))
-            strain = gate_data(strain, gate_params)
-
         # remove corruption at begginning 
         strain = strain[self.corruption:]
         
