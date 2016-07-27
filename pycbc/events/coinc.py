@@ -552,7 +552,6 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             zerolag_results['foreground/%s/trigger_id1' % self.ifos[0]] = tid0
             zerolag_results['foreground/%s/trigger_id2' % self.ifos[1]] = tid1
             coinc_results.update(zerolag_results)
-            print "ZEROLAG", cstat[zerolag_idx]
 
         if self.return_background:
             coinc_results['background/stat'] = self.coincs.data
