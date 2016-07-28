@@ -411,7 +411,7 @@ class CoincExpireBuffer(object):
 
         self.buffer[self.index:self.index+len(values)] = values
         for ifo in self.ifos:
-            self.timer[self.index:self.index+len(values)] = times[ifo]
+            self.timer[ifo][self.index:self.index+len(values)] = times[ifo]
 
         self.index += len(values)
 
