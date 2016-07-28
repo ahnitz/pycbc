@@ -363,7 +363,17 @@ class MultiRingBuffer(object):
         index += 1
         index[index == self.pad_count] = 0
         self.index[indices] = index
-        self.size_increment()
+        self.size_increment()        
+
+    def expire_vector(self, buffer_index):
+        buffer_part = self.buffer_expire[buffer_index]
+        start = self.start[buffer_index]
+        end = self.index[buffer_index]
+        
+        if start <= end:
+            return buffer_part[start:end]
+        else:
+            return numpy.concatenate([buffer_part[start:], buffer_part[:end]])        
     
     def data(self, buffer_index):
         buffer_part = self.buffer[buffer_index]
@@ -375,16 +385,23 @@ class MultiRingBuffer(object):
         else:
             return numpy.concatenate([buffer_part[start:], buffer_part[:end]])
 
-class ExpireBuffer(object):
-    def __init__(self, expiration, initial_size=2**20, dtype=numpy.float32):
+class CoincExpireBuffer(object):
+    def __init__(self, expiration, ifos,
+                       initial_size=2**20, dtype=numpy.float32):
         self.expiration = expiration
         self.buffer = numpy.zeros(initial_size, dtype=dtype)
-        self.timer = numpy.zeros(initial_size, dtype=numpy.int32)
         self.index = 0
-        self.time = expiration + 1
+        self.ifos = ifos
 
-    def add(self, values):
-        self.time += 1
+        self.time = {}
+        self.timer = {}
+        for ifo in self.ifos:
+            self.time[ifo] = expiration + 1
+            self.timer[ifo] = numpy.zeros(initial_size, dtype=numpy.int32)
+
+    def add(self, values, times, ifos):
+        for ifo in ifos:
+            self.time[ifo] += 1
 
         # Resize the internal buffer if we need more space
         if self.index + len(values) >= len(self.buffer):
@@ -393,14 +410,17 @@ class ExpireBuffer(object):
             self.buffer.resize(newlen)
 
         self.buffer[self.index:self.index+len(values)] = values
-        self.timer[self.index:self.index+len(values)] = self.time
+        for ifo in self.ifos:
+            self.timer[self.index:self.index+len(values)] = times[ifo]
+
         self.index += len(values)
 
         # Remove the expired old elements
-        keep = self.timer[:self.index] > self.time - self.expiration
-        self.index = keep.sum()
-        self.buffer[:self.index] = self.buffer[keep]
-        self.timer[:self.index] = self.timer[keep]
+        for ifo in self.ifos:
+            keep = self.timer[ifo][:self.index] > self.time[ifo] - self.expiration
+            self.index = keep.sum()
+            self.buffer[:self.index] = self.buffer[keep]
+            self.timer[ifo][:self.index] = self.timer[ifo][keep]
         
     def num_greater(self, value):
         return (self.buffer[:self.index] > value).sum()
@@ -440,7 +460,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             self.singles[ifo] = MultiRingBuffer(num_templates,
                                                 self.buffer_size,
                                                 dtype=self.singles_dtype)
-        self.coincs = ExpireBuffer(expiration=self.buffer_size)
+        self.coincs = CoincExpireBuffer(self.buffer_size, self.ifos)
 
     @property
     def background_time(self):
@@ -488,6 +508,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         cstat = []
         offsets = []
         ctimes = {self.ifos[0]:[], self.ifos[1]:[]}
+        single_block = {self.ifos[0]:[], self.ifos[1]:[]}
         for ifo in results:
             trigs = results[ifo]
             for i in range(len(trigs['end_time'])):
@@ -498,6 +519,8 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 oifo = self.ifos[1] if self.ifos[0] == ifo else self.ifos[0]
                 times = self.singles[oifo].data(template)['time']
                 stats = self.singles[oifo].data(template)['stat']
+
+                
                 _, idx, slide = time_coincidence(numpy.array(trig_time, ndmin=1),
                                                  times, self.time_window,
                                                  self.timeslide_interval)
@@ -507,7 +530,12 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 cstat.append(c)
                 ctimes[oifo].append(times[idx])
                 ctimes[ifo].append(numpy.zeros(len(c), dtype=numpy.float64))
-                ctimes[ifo][-1].fill(trig_time)
+                ctimes[ifo][-1].fill(trig_time)        
+
+                single_block[oifo].append(self.singles[oifo].expire_vector(template)[idx])
+                single_block[ifo].append(numpy.zeros(len(c), dtype=numpy.float64))
+                single_block[ifo][-1].fill(self.singles[ifo].expire - 1)
+   
 
         # cluster the triggers we've found
         # (both zerolag and non handled together)
@@ -519,6 +547,10 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 offsets = numpy.concatenate(offsets)
                 ctime0 = numpy.concatenate(ctimes[self.ifos[0]]).astype(numpy.float64)
                 ctime1 = numpy.concatenate(ctimes[self.ifos[1]]).astype(numpy.float64)
+
+                for ifo in self.ifos:
+                    single_block[ifo] = numpy.concatenate(single_block[ifo])
+
                 cidx = cluster_coincs(cstat, ctime0, ctime1, offsets, 
                                           self.timeslide_interval,
                                           self.analysis_block)
@@ -530,7 +562,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 zerolag_idx = (offsets == 0)
                 bkg_idx = (offsets != 0)
 
-                self.coincs.add(cstat[bkg_idx])
+                self.coincs.add(cstat[bkg_idx], single_block, results.keys())
                 num_zerolag = zerolag_idx.sum()
 
         coinc_results = {}
