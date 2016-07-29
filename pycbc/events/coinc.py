@@ -411,6 +411,7 @@ class CoincExpireBuffer(object):
 
         self.buffer[self.index:self.index+len(values)] = values
         for ifo in self.ifos:
+            print times[ifo], values, ifos
             self.timer[ifo][self.index:self.index+len(values)] = times[ifo]
 
         self.index += len(values)
@@ -548,9 +549,6 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 ctime0 = numpy.concatenate(ctimes[self.ifos[0]]).astype(numpy.float64)
                 ctime1 = numpy.concatenate(ctimes[self.ifos[1]]).astype(numpy.float64)
 
-                for ifo in self.ifos:
-                    single_block[ifo] = numpy.concatenate(single_block[ifo])
-
                 cidx = cluster_coincs(cstat, ctime0, ctime1, offsets, 
                                           self.timeslide_interval,
                                           self.analysis_block)
@@ -559,8 +557,13 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 ctime0 = ctime0[cidx]
                 ctime1 = ctime1[cidx]
 
+                print cstat, offsets
+
                 zerolag_idx = (offsets == 0)
                 bkg_idx = (offsets != 0)
+
+                for ifo in self.ifos:
+                    single_block[ifo] = numpy.concatenate(single_block[ifo])[cidx][bkg_idx]
 
                 self.coincs.add(cstat[bkg_idx], single_block, results.keys())
                 num_zerolag = zerolag_idx.sum()
