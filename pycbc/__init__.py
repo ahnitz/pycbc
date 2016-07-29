@@ -29,7 +29,6 @@ import subprocess, os, sys, tempfile
 import logging
 import signal
 
-<<<<<<< 38ebfe425f5b8126d12c48c2dfbe41315b3ad57e
 # We need to allow a try/except here to allow for importing during install
 # of pycbc, where we can't guarantee that scipy is installed yet.
 try:
@@ -39,12 +38,7 @@ try:
     scipy.weave.inline_tools.compile_function = pycbc_weave.pycbc_compile_function
 except:
     pass
-=======
-import scipy.weave.inline_tools
-from . import weave as pycbc_weave
-scipy.weave.inline_tools._compile_function = scipy.weave.inline_tools.compile_function
-scipy.weave.inline_tools.compile_function = pycbc_weave.pycbc_compile_function
->>>>>>> add file locking to weave to avoid multiprocessing headaches
+
 
 try:
     # This will fail when pycbc is imported during the build process,
