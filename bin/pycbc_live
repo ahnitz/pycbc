@@ -252,7 +252,6 @@ with ctx:
     data_end = lambda: data_reader[data_reader.keys()[0]].end_time
     i = 0
     while data_end() < args.end_time:
-        if args.sync: evnt.barrier()
         t1 = time()
         logging.info('%s: Analyzing up to %s', evnt.rank, data_end())
         results = {}

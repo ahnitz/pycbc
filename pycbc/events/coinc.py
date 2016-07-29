@@ -345,6 +345,12 @@ class MultiRingBuffer(object):
     def __len__(self):
         return self.size
 
+    def num_elements(self):
+        count = self.index - self.start
+        count[self.index < self.start] += self.pad_count
+        total = count.sum()
+        return total
+
     def size_increment(self):
         if self.size < self.max_length:
             self.size += 1
@@ -591,6 +597,10 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         if self.return_background:
             coinc_results['background/stat'] = self.coincs.data
             coinc_results['background/time'] = numpy.array([self.background_time])
+
+            for ifo in self.singles:
+                coinc_results['background/%s/count' % ifo] = numpy.array(self.singles[ifo].num_elements())
+                print numpy.array(self.singles[ifo].num_elements()), self.background_time
             
         return coinc_results
 
