@@ -444,7 +444,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         from pycbc import detector
         from . import stat
         self.analysis_block = analysis_block
-        self.stat_calculator = stat.get_statistic(background_statistic, stat_files)
+        self.stat_calculator = stat.get_statistic(background_statistic)(stat_files)
         self.timeslide_interval = timeslide_interval
         self.return_background = return_background
 
