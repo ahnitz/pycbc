@@ -228,7 +228,7 @@ def time_coincidence(t1, t2, window, slide_step=0):
     if len(idx2) > 0:
         idx2 = numpy.concatenate(idx2)
     else:
-        idx2 = numpy.array([])
+        idx2 = numpy.array([], dtype=numpy.int64)
 
     if slide_step:
         diff = ((t1 / slide_step)[idx1] - (t2 / slide_step)[idx2])
@@ -531,12 +531,13 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 times = self.singles[oifo].data(template)['time']
                 stats = self.singles[oifo].data(template)['stat']
 
-                end_times = {ifo:numpy.array(trig_time, ndmin=1),
+                end_times = {ifo:numpy.array(trig_time, ndmin=1, dtype=numpy.float64),
                             oifo:times}             
-
+                print end_times
                 i1, i2, slide = time_coincidence(end_times[self.ifos[0]],
                                                  end_times[self.ifos[1]], self.time_window,
                                                  self.timeslide_interval)
+                print "SURVIVED!"
                 idx = i1 if self.ifos[0] == oifo else i2
 
                 c = self.stat_calculator.coinc(trig_stat, stats[idx],
