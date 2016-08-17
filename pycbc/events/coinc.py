@@ -563,8 +563,6 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 ctime0 = ctime0[cidx]
                 ctime1 = ctime1[cidx]
 
-                print cstat, offsets
-
                 zerolag_idx = (offsets == 0)
                 bkg_idx = (offsets != 0)
 
@@ -599,8 +597,6 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             coinc_results['background/time'] = numpy.array([self.background_time])
 
             for ifo in self.singles:
-                coinc_results['background/%s/count' % ifo] = numpy.array(self.singles[ifo].num_elements())
-                print numpy.array(self.singles[ifo].num_elements()), self.background_time
-            
+                coinc_results['background/%s/count' % ifo] = numpy.array(self.singles[ifo].num_elements())            
         return coinc_results
 
