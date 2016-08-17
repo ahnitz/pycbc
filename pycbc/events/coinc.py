@@ -402,13 +402,10 @@ class CoincExpireBuffer(object):
         self.time = {}
         self.timer = {}
         for ifo in self.ifos:
-            self.time[ifo] = expiration + 1
+            self.time[ifo] = 0
             self.timer[ifo] = numpy.zeros(initial_size, dtype=numpy.int32)
 
     def add(self, values, times, ifos):
-        for ifo in ifos:
-            self.time[ifo] += 1
-
         # Resize the internal buffer if we need more space
         if self.index + len(values) >= len(self.buffer):
             newlen = len(self.buffer) * 2
@@ -417,18 +414,25 @@ class CoincExpireBuffer(object):
 
         self.buffer[self.index:self.index+len(values)] = values
         for ifo in self.ifos:
-            print times[ifo], values, ifos
             self.timer[ifo][self.index:self.index+len(values)] = times[ifo]
 
         self.index += len(values)
 
         # Remove the expired old elements
+        keep = None
+        for ifo in ifos:
+            kt = self.timer[ifo][:self.index] > self.time[ifo] - self.expiration
+            keep = numpy.logical_and(keep, kt) if keep is not None else kt
+
+        self.index = keep.sum()
+        self.buffer[:self.index] = self.buffer[keep]
+
         for ifo in self.ifos:
-            keep = self.timer[ifo][:self.index] > self.time[ifo] - self.expiration
-            self.index = keep.sum()
-            self.buffer[:self.index] = self.buffer[keep]
             self.timer[ifo][:self.index] = self.timer[ifo][keep]
-        
+
+        for ifo in ifos:
+            self.time[ifo] += 1
+
     def num_greater(self, value):
         return (self.buffer[:self.index] > value).sum()
         
@@ -527,10 +531,14 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 times = self.singles[oifo].data(template)['time']
                 stats = self.singles[oifo].data(template)['stat']
 
-                
-                _, idx, slide = time_coincidence(numpy.array(trig_time, ndmin=1),
-                                                 times, self.time_window,
+                end_times = {ifo:numpy.array(trig_time, ndmin=1),
+                            oifo:times}             
+
+                i1, i2, slide = time_coincidence(end_times[self.ifos[0]],
+                                                 end_times[self.ifos[1]], self.time_window,
                                                  self.timeslide_interval)
+                idx = i1 if self.ifos[0] == oifo else i2
+
                 c = self.stat_calculator.coinc(trig_stat, stats[idx],
                                                slide, self.timeslide_interval)
                 offsets.append(slide)
@@ -554,10 +562,11 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 offsets = numpy.concatenate(offsets)
                 ctime0 = numpy.concatenate(ctimes[self.ifos[0]]).astype(numpy.float64)
                 ctime1 = numpy.concatenate(ctimes[self.ifos[1]]).astype(numpy.float64)
-
+                
                 cidx = cluster_coincs(cstat, ctime0, ctime1, offsets, 
                                           self.timeslide_interval,
                                           self.analysis_block)
+
                 cstat = cstat[cidx]
                 offsets = offsets[cidx]
                 ctime0 = ctime0[cidx]
@@ -578,6 +587,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             zerolag_results = {}
             zerolag_ctime0 = ctime0[zerolag_idx]
             zerolag_ctime1 = ctime1[zerolag_idx]
+
             zerolag_cstat = cstat[zerolag_idx]
             ifar = numpy.array([self.ifar(c) for c in zerolag_cstat], dtype=numpy.float32)
             tid0 = numpy.array([numpy.where(t == results[self.ifos[0]]['end_time'])[0]
