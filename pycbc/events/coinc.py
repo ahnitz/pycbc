@@ -406,6 +406,9 @@ class CoincExpireBuffer(object):
             self.timer[ifo] = numpy.zeros(initial_size, dtype=numpy.int32)
 
     def add(self, values, times, ifos):
+        for ifo in ifos:
+            self.time[ifo] += 1
+
         # Resize the internal buffer if we need more space
         if self.index + len(values) >= len(self.buffer):
             newlen = len(self.buffer) * 2
@@ -421,17 +424,19 @@ class CoincExpireBuffer(object):
         # Remove the expired old elements
         keep = None
         for ifo in ifos:
-            kt = self.timer[ifo][:self.index] > self.time[ifo] - self.expiration
+            kt = self.timer[ifo][:self.index] >= self.time[ifo] - self.expiration
             keep = numpy.logical_and(keep, kt) if keep is not None else kt
+            if self.index > 0:
+                print ifo, self.timer[ifo][:self.index].min(), self.timer[ifo][:self.index].max(), self.time[ifo]
+
+        print keep
+        print len(values), self.index - keep.sum(), self.expiration
 
         self.index = keep.sum()
         self.buffer[:self.index] = self.buffer[keep]
 
         for ifo in self.ifos:
             self.timer[ifo][:self.index] = self.timer[ifo][keep]
-
-        for ifo in ifos:
-            self.time[ifo] += 1
 
     def num_greater(self, value):
         return (self.buffer[:self.index] > value).sum()
