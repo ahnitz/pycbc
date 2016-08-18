@@ -426,11 +426,6 @@ class CoincExpireBuffer(object):
         for ifo in ifos:
             kt = self.timer[ifo][:self.index] >= self.time[ifo] - self.expiration
             keep = numpy.logical_and(keep, kt) if keep is not None else kt
-            if self.index > 0:
-                print ifo, self.timer[ifo][:self.index].min(), self.timer[ifo][:self.index].max(), self.time[ifo]
-
-        print keep
-        print len(values), self.index - keep.sum(), self.expiration
 
         self.index = keep.sum()
         self.buffer[:self.index] = self.buffer[keep]
