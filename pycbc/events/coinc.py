@@ -405,6 +405,9 @@ class CoincExpireBuffer(object):
             self.time[ifo] = 0
             self.timer[ifo] = numpy.zeros(initial_size, dtype=numpy.int32)
 
+    def increment(self, ifos):
+        self.add([], [], ifos)
+
     def add(self, values, times, ifos):
         for ifo in ifos:
             self.time[ifo] += 1
@@ -416,8 +419,9 @@ class CoincExpireBuffer(object):
             self.buffer.resize(newlen)
 
         self.buffer[self.index:self.index+len(values)] = values
-        for ifo in self.ifos:
-            self.timer[ifo][self.index:self.index+len(values)] = times[ifo]
+        if len(values) > 0:
+            for ifo in self.ifos:
+                self.timer[ifo][self.index:self.index+len(values)] = times[ifo]
 
         self.index += len(values)
 
@@ -581,6 +585,8 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
                 self.coincs.add(cstat[bkg_idx], single_block, results.keys())
                 num_zerolag = zerolag_idx.sum()
+        else:
+            self.coincs.increment(results.keys())
 
         coinc_results = {}
         # Collect coinc results for saving
