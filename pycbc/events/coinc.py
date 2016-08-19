@@ -423,7 +423,7 @@ class CoincExpireBuffer(object):
             for ifo in self.ifos:
                 self.timer[ifo][self.index:self.index+len(values)] = times[ifo]
 
-        self.index += len(values)
+            self.index += len(values)
 
         # Remove the expired old elements
         keep = None
@@ -585,7 +585,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
                 self.coincs.add(cstat[bkg_idx], single_block, results.keys())
                 num_zerolag = zerolag_idx.sum()
-        else:
+        elif len(results.keys()) > 0:
             self.coincs.increment(results.keys())
 
         coinc_results = {}
