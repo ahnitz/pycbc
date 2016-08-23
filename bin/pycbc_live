@@ -7,6 +7,7 @@ from time import time
 import os.path
 from mpi4py import MPI as mpi
 from pycbc.events.coinc import LiveCoincTimeslideBackgroundEstimator
+import pycbc.waveform.bank
 
 def makedir(path):
     """
@@ -101,6 +102,7 @@ class LiveEventManager(object):
         pass
 
 parser = argparse.ArgumentParser()
+pycbc.waveform.bank.add_approximant_arg(parser)
 parser.add_argument('--verbose', action='store_true')
 parser.add_argument('--version', action='version', version=version.git_verbose_msg)
 parser.add_argument('--bank-file', help="Template bank xml file")
@@ -151,8 +153,6 @@ parser.add_argument('--end-time', type=int, default=numpy.inf)
 parser.add_argument('--output-path')
 parser.add_argument('--day-hour-output-prefix', action='store_true')
 parser.add_argument('--store-psd', action='store_true')
-
-parser.add_argument('--approximant')
 
 parser.add_argument('--newsnr-threshold', type=float, default=0)
 parser.add_argument('--max-batch-size', type=int, default=2**27)
