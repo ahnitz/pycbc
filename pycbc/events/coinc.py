@@ -415,7 +415,8 @@ class CoincExpireBuffer(object):
         # Resize the internal buffer if we need more space
         if self.index + len(values) >= len(self.buffer):
             newlen = len(self.buffer) * 2
-            self.timer.resize(newlen)
+            for ifo in self.ifos:
+                self.timer[ifo].resize(newlen)
             self.buffer.resize(newlen)
 
         self.buffer[self.index:self.index+len(values)] = values
