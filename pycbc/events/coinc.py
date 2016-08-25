@@ -449,13 +449,16 @@ class LiveCoincTimeslideBackgroundEstimator(object):
     def __init__(self, num_templates, analysis_block, background_statistic, stat_files, ifos, 
                  ifar_limit=100,
                  timeslide_interval=.035,
-                 coinc_threshold=0.002, return_background=False):
+                 ifar_remove_threshold=100,
+                 coinc_threshold=0.002,
+                 return_background=False):
         from pycbc import detector
         from . import stat
         self.analysis_block = analysis_block
         self.stat_calculator = stat.get_statistic(background_statistic)(stat_files)
         self.timeslide_interval = timeslide_interval
         self.return_background = return_background
+        self.ifar_remove_threshold = ifar_remove_threshold
 
         self.ifos = ifos
         if len(self.ifos) != 2:
