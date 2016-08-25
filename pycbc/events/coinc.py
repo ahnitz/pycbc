@@ -609,11 +609,15 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             zerolag_results['foreground/%s/trigger_id2' % self.ifos[1]] = tid1
             coinc_results.update(zerolag_results)
 
+        # Save some summary statistics about the background
+        coinc_results['background/time'] = numpy.array([self.background_time])
+        for ifo in self.singles:
+            coinc_results['background/%s/count' % ifo] = numpy.array(self.singles[ifo].num_elements())
+        coinc_results['background/count'] = len(self.coincs.data)
+   
+        # Save all the background triggers
         if self.return_background:
             coinc_results['background/stat'] = self.coincs.data
-            coinc_results['background/time'] = numpy.array([self.background_time])
-
-            for ifo in self.singles:
-                coinc_results['background/%s/count' % ifo] = numpy.array(self.singles[ifo].num_elements())            
+    
         return coinc_results
 
