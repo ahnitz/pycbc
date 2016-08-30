@@ -454,6 +454,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                  return_background=False):
         from pycbc import detector
         from . import stat
+        self.num_templates = num_templates
         self.analysis_block = analysis_block
         self.stat_calculator = stat.get_statistic(background_statistic)(stat_files)
         self.timeslide_interval = timeslide_interval
@@ -469,17 +470,9 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
         det0, det1 = detector.Detector(ifos[0]), detector.Detector(ifos[1])
         self.time_window = det0.light_travel_time_to_detector(det1) + coinc_threshold
-
-        # Preallocate ring buffers to hold all the single detector triggers
-        # from each template separately. The ring buffer naturally expires
-        # old triggers when they wraparound.
-        self.singles = {}
-        self.singles_dtype = [('time', numpy.float64), ('stat', numpy.float32)]
-        for ifo in self.ifos:
-            self.singles[ifo] = MultiRingBuffer(num_templates,
-                                                self.buffer_size,
-                                                dtype=self.singles_dtype)
         self.coincs = CoincExpireBuffer(self.buffer_size, self.ifos)
+
+        self.singles = {}
 
     @property
     def background_time(self):
@@ -494,7 +487,42 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         n = self.coincs.num_greater(coinc_stat)
         return self.background_time / lal.YRJUL_SI / (n + 1)
 
+    def set_singles_buffer(self, results):
+        """ Create the singles buffer
+    
+        This creates the singles buffer for each ifo. The dtype is determined
+        by a representative sample of the single triggers in the results.
+
+        Parameters
+        ----------
+        restuls: dict of dict
+            Dict indexed by ifo and then trigger column.
+        """
+        # Determine the dtype from a sample of the data. 
+        self.singles_dtype = []
+        data = False
+        for ifo in self.ifos:
+            if ifo in results and results[ifo] is not False:
+                data = results[ifo]
+                break
+       
+        if data is False:
+            return    
+
+        for key in data:
+            self.singles_dtype.append((key, data[key].dtype))
+        self.singles_dtype.append(('stat', numpy.float32))
+
+        # Create a ring buffer for each template ifo combination
+        for ifo in self.ifos:
+            self.singles[ifo] = MultiRingBuffer(self.num_templates,
+                                            self.buffer_size,
+                                            dtype=self.singles_dtype)
+
     def add_singles(self, results):
+        if len(self.singles.keys()) == 0:
+            self.set_singles_buffer(results)
+
         # convert to single detector trigger values 
         # FIXME Currently configured to use pycbc live output 
         # where chisq is the reduced chisq and chisq_dof is the actual DOF
@@ -510,18 +538,17 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 single_stat = self.stat_calculator.single(trigs)
             else:
                 single_stat = numpy.array([], ndmin=1, dtype=numpy.float32)
-
-            # prepare the data that will go in the single detector buffers
-            data = numpy.array(numpy.zeros(len(single_stat),
-                               dtype=self.singles_dtype), ndmin=1)
-            data['stat'] = single_stat
-            data['time'] = trigs['end_time']
-            singles_data[ifo] = (trigs['template_id'], data)
+            trigs['stat'] = single_stat
 
             # add each single detector trigger to the 
             # ring buffer associated with 
             # the template it was found in.
-            self.singles[ifo].add(*singles_data[ifo])
+            data = numpy.zeros(len(single_stat), dtype=self.singles_dtype)
+            for key, value in trigs.items():
+                data[key] = value
+
+            self.singles[ifo].add(trigs['template_id'], data)
+            singles_data[ifo] = data
             
         # for each single detector trigger find the allowed coincidences
         cstat = []
@@ -531,12 +558,12 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         for ifo in results:
             trigs = results[ifo]
             for i in range(len(trigs['end_time'])):
-                trig_stat = singles_data[ifo][1]['stat'][i]
+                trig_stat = singles_data[ifo]['stat'][i]
                 trig_time = trigs['end_time'][i]
                 template = trigs['template_id'][i]
 
                 oifo = self.ifos[1] if self.ifos[0] == ifo else self.ifos[0]
-                times = self.singles[oifo].data(template)['time']
+                times = self.singles[oifo].data(template)['end_time']
                 stats = self.singles[oifo].data(template)['stat']
 
                 end_times = {ifo:numpy.array(trig_time, ndmin=1, dtype=numpy.float64),
