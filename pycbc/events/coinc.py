@@ -593,29 +593,30 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         num_zerolag = 0
         if len(cstat) > 0:
             cstat = numpy.concatenate(cstat)
-            logging.info('%s background and zerolag coincs', len(cstat))
-            if len(cstat) > 0:
-                offsets = numpy.concatenate(offsets)
-                ctime0 = numpy.concatenate(ctimes[self.ifos[0]]).astype(numpy.float64)
-                ctime1 = numpy.concatenate(ctimes[self.ifos[1]]).astype(numpy.float64)
-                
-                cidx = cluster_coincs(cstat, ctime0, ctime1, offsets, 
-                                          self.timeslide_interval,
-                                          self.analysis_block)
 
-                cstat = cstat[cidx]
-                offsets = offsets[cidx]
-                ctime0 = ctime0[cidx]
-                ctime1 = ctime1[cidx]
+        logging.info('%s background and zerolag coincs', len(cstat))
+        if len(cstat) > 0:
+            offsets = numpy.concatenate(offsets)
+            ctime0 = numpy.concatenate(ctimes[self.ifos[0]]).astype(numpy.float64)
+            ctime1 = numpy.concatenate(ctimes[self.ifos[1]]).astype(numpy.float64)
+            
+            cidx = cluster_coincs(cstat, ctime0, ctime1, offsets, 
+                                      self.timeslide_interval,
+                                      self.analysis_block)
 
-                zerolag_idx = (offsets == 0)
-                bkg_idx = (offsets != 0)
+            cstat = cstat[cidx]
+            offsets = offsets[cidx]
+            ctime0 = ctime0[cidx]
+            ctime1 = ctime1[cidx]
 
-                for ifo in self.ifos:
-                    single_block[ifo] = numpy.concatenate(single_block[ifo])[cidx][bkg_idx]
+            zerolag_idx = (offsets == 0)
+            bkg_idx = (offsets != 0)
 
-                self.coincs.add(cstat[bkg_idx], single_block, results.keys())
-                num_zerolag = zerolag_idx.sum()
+            for ifo in self.ifos:
+                single_block[ifo] = numpy.concatenate(single_block[ifo])[cidx][bkg_idx]
+
+            self.coincs.add(cstat[bkg_idx], single_block, results.keys())
+            num_zerolag = zerolag_idx.sum()
         elif len(results.keys()) > 0:
             self.coincs.increment(results.keys())
 
@@ -628,16 +629,11 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
             zerolag_cstat = cstat[zerolag_idx]
             ifar = numpy.array([self.ifar(c) for c in zerolag_cstat], dtype=numpy.float32)
-            tid0 = numpy.array([numpy.where(t == results[self.ifos[0]]['end_time'])[0]
-                                for t in zerolag_ctime0], dtype=numpy.uint32)                    
-            tid1 = numpy.array([numpy.where(t == results[self.ifos[1]]['end_time'])[0]
-                                for t in zerolag_ctime1], dtype=numpy.uint32)
             zerolag_results['foreground/ifar'] = ifar
             zerolag_results['foreground/stat'] = zerolag_cstat
             zerolag_results['foreground/%s/end_time' % self.ifos[0]] = zerolag_ctime0
             zerolag_results['foreground/%s/end_time' % self.ifos[1]] = zerolag_ctime1
-            zerolag_results['foreground/%s/trigger_id1' % self.ifos[0]] = tid0
-            zerolag_results['foreground/%s/trigger_id2' % self.ifos[1]] = tid1
+
             coinc_results.update(zerolag_results)
 
         # Save some summary statistics about the background
