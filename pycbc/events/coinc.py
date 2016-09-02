@@ -505,6 +505,12 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         n = self.coincs.num_greater(coinc_stat)
         return self.background_time / lal.YRJUL_SI / (n + 1)
 
+    def upload_single(self):
+        pass
+
+    def upload_coinc(self):
+        pass
+
     def set_singles_buffer(self, results):
         """Create the singles buffer
     
