@@ -1079,6 +1079,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                        psd_recalculate_difference=None,
                        force_update_cache=True,
                        increment_update_cache=None,
+                       analyze_flags=None,
                  ):
         """ Class to produce overwhitened strain incrementally
         
@@ -1134,6 +1135,9 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         force_update_cache: {boolean, True}, Optional
             Re-check the filesystem for frame files on every attempt to 
         read more data.
+        analyze_flags: list of strs
+            The flags that must be on to mark the current data as valid for
+        *any* use.
         increment_update_cache: {str, None}, Optional
             Pattern to look for frame files in a GPS dependent directory. This
         is an alternate to the forced updated of the frame cache, and attempts
@@ -1148,9 +1152,14 @@ class StrainBuffer(pycbc.frame.DataBuffer):
 
         # We could similarly add a dq vector here when that becomes available.
         self.state_channel = state_channel
+        self.analyze_flags = analyze_flags
         if 'None' not in self.state_channel:
+            valid_mask = 0
+            for flag in self.analyze_flags:
+                valid_mask = valid_mask | getattr(pycbc.frame, flag) 
             self.state = pycbc.frame.StatusBuffer(frame_src, state_channel, start_time,
                                            max_buffer=max_buffer,
+                                           valid_mask=valid_mask,
                                            force_update_cache=force_update_cache,
                                            increment_update_cache=increment_update_cache)
         else:
