@@ -116,7 +116,15 @@ parser.add_argument('--snr-threshold', type=float)
 parser.add_argument('--snr-abort-threshold', type=float)
 
 parser.add_argument('--channel-name', action=MultiDetOptionAction, nargs='+')
-parser.add_argument('--state-channel', action=MultiDetOptionAction, nargs='+')
+parser.add_argument('--state-channel', action=MultiDetOptionAction, nargs='+', 
+          help="The channel containing frame status information. This is used "
+               "to determine when to analyze the hoft data. This somewhat "
+               "corresponds to CAT1 information")
+parser.add_argument('--data-quality-channel', action=MultiDetOptionAction, nargs='+', 
+          help="The channel containing data quality information. This is used "
+                "to determine when hoft may be suspect and may be used to veto"
+                "triggers or not analyze a segment of data. This roughly "
+                "corresponds to CAT2 information")
 parser.add_argument('--frame-src', action=MultiDetOptionAction, nargs='+')
 parser.add_argument('--force-update-cache', action='store_true')
 parser.add_argument('--highpass-frequency', type=float,
@@ -218,6 +226,7 @@ with ctx:
                             '%s:%s' % (ifo, args.channel_name[ifo]),
                             args.start_time, max_buffer=maxlen * 2,
                             state_channel ='%s:%s' % (ifo, args.state_channel[ifo]),
+                            data_quality_channel ='%s:%s' % (ifo, args.state_channel[ifo]),
                             sample_rate=args.sample_rate,
                             low_frequency_cutoff=args.low_frequency_cutoff,
                             highpass_frequency=args.highpass_frequency,
@@ -274,9 +283,8 @@ with ctx:
                                  args.min_psd_abort_distance, args.max_psd_abort_distance, dist)
                     status = False               
 
-            # We fail the frame file if *any* of the processes
-            # failed to get it for whatever reason
-            # this ensures the data is synchronized
+            # We fail the frame file if *any* of the processes failed to get it
+            # for whatever reason his ensures the data is synchronized
             if args.sync_frame_status:
                 status = evnt.barrier_status(status)
     

@@ -519,7 +519,11 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                                             self.buffer_size,
                                             dtype=self.singles_dtype)
 
-    def add_singles(self, results):
+    def add_singles(self, results, status=None):
+        
+        # If the time we are analyzing has some special status
+        # 1) Hardware injection -> calculate FAR, do not add singles or coincs
+
         if len(self.singles.keys()) == 0:
             self.set_singles_buffer(results)
 
