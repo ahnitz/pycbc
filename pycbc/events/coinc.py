@@ -451,7 +451,8 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                  timeslide_interval=.035,
                  ifar_remove_threshold=100,
                  coinc_threshold=0.002,
-                 return_background=False):
+                 return_background=False,
+                 save_background_on_interrupt=False):
         from pycbc import detector
         from . import stat
         self.num_templates = num_templates
@@ -474,6 +475,12 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
         self.singles = {}
 
+        if self.save_background_on_interrupt:
+            import signal
+            def sig_handler(signum, frame):
+                pass
+            signal.signal(signal.SIGINT, sig_handler)
+
     @property
     def background_time(self):
         time = 1.0 / self.timeslide_interval
@@ -481,14 +488,25 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             time *= len(self.singles[ifo]) * self.analysis_block
         return time
 
+    def save_state(self, filename):
+        """Save the current state of the background buffers"""
+        import cPickle
+        cPickle.dump(self, filename)
+
+    @static
+    def restore_state(filename):
+        """Restore state of the background buffers from a file"""
+        import cPickle
+        return cPickle.load(filname)
+
     def ifar(self, coinc_stat):
-        """ Return the far that would be associated with the coincident given.
+        """Return the far that would be associated with the coincident given.
         """
         n = self.coincs.num_greater(coinc_stat)
         return self.background_time / lal.YRJUL_SI / (n + 1)
 
     def set_singles_buffer(self, results):
-        """ Create the singles buffer
+        """Create the singles buffer
     
         This creates the singles buffer for each ifo. The dtype is determined
         by a representative sample of the single triggers in the results.
