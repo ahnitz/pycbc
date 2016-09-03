@@ -543,11 +543,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                                             self.buffer_size,
                                             dtype=self.singles_dtype)
 
-    def add_singles(self, results, status=None):
-        
-        # If the time we are analyzing has some special status
-        # 1) Hardware injection -> calculate FAR, do not add singles or coincs
-
+    def _add_singles_to_buffer(self, results):
         if len(self.singles.keys()) == 0:
             self.set_singles_buffer(results)
 
@@ -555,7 +551,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # FIXME Currently configured to use pycbc live output 
         # where chisq is the reduced chisq and chisq_dof is the actual DOF
         logging.info("adding singles to the background estimate...")
-        singles_data = {}
+        singles_stat = {}
         for ifo in results:
             trigs = results[ifo]
             trigs = copy.copy(trigs)
@@ -576,7 +572,16 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 data[key] = value
 
             self.singles[ifo].add(trigs['template_id'], data)
-            singles_data[ifo] = data
+            singles_stat[ifo] = single_stat
+        return singles_stat
+
+    def add_singles(self, results, status=None):
+        
+        # If the time we are analyzing has some special status
+        # 1) Hardware injection -> calculate FAR, do not add singles or coincs
+
+        
+        stats = self._add_singles_to_buffer(results)
             
         # for each single detector trigger find the allowed coincidences
         cstat = []
@@ -586,7 +591,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         for ifo in results:
             trigs = results[ifo]
             for i in range(len(trigs['end_time'])):
-                trig_stat = singles_data[ifo]['stat'][i]
+                trig_stat = stats[ifo][i]
                 trig_time = trigs['end_time'][i]
                 template = trigs['template_id'][i]
 
