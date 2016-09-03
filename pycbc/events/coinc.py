@@ -345,6 +345,14 @@ class MultiRingBuffer(object):
     def __len__(self):
         return self.size
 
+    @property
+    def start_time(self):
+        return self.buffer[0][self.start[0]]['end_time']
+
+    @property
+    def end_time(self):
+        return self.buffer[0][self.index[0]]['end_time']    
+
     def num_elements(self):
         count = self.index - self.start
         count[self.index < self.start] += self.pad_count
@@ -475,7 +483,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
         self.singles = {}
 
-        if self.save_background_on_interrupt:
+        if save_background_on_interrupt:
             import signal
             def sig_handler(signum, frame):
                 pass
@@ -493,7 +501,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         import cPickle
         cPickle.dump(self, filename)
 
-    @static
+    @staticmethod
     def restore_state(filename):
         """Restore state of the background buffers from a file"""
         import cPickle
@@ -575,13 +583,10 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             singles_stat[ifo] = single_stat
         return singles_stat
 
-    def add_singles(self, results, status=None):
-        
+    def add_singles(self, results, status=None):      
         # If the time we are analyzing has some special status
         # 1) Hardware injection -> calculate FAR, do not add singles or coincs
-
-        
-        stats = self._add_singles_to_buffer(results)
+        single_stats = self._add_singles_to_buffer(results)
             
         # for each single detector trigger find the allowed coincidences
         cstat = []
@@ -591,7 +596,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         for ifo in results:
             trigs = results[ifo]
             for i in range(len(trigs['end_time'])):
-                trig_stat = stats[ifo][i]
+                trig_stat = single_stats[ifo][i]
                 trig_time = trigs['end_time'][i]
                 template = trigs['template_id'][i]
 
@@ -601,13 +606,11 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
                 end_times = {ifo:numpy.array(trig_time, ndmin=1, dtype=numpy.float64),
                             oifo:times}             
-
                 i1, i2, slide = time_coincidence(end_times[self.ifos[0]],
                                                  end_times[self.ifos[1]], self.time_window,
                                                  self.timeslide_interval)
 
                 idx = i1 if self.ifos[0] == oifo else i2
-
                 c = self.stat_calculator.coinc(trig_stat, stats[idx],
                                                slide, self.timeslide_interval)
                 offsets.append(slide)
@@ -636,12 +639,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             cidx = cluster_coincs(cstat, ctime0, ctime1, offsets, 
                                       self.timeslide_interval,
                                       self.analysis_block)
-
-            cstat = cstat[cidx]
             offsets = offsets[cidx]
-            ctime0 = ctime0[cidx]
-            ctime1 = ctime1[cidx]
-
             zerolag_idx = (offsets == 0)
             bkg_idx = (offsets != 0)
 
@@ -657,10 +655,10 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # Collect coinc results for saving
         if num_zerolag > 0:
             zerolag_results = {}
-            zerolag_ctime0 = ctime0[zerolag_idx]
-            zerolag_ctime1 = ctime1[zerolag_idx]
+            zerolag_ctime0 = ctime0[cidx][zerolag_idx]
+            zerolag_ctime1 = ctime1[cidx][zerolag_idx]
 
-            zerolag_cstat = cstat[zerolag_idx]
+            zerolag_cstat = cstat[cidx][zerolag_idx]
             ifar = numpy.array([self.ifar(c) for c in zerolag_cstat], dtype=numpy.float32)
             zerolag_results['foreground/ifar'] = ifar
             zerolag_results['foreground/stat'] = zerolag_cstat
@@ -673,6 +671,8 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         coinc_results['background/time'] = numpy.array([self.background_time])
         for ifo in self.singles:
             coinc_results['background/%s/count' % ifo] = numpy.array(self.singles[ifo].num_elements())
+            coinc_results['background/%s/start_time' % ifo] = self.singles[ifo].start_time
+            coinc_results['background/%s/end_time' % ifo] = self.singles[ifo].end_time
         coinc_results['background/count'] = len(self.coincs.data)
    
         # Save all the background triggers
