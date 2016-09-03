@@ -659,25 +659,30 @@ class StatusBuffer(DataBuffer):
                                  increment_update_cache=increment_update_cache) 
         self.valid_mask = valid_mask
 
-    def check_valid(self, values):
+    def check_valid(self, values, flag=None):
         """Check if the data contains any non-valid status information
         
         Parameters
         ----------
         values: pycbc.types.Array
             Array of status information
+        flag: str, optional
+            Override the default valid mask with a user defined mask.
 
         Returns
         -------
         status: boolean
             Returns True if all of the status information if valid, False if any is not.
         """ 
-        if numpy.any(numpy.bitwise_and(values.numpy(), self.valid_mask) != self.valid_mask):
+        if flag is None:
+            flag = self.valid_mask        
+
+        if numpy.any(numpy.bitwise_and(values.numpy(), flag) != flag):
             return False
         else:
             return True
         
-    def is_extent_valid(self, start_time, duration):
+    def is_extent_valid(self, start_time, duration, flag=None):
         """Check if the duration contains any non-valid frames
 
         Parameters
@@ -686,6 +691,8 @@ class StatusBuffer(DataBuffer):
             Begging of the duration to check in gps seconds
         duration: int
             Number of seconds after the start_time to check
+        flag: str, optional
+            Override the default valid mask with a user defined mask.
 
         Returns
         -------
