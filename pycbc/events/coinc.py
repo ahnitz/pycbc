@@ -584,7 +584,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         cstat = []
         offsets = []
         ctimes = {self.ifos[0]:[], self.ifos[1]:[]}
-        single_block = {self.ifos[0]:[], self.ifos[1]:[]}
+        single_expire = {self.ifos[0]:[], self.ifos[1]:[]}
         for ifo in results:
             trigs = results[ifo]
             for i in range(len(trigs['end_time'])):
@@ -595,25 +595,23 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 oifo = self.ifos[1] if self.ifos[0] == ifo else self.ifos[0]
                 times = self.singles[oifo].data(template)['end_time']
                 stats = self.singles[oifo].data(template)['stat']
+         
+                i1, _, slide = time_coincidence(times,
+                                 numpy.array(trig_time, ndmin=1, dtype=numpy.float64),
+                                 self.time_window,
+                                 self.timeslide_interval)
 
-                end_times = {ifo:numpy.array(trig_time, ndmin=1, dtype=numpy.float64),
-                            oifo:times}             
-                i1, i2, slide = time_coincidence(end_times[self.ifos[0]],
-                                                 end_times[self.ifos[1]], self.time_window,
-                                                 self.timeslide_interval)
-
-                idx = i1 if self.ifos[0] == oifo else i2
-                c = self.stat_calculator.coinc(trig_stat, stats[idx],
+                c = self.stat_calculator.coinc(trig_stat, stats[i1],
                                                slide, self.timeslide_interval)
                 offsets.append(slide)
                 cstat.append(c)
-                ctimes[oifo].append(times[idx])
+                ctimes[oifo].append(times[i1])
                 ctimes[ifo].append(numpy.zeros(len(c), dtype=numpy.float64))
                 ctimes[ifo][-1].fill(trig_time)        
 
-                single_block[oifo].append(self.singles[oifo].expire_vector(template)[idx])
-                single_block[ifo].append(numpy.zeros(len(c), dtype=numpy.float64))
-                single_block[ifo][-1].fill(self.singles[ifo].expire - 1)
+                single_expire[oifo].append(self.singles[oifo].expire_vector(template)[i1])
+                single_expire[ifo].append(numpy.zeros(len(c), dtype=numpy.float64))
+                single_expire[ifo][-1].fill(self.singles[ifo].expire - 1)
    
 
         # cluster the triggers we've found
@@ -636,9 +634,9 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             bkg_idx = (offsets != 0)
 
             for ifo in self.ifos:
-                single_block[ifo] = numpy.concatenate(single_block[ifo])[cidx][bkg_idx]
+                single_expire[ifo] = numpy.concatenate(single_expire[ifo])[cidx][bkg_idx]
 
-            self.coincs.add(cstat[bkg_idx], single_block, results.keys())
+            self.coincs.add(cstat[bkg_idx], single_expire, results.keys())
             num_zerolag = zerolag_idx.sum()
         elif len(results.keys()) > 0:
             self.coincs.increment(results.keys())
