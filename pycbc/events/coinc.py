@@ -359,7 +359,13 @@ class MultiRingBuffer(object):
         total = count.sum()
         return total
 
-    def size_increment(self):
+    def discard_last(self, indices):
+        index = self.index[indices]
+        index -= 1
+        index[index < 0] = self.pad_count
+        self.index[indices] = index
+
+    def advance_time(self):
         if self.size < self.max_length:
             self.size += 1
         self.expire += 1
@@ -377,7 +383,7 @@ class MultiRingBuffer(object):
         index += 1
         index[index == self.pad_count] = 0
         self.index[indices] = index
-        self.size_increment()        
+        self.advance_time()        
 
     def expire_vector(self, buffer_index):
         buffer_part = self.buffer_expire[buffer_index]
@@ -559,7 +565,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # FIXME Currently configured to use pycbc live output 
         # where chisq is the reduced chisq and chisq_dof is the actual DOF
         logging.info("adding singles to the background estimate...")
-        singles_stat = {}
+        updated_indices = {}
         for ifo in results:
             trigs = results[ifo]
 
@@ -578,6 +584,8 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 data[key] = value
 
             self.singles[ifo].add(trigs['template_id'], data)
+            updated_indices[ifo] = trigs['template_id']
+        return updated_indices
 
     def _find_coincs(self, results):
         # for each single detector trigger find the allowed coincidences
@@ -675,7 +683,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # Apply CAT2 data quality here (just remove the triggers
         # time still counted.
         # results = self.veto_singles(results, data_reader)
-        self._add_singles_to_buffer(results)
+        updated_indices = self._add_singles_to_buffer(results)
         coinc_results = self._find_coincs(results)
         return coinc_results
 
