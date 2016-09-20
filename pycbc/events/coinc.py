@@ -562,26 +562,22 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         singles_stat = {}
         for ifo in results:
             trigs = results[ifo]
-            trigs = copy.copy(trigs)
-            trigs['chisq'] = trigs['chisq'] * trigs['chisq_dof']
-            trigs['chisq_dof'] = (trigs['chisq_dof'] + 2) / 2
 
             if len(trigs['snr'] > 0):
+                trigsc = copy.copy(trigs)
+                trigsc['chisq'] = trigs['chisq'] * trigs['chisq_dof']
+                trigsc['chisq_dof'] = (trigs['chisq_dof'] + 2) / 2
                 single_stat = self.stat_calculator.single(trigs)
             else:
                 single_stat = numpy.array([], ndmin=1, dtype=numpy.float32)
             trigs['stat'] = single_stat
 
-            # add each single detector trigger to the 
-            # ring buffer associated with 
-            # the template it was found in.
+            # add each single detector trigger to the and advance the buffer
             data = numpy.zeros(len(single_stat), dtype=self.singles_dtype)
             for key, value in trigs.items():
                 data[key] = value
 
             self.singles[ifo].add(trigs['template_id'], data)
-            singles_stat[ifo] = single_stat
-        return singles_stat
 
     def _find_coincs(self, results):
         # for each single detector trigger find the allowed coincidences
@@ -681,7 +677,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # Apply CAT2 data quality here (just remove the triggers
         # time still counted.
         # results = self.veto_singles(results, data_reader)
-        results.update(self._add_singles_to_buffer(results))
+        self._add_singles_to_buffer(results)
         coinc_results = self._find_coincs(results)
         return coinc_results
 
