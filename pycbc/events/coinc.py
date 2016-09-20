@@ -583,11 +583,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             singles_stat[ifo] = single_stat
         return singles_stat
 
-    def add_singles(self, results, status=None):      
-        # If the time we are analyzing has some special status
-        # 1) Hardware injection -> calculate FAR, do not add singles or coincs
-        single_stats = self._add_singles_to_buffer(results)
-            
+    def _find_coincs(self, results, single_stats):
         # for each single detector trigger find the allowed coincidences
         cstat = []
         offsets = []
@@ -678,6 +674,12 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # Save all the background triggers
         if self.return_background:
             coinc_results['background/stat'] = self.coincs.data
-    
+        return coinc_results
+
+    def add_singles(self, results, data_reader):
+        """ Add singles to the bacckground estimate and find candidates
+        """      
+        single_stats = self._add_singles_to_buffer(results)
+        coinc_results = self._find_coincs(results, single_stats)
         return coinc_results
 

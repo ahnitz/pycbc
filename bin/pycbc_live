@@ -307,7 +307,7 @@ with ctx:
         
             coinc_results = {}
             if args.enable_background_estimation:
-                coinc_results = estimator.add_singles(results)
+                coinc_results = estimator.add_singles(results, data_reader)
     
             prefix = '%s-Live-%s-%s' % (''.join(ifos), data_end() - args.analysis_chunk, valid_pad)
             evnt.dump(results, prefix, time_index=data_end(),
