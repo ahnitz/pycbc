@@ -583,7 +583,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             singles_stat[ifo] = single_stat
         return singles_stat
 
-    def _find_coincs(self, results, single_stats):
+    def _find_coincs(self, results):
         # for each single detector trigger find the allowed coincidences
         cstat = []
         offsets = []
@@ -592,7 +592,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         for ifo in results:
             trigs = results[ifo]
             for i in range(len(trigs['end_time'])):
-                trig_stat = single_stats[ifo][i]
+                trig_stat = trigs['stat'][i]
                 trig_time = trigs['end_time'][i]
                 template = trigs['template_id'][i]
 
@@ -681,7 +681,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # Apply CAT2 data quality here (just remove the triggers
         # time still counted.
         # results = self.veto_singles(results, data_reader)
-        single_stats = self._add_singles_to_buffer(results)
-        coinc_results = self._find_coincs(results, single_stats)
+        results.update(self._add_singles_to_buffer(results))
+        coinc_results = self._find_coincs(results)
         return coinc_results
 
