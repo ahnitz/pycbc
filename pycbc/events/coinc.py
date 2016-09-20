@@ -422,6 +422,9 @@ class CoincExpireBuffer(object):
     def increment(self, ifos):
         self.add([], [], ifos)
 
+    def remove(self, num):
+        self.index -= num
+    
     def add(self, values, times, ifos):
         for ifo in ifos:
             self.time[ifo] += 1
