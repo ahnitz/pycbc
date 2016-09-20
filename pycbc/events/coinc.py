@@ -647,20 +647,19 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         elif len(results.keys()) > 0:
             self.coincs.increment(results.keys())
 
-        coinc_results = {}
         # Collect coinc results for saving
+        coinc_results = {}
         if num_zerolag > 0:
             zerolag_results = {}
             zerolag_ctime0 = ctime0[cidx][zerolag_idx]
             zerolag_ctime1 = ctime1[cidx][zerolag_idx]
-
             zerolag_cstat = cstat[cidx][zerolag_idx]
             ifar = numpy.array([self.ifar(c) for c in zerolag_cstat], dtype=numpy.float32)
+
             zerolag_results['foreground/ifar'] = ifar
             zerolag_results['foreground/stat'] = zerolag_cstat
             zerolag_results['foreground/%s/end_time' % self.ifos[0]] = zerolag_ctime0
             zerolag_results['foreground/%s/end_time' % self.ifos[1]] = zerolag_ctime1
-
             coinc_results.update(zerolag_results)
 
         # Save some summary statistics about the background
@@ -678,7 +677,10 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
     def add_singles(self, results, data_reader):
         """ Add singles to the bacckground estimate and find candidates
-        """      
+        """  
+        # Apply CAT2 data quality here (just remove the triggers
+        # time still counted.
+        # results = self.veto_singles(results, data_reader)
         single_stats = self._add_singles_to_buffer(results)
         coinc_results = self._find_coincs(results, single_stats)
         return coinc_results
