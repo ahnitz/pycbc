@@ -1,0 +1,165 @@
+#!/bin/env python
+import argparse
+import scipy
+import numpy
+import h5py
+import logging
+import scipy.misc
+import pycbc
+from pycbc.types import MultiDetOptionAction
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--single-trigger-files', action=MultiDetOptionAction, nargs='+')
+parser.add_argument('--coinc-triggers', nargs='+')
+parser.add_argument('--coinc-threshold', type=float)
+parser.add_argument('--window', type=float)
+parser.add_argument('--output-file')
+parser.add_argument('--verbose', action='store_true')
+
+args = parser.parse_args()
+pycbc.init_logging(args.verbose)
+o = h5py.File(args.output_file, 'w')
+snrs = {}
+
+def mstat(fac):
+    return scipy.misc.logsumexp(fac)
+
+# SINGLES ####################################################################
+logging.info('Handling Single Detector Triggers')
+for ifo in args.single_trigger_files:
+    f = h5py.File(args.single_trigger_files[ifo], 'r')[ifo]
+
+    # Time order the triggers
+    time = f['end_time'][:]
+    snr = f['snr'][:]
+    snrs[ifo] = snr
+
+    tsort = time.argsort()
+    time = time[tsort]
+    fac = snr[tsort] ** 2.0 / 2
+    logging.info('%s trigger', len(time))
+    
+    # find the edges of the integral
+    stime = float(int(time[0] / args.window))
+    window_times = numpy.arange(stime, int(time[-1] / args.window) + 1) * args.window
+
+    left = numpy.searchsorted(time, window_times - args.window)
+    right = numpy.searchsorted(time, window_times + args.window)
+
+    v = []
+    t = []
+    for i, (l, r) in enumerate(zip(left, right)):
+        logging.info('%s: %2.1f complete', ifo, float(i) / len(right) * 100)
+        if r > l:
+            t.append(window_times[i])
+            go = mstat(fac[l:r])
+            v.append(go)            
+
+    o['%s/time' % ifo] = numpy.array(t)
+    o['%s/value' % ifo] = numpy.array(v)
+
+# COINCS ######################################################################
+# Assumes that *all* the coincs above some threshold are available.    
+logging.info('Handling the Coincident Triggers')
+logging.info ('Collecting coincs')
+
+t1 = []
+t2 = []
+ts = []
+tid = {'H1':[], 'L1':[]}
+for fname in args.coinc_triggers:
+    f = h5py.File(fname)
+    logging.info('reading %s', fname)
+    stat = f['stat'][:]
+    l = stat > args.coinc_threshold
+    t1.append(f['time1'][:][l])
+    t2.append(f['time2'][:][l])
+    ts.append(f['timeslide_id'][:][l])
+    tid[f.attrs['detector_1']].append(f['trigger_id1'][:][l])
+    tid[f.attrs['detector_2']].append(f['trigger_id2'][:][l])
+    
+t1 = numpy.concatenate(t1)
+t2 = numpy.concatenate(t2)
+ts = numpy.concatenate(ts)
+slide = f.attrs['timeslide_interval']
+
+for ifo in tid:
+    tid[ifo] = numpy.concatenate(tid[ifo])   
+
+logging.info('Start Sorting')
+time = (t2 + (t1 + ts * slide)) / 2
+
+time = time.astype(numpy.float128)
+
+span = int((time.max() - time.min()) / args.window) * float(args.window) + args.window * 10
+time = time + span * ts.astype(numpy.float128)
+
+time_sorting = time.argsort()
+time = time[time_sorting]
+ts = ts[time_sorting]
+for ifo in tid:
+    tid[ifo] = tid[ifo][time_sorting]
+
+window_pos = (time / args.window).astype(numpy.int64)
+window_pos = numpy.unique(numpy.concatenate([window_pos, window_pos + 1]))
+window_pos = window_pos.astype(numpy.float128) * args.window
+
+left = numpy.searchsorted(time, window_pos - args.window)
+right = numpy.searchsorted(time, window_pos + args.window)
+
+k = (right - left) > 0
+left = left[k]
+right = right[k]
+window_pos = window_pos[k]
+
+print time[left].max(), time[left].min()
+print time[right-1].max(), time[right-1].min()
+print time.max(), time.min()
+
+vs = []
+ws = []
+
+logging.info('Done Sorting')
+for i, (l, r) in enumerate(zip(left, right)):
+    htid = tid['H1'][l:r]
+    ltid = tid['L1'][l:r]
+    ws.append(i)
+    fac = snrs['H1'][htid]**2.0 / 2.0 + snrs['L1'][ltid]**2.0 / 2.0        
+    go = mstat(fac)
+    vs.append(go)
+    logging.info('COINC: %2.2f', float(i) / len(right) * 100)
+vs = numpy.array(vs)
+ws = numpy.array(ws)
+
+print window_pos.max(), window_pos.min()
+print window_pos[ws].max(), window_pos[ws].min()
+print time.max()
+
+o['coinc/value'] = vs
+o['coinc/time'] = (window_pos[ws] / args.window).astype(numpy.int64) 
+o['coinc'].attrs['span'] = span
+o['coinc'].attrs['window'] = args.window
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
