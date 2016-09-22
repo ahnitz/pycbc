@@ -1,7 +1,6 @@
+from lal import LIGOTimeGPS, YRJUL_SI
 from glue.ligolw import ligolw
-from glue.ligolw import table
 from glue.ligolw import lsctables
-from glue.ligolw import ilwd
 from glue.ligolw import utils as ligolw_utils
 from glue.ligolw.utils import process as ligolw_process
 from pycbc import version as pycbc_version
@@ -63,7 +62,7 @@ class SingleCoincForGraceDB(object):
         coinc_inspiral_row.mass = mass1 + mass2
         coinc_inspiral_row.set_end(LIGOTimeGPS(end_time))
         coinc_inspiral_row.snr = coinc_results['foreground/stat']
-        coinc_inspiral_row.combined_far = YRJUL_SI /coinc_event['foreground/ifar']
+        coinc_inspiral_row.combined_far = YRJUL_SI / coinc_results['foreground/ifar']
         coinc_inspiral_table.append(coinc_inspiral_row)
         outdoc.childNodes[0].appendChild(coinc_inspiral_table)
 
@@ -71,9 +70,9 @@ class SingleCoincForGraceDB(object):
         sngl_inspiral_table = lsctables.New(lsctables.SnglInspiralTable)
         coinc_event_map_table = lsctables.New(lsctables.CoincMapTable)
 
-        names = [n.split('/')[-1] for n in coinc_results if 'foreground' in n]
         sngl_id = 0
         for ifo in ifos:
+            names = [n.split('/')[-1] for n in coinc_results if 'foreground/%s' % ifo in n]
             sngl_id += 1
             sngl = return_empty_sngl()
             sngl.event_id = lsctables.SnglInspiralID(sngl_id)
@@ -105,7 +104,7 @@ class SingleCoincForGraceDB(object):
         outdoc.childNodes[0].appendChild(sngl_inspiral_table)
         self.outdoc = outdoc
 
-    def write_coinc_xml(self, filename):
+    def save(self, filename):
         ligolw_utils.write_filename(self.outdoc, filename)
 
 
