@@ -6,10 +6,17 @@ from glue.ligolw.utils import process as ligolw_process
 from pycbc import version as pycbc_version
 from pycbc import pnutils
 from pycbc.tmpltbank import return_empty_sngl
+import logging
+import pycbc
 
 class SingleCoincForGraceDB(object):
     """ Create xml files and submit them to gracedb from PyCBC Live """
     def __init__(self, ifos, coinc_results):
+        # remember if this should be marked as HWINJ
+        self.is_hardware_injection = False
+        if 'foreground/HWINJ' in coinc_results:
+            self.is_hardware_injection = True
+
         # Set up the bare structure of the xml document
         outdoc = ligolw.Document()
         outdoc.appendChild(ligolw.LIGO_LW())
@@ -106,6 +113,35 @@ class SingleCoincForGraceDB(object):
 
     def save(self, filename):
         ligolw_utils.write_filename(self.outdoc, filename)
+
+    def upload(self, fname, psds, low_frequency_cutoff, testing=True):
+#        from ligo.gracedb.rest import GraceDb
+        import lal.series, lal
+        if testing:
+            group = 'Test'
+        else:
+            group = 'CBC'
+
+        #r = gracedb.createEvent(group, "pycbc", fname, "AllSky").json()
+        #logging.info("Uploaded event %s.", r["graceid"])    
+        psds_lal = {}
+        for ifo in psds:
+            psd = psds[ifo]
+            kmin = int(low_frequency_cutoff / psd.delta_f)
+            fseries = lal.CreateREAL8FrequencySeries(
+                "psd", psd.epoch, low_frequency_cutoff, psd.delta_f,
+                lal.StrainUnit**2 / lal.HertzUnit, len(psd) - kmin)
+            fseries.data.data = psd.numpy()[kmin:] / pycbc.DYN_RANGE_FAC ** 2.0
+            psds_lal[ifo] = fseries
+        
+        psd_xmldoc = lal.series.make_psd_xmldoc(psds_lal)
+        ligolw_utils.write_filename(psd_xmldoc, "tmp_psd.xml.gz", gz=True)
+
+        #gracedb.writeLog(r["graceid"],
+        #         "PyCBC PSD estimate from the time of event",
+        #         "psd.xml.gz", open("tmp_psd.xml.gz", "rb").read(),
+        #         "psd").json()
+        #logging.info("Uploaded file psd.xml.gz to event %s.", r["graceid"])     
 
 
 

@@ -19,7 +19,9 @@ def makedir(path):
         os.makedirs(path)
 
 class LiveEventManager(object):
-    def __init__(self, output_path, use_date_prefix=False):
+    def __init__(self, output_path,
+                       use_date_prefix=False,
+                       ifar_upload_threshold=None):
         self.path = output_path
         
         # Figure out what we are supposed to process within the pool of MPI processes
@@ -27,7 +29,8 @@ class LiveEventManager(object):
         self.size = self.comm.Get_size()
         self.rank = self.comm.Get_rank()
 
-        self.use_date_prefix=use_date_prefix
+        self.use_date_prefix = use_date_prefix
+        self.ifar_upload_threshold = ifar_upload_threshold
 
     def commit_results(self, results):
         self.comm.gather(results, root=0)
@@ -66,13 +69,19 @@ class LiveEventManager(object):
         else:
             raise TypeError("Not root process")
 
-    def dump_xml(self, ifos, coinc_results):
+    def dump_xml(self, ifos, coinc_results, psds, low_frequency_cutoff):
         """ Save zerolag triggers to a coinc xml file """
-        if 'foreground/ifar' in coinc_results:       
+        if 'foreground/ifar' in coinc_results: 
+            ifar = coinc_results['foreground/ifar']
             event = SingleCoincForGraceDB(ifos, coinc_results)
             time = int(coinc_results['foreground/%s/end_time' % ifos[0]])
             fname = os.path.join(self.path, 'coinc-%s.xml' % time)
+            logging.info('saveing coinc to xml %s', fname)
             event.save(fname)
+
+            if self.ifar_upload_threshold is not None and \
+               self.ifar_upload_threshold < ifar:
+                event.upload(fname, psds, low_frequency_cutoff)
 
     def dump(self, results, name, store_psd=False, time_index=None,
                   store_loudest_index=False,
@@ -192,6 +201,8 @@ parser.add_argument('--analyze-flags', nargs='+', default=['HOFT_OK', 'SCIENCE_I
                     help='The flags that must be in the "good" state to analzye data')
 parser.add_argument('--background-ifar-limit', type=float, default=100.0)
 parser.add_argument('--ifar-remove-threshold', type=float, default=100.0)
+parser.add_argument('--ifar-upload-threshold', type=float)
+
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
 args = parser.parse_args()
@@ -212,7 +223,9 @@ bank = waveform.LiveFilterBank(args.bank_file, flow, sr, total_pad,
                                approximant=args.approximant, increment=args.increment)
 
 ifos = args.channel_name.keys()
-evnt = LiveEventManager(args.output_path, use_date_prefix=args.day_hour_output_prefix)
+evnt = LiveEventManager(args.output_path, 
+                        use_date_prefix=args.day_hour_output_prefix, 
+                        ifar_upload_threshold=args.ifar_upload_threshold)
 
 
 # I'm not the root, so do some actually filtering.
@@ -319,7 +332,7 @@ with ctx:
             coinc_results = {}
             if args.enable_background_estimation:
                 coinc_results = estimator.add_singles(results, data_reader)
-                evnt.dump_xml(results.keys(), coinc_results)
+                evnt.dump_xml(results.keys(), coinc_results, psds, args.low_frequency_cutoff)
 
             prefix = '%s-Live-%s-%s' % (''.join(ifos), data_end() - args.analysis_chunk, valid_pad)
             evnt.dump(results, prefix, time_index=data_end(),
