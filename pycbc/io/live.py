@@ -69,7 +69,7 @@ class SingleCoincForGraceDB(object):
         coinc_inspiral_row.mass = mass1 + mass2
         coinc_inspiral_row.set_end(LIGOTimeGPS(end_time))
         coinc_inspiral_row.snr = coinc_results['foreground/stat']
-        coinc_inspiral_row.combined_far = YRJUL_SI / coinc_results['foreground/ifar']
+        coinc_inspiral_row.combined_far = 1.0 / (YRJUL_SI * coinc_results['foreground/ifar'])
         coinc_inspiral_table.append(coinc_inspiral_row)
         outdoc.childNodes[0].appendChild(coinc_inspiral_table)
 
