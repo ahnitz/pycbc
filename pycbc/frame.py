@@ -402,7 +402,8 @@ class DataBuffer(object):
                        start_time,
                        max_buffer=2048, 
                        force_update_cache=True,
-                       increment_update_cache=None):
+                       increment_update_cache=None,
+                       dtype=numpy.float64):
         """ Create a rolling buffer of frame data
 
         Parameters
@@ -427,7 +428,7 @@ class DataBuffer(object):
         self.channel_type, self.raw_sample_rate = self._retrieve_metadata(self.stream, self.channel_name)
 
         raw_size = self.raw_sample_rate * max_buffer
-        self.raw_buffer = TimeSeries(zeros(raw_size, dtype=numpy.float64),
+        self.raw_buffer = TimeSeries(zeros(raw_size, dtype=dtype),
                                      copy=False,
                                      epoch=start_time - max_buffer,
                                      delta_t=1.0/self.raw_sample_rate)
@@ -657,7 +658,8 @@ class StatusBuffer(DataBuffer):
         DataBuffer.__init__(self, frame_src, channel_name, start_time,
                                  max_buffer=max_buffer,
                                  force_update_cache=force_update_cache,
-                                 increment_update_cache=increment_update_cache) 
+                                 increment_update_cache=increment_update_cache,
+                                 dtype=numpy.int32) 
         self.valid_mask = valid_mask
 
     def check_valid(self, values, flag=None):
@@ -703,7 +705,8 @@ class StatusBuffer(DataBuffer):
         sr = self.raw_buffer.sample_rate
         s = int((start_time - self.raw_buffer.start_time) * sr)
         e = s + int(duration * sr)
-        return self.check_valid(self.raw_buffer[s:e], flag=flag)
+        data = self.raw_buffer[s:e]
+        return self.check_valid(data, flag=flag)
 
     def advance(self, blocksize):
         """ Add blocksize seconds more to the buffer, push blocksize seconds

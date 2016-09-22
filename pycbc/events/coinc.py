@@ -707,14 +707,31 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         for ifo in self.updated_indices:
             self.singles[ifo].discard_last(updated_singles[ifo])
         self.coincs.remove(num_coincs)
-        
+
+    def check_for_hwinj(self, coinc_results, data_reader):
+        from pycbc import frame
+        if 'foreground/ifar' in coinc_results:
+            for ifo in self.ifos:
+                start = coinc_results['foreground/%s/end_time' % ifo]
+                if not data_reader[ifo].state.is_extent_valid(start, 2.0, frame.NO_HWINJ):
+                    return True
 
     def add_singles(self, results, data_reader):
         """ Add singles to the bacckground estimate and find candidates
         """  
         # Apply CAT2 data quality here
         # results = self.veto_singles(results, data_reader)
+
+        # Add single triggers to the internal buffer
         updated_indices = self._add_singles_to_buffer(results)
+
+        # Calculate zerolag and background coincidences
         num_background, coinc_results = self._find_coincs(results)
+
+        # If we have a zerolag trigger, check 
+        # that it is not a hardware injection
+        if self.check_for_hwinj(coinc_results, data_reader):
+            self.backout_last(updated_indices, num_background)
+            coinc_results['foreground/HWINJ'] = True
         return coinc_results
 
