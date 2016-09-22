@@ -115,15 +115,16 @@ class SingleCoincForGraceDB(object):
         ligolw_utils.write_filename(self.outdoc, filename)
 
     def upload(self, fname, psds, low_frequency_cutoff, testing=True):
-#        from ligo.gracedb.rest import GraceDb
+        from ligo.gracedb.rest import GraceDb
         import lal.series, lal
         if testing:
             group = 'Test'
         else:
             group = 'CBC'
-
-        #r = gracedb.createEvent(group, "pycbc", fname, "AllSky").json()
-        #logging.info("Uploaded event %s.", r["graceid"])    
+ 
+        gracedb = GraceDb()
+        r = gracedb.createEvent(group, "pycbc", fname, "AllSky").json()
+        logging.info("Uploaded event %s.", r["graceid"])    
         psds_lal = {}
         for ifo in psds:
             psd = psds[ifo]
@@ -137,11 +138,8 @@ class SingleCoincForGraceDB(object):
         psd_xmldoc = lal.series.make_psd_xmldoc(psds_lal)
         ligolw_utils.write_filename(psd_xmldoc, "tmp_psd.xml.gz", gz=True)
 
-        #gracedb.writeLog(r["graceid"],
-        #         "PyCBC PSD estimate from the time of event",
-        #         "psd.xml.gz", open("tmp_psd.xml.gz", "rb").read(),
-        #         "psd").json()
-        #logging.info("Uploaded file psd.xml.gz to event %s.", r["graceid"])     
-
-
-
+        gracedb.writeLog(r["graceid"],
+                 "PyCBC PSD estimate from the time of event",
+                 "psd.xml.gz", open("tmp_psd.xml.gz", "rb").read(),
+                 "psd").json()
+        logging.info("Uploaded file psd.xml.gz to event %s.", r["graceid"])

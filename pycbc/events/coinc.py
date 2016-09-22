@@ -449,12 +449,10 @@ class CoincExpireBuffer(object):
             kt = self.timer[ifo][:self.index] >= self.time[ifo] - self.expiration
             keep = numpy.logical_and(keep, kt) if keep is not None else kt
 
+        self.buffer[:keep.sum()] = self.buffer[:self.index][keep]
         for ifo in self.ifos:
             self.timer[ifo][:keep.sum()] = self.timer[ifo][:self.index][keep]
-
         self.index = keep.sum()
-        self.buffer[:self.index] = self.buffer[keep]
-
 
     def num_greater(self, value):
         return (self.buffer[:self.index] > value).sum()
@@ -665,7 +663,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
             for ifo in self.ifos:
                 single_expire[ifo] = numpy.concatenate(single_expire[ifo])[cidx][bkg_idx]
 
-            self.coincs.add(cstat[bkg_idx], single_expire, results.keys())
+            self.coincs.add(cstat[cidx][bkg_idx], single_expire, results.keys())
             num_zerolag = zerolag_idx.sum()
             num_background = bkg_idx.sum()
         elif len(results.keys()) > 0:
