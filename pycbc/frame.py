@@ -625,6 +625,7 @@ KAPPA_TST_OK = 2048
 KAPPA_C_OK = 4096
 FCC_OK = 8192
 NO_GAP = 16384    
+NO_HWINJ = NO_STOCH_HW_INJ & NO_CBC_HW_INJ & NO_BURST_HW_INJ & NO_DETCHAR_HW_INJ
                
 class StatusBuffer(DataBuffer):
 
@@ -699,10 +700,10 @@ class StatusBuffer(DataBuffer):
         status: boolean
             Returns True if all of the status information if valid, False if any is not.        
         """
-        s = self.raw_buffer.start_time - start_time
-        e = s + duration
-        values = self.raw_buffer[s * self.raw_sample_rate: e * self.raw_sample_rate]
-        return self.check_valid(values)
+        sr = self.raw_buffer.sample_rate
+        s = int((start_time - self.raw_buffer.start_time) * sr)
+        e = s + int(duration * sr)
+        return self.check_valid(self.raw_buffer[s:e], flag=flag)
 
     def advance(self, blocksize):
         """ Add blocksize seconds more to the buffer, push blocksize seconds
