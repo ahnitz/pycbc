@@ -449,11 +449,12 @@ class CoincExpireBuffer(object):
             kt = self.timer[ifo][:self.index] >= self.time[ifo] - self.expiration
             keep = numpy.logical_and(keep, kt) if keep is not None else kt
 
+        for ifo in self.ifos:
+            self.timer[ifo][:keep.sum()] = self.timer[ifo][:self.index][keep]
+
         self.index = keep.sum()
         self.buffer[:self.index] = self.buffer[keep]
 
-        for ifo in self.ifos:
-            self.timer[ifo][:self.index] = self.timer[ifo][keep]
 
     def num_greater(self, value):
         return (self.buffer[:self.index] > value).sum()
