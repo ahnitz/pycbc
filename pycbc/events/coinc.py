@@ -592,10 +592,17 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
     def _find_coincs(self, results):
         # for each single detector trigger find the allowed coincidences
-        cstat = []
+        # Record which template and the index of the single trigger
+        # that forms each coincident trigger
+        cstat = [[]]
         offsets = []
         ctimes = {self.ifos[0]:[], self.ifos[1]:[]}
         single_expire = {self.ifos[0]:[], self.ifos[1]:[]}
+        template_ids = [[]]
+        trigger_ids = {self.ifos[0]:[[]], self.ifos[1]:[[]]}
+
+        # Calculate all the permutations of coincident triggers for each
+        # new single detector trigger collected
         for ifo in results:
             trigs = results[ifo]
             for i in range(len(trigs['end_time'])):
@@ -623,13 +630,23 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 single_expire[oifo].append(self.singles[oifo].expire_vector(template)[i1])
                 single_expire[ifo].append(numpy.zeros(len(c), dtype=numpy.float64))
                 single_expire[ifo][-1].fill(self.singles[ifo].expire - 1)
-   
+
+                # save the template and trigger ids to keep association to singles
+                # The trigger was just added so it must be in the last position
+                # we mark this with -1 so the slicing pickes the right point
+                template_ids.append(numpy.zeros(len(c)) + template)
+                trigger_ids[oifo].append(i1)
+                trigger_ids[ifo].append(numpy.zeros(len(c)) - 1)
+
+        cstat = numpy.concatenate(cstat)
+        template_ids = numpy.concatenate(template_ids).astype(numpy.int32)
+        for ifo in self.ifos:
+            trigger_ids[ifo] = numpy.concatenate(trigger_ids[ifo]).astype(numpy.int32)
 
         # cluster the triggers we've found
         # (both zerolag and non handled together)
         num_zerolag = 0
-        if len(cstat) > 0:
-            cstat = numpy.concatenate(cstat)
+        num_background = 0
 
         logging.info('%s background and zerolag coincs', len(cstat))
         if len(cstat) > 0:
@@ -649,22 +666,27 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
             self.coincs.add(cstat[bkg_idx], single_expire, results.keys())
             num_zerolag = zerolag_idx.sum()
+            num_background = bkg_idx.sum()
         elif len(results.keys()) > 0:
             self.coincs.increment(results.keys())
 
-        # Collect coinc results for saving
+        ####################################Collect coinc results for saving
         coinc_results = {}
+
+        # Save information about zerolag triggers
         if num_zerolag > 0:
             zerolag_results = {}
-            zerolag_ctime0 = ctime0[cidx][zerolag_idx]
-            zerolag_ctime1 = ctime1[cidx][zerolag_idx]
+            idx = cidx[zerolag_idx][0]
             zerolag_cstat = cstat[cidx][zerolag_idx]
-            ifar = numpy.array([self.ifar(c) for c in zerolag_cstat], dtype=numpy.float32)
-
-            zerolag_results['foreground/ifar'] = ifar
+            zerolag_results['foreground/ifar'] = self.ifar(zerolag_cstat)
             zerolag_results['foreground/stat'] = zerolag_cstat
-            zerolag_results['foreground/%s/end_time' % self.ifos[0]] = zerolag_ctime0
-            zerolag_results['foreground/%s/end_time' % self.ifos[1]] = zerolag_ctime1
+            template = template_ids[idx]
+            for ifo in self.ifos:
+                trig_id = trigger_ids[ifo][idx]
+                single_data = self.singles[ifo].data(template)[trig_id]
+                for key in single_data.dtype.names:
+                    zerolag_results['foreground/%s/%s' % (ifo, key)] = single_data[key]
+
             coinc_results.update(zerolag_results)
 
         # Save some summary statistics about the background
@@ -678,15 +700,21 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # Save all the background triggers
         if self.return_background:
             coinc_results['background/stat'] = self.coincs.data
-        return coinc_results
+        return num_background, coinc_results
+
+    def backout_last(self, updated_singles, num_coincs):
+        """ Remove the recently added singles and coincs """
+        for ifo in self.updated_indices:
+            self.singles[ifo].discard_last(updated_singles[ifo])
+        self.coincs.remove(num_coincs)
+        
 
     def add_singles(self, results, data_reader):
         """ Add singles to the bacckground estimate and find candidates
         """  
-        # Apply CAT2 data quality here (just remove the triggers
-        # time still counted.
+        # Apply CAT2 data quality here
         # results = self.veto_singles(results, data_reader)
         updated_indices = self._add_singles_to_buffer(results)
-        coinc_results = self._find_coincs(results)
+        num_background, coinc_results = self._find_coincs(results)
         return coinc_results
 
