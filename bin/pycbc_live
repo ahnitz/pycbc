@@ -76,7 +76,7 @@ class LiveEventManager(object):
             event = SingleCoincForGraceDB(ifos, coinc_results)
             time = int(coinc_results['foreground/%s/end_time' % ifos[0]])
             fname = os.path.join(self.path, 'coinc-%s.xml' % time)
-            logging.info('saveing coinc to xml %s', fname)
+            logging.info('saving coinc to xml %s', fname)
             event.save(fname)
 
             if self.ifar_upload_threshold is not None and \
