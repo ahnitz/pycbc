@@ -710,8 +710,9 @@ class LiveCoincTimeslideBackgroundEstimator(object):
     def check_for_hwinj(self, coinc_results, data_reader):
         from pycbc import frame
         for ifo in self.ifos:
-            start = coinc_results['foreground/%s/end_time' % ifo]
-            if not data_reader[ifo].state.is_extent_valid(start, 2.0, frame.NO_HWINJ):
+            start = data_reader[ifo].start_time
+            state = data_reader[ifo].state
+            if not state.is_extent_valid(start, self.analysis_block, frame.NO_HWINJ):
                 return True
 
     def add_singles(self, results, data_reader):
@@ -726,12 +727,11 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         # Calculate zerolag and background coincidences
         num_background, coinc_results = self._find_coincs(results)
 
-        if 'foreground/ifar' in coinc_results:
-            # If we have a zerolag trigger, check 
-            # that it is not a hardware injection
-            if self.check_for_hwinj(coinc_results, data_reader):
-                self.backout_last(updated_indices, num_background)
-                coinc_results['foreground/HWINJ'] = True   
+        # If there is a hardware injection anywhere near here dump these
+        # results
+        if self.check_for_hwinj(coinc_results, data_reader):
+            self.backout_last(updated_indices, num_background)
+            coinc_results['HWINJ'] = True
 
         return coinc_results
 

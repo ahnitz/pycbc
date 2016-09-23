@@ -25,7 +25,7 @@ class SingleCoincForGraceDB(object):
         """
         # remember if this should be marked as HWINJ
         self.is_hardware_injection = False
-        if 'foreground/HWINJ' in coinc_results:
+        if 'HWINJ' in coinc_results:
             self.is_hardware_injection = True
 
         # Set up the bare structure of the xml document
