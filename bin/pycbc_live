@@ -79,7 +79,8 @@ class LiveEventManager(object):
 
             if self.ifar_upload_threshold is not None and \
                self.ifar_upload_threshold < ifar:
-                event.upload(fname, psds, low_frequency_cutoff)
+                event.upload(fname, psds, low_frequency_cutoff, 
+                             testing=not args.enable_gracedb_production_upload)
             else:
                 event.save(fname)
 
@@ -204,6 +205,7 @@ parser.add_argument('--analyze-flags', nargs='+', default=['HOFT_OK', 'SCIENCE_I
 parser.add_argument('--background-ifar-limit', type=float, default=100.0)
 parser.add_argument('--ifar-remove-threshold', type=float, default=100.0)
 parser.add_argument('--ifar-upload-threshold', type=float)
+parser.add_argument('--enable-production-gracedb-upload', action='store_true', default=False)
 
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)

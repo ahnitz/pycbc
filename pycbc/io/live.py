@@ -133,7 +133,21 @@ class SingleCoincForGraceDB(object):
         ligolw_utils.write_filename(self.outdoc, filename)
 
     def upload(self, fname, psds, low_frequency_cutoff, testing=True):
-        """Upload the trigger xml file to gracedb"""
+        """Upload this trigger to gracedb 
+        
+        Parameters
+        ----------
+        fname: str
+            The name to give the xml file associated with this trigger
+        pds: dict of pybc.types.FrequencySeries
+            A ifo keyed dictionary of psds to be uploaded in association
+        with this trigger.
+        low_frequency_cutoff: float
+            The low frequency cutoff of the psds.
+        testing: bool
+            Switch to determine if the upload should be sent to gracedb as a
+        test trigger (True) or a production trigger (False)
+        """
         from ligo.gracedb.rest import GraceDb
         import lal.series, lal
 
