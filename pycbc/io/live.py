@@ -10,8 +10,19 @@ import logging
 import pycbc
 
 class SingleCoincForGraceDB(object):
-    """ Create xml files and submit them to gracedb from PyCBC Live """
+    """Create xml files and submit them to gracedb from PyCBC Live"""
     def __init__(self, ifos, coinc_results):
+        """Initialize a ligolw xml representation of a zerolag trigger
+        for upload from pycbc live to gracedb.
+
+        Parameters
+        ----------
+        ifos: list of strs
+            A list of the ifos pariticipating in this trigger
+        coinc_results: dict of values
+            A dictionary of values. The format is define in pycbc/events/coinc.py
+        and matches the on disk representation in the hdf file for this time.
+        """
         # remember if this should be marked as HWINJ
         self.is_hardware_injection = False
         if 'foreground/HWINJ' in coinc_results:
@@ -112,11 +123,21 @@ class SingleCoincForGraceDB(object):
         self.outdoc = outdoc
 
     def save(self, filename):
+        """Write this trigger to gracedb compatible xml format
+        
+        Parameters
+        ----------
+        filename: str
+            Name of file to write to disk.
+        """
         ligolw_utils.write_filename(self.outdoc, filename)
 
     def upload(self, fname, psds, low_frequency_cutoff, testing=True):
+        """Upload the trigger xml file to gracedb"""
         from ligo.gracedb.rest import GraceDb
         import lal.series, lal
+
+        self.save(fname)
         if testing:
             group = 'Test'
         else:
@@ -126,6 +147,8 @@ class SingleCoincForGraceDB(object):
         r = gracedb.createEvent(group, "pycbc", fname, "AllSky").json()
         logging.info("Uploaded event %s.", r["graceid"])    
         psds_lal = {}
+        # Convert our psds to the xml psd format.
+        #FIXME: we should not use lal.series!!!
         for ifo in psds:
             psd = psds[ifo]
             kmin = int(low_frequency_cutoff / psd.delta_f)
@@ -137,7 +160,6 @@ class SingleCoincForGraceDB(object):
         
         psd_xmldoc = lal.series.make_psd_xmldoc(psds_lal)
         ligolw_utils.write_filename(psd_xmldoc, "tmp_psd.xml.gz", gz=True)
-
         gracedb.writeLog(r["graceid"],
                  "PyCBC PSD estimate from the time of event",
                  "psd.xml.gz", open("tmp_psd.xml.gz", "rb").read(),
