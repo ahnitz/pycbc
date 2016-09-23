@@ -77,8 +77,7 @@ class LiveEventManager(object):
             time = int(coinc_results['foreground/%s/end_time' % ifos[0]])
             fname = os.path.join(self.path, 'coinc-%s.xml' % time)
 
-            if self.ifar_upload_threshold is not None and \
-               self.ifar_upload_threshold < ifar:
+            if self.enable_gracedb_upload and self.ifar_upload_threshold < ifar:
                 event.upload(fname, psds, low_frequency_cutoff, 
                              testing=not args.enable_gracedb_production_upload)
             else:
@@ -205,6 +204,7 @@ parser.add_argument('--analyze-flags', nargs='+', default=['HOFT_OK', 'SCIENCE_I
 parser.add_argument('--background-ifar-limit', type=float, default=100.0)
 parser.add_argument('--ifar-remove-threshold', type=float, default=100.0)
 parser.add_argument('--ifar-upload-threshold', type=float)
+parser.add_argument('--enable-gracedb-upload', action='store_true', default=False)
 parser.add_argument('--enable-production-gracedb-upload', action='store_true', default=False)
 
 scheme.insert_processing_option_group(parser)
