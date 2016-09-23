@@ -21,7 +21,10 @@ def makedir(path):
 class LiveEventManager(object):
     def __init__(self, output_path,
                        use_date_prefix=False,
-                       ifar_upload_threshold=None):
+                       ifar_upload_threshold=None,
+                       enable_gracedb_upload=False,
+                       gracedb_testing=True,
+                 ):
         self.path = output_path
         
         # Figure out what we are supposed to process within the pool of MPI processes
@@ -31,6 +34,8 @@ class LiveEventManager(object):
 
         self.use_date_prefix = use_date_prefix
         self.ifar_upload_threshold = ifar_upload_threshold
+        self.gracedb_testing = gracedb_testing
+        self.enable_gracedb_upload = enable_gracedb_upload
 
     def commit_results(self, results):
         self.comm.gather(results, root=0)
@@ -79,7 +84,7 @@ class LiveEventManager(object):
 
             if self.enable_gracedb_upload and self.ifar_upload_threshold < ifar:
                 event.upload(fname, psds, low_frequency_cutoff, 
-                             testing=not args.enable_gracedb_production_upload)
+                             testing=self.gracedb_testing)
             else:
                 event.save(fname)
 
@@ -229,7 +234,10 @@ bank = waveform.LiveFilterBank(args.bank_file, flow, sr, total_pad,
 ifos = args.channel_name.keys()
 evnt = LiveEventManager(args.output_path, 
                         use_date_prefix=args.day_hour_output_prefix, 
-                        ifar_upload_threshold=args.ifar_upload_threshold)
+                        ifar_upload_threshold=args.ifar_upload_threshold, 
+                        enable_gracedb_upload=args.enable_gracedb_upload,
+                        gracedb_testing=not args.enable_production_gracedb_upload,
+                       )
 
 
 # I'm not the root, so do some actually filtering.
