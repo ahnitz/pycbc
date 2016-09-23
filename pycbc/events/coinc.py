@@ -728,7 +728,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         num_background, coinc_results = self._find_coincs(results)
 
         # If there is a hardware injection anywhere near here dump these
-        # results
+        # results and mark the result group as possibly being influenced
         if self.check_for_hwinj(coinc_results, data_reader):
             self.backout_last(updated_indices, num_background)
             coinc_results['HWINJ'] = True
