@@ -80,7 +80,8 @@ class SingleCoincForGraceDB(object):
         coinc_inspiral_row.mass = mass1 + mass2
         coinc_inspiral_row.set_end(LIGOTimeGPS(end_time))
         coinc_inspiral_row.snr = coinc_results['foreground/stat']
-        coinc_inspiral_row.combined_far = 1.0 / (YRJUL_SI * coinc_results['foreground/ifar'])
+        far = 1.0 / (YRJUL_SI * coinc_results['foreground/ifar'])
+        coinc_inspiral_row.combined_far = far
         coinc_inspiral_table.append(coinc_inspiral_row)
         outdoc.childNodes[0].appendChild(coinc_inspiral_table)
 
@@ -160,9 +161,14 @@ class SingleCoincForGraceDB(object):
         gracedb = GraceDb()
         r = gracedb.createEvent(group, "pycbc", fname, "AllSky").json()
         logging.info("Uploaded event %s.", r["graceid"])    
-        psds_lal = {}
+
+        if self.is_hardware_injection:
+            g.writeLabel(r['graceid'], 'INJ')
+            logging.info("Tagging event %s as an injection", r["graceid"])
+
         # Convert our psds to the xml psd format.
         #FIXME: we should not use lal.series!!!
+        psds_lal = {}
         for ifo in psds:
             psd = psds[ifo]
             kmin = int(low_frequency_cutoff / psd.delta_f)
