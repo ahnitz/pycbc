@@ -33,9 +33,9 @@ class SingleCoincForGraceDB(object):
         outdoc.appendChild(ligolw.LIGO_LW())
 
         proc_id = ligolw_process.register_to_xmldoc(outdoc, 'pycbc',
-                     {}, ifos=ifos, comment='', version=pycbc_version.git_hash,
-                     cvs_repository='pycbc/'+pycbc_version.git_branch,
-                     cvs_entry_time=pycbc_version.date).process_id
+                 {}, ifos=ifos, comment='', version=pycbc_version.git_hash,
+                 cvs_repository='pycbc/'+pycbc_version.git_branch,
+                 cvs_entry_time=pycbc_version.date).process_id
     
         # Set up coinc_definer table
         coinc_def_table = lsctables.New(lsctables.CoincDefTable)
@@ -61,29 +61,6 @@ class SingleCoincForGraceDB(object):
         coinc_event_row.likelihood = 0.
         coinc_event_table.append(coinc_event_row)
         outdoc.childNodes[0].appendChild(coinc_event_table)
-
-        # Get summary information for the coinc table
-        mass1 = coinc_results['foreground/%s/mass1' % ifos[0]]
-        mass2 = coinc_results['foreground/%s/mass1' % ifos[0]]
-        mchirp, eta = pnutils.mass1_mass2_to_mchirp_eta(mass1, mass2)
-        end_time = coinc_results['foreground/%s/end_time' % ifos[0]]
-    
-        # Set up the coinc inspiral table
-        coinc_inspiral_table = lsctables.New(lsctables.CoincInspiralTable)
-        coinc_inspiral_row = lsctables.CoincInspiral()
-        # This seems to be used as FAP, which should not be in gracedb
-        coinc_inspiral_row.false_alarm_rate = 0
-        coinc_inspiral_row.minimum_duration = 0.
-        coinc_inspiral_row.set_ifos(ifos)
-        coinc_inspiral_row.coinc_event_id = coinc_id
-        coinc_inspiral_row.mchirp = mchirp
-        coinc_inspiral_row.mass = mass1 + mass2
-        coinc_inspiral_row.set_end(LIGOTimeGPS(end_time))
-        coinc_inspiral_row.snr = coinc_results['foreground/stat']
-        far = 1.0 / (YRJUL_SI * coinc_results['foreground/ifar'])
-        coinc_inspiral_row.combined_far = far
-        coinc_inspiral_table.append(coinc_inspiral_row)
-        outdoc.childNodes[0].appendChild(coinc_inspiral_table)
 
         # Set up sngls
         sngl_inspiral_table = lsctables.New(lsctables.SnglInspiralTable)
@@ -121,6 +98,26 @@ class SingleCoincForGraceDB(object):
 
         outdoc.childNodes[0].appendChild(coinc_event_map_table)
         outdoc.childNodes[0].appendChild(sngl_inspiral_table)
+
+        # Set up the coinc inspiral table
+        coinc_inspiral_table = lsctables.New(lsctables.CoincInspiralTable)
+        coinc_inspiral_row = lsctables.CoincInspiral()
+        # This seems to be used as FAP, which should not be in gracedb
+        coinc_inspiral_row.false_alarm_rate = 0
+        coinc_inspiral_row.minimum_duration = 0.
+        coinc_inspiral_row.set_ifos(ifos)
+        coinc_inspiral_row.coinc_event_id = coinc_id
+        coinc_inspiral_row.mchirp = sngl.mchirp
+        coinc_inspiral_row.mass = sngl.mtotal
+        coinc_inspiral_row.end_time = sngl.end_time
+        coinc_inspiral_row.end_time_ns = sngl.end_time_ns
+        coinc_inspiral_row.snr = coinc_results['foreground/stat']
+        far = 1.0 / (YRJUL_SI * coinc_results['foreground/ifar'])
+        coinc_inspiral_row.combined_far = far
+        coinc_inspiral_table.append(coinc_inspiral_row)
+        outdoc.childNodes[0].appendChild(coinc_inspiral_table)
+
+
         self.outdoc = outdoc
 
     def save(self, filename):
