@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-import argparse, numpy, numpy.random, pycbc, logging, cProfile, h5py
+import argparse, numpy, numpy.random, pycbc, logging, cProfile, h5py, lal
 from pycbc import fft, version, waveform, types, filter as pfilter, scheme, psd as pypsd, noise, vetoes, strain, frame
 from pycbc.types import MultiDetOptionAction, zeros
 from pycbc.filter import LiveBatchMatchedFilter
@@ -96,7 +96,6 @@ class LiveEventManager(object):
                   gracedb_results=None):
         """ Save the results from this time block to an hdf output file """
         if self.use_date_prefix:
-            import lal
             tm = lal.GPSToUTC(int(time_index))
             subdir = '%s_%s_%s' % (tm[0], tm[1], tm[2])
             makedir(os.path.join(self.path, subdir))
@@ -182,7 +181,7 @@ parser.add_argument('--increment-update-cache', action=MultiDetOptionAction, nar
 parser.add_argument('--frame-read-timeout', type=float, default=30)
 parser.add_argument('--increment', type=int, default=8)
 
-parser.add_argument('--start-time', type=int, default=0)
+parser.add_argument('--start-time', type=int, default=lal.GPSTimeNow())
 parser.add_argument('--end-time', type=int, default=numpy.inf)
 
 parser.add_argument('--output-path')
