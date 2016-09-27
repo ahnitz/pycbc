@@ -254,8 +254,6 @@ with ctx:
                                      newsnr_threshold=args.newsnr_threshold,
                                      max_triggers_in_batch=args.max_triggers_in_batch,
                                      maxelements=args.max_batch_size)
-
-
     data_reader = {}
     for ifo in ifos:
         data_reader[ifo] = pycbc.strain.StrainBuffer([args.frame_src[ifo]], 
@@ -307,6 +305,7 @@ with ctx:
         results = {}
 
         for ifo in ifos:
+            results[ifo] = False
             status = data_reader[ifo].advance(valid_pad, timeout=args.frame_read_timeout)
 
             if status is True:
