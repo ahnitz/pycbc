@@ -20,14 +20,13 @@ parser.add_argument('--check-interval', type=int,
                    help="Time in seconds to wait before rechecking status")
 args = parser.parse_args()
 
-status = {}
-status['author'] = "Alexander Harvey Nitz"
-status['email'] = "alex.nitz@ligo.org"
-status['created_gps'] = int(lal.GPSTimeNow())
-
-tdiff = time.time() - os.path.getmtime(args.log_file)
 
 while 1:
+    status = {}
+    status['author'] = "Alexander Harvey Nitz"
+    status['email'] = "alex.nitz@ligo.org"
+    status['created_gps'] = int(lal.GPSTimeNow())
+    tdiff = time.time() - os.path.getmtime(args.log_file)
     everything_ok = True
 
     # Check that the pycbc live logfile has been updated recently.
@@ -56,6 +55,6 @@ while 1:
         status['status_intervals'] = [{"num_status": 2,
                                        "txt_status": "PyCBC Live appears to be down!",
                                       }]
-    open(args.output_file).write(json.dump(status))
+    open(args.output_file, 'w').write(json.dumps(status))
     time.sleep(args.check_interval)
     
