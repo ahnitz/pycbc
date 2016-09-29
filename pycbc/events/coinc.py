@@ -703,21 +703,26 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
     def backout_last(self, updated_singles, num_coincs):
         """ Remove the recently added singles and coincs """
-        for ifo in self.updated_indices:
+        for ifo in updated_singles:
             self.singles[ifo].discard_last(updated_singles[ifo])
         self.coincs.remove(num_coincs)
 
-    def check_for_hwinj(self, coinc_results, data_reader):
+    def check_for_hwinj(self, coinc_results, data_reader, valid_ifos):
         from pycbc import frame
-        for ifo in self.ifos:
+        for ifo in valid_ifos:
             start = data_reader[ifo].start_time
             state = data_reader[ifo].state
             if not state.is_extent_valid(start, self.analysis_block, frame.NO_HWINJ):
                 return True
+        return False
 
     def add_singles(self, results, data_reader):
         """ Add singles to the bacckground estimate and find candidates
         """
+        # If there are no results just return
+        valid_ifos = [k for k in results.keys() if results[k] != False] 
+        if len(valid_ifos) == 0: return {}
+
         # Apply CAT2 data quality here
         # results = self.veto_singles(results, data_reader)
 
@@ -729,9 +734,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
         # If there is a hardware injection anywhere near here dump these
         # results and mark the result group as possibly being influenced
-        if self.check_for_hwinj(coinc_results, data_reader):
+        if self.check_for_hwinj(coinc_results, data_reader, valid_ifos):
             self.backout_last(updated_indices, num_background)
             coinc_results['HWINJ'] = True
-
         return coinc_results
-

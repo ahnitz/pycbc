@@ -1366,6 +1366,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
             Returns True if this block is analyzable.         
         """
         ts = super(StrainBuffer, self).attempt_advance(blocksize, timeout=timeout)
+        self.blocksize = blocksize
 
         # We have given up so there is no time series
         if ts is None:
@@ -1387,7 +1388,6 @@ class StrainBuffer(pycbc.frame.DataBuffer):
             return False
 
         self.segments = {}
-        self.blocksize = blocksize
 
         # only condition with the needed raw data so we can continuously add
         # to the existing result
