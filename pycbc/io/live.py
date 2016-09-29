@@ -160,7 +160,7 @@ class SingleCoincForGraceDB(object):
         logging.info("Uploaded event %s.", r["graceid"])    
 
         if self.is_hardware_injection:
-            g.writeLabel(r['graceid'], 'INJ')
+            gracedb.writeLabel(r['graceid'], 'INJ')
             logging.info("Tagging event %s as an injection", r["graceid"])
 
         # Convert our psds to the xml psd format.
