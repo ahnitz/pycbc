@@ -575,7 +575,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
                 trigsc = copy.copy(trigs)
                 trigsc['chisq'] = trigs['chisq'] * trigs['chisq_dof']
                 trigsc['chisq_dof'] = (trigs['chisq_dof'] + 2) / 2
-                single_stat = self.stat_calculator.single(trigs)
+                single_stat = self.stat_calculator.single(trigsc)
             else:
                 single_stat = numpy.array([], ndmin=1, dtype=numpy.float32)
             trigs['stat'] = single_stat
