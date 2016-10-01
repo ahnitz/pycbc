@@ -49,11 +49,15 @@ def min(self):
 
 code_abs_arg_max = """
 float val = 0;
+#pragma omp parallel for
 for (int i=0; i<N; i++){
     float mag = data[i*2] * data[i*2] + data[i*2+1] * data[i*2+1];
     if ( mag > val){
+        #pragma omp critical
+        {
         loc[0] = i;
         val = mag;
+        }
     }
 }
 """
@@ -106,7 +110,28 @@ def weighted_inner(self, other, weight):
         acum_dtype = float64
 
     return _np.sum(self.data.conj() * other / weight, dtype=acum_dtype)
-    
+
+
+inner_code = """
+double value = 0;
+
+#pragma omp parallel for reduction(+:value)
+for (int i=0; i<N; i++){
+    float val = x[i] * y[i];
+    value += val;
+}
+total[0] = value;
+"""
+
+def inner_inline_real(self, other):
+    x = _np.array(self._data, copy=False)
+    y = _np.array(other, copy=False)
+    total = _np.array([0])
+    N = len(self)
+    inline(inner_code, ['x', 'y', 'total', 'N'], libraries=omp_libs,
+           extra_compile_args=[WEAVE_FLAGS + '-march=native -O3 -w'] + omp_flags)
+    return total[0]
+
 def inner(self, other):
     """ Return the inner product of the array with complex conjugation.
     """
@@ -114,6 +139,7 @@ def inner(self, other):
     if cdtype.kind == 'c':
         acum_dtype = complex128
     else:
+        return inner_inline_real(self, other)
         acum_dtype = float64
     return _np.sum(self.data.conj() * other, dtype=acum_dtype)
     #return _np.vdot(self.data, other)
