@@ -49,17 +49,15 @@ def min(self):
 
 code_abs_arg_max = """
 float val = 0;
-#pragma omp parallel for
+int l = 0;
 for (int i=0; i<N; i++){
     float mag = data[i*2] * data[i*2] + data[i*2+1] * data[i*2+1];
     if ( mag > val){
-        #pragma omp critical
-        {
-        loc[0] = i;
+        l = i;
         val = mag;
-        }
     }
 }
+loc[0] = l;
 """
 
 def abs_arg_max(self):
