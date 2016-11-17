@@ -571,7 +571,7 @@ class LiveFilterBank(TemplateBank):
         if f_end is None or f_end >= (flen * delta_f):
             f_end = (flen-1) * delta_f
 
-        logging.info("Generating %s, %ss, %i" % (approximant, 1.0/delta_f, index))
+        logging.info("Generating %s, %ss, %i, starting from %s Hz" % (approximant, 1.0/delta_f, index, flow))
 
         # Get the waveform filter
         distance = 1.0 / DYN_RANGE_FAC
@@ -594,7 +594,7 @@ class LiveFilterBank(TemplateBank):
 
         htilde = htilde.astype(numpy.complex64)
         htilde.f_lower = flow
-        htilde.end_idx = int(htilde.f_end / htilde.delta_f)
+        htilde.end_idx = int(f_end / htilde.delta_f)
         htilde.params = self.table[index]
         htilde.chirp_length = template_duration
         htilde.length_in_time = ttotal
