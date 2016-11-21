@@ -298,7 +298,7 @@ with ctx:
                             force_update_cache=args.force_update_cache,
                             increment_update_cache=args.increment_update_cache[ifo],
                             analyze_flags=args.analyze_flags)
-    if args.enable_background_estimation:
+    if args.enable_background_estimation and evnt.rank == 0:
         estimator = LiveCoincTimeslideBackgroundEstimator(
                                     len(bank),
                                     args.analysis_chunk,

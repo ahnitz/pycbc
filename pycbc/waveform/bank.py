@@ -485,6 +485,10 @@ class TemplateBank(object):
                 self.table = self.table.add_fields(vec, 'f_lower')
             self.table['f_lower'][:] = low_frequency_cutoff        
 
+        self.min_f_lower = min(self.table['f_lower'])
+        if self.f_lower is None and self.min_f_lower == 0.:
+            raise ValueError('Invalid low-frequency cutoff settings')
+
 class LiveFilterBank(TemplateBank):
     def __init__(self, filename, sample_rate, minimum_buffer,
                        approximant=None, increment=8, parameters=None,
@@ -496,6 +500,7 @@ class LiveFilterBank(TemplateBank):
         self.filename = filename
         self.sample_rate = sample_rate
         self.minimum_buffer = minimum_buffer
+        self.f_lower = low_frequency_cutoff
 
         super(LiveFilterBank, self).__init__(filename, approximant=approximant,
                 parameters=parameters, load_compressed=load_compressed,
@@ -594,6 +599,7 @@ class LiveFilterBank(TemplateBank):
 
         htilde = htilde.astype(numpy.complex64)
         htilde.f_lower = flow
+        htilde.min_f_lower = self.min_f_lower
         htilde.end_idx = int(f_end / htilde.delta_f)
         htilde.params = self.table[index]
         htilde.chirp_length = template_duration
@@ -634,10 +640,6 @@ class FilterBank(TemplateBank):
             load_compressed_now=load_compressed_now,
             **kwds)
         self.ensure_standard_filter_columns(low_frequency_cutoff=low_frequency_cutoff)
-
-        self.min_f_lower = min(self.table['f_lower'])
-        if self.f_lower is None and self.min_f_lower == 0.:
-            raise ValueError('Invalid low-frequency cutoff settings')
 
     def __getitem__(self, index):
         # Make new memory for templates if we aren't given output memory
