@@ -632,6 +632,11 @@ NO_GAP = 16384
 NO_HWINJ = NO_STOCH_HW_INJ | NO_CBC_HW_INJ | \
            NO_BURST_HW_INJ | NO_DETCHAR_HW_INJ
 
+# O2 Low-Latency DQ vector definition 
+# If the bit is 0 then we should veto
+OMC_DCPD_ADC_OVERFLOW = 0x2
+ETMY_ESD_DAC_OVERFLOW = 0x4
+
 class StatusBuffer(DataBuffer):
 
     """ Read state vector information from a frame file """
@@ -736,4 +741,5 @@ class StatusBuffer(DataBuffer):
             ts = DataBuffer.advance(self, blocksize)
             return self.check_valid(ts)
         except RuntimeError:
+            self.null_advance(blocksize)
             return False

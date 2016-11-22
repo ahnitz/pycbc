@@ -157,11 +157,16 @@ parser.add_argument('--state-channel', action=MultiDetOptionAction, nargs='+',
           help="The channel containing frame status information. This is used "
                "to determine when to analyze the hoft data. This somewhat "
                "corresponds to CAT1 information")
+parser.add_argument('--analyze-flags', nargs='+', default=['HOFT_OK', 'SCIENCE_INTENT'], 
+                    help='The flags that must be in the "good" state to analzye data')
 parser.add_argument('--data-quality-channel', action=MultiDetOptionAction, nargs='+', 
           help="The channel containing data quality information. This is used "
                 "to determine when hoft may be suspect and may be used to veto"
                 "triggers or not analyze a segment of data. This roughly "
                 "corresponds to CAT2 information")
+parser.add_argument('--data-quality-flags', nargs='+',
+          default=['OMC_DCPD_ADC_OVERFLOW', 'ETMY_ESD_DAC_OVERFLOW'], 
+          help='The flags used to determine when to throw triggers away')
 parser.add_argument('--frame-src', action=MultiDetOptionAction, nargs='+')
 parser.add_argument('--force-update-cache', action='store_true')
 parser.add_argument('--highpass-frequency', type=float,
@@ -216,8 +221,6 @@ parser.add_argument('--enable-background-estimation', default=False, action='sto
 parser.add_argument('--background-statistic', default='newsnr')
 parser.add_argument('--background-statistic-files', nargs='+', default=[])
 parser.add_argument('--store-background', action='store_true')
-parser.add_argument('--analyze-flags', nargs='+', default=['HOFT_OK', 'SCIENCE_INTENT'], 
-                    help='The flags that must be in the "good" state to analzye data')
 parser.add_argument('--background-ifar-limit', type=float, default=100.0)
 parser.add_argument('--timeslide-interval', type=float, default=0.1)
 parser.add_argument('--ifar-remove-threshold', type=float, default=100.0)
@@ -275,11 +278,13 @@ with ctx:
                                      maxelements=args.max_batch_size)
     data_reader = {}
     for ifo in ifos:
+        state = '%s:%s' % (ifo, args.state_channel[ifo]) if args.state_channel else None
+        dq ='%s:%s' % (ifo, args.data_quality_channel[ifo]) if args.data_quality_channel else None
         data_reader[ifo] = pycbc.strain.StrainBuffer([args.frame_src[ifo]], 
                             '%s:%s' % (ifo, args.channel_name[ifo]),
                             args.start_time, max_buffer=maxlen * 2,
-                            state_channel ='%s:%s' % (ifo, args.state_channel[ifo]),
-                            data_quality_channel ='%s:%s' % (ifo, args.state_channel[ifo]),
+                            state_channel=state,
+                            data_quality_channel=dq,
                             sample_rate=args.sample_rate,
                             low_frequency_cutoff=args.low_frequency_cutoff,
                             highpass_frequency=args.highpass_frequency,
@@ -297,7 +302,8 @@ with ctx:
                             psd_recalculate_difference=args.psd_recalculate_difference,
                             force_update_cache=args.force_update_cache,
                             increment_update_cache=args.increment_update_cache[ifo],
-                            analyze_flags=args.analyze_flags)
+                            analyze_flags=args.analyze_flags,
+                            data_quality_flags=args.data_quality_flags)
     if args.enable_background_estimation and evnt.rank == 0:
         estimator = LiveCoincTimeslideBackgroundEstimator(
                                     len(bank),
