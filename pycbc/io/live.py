@@ -1,3 +1,6 @@
+import logging
+import pycbc
+import numpy
 from lal import LIGOTimeGPS, YRJUL_SI
 from glue.ligolw import ligolw
 from glue.ligolw import lsctables
@@ -6,9 +9,44 @@ from glue.ligolw.utils import process as ligolw_process
 from pycbc import version as pycbc_version
 from pycbc import pnutils
 from pycbc.tmpltbank import return_empty_sngl
-import logging
-import pycbc
 
+#FIXME Legacy build PSD xml helpers, delete me when we move away entirely from
+# xml formats
+def _build_series(series, dim_names, comment, delta_name, delta_unit):
+    from glue.ligolw import array as ligolw_array
+    from glue.ligolw import param as ligolw_param
+    Attributes = ligolw.sax.xmlreader.AttributesImpl
+    elem = ligolw.LIGO_LW(Attributes({u"Name": unicode(series.__class__.__name__)}))
+    if comment is not None:
+        elem.appendChild(ligolw.Comment()).pcdata = comment
+    elem.appendChild(ligolw.Time.from_gps(series.epoch, u"epoch"))
+    elem.appendChild(ligolw_param.from_pyvalue(u"f0", series.f0, unit=u"s^-1"))
+    delta = getattr(series, delta_name)
+    if numpy.iscomplexobj(series.data.data):
+        data = numpy.row_stack((numpy.arange(len(series.data.data)) * delta,
+                             series.data.data.real, series.data.data.imag))
+    else:
+        data = numpy.row_stack((numpy.arange(len(series.data.data)) * delta, series.data.data))
+    a = ligolw_array.from_array(series.name, data, dim_names=dim_names)
+    a.Unit = str(series.sampleUnits)
+    dim0 = a.getElementsByTagName(ligolw.Dim.tagName)[0]
+    dim0.Unit = delta_unit
+    dim0.Start = series.f0
+    dim0.Scale = delta
+    elem.appendChild(a)
+    return elem
+
+def make_psd_xmldoc(psddict):
+    Attributes = ligolw.sax.xmlreader.AttributesImpl
+    xmldoc = ligolw.Document()
+    root_name = u"psd"
+    lw = xmldoc.appendChild(ligolw.LIGO_LW(Attributes({u"Name": root_name})))
+    for instrument, psd in psddict.items():
+        xmlseries = _build_series(psd, (u"Frequency,Real", u"Frequency"),
+                                  None, 'deltaF', 's^-1')
+        fs = lw.appendChild(xmlseries)
+        fs.appendChild(ligolw_param.from_pyvalue(u"instrument", instrument))
+    return xmldoc
 
 class SingleCoincForGraceDB(object):
     """Create xml files and submit them to gracedb from PyCBC Live"""
@@ -150,7 +188,6 @@ class SingleCoincForGraceDB(object):
         """
         from ligo.gracedb.rest import GraceDb
         import lal
-        import lal.series
 
         self.save(fname)
         extra_strings = [] if extra_strings is None else extra_strings
@@ -167,8 +204,7 @@ class SingleCoincForGraceDB(object):
             gracedb.writeLabel(r['graceid'], 'INJ')
             logging.info("Tagging event %s as an injection", r["graceid"])
 
-        # Convert our psds to the xml psd format.
-        # FIXME: we should not use lal.series!!!
+
         psds_lal = {}
         for ifo in psds:
             psd = psds[ifo]
@@ -178,8 +214,8 @@ class SingleCoincForGraceDB(object):
                 lal.StrainUnit**2 / lal.HertzUnit, len(psd) - kmin)
             fseries.data.data = psd.numpy()[kmin:] / pycbc.DYN_RANGE_FAC ** 2.0
             psds_lal[ifo] = fseries
+        psd_xmldoc = make_psd_xmldoc(psds_lal)
 
-        psd_xmldoc = lal.series.make_psd_xmldoc(psds_lal)
         ligolw_utils.write_filename(psd_xmldoc, "tmp_psd.xml.gz", gz=True)
         gracedb.writeLog(r["graceid"],
                          "PyCBC PSD estimate from the time of event",
