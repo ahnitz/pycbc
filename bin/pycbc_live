@@ -368,7 +368,7 @@ with ctx:
                 results, valid_end = evnt.gather_results()
 
             # Veto single detector triggers if they fail the DQ vector
-            if self.data_quality_channel:
+            if args.data_quality_channel:
                 for ifo in results:
                     start = data_reader[ifo].start_time
                     end = data_reader[ifo].end_time
