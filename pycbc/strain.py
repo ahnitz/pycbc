@@ -37,7 +37,6 @@ import pycbc.events
 import pycbc.frame
 import pycbc.filter
 from scipy.signal import kaiserord
- 
 
 def next_power_of_2(n):
     """Return the smallest integer power of 2 larger than the argument.

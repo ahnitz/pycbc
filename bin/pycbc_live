@@ -306,15 +306,15 @@ with ctx:
                             data_quality_flags=args.data_quality_flags)
     if args.enable_background_estimation and evnt.rank == 0:
         estimator = LiveCoincTimeslideBackgroundEstimator(
-                                    len(bank),
-                                    args.analysis_chunk,
-                                    args.background_statistic, 
-                                    args.background_statistic_files, 
-                                    return_background=args.store_background,
-                                    ifar_limit=args.background_ifar_limit,
-                                    timeslide_interval=args.timeslide_interval,
-                                    ifar_remove_threshold=args.ifar_remove_threshold,
-                                    ifos=ifos)
+                            len(bank),
+                            args.analysis_chunk,
+                            args.background_statistic, 
+                            args.background_statistic_files, 
+                            return_background=args.store_background,
+                            ifar_limit=args.background_ifar_limit,
+                            timeslide_interval=args.timeslide_interval,
+                            ifar_remove_threshold=args.ifar_remove_threshold,
+                            ifos=ifos)
 
     logging.info('%s: Starting... ', evnt.rank)
 
@@ -363,9 +363,21 @@ with ctx:
             for ifo in data_reader:
                 psds[ifo] = data_reader[ifo].psd
 
+            # Collect together the single detector triggers
             if evnt.size > 1:
                 results, valid_end = evnt.gather_results()
+
+            # Veto single detector triggers if they fail the DQ vector
+            if self.data_quality_channel:
+                for ifo in results:
+                    start = data_reader[ifo].start_time
+                    end = data_reader[ifo].end_time
+                    idx = data_reader[ifo].dq.indices_of_flag(start, end, results[ifo]['end_time'])
+                    for key in results[ifo]:
+                        if len(results[ifo][key]) > 0:
+                            results[ifo][key] = results[ifo][key][idx]
         
+            # Look for coincident triggers and do background estimation
             coinc_results = {}
             if args.enable_background_estimation:
                 coinc_results = estimator.add_singles(results, data_reader)

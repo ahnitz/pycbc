@@ -701,7 +701,7 @@ class StatusBuffer(DataBuffer):
         Parameters
         ----------
         start_time: int
-            Begging of the duration to check in gps seconds
+            Beginning of the duration to check in gps seconds
         duration: int
             Number of seconds after the start_time to check
         flag: str, optional
@@ -718,6 +718,30 @@ class StatusBuffer(DataBuffer):
         e = s + int(duration * sr)
         data = self.raw_buffer[s:e]
         return self.check_valid(data, flag=flag)
+
+    def indices_of_flag(start_time, duration, times):
+        """ Return the indices of the times lying in the flagged region
+        
+        Parameters
+        ----------
+        start_time: int
+            Beginning time to request for
+        duration: int
+            Number of seconds to check.
+        
+        Returns
+        -------
+        indices: numpy.ndarray
+            Array of indices marking the location of triggers within valid
+        time.
+        """ 
+        from pycbc.events.coinc import indices_within_times
+        sr = self.raw_buffer.sample_rate
+        s = int((start_time - self.raw_buffer.start_time) * sr)
+        e = s + int(duration * sr)
+        starts = self.raw_buffer[s:e]
+        ends = data + 1.0 / sr  
+        return indices_within_times(starts, ends, times)        
 
     def advance(self, blocksize):
         """ Add blocksize seconds more to the buffer, push blocksize seconds
