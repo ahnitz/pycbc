@@ -1168,15 +1168,13 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         self.low_frequency_cutoff = low_frequency_cutoff
 
         # Set up status buffers
-        self.state_channel = state_channel
-        self.data_quality_channel = data_quality_channel
         self.analyze_flags = analyze_flags
         self.data_quality_flags = data_quality_flags
         self.state = None
         self.dq = None
 
         # State channel
-        if self.state_channel is not None:
+        if state_channel is not None:
             valid_mask = 0
             for flag in self.analyze_flags:
                 valid_mask = valid_mask | getattr(pycbc.frame, flag)
@@ -1189,13 +1187,13 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                 increment_update_cache=increment_update_cache)
 
         # low latency dq channel
-        if self.data_quality_channel is not None:
+        if data_quality_channel is not None:
             valid_mask = 0
             for flag in self.data_quality_flags:
                 valid_mask = valid_mask | getattr(pycbc.frame, flag)
             self.dq = pycbc.frame.StatusBuffer(
                 frame_src,
-                state_channel, start_time,
+                data_quality_channel, start_time,
                 max_buffer=max_buffer,
                 valid_mask=valid_mask,
                 force_update_cache=force_update_cache,
@@ -1469,5 +1467,3 @@ class StrainBuffer(pycbc.frame.DataBuffer):
             return False
         else:
             return True
-
-

@@ -369,10 +369,13 @@ with ctx:
 
             # Veto single detector triggers if they fail the DQ vector
             if args.data_quality_channel:
+                logging.info('checking the dq vector')
                 for ifo in results:
                     start = data_reader[ifo].start_time
                     end = data_reader[ifo].end_time
-                    idx = data_reader[ifo].dq.indices_of_flag(start, end, results[ifo]['end_time'])
+                    times = results[ifo]['end_time']
+                    idx = data_reader[ifo].dq.indices_of_flag(start, valid_pad, times)
+                    logging.info('Keeping %s triggers out of %s triggers in %s', len(idx), len(times), ifo)
                     for key in results[ifo]:
                         if len(results[ifo][key]) > 0:
                             results[ifo][key] = results[ifo][key][idx]

@@ -634,8 +634,8 @@ NO_HWINJ = NO_STOCH_HW_INJ | NO_CBC_HW_INJ | \
 
 # O2 Low-Latency DQ vector definition 
 # If the bit is 0 then we should veto
-OMC_DCPD_ADC_OVERFLOW = 0x2
-ETMY_ESD_DAC_OVERFLOW = 0x4
+OMC_DCPD_ADC_OVERFLOW = 2
+ETMY_ESD_DAC_OVERFLOW = 4
 
 class StatusBuffer(DataBuffer):
 
@@ -719,7 +719,7 @@ class StatusBuffer(DataBuffer):
         data = self.raw_buffer[s:e]
         return self.check_valid(data, flag=flag)
 
-    def indices_of_flag(start_time, duration, times):
+    def indices_of_flag(self, start_time, duration, times):
         """ Return the indices of the times lying in the flagged region
         
         Parameters
@@ -735,13 +735,17 @@ class StatusBuffer(DataBuffer):
             Array of indices marking the location of triggers within valid
         time.
         """ 
-        from pycbc.events.coinc import indices_within_times
+        from pycbc.events.veto import indices_within_times
         sr = self.raw_buffer.sample_rate
         s = int((start_time - self.raw_buffer.start_time) * sr)
         e = s + int(duration * sr)
-        starts = self.raw_buffer[s:e]
-        ends = data + 1.0 / sr  
-        return indices_within_times(starts, ends, times)        
+        data = self.raw_buffer[s:e]
+        stamps = data.sample_times.numpy()
+        valid = numpy.bitwise_and(data.numpy(), self.valid_mask) == self.valid_mask
+        starts = stamps[valid]
+        ends = starts + 1.0 / sr                
+        idx = indices_within_times(times, starts, ends)
+        return idx
 
     def advance(self, blocksize):
         """ Add blocksize seconds more to the buffer, push blocksize seconds
