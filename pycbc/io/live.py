@@ -37,6 +37,7 @@ def _build_series(series, dim_names, comment, delta_name, delta_unit):
     return elem
 
 def make_psd_xmldoc(psddict):
+    from glue.ligolw import param as ligolw_param
     Attributes = ligolw.sax.xmlreader.AttributesImpl
     xmldoc = ligolw.Document()
     root_name = u"psd"
@@ -203,7 +204,6 @@ class SingleCoincForGraceDB(object):
         if self.is_hardware_injection:
             gracedb.writeLabel(r['graceid'], 'INJ')
             logging.info("Tagging event %s as an injection", r["graceid"])
-
 
         psds_lal = {}
         for ifo in psds:
