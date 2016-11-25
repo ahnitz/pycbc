@@ -164,10 +164,9 @@ parser.add_argument('--data-quality-channel', action=MultiDetOptionAction, nargs
                 "to determine when hoft may be suspect and may be used to veto"
                 "triggers or not analyze a segment of data. This roughly "
                 "corresponds to CAT2 information")
-parser.add_argument('--data-quality-flags', nargs='+',
-          default=['OMC_DCPD_ADC_OVERFLOW', 'ETMY_ESD_DAC_OVERFLOW'], 
+parser.add_argument('--data-quality-flags', nargs='+', 
           help='The flags used to determine when to throw triggers away')
-parser.add_argument('--data-quality-padding', type=float,
+parser.add_argument('--data-quality-padding', type=float, default=0,
 	  help='Time in seconds around a bad dq time to additionally remove triggers')
 parser.add_argument('--frame-src', action=MultiDetOptionAction, nargs='+')
 parser.add_argument('--force-update-cache', action='store_true')
