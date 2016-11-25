@@ -167,6 +167,8 @@ parser.add_argument('--data-quality-channel', action=MultiDetOptionAction, nargs
 parser.add_argument('--data-quality-flags', nargs='+',
           default=['OMC_DCPD_ADC_OVERFLOW', 'ETMY_ESD_DAC_OVERFLOW'], 
           help='The flags used to determine when to throw triggers away')
+parser.add_argument('--data-quality-padding', type=float,
+	  help='Time in seconds around a bad dq time to additionally remove triggers')
 parser.add_argument('--frame-src', action=MultiDetOptionAction, nargs='+')
 parser.add_argument('--force-update-cache', action='store_true')
 parser.add_argument('--highpass-frequency', type=float,
@@ -374,7 +376,8 @@ with ctx:
                     start = data_reader[ifo].start_time
                     end = data_reader[ifo].end_time
                     times = results[ifo]['end_time']
-                    idx = data_reader[ifo].dq.indices_of_flag(start, valid_pad, times)
+                    idx = data_reader[ifo].dq.indices_of_flag(start, valid_pad, times,
+                                                              padding=args.data_quality_padding)
                     logging.info('Keeping %s triggers out of %s triggers in %s', len(idx), len(times), ifo)
                     for key in results[ifo]:
                         if len(results[ifo][key]) > 0:

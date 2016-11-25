@@ -719,7 +719,7 @@ class StatusBuffer(DataBuffer):
         data = self.raw_buffer[s:e]
         return self.check_valid(data, flag=flag)
 
-    def indices_of_flag(self, start_time, duration, times):
+    def indices_of_flag(self, start_time, duration, times, padding=0):
         """ Return the indices of the times lying in the flagged region
         
         Parameters
@@ -728,6 +728,9 @@ class StatusBuffer(DataBuffer):
             Beginning time to request for
         duration: int
             Number of seconds to check.
+        padding: float
+            Number of seconds to add around flag inactive times to be considered
+        inactive as well.
         
         Returns
         -------
@@ -735,16 +738,16 @@ class StatusBuffer(DataBuffer):
             Array of indices marking the location of triggers within valid
         time.
         """ 
-        from pycbc.events.veto import indices_within_times
+        from pycbc.events.veto import indices_outside_times
         sr = self.raw_buffer.sample_rate
         s = int((start_time - self.raw_buffer.start_time) * sr) - 1
         e = s + int(duration * sr) + 1
         data = self.raw_buffer[s:e]
         stamps = data.sample_times.numpy()
-        valid = numpy.bitwise_and(data.numpy(), self.valid_mask) == self.valid_mask
-        starts = stamps[valid]
-        ends = starts + 1.0 / sr                
-        idx = indices_within_times(times, starts, ends)
+        invalid = numpy.bitwise_and(data.numpy(), self.valid_mask) != self.valid_mask
+        starts = stamps[invalid] - padding
+        ends = starts + 1.0 / sr + padding                 
+        idx = indices_outside_times(times, starts, ends)
         return idx
 
     def advance(self, blocksize):
