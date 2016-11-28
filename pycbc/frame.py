@@ -740,13 +740,14 @@ class StatusBuffer(DataBuffer):
         """ 
         from pycbc.events.veto import indices_outside_times
         sr = self.raw_buffer.sample_rate
-        s = int((start_time - self.raw_buffer.start_time) * sr) - 1
-        e = s + int(duration * sr) + 1
+        s = int((start_time - self.raw_buffer.start_time - padding) * sr) - 1
+        e = s + int((duration + padding) * sr) + 1
         data = self.raw_buffer[s:e]
         stamps = data.sample_times.numpy()
         invalid = numpy.bitwise_and(data.numpy(), self.valid_mask) != self.valid_mask
+
         starts = stamps[invalid] - padding
-        ends = starts + 1.0 / sr + padding                 
+        ends = starts + 1.0 / sr + padding * 2.0
         idx = indices_outside_times(times, starts, ends)
         return idx
 
