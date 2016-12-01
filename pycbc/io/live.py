@@ -64,6 +64,9 @@ class SingleCoincForGraceDB(object):
             in pycbc/events/coinc.py
         and matches the on disk representation in the hdf file for this time.
         """
+        self.ifos = ifos
+        self.template_id = coinc_results['foreground/%s/template_id' % self.ifos[0]]
+        
         # remember if this should be marked as HWINJ
         self.is_hardware_injection = False
         if 'HWINJ' in coinc_results:
@@ -161,6 +164,22 @@ class SingleCoincForGraceDB(object):
         outdoc.childNodes[0].appendChild(coinc_inspiral_table)
         self.outdoc = outdoc
         self.time = sngl.end_time
+        
+    def upload_snr_series(self, graceid, data_readers, bank):
+        from pycbc.filter import correlate
+        from pycbc.fft import ifft
+        from pycbc.types import zeros
+        snrs = {}
+        for ifo in self.ifos:
+            htilde = bank[self.template_id]
+            stilde = data_readers[ifo].overwhitened_data(htilde.delta_f)
+            norm = 4.0 * htilde.delta_f / (htilde.sigmasq(stilde.psd) ** 0.5)
+            qtilde = zeros((len(htilde)-1)*2, dtype=htilde.dtype)
+            correlate(htilde, stilde, qtilde)
+            snr = qtilde * 0
+            ifft(qtilde, snr)
+            snr *= norm
+            snrs[ifo] = snr
 
     def save(self, filename):
         """Write this trigger to gracedb compatible xml format
@@ -172,7 +191,10 @@ class SingleCoincForGraceDB(object):
         """
         ligolw_utils.write_filename(self.outdoc, filename)
 
-    def upload(self, fname, psds, low_frequency_cutoff, testing=True, extra_strings=None):
+    def upload(self, fname, psds, low_frequency_cutoff,
+               testing=True,
+               extra_strings=None,
+               ):
         """Upload this trigger to gracedb
 
         Parameters
@@ -227,6 +249,7 @@ class SingleCoincForGraceDB(object):
         for text in extra_strings:
             gracedb.writeLog(r["graceid"], text).json()
         logging.info("Uploaded file psd.xml.gz to event %s.", r["graceid"])
+        return r['graceid']
 
 class SingleForGraceDB(SingleCoincForGraceDB):
     """Create xml files and submit them to gracedb from PyCBC Live"""
