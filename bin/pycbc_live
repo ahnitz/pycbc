@@ -75,19 +75,23 @@ class LiveEventManager(object):
         else:
             raise TypeError("Not root process")
 
-    def check_coincs(self, ifos, coinc_results, psds, low_frequency_cutoff):
+    def check_coincs(self, ifos, coinc_results, psds, low_frequency_cutoff, data_readers, bank):
         """ Save zerolag triggers to a coinc xml file """
         if 'foreground/ifar' in coinc_results: 
             ifar = coinc_results['foreground/ifar']
             event = SingleCoincForGraceDB(ifos, coinc_results)
+
             time = int(coinc_results['foreground/%s/end_time' % ifos[0]])
             fname = os.path.join(self.path, 'coinc-%s.xml' % time)
 
             comments = ['using ranking statistic: %s' % args.background_statistic]
 
             if self.enable_gracedb_upload and self.ifar_upload_threshold < ifar:
-                event.upload(fname, psds, low_frequency_cutoff, 
+                r = event.upload(fname, psds, low_frequency_cutoff, 
                              testing=self.gracedb_testing, extra_strings=comments)
+                             
+                if args.upload_snr_series:
+                    event.upload_snr_series(r, data_readers, bank)
             else:
                 event.save(fname)
 
@@ -245,6 +249,7 @@ parser.add_argument('--enable-gracedb-upload', action='store_true', default=Fals
 parser.add_argument('--file-prefix', default='Live')
 parser.add_argument('--enable-production-gracedb-upload', action='store_true', default=False)
 parser.add_argument('--enable-single-detector-upload', action='store_true', default=False)
+parser.add_argument('--upload-snr-series', action='store_true', default=False)
 
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
@@ -402,7 +407,8 @@ with ctx:
             coinc_results = {}
             if args.enable_background_estimation:
                 coinc_results = estimator.add_singles(results, data_reader)
-                evnt.check_coincs(results.keys(), coinc_results, psds, args.low_frequency_cutoff)
+                evnt.check_coincs(results.keys(), coinc_results,
+                                  psds, args.low_frequency_cutoff, data_reader, bank)
 
             # Check for singles if we don't have coinc time
             if args.enable_single_detector_upload:

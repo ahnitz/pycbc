@@ -126,6 +126,7 @@ class SingleCoincForGraceDB(object):
                 else:
                     try:
                         setattr(sngl, name, val)
+                        print name, val
                     except AttributeError:
                         pass
             sngl.mtotal, sngl.eta = pnutils.mass1_mass2_to_mtotal_eta(
@@ -163,21 +164,27 @@ class SingleCoincForGraceDB(object):
         coinc_inspiral_table.append(coinc_inspiral_row)
         outdoc.childNodes[0].appendChild(coinc_inspiral_table)
         self.outdoc = outdoc
-        self.time = sngl.end_time
+        self.time = sngl.get_end()
         
     def upload_snr_series(self, graceid, data_readers, bank):
         from pycbc.filter import correlate
         from pycbc.fft import ifft
         from pycbc.types import zeros
         snrs = {}
+        htilde = bank[self.template_id]
+                
         for ifo in self.ifos:
-            htilde = bank[self.template_id]
             stilde = data_readers[ifo].overwhitened_data(htilde.delta_f)
             norm = 4.0 * htilde.delta_f / (htilde.sigmasq(stilde.psd) ** 0.5)
             qtilde = zeros((len(htilde)-1)*2, dtype=htilde.dtype)
             correlate(htilde, stilde, qtilde)
             snr = qtilde * 0
             ifft(qtilde, snr)
+
+            valid_end = int(len(qtilde) - data_readers[ifo].trim_padding)
+            valid_start = int(valid_end - data_readers[ifo].blocksize * data_readers[ifo].sample_rate)
+            seg = slice(valid_start, valid_end)
+            snr = snr[seg]
             snr *= norm
             snrs[ifo] = snr
 
