@@ -47,6 +47,15 @@ class LiveEventManager(object):
     def barrier_status(self, status):
         return self.comm.allreduce(status, op=mpi.LAND)
 
+    def check_singles(self, results):
+        active = [k for k in results if results[k] != None]
+        if len(active) == 1:
+            from pycbc.events.single import live_single_far_line
+            ifo = active[0]
+            single = live_single_far_line(ifo, results[ifo])
+            if single is not None:
+                single.save('single-%s-%s.xml' % (ifo, single.time))
+
     def gather_results(self):
         """ Collect results from the mpi subprocesses and collate them into
         contiguous sets of arrays.
@@ -229,6 +238,7 @@ parser.add_argument('--ifar-upload-threshold', type=float)
 parser.add_argument('--enable-gracedb-upload', action='store_true', default=False)
 parser.add_argument('--file-prefix', default='Live')
 parser.add_argument('--enable-production-gracedb-upload', action='store_true', default=False)
+parser.add_argument('--enable-single-detector-upload', action='store_true', default=False)
 
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
@@ -387,6 +397,10 @@ with ctx:
             if args.enable_background_estimation:
                 coinc_results = estimator.add_singles(results, data_reader)
                 evnt.dump_xml(results.keys(), coinc_results, psds, args.low_frequency_cutoff)
+
+            # Check for singles if we don't have coinc time
+            if args.enable_single_detector_upload:
+                evnt.check_singles(results)
 
             prefix = '%s-%s-%s-%s' % (''.join(ifos), args.file_prefix, data_end() - args.analysis_chunk, valid_pad)
             evnt.dump(results, prefix, time_index=data_end(),

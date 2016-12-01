@@ -160,6 +160,7 @@ class SingleCoincForGraceDB(object):
         coinc_inspiral_table.append(coinc_inspiral_row)
         outdoc.childNodes[0].appendChild(coinc_inspiral_table)
         self.outdoc = outdoc
+        self.time = sngl.end_time
 
     def save(self, filename):
         """Write this trigger to gracedb compatible xml format
@@ -226,3 +227,25 @@ class SingleCoincForGraceDB(object):
         for text in extra_strings:
             gracedb.writeLog(r["graceid"], text).json()
         logging.info("Uploaded file psd.xml.gz to event %s.", r["graceid"])
+
+class SingleForGraceDB(SingleCoincForGraceDB):
+    """Create xml files and submit them to gracedb from PyCBC Live"""
+    def __init__(self, ifo, sngls_dict):
+        """Initialize a ligolw xml representation of this single trigger for
+        upload to gracedb
+
+        Parameters
+        ----------
+        ifo: str
+            The IFO that the trigger came from.
+        sngls_dict: dict
+            Dictionary of singles parameters. Must include template parameters
+        and both 'ifar' and 'stat' values.
+        """
+        fake_coinc = {}
+        fake_coinc['foreground/stat'] = sngls_dict.pop('stat')
+        fake_coinc['foreground/ifar'] = sngls_dict.pop('ifar')
+        for key in sngls_dict:
+            fake_coinc['foreground/%s/%s' % (ifo, key)] = sngls_dict[key]
+        SingleCoincForGraceDB.__init__(self, [ifo], fake_coinc)
+ 
