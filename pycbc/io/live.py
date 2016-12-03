@@ -184,8 +184,9 @@ class SingleCoincForGraceDB(object):
             seg = slice(valid_start, valid_end)
             snr = snr[seg]
             snr *= norm
-            snr = TimeSeries(snr, delta_t=data_readers[ifo].sample_rate,
-                             epoch=data_readers[ifo].start_time)
+            delta_t = 1.0 / data_readers[ifo].sample_rate
+            start = data_readers[ifo].start_time
+            snr = TimeSeries(snr, delta_t=delta_t, epoch=start)
             snr.save(filename, group='%s/snr' % ifo)
             stilde.psd.save(filename, group='%s/psd' % ifo)
         from ligo.gracedb import GraceDB
