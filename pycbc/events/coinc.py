@@ -629,8 +629,7 @@ class LiveCoincTimeslideBackgroundEstimator(object):
 
     @staticmethod
     def insert_args(parser):
-        import argparse
-        group = argparse.add_argument_group('Coincident Background Estimation')
+        group = parser.add_argument_group('Coincident Background Estimation')
         group.add_argument('--background-statistic', default='newsnr', 
             help="Ranking statistic to use for candidate coincident events")
         group.add_argument('--background-statistic-files', nargs='+',

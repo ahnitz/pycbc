@@ -126,7 +126,6 @@ class SingleCoincForGraceDB(object):
                 else:
                     try:
                         setattr(sngl, name, val)
-                        print name, val
                     except AttributeError:
                         pass
             sngl.mtotal, sngl.eta = pnutils.mass1_mass2_to_mtotal_eta(
