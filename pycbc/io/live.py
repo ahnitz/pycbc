@@ -9,6 +9,7 @@ from glue.ligolw.utils import process as ligolw_process
 from pycbc import version as pycbc_version
 from pycbc import pnutils
 from pycbc.tmpltbank import return_empty_sngl
+from pycbc.types import TimeSeries
 
 #FIXME Legacy build PSD xml helpers, delete me when we move away entirely from
 # xml formats
@@ -165,13 +166,11 @@ class SingleCoincForGraceDB(object):
         self.outdoc = outdoc
         self.time = sngl.get_end()
         
-    def upload_snr_series(self, graceid, data_readers, bank):
+    def upload_snr_series(self, filename, graceid, data_readers, bank):
         from pycbc.filter import correlate
         from pycbc.fft import ifft
         from pycbc.types import zeros
-        snrs = {}
         htilde = bank[self.template_id]
-                
         for ifo in self.ifos:
             stilde = data_readers[ifo].overwhitened_data(htilde.delta_f)
             norm = 4.0 * htilde.delta_f / (htilde.sigmasq(stilde.psd) ** 0.5)
@@ -185,7 +184,11 @@ class SingleCoincForGraceDB(object):
             seg = slice(valid_start, valid_end)
             snr = snr[seg]
             snr *= norm
-            snrs[ifo] = snr
+            snr = TimeSeries(snr, delta_t=data_readers[ifo].sample_rate,
+                             epoch=data_readers[ifo].start_time)
+            snr.save(filename, group='%s/snr' % ifo)
+            stilde.psd.save(filename, group='%s/psd' % ifo)
+        
 
     def save(self, filename):
         """Write this trigger to gracedb compatible xml format

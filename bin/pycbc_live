@@ -90,7 +90,7 @@ class LiveEventManager(object):
                 r = event.upload(fname, psds, low_frequency_cutoff, 
                              testing=self.gracedb_testing, extra_strings=comments)
                 if args.upload_snr_series:
-                    event.upload_snr_series(r, data_readers, bank)    
+                    event.upload_snr_series(fname + '.hdf', r, data_readers, bank)
             else:
                 event.save(fname)
 
