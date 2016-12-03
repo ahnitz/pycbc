@@ -213,7 +213,6 @@ parser.add_argument('--autogating-window', type=float, default=0.5)
 parser.add_argument('--autogating-cluster', type=float, default=.25)
 
 parser.add_argument('--sync', action='store_true')
-parser.add_argument('--sync-frame-status', action='store_true')
 parser.add_argument('--increment-update-cache', action=MultiDetOptionAction, nargs='+')
 parser.add_argument('--frame-read-timeout', type=float, default=30)
 parser.add_argument('--increment', type=int, default=8)
@@ -243,6 +242,8 @@ parser.add_argument('--file-prefix', default='Live')
 parser.add_argument('--enable-production-gracedb-upload', action='store_true', default=False)
 parser.add_argument('--enable-single-detector-upload', action='store_true', default=False)
 parser.add_argument('--upload-snr-series', action='store_true', default=False)
+parser.add_argument('--followup-detectors', default=[], nargs='*',
+                    help='List of detectors to use as followup')
 
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
@@ -266,7 +267,13 @@ bank = waveform.LiveFilterBank(args.bank_file, sr, total_pad,
                        approximant=args.approximant,
                        increment=args.increment)
 
+# ifos used for primary analysis (only two at the moment)
 ifos = args.channel_name.keys()
+followup_ifos = args.followup_detectors
+for ifo in ifos:
+    if ifo in followup_ifos:
+        ifos.pop()
+        
 evnt = LiveEventManager(args.output_path, 
                         use_date_prefix=args.day_hour_output_prefix, 
                         ifar_upload_threshold=args.ifar_upload_threshold, 
@@ -293,7 +300,7 @@ with ctx:
                                      max_triggers_in_batch=args.max_triggers_in_batch,
                                      maxelements=args.max_batch_size)
     data_reader = {}
-    for ifo in ifos:
+    for ifo in ifos + followup_ifos:
         state = '%s:%s' % (ifo, args.state_channel[ifo]) if args.state_channel else None
         dq ='%s:%s' % (ifo, args.data_quality_channel[ifo]) if args.data_quality_channel else None
         data_reader[ifo] = pycbc.strain.StrainBuffer([args.frame_src[ifo]], 
@@ -351,11 +358,6 @@ with ctx:
                     logging.info("PSD outside acceptable sensitivity %s - %s, have %s",
                                  args.min_psd_abort_distance, args.max_psd_abort_distance, dist)
                     status = False               
-
-            # We fail the frame file if *any* of the processes failed to get it
-            # for whatever reason his ensures the data is synchronized
-            if args.sync_frame_status:
-                status = evnt.barrier_status(status)
     
             if status is True:
                 logging.info('%s: Filtering: %s', evnt.rank, ifo)
