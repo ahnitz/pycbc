@@ -188,7 +188,8 @@ class SingleCoincForGraceDB(object):
                              epoch=data_readers[ifo].start_time)
             snr.save(filename, group='%s/snr' % ifo)
             stilde.psd.save(filename, group='%s/psd' % ifo)
-        
+        from ligo.gracedb import GraceDB
+        GraceDB().writeFile(graceid, filename)
 
     def save(self, filename):
         """Write this trigger to gracedb compatible xml format
