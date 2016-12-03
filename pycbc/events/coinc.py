@@ -616,6 +616,36 @@ class LiveCoincTimeslideBackgroundEstimator(object):
         #        pass
         #    signal.signal(signal.SIGINT, sig_handler)
 
+    @classmethod
+    def from_cli(cls, args, num_templates, analysis_chunk, ifos):
+        return cls(num_templates, analysis_chunk,
+                   args.background_statistic, 
+                   args.background_statistic_files, 
+                   return_background=args.store_background,
+                   ifar_limit=args.background_ifar_limit,
+                   timeslide_interval=args.timeslide_interval,
+                   ifar_remove_threshold=args.ifar_remove_threshold,
+                   ifos=ifos)  
+
+    @staticmethod
+    def insert_args(parser):
+        import argparse
+        group = argparse.add_argument_group('Coincident Background Estimation')
+        group.add_argument('--background-statistic', default='newsnr', 
+            help="Ranking statistic to use for candidate coincident events")
+        group.add_argument('--background-statistic-files', nargs='+',
+            help="Files containing precalculate values to calculate ranking"
+                 " statistic values", default=[])
+        group.add_argument('--store-background', action='store_true',
+            help="Return background triggers with zerolag coincidencs")
+        group.add_argument('--background-ifar-limit', type=float,
+            help="The limit on inverse false alarm rate to calculate "
+                 "background in years", default=100.0)
+        group.add_argument('--timeslide-interval', type=float,
+            help="The interval between timeslides in seconds", default=0.1)
+        group.add_argument('--ifar-remove-threshold', type=float,
+            help="NOT YET IMLEMENTED", default=100.0)
+
     @property
     def background_time(self):
         """Return the amount of background time that the buffers contain"""

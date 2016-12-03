@@ -89,15 +89,14 @@ class LiveEventManager(object):
             if self.enable_gracedb_upload and self.ifar_upload_threshold < ifar:
                 r = event.upload(fname, psds, low_frequency_cutoff, 
                              testing=self.gracedb_testing, extra_strings=comments)
-                             
                 if args.upload_snr_series:
-                    event.upload_snr_series(r, data_readers, bank)
+                    event.upload_snr_series(r, data_readers, bank)    
             else:
                 event.save(fname)
 
             logging.info('saving coinc to xml %s', fname)
 
-    def check_singles(self, results, psd, low_frequency_cutoff):
+    def check_singles(self, results, psds, low_frequency_cutoff):
         active = [k for k in results if results[k] != None]
         if len(active) == 1:
             from pycbc.events.single import live_single_far_line
@@ -106,7 +105,7 @@ class LiveEventManager(object):
             if single is not None:
                 fname = 'single-%s-%s.xml' % (ifo, single.time)
                 if self.enable_gracedb_upload:
-                    single.upload(fname, psd,
+                    r = single.upload(fname, psds[ifo],
                               low_frequency_cutoff,
                               testing=self.gracedb_testing)  
                 else:
@@ -238,12 +237,6 @@ parser.add_argument('--enable-profiling', type=int,
                          " the end of program executrion")
 
 parser.add_argument('--enable-background-estimation', default=False, action='store_true')
-parser.add_argument('--background-statistic', default='newsnr')
-parser.add_argument('--background-statistic-files', nargs='+', default=[])
-parser.add_argument('--store-background', action='store_true')
-parser.add_argument('--background-ifar-limit', type=float, default=100.0)
-parser.add_argument('--timeslide-interval', type=float, default=0.1)
-parser.add_argument('--ifar-remove-threshold', type=float, default=100.0)
 parser.add_argument('--ifar-upload-threshold', type=float)
 parser.add_argument('--enable-gracedb-upload', action='store_true', default=False)
 parser.add_argument('--file-prefix', default='Live')
@@ -253,6 +246,7 @@ parser.add_argument('--upload-snr-series', action='store_true', default=False)
 
 scheme.insert_processing_option_group(parser)
 fft.insert_fft_option_group(parser)
+LiveCoincTimeslideBackgroundEstimator.insert_args(parser)
 args = parser.parse_args()
 scheme.verify_processing_options(args, parser)
 
@@ -327,16 +321,8 @@ with ctx:
                             analyze_flags=args.analyze_flags,
                             data_quality_flags=args.data_quality_flags)
     if args.enable_background_estimation and evnt.rank == 0:
-        estimator = LiveCoincTimeslideBackgroundEstimator(
-                            len(bank),
-                            args.analysis_chunk,
-                            args.background_statistic, 
-                            args.background_statistic_files, 
-                            return_background=args.store_background,
-                            ifar_limit=args.background_ifar_limit,
-                            timeslide_interval=args.timeslide_interval,
-                            ifar_remove_threshold=args.ifar_remove_threshold,
-                            ifos=ifos)
+        estimator = LiveCoincTimeslideBackgroundEstimator.from_cli(args,
+                            len(bank), args.analysis_chunk, ifos)
 
     logging.info('%s: Starting... ', evnt.rank)
 
@@ -412,7 +398,7 @@ with ctx:
 
             # Check for singles if we don't have coinc time
             if args.enable_single_detector_upload:
-                evnt.check_singles(results, {ifo:psds[ifo]}, args.low_frequency_cutoff)
+                evnt.check_singles(results, psds, args.low_frequency_cutoff)
 
             prefix = '%s-%s-%s-%s' % (''.join(ifos), args.file_prefix, data_end() - args.analysis_chunk, valid_pad)
             evnt.dump(results, prefix, time_index=data_end(),
