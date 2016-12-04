@@ -167,6 +167,7 @@ class SingleCoincForGraceDB(object):
         self.time = sngl.get_end()
         
     def upload_snr_series(self, filename, graceid, data_readers, bank):
+        from ligo.gracedb.rest import GraceDb
         from pycbc.filter import correlate
         from pycbc.fft import ifft
         from pycbc.types import zeros
@@ -189,7 +190,6 @@ class SingleCoincForGraceDB(object):
             snr = TimeSeries(snr, delta_t=delta_t, epoch=start)
             snr.save(filename, group='%s/snr' % ifo)
             stilde.psd.save(filename, group='%s/psd' % ifo)
-        from ligo.gracedb import GraceDB
         GraceDB().writeFile(graceid, filename)
 
     def save(self, filename):
