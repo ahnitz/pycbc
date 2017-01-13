@@ -80,7 +80,9 @@ class LiveEventManager(object):
         """ Save zerolag triggers to a coinc xml file """
         if 'foreground/ifar' in coinc_results: 
             ifar = coinc_results['foreground/ifar']
-            event = SingleCoincForGraceDB(ifos, coinc_results)
+            event = SingleCoincForGraceDB(
+                    ifos, coinc_results, data_readers=data_readers,
+                    bank=bank, upload_snr_series=args.upload_snr_series)
 
             time = int(coinc_results['foreground/%s/end_time' % ifos[0]])
             fname = os.path.join(self.path, 'coinc-%s.xml' % time)
@@ -88,10 +90,8 @@ class LiveEventManager(object):
             comments = ['using ranking statistic: %s' % args.background_statistic]
 
             if self.enable_gracedb_upload and self.ifar_upload_threshold < ifar:
-                r = event.upload(fname, psds, low_frequency_cutoff, 
+                event.upload(fname, psds, low_frequency_cutoff, 
                              testing=self.gracedb_testing, extra_strings=comments)
-                if args.upload_snr_series:
-                    event.upload_snr_series(fname + '.hdf', r, data_readers, bank)
             else:
                 event.save(fname)
 

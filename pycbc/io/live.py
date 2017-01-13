@@ -1,21 +1,23 @@
 import logging
 import pycbc
 import numpy
-from lal import LIGOTimeGPS, YRJUL_SI
+import lal
 from glue.ligolw import ligolw
 from glue.ligolw import lsctables
 from glue.ligolw import utils as ligolw_utils
 from glue.ligolw.utils import process as ligolw_process
+from glue.ligolw import param as ligolw_param
 from pycbc import version as pycbc_version
 from pycbc import pnutils
 from pycbc.tmpltbank import return_empty_sngl
-from pycbc.types import TimeSeries
+from pycbc.types import TimeSeries, zeros
+from pycbc.filter import correlate
+from pycbc.fft import ifft
 
 #FIXME Legacy build PSD xml helpers, delete me when we move away entirely from
 # xml formats
 def _build_series(series, dim_names, comment, delta_name, delta_unit):
     from glue.ligolw import array as ligolw_array
-    from glue.ligolw import param as ligolw_param
     Attributes = ligolw.sax.xmlreader.AttributesImpl
     elem = ligolw.LIGO_LW(Attributes({u"Name": unicode(series.__class__.__name__)}))
     if comment is not None:
@@ -38,7 +40,6 @@ def _build_series(series, dim_names, comment, delta_name, delta_unit):
     return elem
 
 def make_psd_xmldoc(psddict):
-    from glue.ligolw import param as ligolw_param
     Attributes = ligolw.sax.xmlreader.AttributesImpl
     xmldoc = ligolw.Document()
     root_name = u"psd"
@@ -52,7 +53,7 @@ def make_psd_xmldoc(psddict):
 
 class SingleCoincForGraceDB(object):
     """Create xml files and submit them to gracedb from PyCBC Live"""
-    def __init__(self, ifos, coinc_results):
+    def __init__(self, ifos, coinc_results, **kwargs):
         """Initialize a ligolw xml representation of a zerolag trigger
         for upload from pycbc live to gracedb.
 
@@ -113,17 +114,19 @@ class SingleCoincForGraceDB(object):
         coinc_event_map_table = lsctables.New(lsctables.CoincMapTable)
 
         sngl_id = 0
+        sngl_event_id_map = {}
         for ifo in ifos:
             names = [n.split('/')[-1] for n in coinc_results
                      if 'foreground/%s' % ifo in n]
             sngl_id += 1
             sngl = return_empty_sngl()
             sngl.event_id = lsctables.SnglInspiralID(sngl_id)
+            sngl_event_id_map[ifo] = sngl.event_id
             sngl.ifo = ifo
             for name in names:
                 val = coinc_results['foreground/%s/%s' % (ifo, name)]
                 if name == 'end_time':
-                    sngl.set_end(LIGOTimeGPS(val))
+                    sngl.set_end(lal.LIGOTimeGPS(val))
                 else:
                     try:
                         setattr(sngl, name, val)
@@ -159,38 +162,58 @@ class SingleCoincForGraceDB(object):
         coinc_inspiral_row.end_time = sngl.end_time
         coinc_inspiral_row.end_time_ns = sngl.end_time_ns
         coinc_inspiral_row.snr = coinc_results['foreground/stat']
-        far = 1.0 / (YRJUL_SI * coinc_results['foreground/ifar'])
+        far = 1.0 / (lal.YRJUL_SI * coinc_results['foreground/ifar'])
         coinc_inspiral_row.combined_far = far
         coinc_inspiral_table.append(coinc_inspiral_row)
         outdoc.childNodes[0].appendChild(coinc_inspiral_table)
         self.outdoc = outdoc
         self.time = sngl.get_end()
-        
-    def upload_snr_series(self, filename, graceid, data_readers, bank):
-        from ligo.gracedb.rest import GraceDb
-        from pycbc.filter import correlate
-        from pycbc.fft import ifft
-        from pycbc.types import zeros
-        htilde = bank[self.template_id]
-        for ifo in self.ifos:
-            stilde = data_readers[ifo].overwhitened_data(htilde.delta_f)
-            norm = 4.0 * htilde.delta_f / (htilde.sigmasq(stilde.psd) ** 0.5)
-            qtilde = zeros((len(htilde)-1)*2, dtype=htilde.dtype)
-            correlate(htilde, stilde, qtilde)
-            snr = qtilde * 0
-            ifft(qtilde, snr)
 
-            valid_end = int(len(qtilde) - data_readers[ifo].trim_padding)
-            valid_start = int(valid_end - data_readers[ifo].blocksize * data_readers[ifo].sample_rate)
-            seg = slice(valid_start, valid_end)
-            snr = snr[seg]
-            snr *= norm
-            delta_t = 1.0 / data_readers[ifo].sample_rate
-            start = data_readers[ifo].start_time
-            snr = TimeSeries(snr, delta_t=delta_t, epoch=start)
-            snr.save(filename, group='%s/snr' % ifo)
-            stilde.psd.save(filename, group='%s/psd' % ifo)
-        GraceDb().writeFile(graceid, filename)
+        # compute SNR time series
+        self.upload_snr_series = kwargs['upload_snr_series']
+        if self.upload_snr_series:
+            data_readers = kwargs['data_readers']
+            bank = kwargs['bank']
+            htilde = bank[self.template_id]
+            self.snr_series = {}
+            self.snr_series_psd = {}
+            for ifo in self.ifos:
+                stilde = data_readers[ifo].overwhitened_data(htilde.delta_f)
+                norm = 4.0 * htilde.delta_f / (htilde.sigmasq(stilde.psd) ** 0.5)
+                qtilde = zeros((len(htilde)-1)*2, dtype=htilde.dtype)
+                correlate(htilde, stilde, qtilde)
+                snr = qtilde * 0
+                ifft(qtilde, snr)
+
+                valid_end = int(len(qtilde) - data_readers[ifo].trim_padding)
+                valid_start = int(valid_end - data_readers[ifo].blocksize * data_readers[ifo].sample_rate)
+                seg = slice(valid_start, valid_end)
+                snr = snr[seg]
+                snr *= norm
+                delta_t = 1.0 / data_readers[ifo].sample_rate
+                start = data_readers[ifo].start_time
+                snr = TimeSeries(snr, delta_t=delta_t, epoch=start)
+                self.snr_series[ifo] = snr
+                self.snr_series_psd[ifo] = stilde.psd
+
+                # store the on-source slice of the series into the XML doc
+                snr_onsource_time = coinc_results['foreground/%s/end_time' % ifo] - snr.start_time
+                snr_onsource_dur = lal.REARTH_SI / lal.C_SI
+                onsource_idx = round(snr_onsource_time * snr.sample_rate)
+                onsource_start = onsource_idx - int(snr.sample_rate * snr_onsource_dur / 2)
+                onsource_end = onsource_idx + int(snr.sample_rate * snr_onsource_dur / 2)
+                onsource_slice = slice(onsource_start, onsource_end + 1)
+                snr_lal = snr[onsource_slice].lal()
+                snr_lal.name = 'snr'
+                snr_lal.sampleUnits = ''
+                snr_xml = _build_series(
+                        snr_lal, (u'Time', u'Time,Real,Imaginary'), None,
+                        'deltaT', 's')
+                snr_node = outdoc.childNodes[-1].appendChild(snr_xml)
+                eid_param = ligolw_param.new_param(
+                        u'event_id', u'ilwd:char',
+                        unicode(sngl_event_id_map[ifo]))
+                snr_node.appendChild(eid_param)
 
     def save(self, filename):
         """Write this trigger to gracedb compatible xml format
@@ -222,7 +245,6 @@ class SingleCoincForGraceDB(object):
         test trigger (True) or a production trigger (False)
         """
         from ligo.gracedb.rest import GraceDb
-        import lal
 
         self.save(fname)
         extra_strings = [] if extra_strings is None else extra_strings
@@ -260,6 +282,16 @@ class SingleCoincForGraceDB(object):
         for text in extra_strings:
             gracedb.writeLog(r["graceid"], text).json()
         logging.info("Uploaded file psd.xml.gz to event %s.", r["graceid"])
+
+        if self.upload_snr_series:
+            snr_series_fname = fname + '.hdf'
+            for ifo in self.ifos:
+                self.snr_series[ifo].save(snr_series_fname,
+                                          group='%s/snr' % ifo)
+                self.snr_series_psd[ifo].save(snr_series_fname,
+                                              group='%s/psd' % ifo)
+            GraceDb().writeFile(r['graceid'], snr_series_fname)
+
         return r['graceid']
 
 class SingleForGraceDB(SingleCoincForGraceDB):
