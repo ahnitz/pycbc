@@ -19,12 +19,16 @@ def nonlinear_tidal_spa(**kwds):
     from pycbc.types import zeros, Array
 
     # We start with the standard TaylorF2 based waveform
-    tmplt = spa_tmplt(**kwds)
+    tmplt = spa_tmplt.spa_tmplt(**kwds)
 
     # Add the phasing difference from the nonlinear tides
-    diff = zeros(len(tmplt))
+    diff = zeros(len(tmplt), dtype=numpy.complex64)
     kmin = (kwds['f0'] / tmplt.delta_f)
     f = numpy.arange(kmin, len(tmplt)) * tmplt.delta_f
     diff[kmin:] = Array(numpy.exp(1.0j * nonlinear_phase_difference(f,
                kwds['f0'], kwds['A'], kwds['n'], kwds['mass1'], kwds['mass2'])))
-    return tmplt + diff
+    return tmplt * diff
+
+def nonlinear_tidal_spa_full(**kwds):
+    v = nonlinear_tidal_spa(**kwds)
+    return v, v * 1.0j

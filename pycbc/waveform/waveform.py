@@ -203,6 +203,8 @@ cpu_sgburst = _lalsim_sgburst_approximants
 cpu_td = dict(_lalsim_td_approximants.items())
 cpu_fd = _lalsim_fd_approximants
 
+cpu_fd['nonlinear_tidal_spa'] = tides.nonlinear_tidal_spa_full
+
 # Waveforms written in CUDA
 _cuda_td_approximants = {}
 _cuda_fd_approximants = {}
