@@ -41,6 +41,8 @@ from spa_tmplt import spa_tmplt, spa_tmplt_norm, spa_tmplt_end, \
                       spa_tmplt_precondition, spa_amplitude_factor, \
                       spa_length_in_time
 
+from . import tides
+
 default_args = (parameters.fd_waveform_params.default_dict() + \
     parameters.td_waveform_params).default_dict()
 
@@ -552,6 +554,7 @@ _cuda_fd_filters = {}
 
 _cuda_fd_filters['SPAtmplt'] = spa_tmplt
 _inspiral_fd_filters['SPAtmplt'] = spa_tmplt
+_inspiral_fd_filters['nonlinear_tidal_spa'] = tides.nonlinear_tidal_spa
 
 filter_wav = _scheme.ChooseBySchemeDict()
 filter_wav.update( {_scheme.CPUScheme:_inspiral_fd_filters,
@@ -597,9 +600,11 @@ def imrphenomd_length_in_time(**kwds):
 
 _filter_norms["SPAtmplt"] = spa_tmplt_norm
 _filter_preconditions["SPAtmplt"] = spa_tmplt_precondition
-
 _filter_ends["SPAtmplt"] = spa_tmplt_end
 _filter_ends["TaylorF2"] = spa_tmplt_end
+_filter_norms["nonlinear_tidal_spa"] = spa_tmplt_norm
+_filter_preconditions["nonlinear_tidal_spa"] = spa_tmplt_precondition
+_filter_ends["nonlinear_tidal_spa"] = spa_tmplt_end
 #_filter_ends["SEOBNRv1_ROM_EffectiveSpin"] = seobnrv2_final_frequency
 #_filter_ends["SEOBNRv1_ROM_DoubleSpin"] =  seobnrv2_final_frequency
 #_filter_ends["SEOBNRv2_ROM_EffectiveSpin"] = seobnrv2_final_frequency
@@ -611,6 +616,8 @@ _filter_ends["TaylorF2"] = spa_tmplt_end
 
 _template_amplitude_norms["SPAtmplt"] = spa_amplitude_factor
 _filter_time_lengths["SPAtmplt"] = spa_length_in_time
+_template_amplitude_norms["nonlinear_tidal_spa"] = spa_amplitude_factor
+_filter_time_lengths["nonlinear_tidal_spa"] = spa_length_in_time
 _filter_time_lengths["TaylorF2"] = spa_length_in_time
 _filter_time_lengths["SEOBNRv1_ROM_EffectiveSpin"] = seobnrv2_length_in_time
 _filter_time_lengths["SEOBNRv1_ROM_DoubleSpin"] = seobnrv2_length_in_time
