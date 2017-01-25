@@ -569,7 +569,7 @@ class LiveFilterBank(TemplateBank):
         buff_size = pycbc.waveform.get_waveform_filter_length_in_time(approximant, **p)
         
         tlen = self.round_up((buff_size + min_buffer) * self.sample_rate)
-        flen = tlen / 2 + 1
+        flen = int(tlen / 2 + 1)
 
         delta_f = self.sample_rate / float(tlen)
 
