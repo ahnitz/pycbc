@@ -75,10 +75,9 @@ class MetricBank(object):
     def __contains__(self, hp):  
         mmax = 0  
         mnum = 0
-        threshold = hp.threshold
         #Apply sigmas maximal match.
         matches = self.sigma_match_bound(hp.s)            
-        r = self.range()[matches > threshold]
+        r = self.range()[matches > hp.threshold]
 
         #Apply tua0 threshold
         if args.tau0_threshold:
@@ -98,7 +97,7 @@ class MetricBank(object):
                 return False            
 
             hc = self[j]
-            m = gen.match(hp, hc)
+            m = hp.gen.match(hp, hc)
             matches[j] = m
             mnum += 1
             
@@ -108,10 +107,10 @@ class MetricBank(object):
             matches[0:j][update] = maxmatches[update]
 
             # Update where to calculate matches
-            skip_threshold = 1 - (1 - threshold) * 2.0
+            skip_threshold = 1 - (1 - hp.threshold) * 2.0
             inc.data = inc.data[matches[inc.data] > skip_threshold]
             
-            if m > threshold:
+            if m > hp.threshold:
                 return True
             if m > mmax:
                 mmax = m     
@@ -128,6 +127,7 @@ class MetricBank(object):
                 print(err)
                 continue
     
+            hp.gen = gen
             hp.threshold = threshold
             if hp not in self:
                 print("ADDING TEMPLATE: %0.3f %i %i" %(hp.mmax, len(self), hp.mnum))
