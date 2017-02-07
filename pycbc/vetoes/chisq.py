@@ -300,7 +300,9 @@ class SingleDetPowerChisq(object):
     """Class that handles precomputation and memory management for efficiently
     running the power chisq in a single detector inspiral analysis.
     """
-    def __init__(self, num_bins=0, snr_threshold=None):
+    def __init__(self, num_bins=0, snr_threshold=None,
+                       residual_chisq_threshold=None,
+                       residual_chisq_locations=None):
         if not (num_bins == "0" or num_bins == 0):
             self.do = True
             self.column_name = "chisq"
@@ -309,6 +311,9 @@ class SingleDetPowerChisq(object):
         else:
             self.do = False
         self.snr_threshold = snr_threshold
+        
+        self.residual_chisq_threshold = residual_chisq_threshold
+        self.residual_chisq_locations = residual_chisq_locations
 
     @staticmethod
     def parse_option(row, arg):
@@ -383,8 +388,30 @@ class SingleDetPowerChisq(object):
                     rchisq[above] = chisq
             else:
                 rchisq = chisq
+            dof = numpy.repeat(dof, len(indices))
+                
+            # This is implemented slowly, so let's not call it often, OK?
+            if self.residual_chisq_threshold:
+                from pycbc.events import newsnr
+                for i in range(len(rchisq)):
+                    if newsnr(abs(snrv[i] * snr_norm), rchisq[i] / dof[i]) > self.residual_chisq_threshold:
+                        # Make new corr with the signal subtracted.
+                        from pycbc.waveform.utils import apply_fd_time_shift
+                        corr_sub = corr * 1
+                        idxs = indices + self.residual_chisq_locations
+                        dt = 1.0 / ((len(template) - 1)*2 * template.delta_f)
+                        times = template.epoch + dt * idxs
+                        corr_sub[0:len(template)] = corr[0:len(template)] - snrv[i] * apply_fd_time_shift(template, time)
+                       
+                        # Sum up chisq from around the original time.
+                        res_chisq = power_chisq_at_points_from_precomputed(
+                                corr_sub, numpy.repeat(snrv[i], len(idxs)), snr_norm, bins, idxs)
+                        print dt, idxs, res_chisq, rchisq[i], dof[i]           
+                        # Update chisq from at the time with this new info
+                        rchisq[i] += res_chisq.sum()
+                        dof[i] *= (len(self.residual_chisq_locations) + 1)
 
-            return rchisq, numpy.repeat(dof, len(indices))# dof * numpy.ones_like(indices)
+            return rchisq, dof
         else:
             return None, None
 
