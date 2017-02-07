@@ -96,7 +96,7 @@ parser.add_argument("--maximization-interval", nargs='+', type=float, default=0,
                     help="Maximize triggers over the template bank (ms)")
 parser.add_argument("--bank-veto-bank-file", type=str, help="FIXME: ADD")
 parser.add_argument("--residual-chisq-threshold", type=float)
-parser.add_argument("--residual-chisq-locations", type=int)
+parser.add_argument("--residual-chisq-locations", type=int, nargs='+')
 parser.add_argument("--chisq-snr-threshold", type=float,
                     help="Minimum SNR to calculate the power chisq")
 parser.add_argument("--chisq-bins", default=0, help=

@@ -396,17 +396,36 @@ class SingleDetPowerChisq(object):
                 for i in range(len(rchisq)):
                     if newsnr(abs(snrv[i] * snr_norm), rchisq[i] / dof[i]) > self.residual_chisq_threshold:
                         # Make new corr with the signal subtracted.
-                        from pycbc.waveform.utils import apply_fd_time_shift
-                        corr_sub = corr * 1
-                        idxs = indices + self.residual_chisq_locations
+                        from pycbc.waveform.utils import apply_fseries_time_shift
+                        from pycbc.types import FrequencySeries
+                        from pycbc.filter import sigma
+                        
+                        kmin = int(template.f_lower / psd.delta_f)
+                        idxs = indices[i] + self.residual_chisq_locations
                         dt = 1.0 / ((len(template) - 1)*2 * template.delta_f)
-                        times = template.epoch + dt * idxs
-                        corr_sub[0:len(template)] = corr[0:len(template)] - snrv[i] * apply_fd_time_shift(template, time)
-                       
+                        time = float(template.epoch) + dt * indices[i]
+                        
+                        stilde = corr[0:len(template)] * psd / template.conj() 
+                        
+                        stilde -= snrv[i] * snr_norm * apply_fseries_time_shift(template, time) / (template.sigmasq(psd)) ** 0.5
+                        corr_sub = (template.conj() * stilde / psd)
+                        corr_sub.resize(len(corr))
+                        corr_sub[0:kmin] = 0
+                        corr_sub[len(psd)-1] = 0
+
+                        snrvr = []   
+                        times = float(template.epoch) - dt * idxs
+                        for t in times:            
+                            snrvr.append(apply_fseries_time_shift(FrequencySeries(corr_sub, delta_f=template.delta_f), t).sum()) 
+                        snrvr = numpy.array(snrvr)   
+                              
+                        #print snrvr, idxs, snrv[i], indices[i], abs(snrvr) / abs(snrv[i])
+                        #print snrvr * snr_norm
                         # Sum up chisq from around the original time.
                         res_chisq = power_chisq_at_points_from_precomputed(
-                                corr_sub, numpy.repeat(snrv[i], len(idxs)), snr_norm, bins, idxs)
-                        print dt, idxs, res_chisq, rchisq[i], dof[i]           
+                                corr_sub, snrvr, snr_norm, bins, idxs)
+                        #print dt, idxs, res_chisq, rchisq[i], dof[i], snrvr, snrv[i] 
+                                 
                         # Update chisq from at the time with this new info
                         rchisq[i] += res_chisq.sum()
                         dof[i] *= (len(self.residual_chisq_locations) + 1)
