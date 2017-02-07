@@ -193,6 +193,12 @@ def newsnr(snr, reduced_x2, q=6., n=2.):
         return newsnr
     else:
         return newsnr[0]
+       
+def bluesnr(snr, bchisq, lchisq):
+    """ Combined SNR derived from NewSNR and Lat Chisq"""
+    # Test function
+    return newsnr(snr, lchisq)
+    
 
 def effsnr(snr, reduced_x2, fac=250.):
     """Calculate the effective SNR statistic. See (S5y1 paper) for definition.
@@ -463,6 +469,9 @@ class EventManager(object):
                 f['chisq_dof'] = numpy.zeros(len(self.events))
 
             f['template_hash'] = th[tid]
+
+            if 'lat_chisq' in self.events.dtype.names:
+                f['lat_chisq'] = self.events['lat_chisq']
 
         if self.opt.trig_start_time:
             f['search/start_time'] = numpy.array([self.opt.trig_start_time])

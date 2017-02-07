@@ -300,7 +300,7 @@ class SingleDetPowerChisq(object):
     """Class that handles precomputation and memory management for efficiently
     running the power chisq in a single detector inspiral analysis.
     """
-    def __init__(self, num_bins=0, snr_threshold=None):
+    def __init__(self, num_bins=0, snr_threshold=None,):
         if not (num_bins == "0" or num_bins == 0):
             self.do = True
             self.column_name = "chisq"
@@ -383,10 +383,76 @@ class SingleDetPowerChisq(object):
                     rchisq[above] = chisq
             else:
                 rchisq = chisq
-
-            return rchisq, numpy.repeat(dof, len(indices))# dof * numpy.ones_like(indices)
+            dof = numpy.repeat(dof, len(indices))
+            return rchisq, dof
         else:
             return None, None
+
+class SingleDetLatChisq(SingleDetPowerChisq):
+    """Class that handles precomputation and memory management for efficiently
+    running the power chisq in a single detector inspiral analysis.
+    """
+    def __init__(self, num_bins=0,
+                       chisq_threshold=None,
+                       chisq_locations=None):
+        if chisq_threshold:
+            self.do = True
+            self.num_bins = num_bins
+        else:
+            self.do = False
+        
+        self.chisq_threshold = chisq_threshold
+        self.chisq_locations = chisq_locations
+
+    def values(self, stilde, template, psd, snrv, snr_norm, indices):
+        """ Calculate the chisq at points given by indices.
+
+        Returns
+        -------
+        chisq: Array
+            Chisq values, one for each sample index
+        """
+        if not self.do:
+            return None
+        
+        bins = self.cached_chisq_bins(template, psd)
+        dof = ((len(bins) - 1) * 2 - 2) *  (len(self.chisq_locations) + 1)
+
+        # This is implemented slowly, so let's not call it often, OK?
+        chisq = numpy.ones(len(snrv))
+        stilde = stilde * psd
+        for i in range(len(snrv)):
+            if abs(snrv[i] * snr_norm) < self.chisq_threshold:
+                continue
+            # Make new corr with the signal subtracted.
+            from pycbc.waveform.utils import apply_fseries_time_shift
+            from pycbc.types import FrequencySeries
+            
+            N = (len(template) - 1)*2 
+            dt = 1.0 / (N * template.delta_f)
+            kmin = int(template.f_lower / psd.delta_f)
+            idxs = indices[i] + (numpy.array(self.chisq_locations) / dt).astype(numpy.int32)
+            
+            # Subtract off the template            
+            time = float(template.epoch) + dt * indices[i]
+            scale = snrv[i] * snr_norm / (template.sigmasq(psd)) ** 0.5
+            stilde -= scale * apply_fseries_time_shift(template, time)
+            corr = (template.conj() * stilde / psd)
+            corr.resize(N)
+            corr[0:kmin] = 0
+            corr[template.end_idx:] = 0
+            
+            # Calculate the SNR for the lateral shifts
+            snrvr = []   
+            times = float(template.epoch) - dt * idxs
+            for t in times:       
+                corr = FrequencySeries(corr, delta_f=template.delta_f)
+                snrvr.append(apply_fseries_time_shift(corr, t).sum()) 
+            snrvr = numpy.array(snrvr)   
+            res_chisq = power_chisq_at_points_from_precomputed(
+                            corr, snrvr, snr_norm, bins, idxs)
+            chisq[i] = res_chisq.sum() / dof 
+        return chisq
 
 class SingleDetSkyMaxPowerChisq(SingleDetPowerChisq):
     """Class that handles precomputation and memory management for efficiently
