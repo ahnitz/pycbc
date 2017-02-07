@@ -14,6 +14,7 @@ parser.add_argument('--minimal-match', type=float)
 parser.add_argument('--buffer-length', type=float, help='size of waveform buffer in seconds')
 parser.add_argument('--sample-rate', type=int, help='sample rate in seconds')
 parser.add_argument('--low-frequency-cutoff', type=float)
+parser.add_argument('--enable-sigma-bound', action='store_true')
 parser.add_argument('--tau0-threshold', type=float)
 parser.add_argument('--permissive')
 parser.add_argument('--tolerance', type=float)
@@ -76,8 +77,12 @@ class MetricBank(object):
         mmax = 0  
         mnum = 0
         #Apply sigmas maximal match.
-        matches = self.sigma_match_bound(hp.s)            
-        r = self.range()[matches > hp.threshold]
+        if args.enable_sigma_bound:
+            matches = self.sigma_match_bound(hp.s)            
+            r = self.range()[matches > hp.threshold]
+        else:
+            matches = numpy.ones(len(self))
+            r = self.range()
 
         #Apply tua0 threshold
         if args.tau0_threshold:
