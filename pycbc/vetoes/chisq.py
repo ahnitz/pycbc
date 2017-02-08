@@ -390,6 +390,7 @@ class SingleDetPowerChisq(object):
                 rchisq = chisq
             dof = numpy.repeat(dof, len(indices))
                 
+            print rchisq
             # This is implemented slowly, so let's not call it often, OK?
             if self.residual_chisq_threshold:
                 from pycbc.events import newsnr
@@ -424,7 +425,7 @@ class SingleDetPowerChisq(object):
                         # Sum up chisq from around the original time.
                         res_chisq = power_chisq_at_points_from_precomputed(
                                 corr_sub, snrvr, snr_norm, bins, idxs)
-                        #print dt, idxs, res_chisq, rchisq[i], dof[i], snrvr, snrv[i] 
+                        print dt, idxs, res_chisq, rchisq[i], dof[i], snrvr, snrv[i] 
                                  
                         # Update chisq from at the time with this new info
                         rchisq[i] += res_chisq.sum()
