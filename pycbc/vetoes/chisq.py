@@ -452,8 +452,6 @@ class SingleDetLatChisq(SingleDetPowerChisq):
             res_chisq = power_chisq_at_points_from_precomputed(
                             corr, snrvr, snr_norm, bins, idxs)
             chisq[i] = res_chisq.sum() / dof 
-            print dof, res_chisq
-        print chisq
         return chisq
 
 class SingleDetSkyMaxPowerChisq(SingleDetPowerChisq):

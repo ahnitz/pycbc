@@ -464,7 +464,7 @@ class EventManager(object):
 
             f['template_hash'] = th[tid]
 
-            if 'lat_chisq' in self.events:
+            if 'lat_chisq' in self.events.dtype.names:
                 f['lat_chisq'] = self.events['lat_chisq']
 
         if self.opt.trig_start_time:
