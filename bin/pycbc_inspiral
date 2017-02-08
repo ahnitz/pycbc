@@ -95,8 +95,8 @@ parser.add_argument("--cluster-window", type=float, default = -1,
 parser.add_argument("--maximization-interval", nargs='+', type=float, default=0,
                     help="Maximize triggers over the template bank (ms)")
 parser.add_argument("--bank-veto-bank-file", type=str, help="FIXME: ADD")
-parser.add_argument("--residual-chisq-threshold", type=float)
-parser.add_argument("--residual-chisq-locations", type=int, nargs='+')
+parser.add_argument("--lat-chisq-threshold", type=float)
+parser.add_argument("--lat-chisq-locations", type=float, nargs='+')
 parser.add_argument("--chisq-snr-threshold", type=float,
                     help="Minimum SNR to calculate the power chisq")
 parser.add_argument("--chisq-bins", default=0, help=
@@ -219,7 +219,8 @@ with ctx:
         'chisq_dof'      : int,
         'bank_chisq'     : float32,
         'bank_chisq_dof' : int,
-        'cont_chisq'     : float32
+        'cont_chisq'     : float32,
+        'lat_chisq'      : float32,
                 }
     out_vals = {
         'time_index'     : None,
@@ -228,7 +229,8 @@ with ctx:
         'chisq_dof'      : None,
         'bank_chisq'     : None,
         'bank_chisq_dof' : None,
-        'cont_chisq'     : None
+        'cont_chisq'     : None,
+        'lat_chisq'      : None,
                }
 
 
@@ -277,9 +279,12 @@ with ctx:
                                           phase_order=opt.order,
                                           approximant=opt.approximant)
 
-    power_chisq = vetoes.SingleDetPowerChisq(opt.chisq_bins, opt.chisq_snr_threshold,
-                                             opt.residual_chisq_threshold,
-                                             opt.residual_chisq_locations)
+    power_chisq = vetoes.SingleDetPowerChisq(opt.chisq_bins, opt.chisq_snr_threshold)
+
+    lat_chisq = vetoes.SingleDetLatChisq(opt.chisq_bins,
+                                             opt.lat_chisq_threshold,
+                                             opt.lat_chisq_locations)                                             
+                                             
     autochisq = vetoes.SingleDetAutoChisq(opt.autochi_stride,
                                  opt.autochi_number_points,
                                  onesided=opt.autochi_onesided,
@@ -355,6 +360,9 @@ with ctx:
             out_vals['chisq'], out_vals['chisq_dof'] = \
                   power_chisq.values(corr, snrv, norm, stilde.psd,
                                      idx+stilde.analyze.start, template)
+
+            out_vals['lat_chisq'] = lat_chisq.values(stilde, template, stilde.psd,
+                                          snrv, norm, idx+stilde.analyze.start)
 
             out_vals['cont_chisq'] = \
                   autochisq.values(snr, idx+stilde.analyze.start, template,

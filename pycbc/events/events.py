@@ -464,6 +464,9 @@ class EventManager(object):
 
             f['template_hash'] = th[tid]
 
+            if 'lat_chisq' in self.events:
+                f['lat_chisq'] = self.events['lat_chisq']
+
         if self.opt.trig_start_time:
             f['search/start_time'] = numpy.array([self.opt.trig_start_time])
             search_start_time = float(self.opt.trig_start_time)
