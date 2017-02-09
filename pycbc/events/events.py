@@ -193,6 +193,12 @@ def newsnr(snr, reduced_x2, q=6., n=2.):
         return newsnr
     else:
         return newsnr[0]
+       
+def bluesnr(snr, bchisq, lchisq):
+    """ Combined SNR derived from NewSNR and Lat Chisq"""
+    # Test function
+    return newsnr(snr, rchsiq) / lchisq
+    
 
 def effsnr(snr, reduced_x2, fac=250.):
     """Calculate the effective SNR statistic. See (S5y1 paper) for definition.
