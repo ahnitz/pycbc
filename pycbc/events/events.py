@@ -197,7 +197,7 @@ def newsnr(snr, reduced_x2, q=6., n=2.):
 def bluesnr(snr, bchisq, lchisq):
     """ Combined SNR derived from NewSNR and Lat Chisq"""
     # Test function
-    return newsnr(snr, rchsiq) / lchisq
+    return newsnr(snr, rchisq)
     
 
 def effsnr(snr, reduced_x2, fac=250.):
