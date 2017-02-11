@@ -138,6 +138,7 @@ point_chisq_code = """
         
         for (unsigned int i=0; i<n; i++){
             chisq[i] += outr[i]*outr[i] + outi[i]*outi[i];
+            //printf("INTERNAL CHISQ %f %f %f \\n", outr[i]*outr[i] + outi[i]*outi[i], float(bstart) / 512.0, float(bend) / 512.0); 
         }
         free(outr);
         free(outi);

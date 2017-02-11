@@ -800,7 +800,7 @@ def get_chisq_from_file_choice(hdfile, chisq_choice):
         bank_chisq /= bank_chisq_dof
     if chisq_choice == 'lat':
         chisq = f['lat_chisq'][:]
-    if chisq_choice == 'traditional':
+    elif chisq_choice == 'traditional':
         chisq = trad_chisq
     elif chisq_choice == 'cont':
         chisq = cont_chisq

@@ -412,46 +412,47 @@ class SingleDetLatChisq(SingleDetPowerChisq):
         chisq: Array
             Chisq values, one for each sample index
         """
+        from pycbc.waveform.utils import apply_fseries_time_shift
+        from pycbc.filter import sigma            
+        from pycbc.waveform import sinegauss
+
         if not self.do:
             return None
         
         bins = self.cached_chisq_bins(template, psd)
-        dof = ((len(bins) - 1) * 2 - 2) *  (len(self.chisq_locations) + 1)
-
+        dof = ((len(bins) - 1) * 2 - 2) *  (len(self.chisq_locations))
+        if bins[-2] * template.delta_f > 600:
+            return numpy.ones(len(snrv))
         # This is implemented slowly, so let's not call it often, OK?
         chisq = numpy.ones(len(snrv))
-        stilde = stilde * psd
         for i in range(len(snrv)):
-            if abs(snrv[i] * snr_norm) < self.chisq_threshold:
+            snr = abs(snrv[i] * snr_norm)
+            if snr < self.chisq_threshold:
                 continue
-            # Make new corr with the signal subtracted.
-            from pycbc.waveform.utils import apply_fseries_time_shift
-            from pycbc.types import FrequencySeries
-            
-            N = (len(template) - 1)*2 
+
+            N = (len(template) - 1) * 2
             dt = 1.0 / (N * template.delta_f)
             kmin = int(template.f_lower / psd.delta_f)
-            idxs = indices[i] + (numpy.array(self.chisq_locations) / dt).astype(numpy.int32)
-            
-            # Subtract off the template            
             time = float(template.epoch) + dt * indices[i]
-            scale = snrv[i] * snr_norm / (template.sigmasq(psd)) ** 0.5
-            stilde -= scale * apply_fseries_time_shift(template, time)
-            corr = (template.conj() * stilde / psd)
-            corr.resize(N)
-            corr[0:kmin] = 0
-            corr[template.end_idx:] = 0
-            
-            # Calculate the SNR for the lateral shifts
-            snrvr = []   
-            times = float(template.epoch) - dt * idxs
-            for t in times:       
-                corr = FrequencySeries(corr, delta_f=template.delta_f)
-                snrvr.append(apply_fseries_time_shift(corr, t).sum()) 
-            snrvr = numpy.array(snrvr)   
-            res_chisq = power_chisq_at_points_from_precomputed(
-                            corr, snrvr, snr_norm, bins, idxs)
-            chisq[i] = res_chisq.sum() / dof 
+            stilde_shift = apply_fseries_time_shift(stilde, -time)
+
+            chisq[i] = 0
+            for offset in [75, 100, 125, 150, 225]:
+                fcen = bins[-2] * template.delta_f + offset
+                flow = max(kmin * template.delta_f, fcen - 50)
+                fhigh = fcen + 50
+                kmin = int(flow / template.delta_f)
+                kmax = int(fhigh / template.delta_f)
+
+                gtem = sinegauss.fd_sine_gaussian(1.0, 30, fcen, flow,
+                                              len(template) * template.delta_f,
+                                              template.delta_f).astype(numpy.complex64)
+                gsigma = sigma(gtem, psd=psd,
+                                     low_frequency_cutoff=flow, 
+                                     high_frequency_cutoff=fhigh)
+                gsnr = (gtem[kmin:kmax] * stilde_shift[kmin:kmax]).sum() * 4.0 * gtem.delta_f / gsigma
+                chisq[i] += abs(gsnr)**2.0 / 10.0
+        print chisq
         return chisq
 
 class SingleDetSkyMaxPowerChisq(SingleDetPowerChisq):
