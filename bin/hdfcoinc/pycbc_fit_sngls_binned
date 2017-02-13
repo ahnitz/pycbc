@@ -35,7 +35,7 @@ stat_dict = {
     "new_snr"       : events.newsnr,
     "effective_snr" : events.effsnr,
     "snr"           : lambda snr, rchisq : snr,
-    "snronchi"      : lambda snr, rchisq : snr / (rchisq ** 0.5)
+    "snronchi"      : lambda snr, rchisq : snr / (rchisq ** 0.5),
     "blue_snr"      : events.bluesnr,
 }
 
@@ -44,9 +44,8 @@ def get_stat(statchoice, snr, rchisq, lchisq, fac):
         if statchoice not in ["new_snr", "effective_snr"]:
             raise RuntimeError("Can't use --stat-factor with this statistic!")
         return stat_dict[statchoice](snr, rchisq, fac)
-    elif:
-        statchoice == 'blue_snr':
-            return stat_dict[statchoice](snr, rchisq, lchisq)
+    elif statchoice == 'blue_snr':
+        return stat_dict[statchoice](snr, rchisq, lchisq)
     else:
         return stat_dict[statchoice](snr, rchisq)
 

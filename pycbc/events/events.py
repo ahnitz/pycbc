@@ -733,7 +733,7 @@ class EventManagerMultiDet(EventManager):
                         f['gating/' + gate_type + '/pad'] = \
                                 numpy.array([g[2] for g in gating_info[gate_type]])
 
-__all__ = ['threshold_and_cluster', 'newsnr', 'effsnr',
+__all__ = ['threshold_and_cluster', 'newsnr', 'effsnr', 'bluesnr',
            'findchirp_cluster_over_window',
            'threshold', 'cluster_reduce', 'ThresholdCluster',
            'threshold_real_numpy',
