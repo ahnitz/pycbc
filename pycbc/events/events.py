@@ -198,8 +198,16 @@ def bluesnr(snr, bchisq, lchisq):
     """ Combined SNR derived from NewSNR and Lat Chisq"""
     # Test function
     nsnr = newsnr(snr, bchisq)
-    nsnr[lchisq > 5] = 4
-    return nsnr
+    nsnr = numpy.array(nsnr, ndmin=1)
+    lchisq = numpy.array(lchisq, ndmin=1)
+    t = numpy.array(lchisq > 5, ndmin=1)
+    if len(t) > 0:
+        nsnr[t] = 4
+
+    if len(nsnr) > 1:
+        return nsnr
+    else:
+        return nsnr[0]
 
 def effsnr(snr, reduced_x2, fac=250.):
     """Calculate the effective SNR statistic. See (S5y1 paper) for definition.
