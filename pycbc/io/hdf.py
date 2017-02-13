@@ -409,7 +409,7 @@ class SingleDetTriggers(object):
                 stat = np.array([stat])
             self.stat_name = "Reweighted SNR"
         elif ranking_statistic == "bluesnr":
-            stat = self.newsnr
+            stat = self.bluesnr
             # newsnr doesn't return an array if len(stat) == 1
             if len(self.snr) == 1:
                 stat = np.array([stat])
