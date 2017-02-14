@@ -392,8 +392,8 @@ class SingleDetLatChisq(SingleDetPowerChisq):
     """Class that handles precomputation and memory management for efficiently
     running the power chisq in a single detector inspiral analysis.
     """
-    def __init__(self, num_bins=0,
-                       chisq_threshold=None,
+    def __init__(self, bank, num_bins=0,
+                       snr_threshold=None,
                        chisq_locations=None):
         if chisq_threshold:
             self.do = True
@@ -401,8 +401,13 @@ class SingleDetLatChisq(SingleDetPowerChisq):
         else:
             self.do = False
         
-        self.chisq_threshold = chisq_threshold
-        self.chisq_locations = chisq_locations
+        self.snr_threshold = snr_threshold
+        self.params = {}
+        for descr in chisq_locations:
+            region, values = descr.split(":")
+            subtable = bank.table.parse_boolargs(region)
+            for h in subtable['template_hash'][:]
+                self.params[h] = values
 
     def values(self, stilde, template, psd, snrv, snr_norm, indices):
         """ Calculate the chisq at points given by indices.
@@ -412,6 +417,11 @@ class SingleDetLatChisq(SingleDetPowerChisq):
         chisq: Array
             Chisq values, one for each sample index
         """
+        if template.param.template_hash not in self.params:
+            return numpy.ones(len(snrv))
+        
+        values = self.params[template.sparam.template_hash].split(',')
+
         from pycbc.waveform.utils import apply_fseries_time_shift
         from pycbc.filter import sigma            
         from pycbc.waveform import sinegauss
@@ -420,9 +430,7 @@ class SingleDetLatChisq(SingleDetPowerChisq):
             return None
         
         bins = self.cached_chisq_bins(template, psd)
-        dof = ((len(bins) - 1) * 2 - 2) *  (len(self.chisq_locations))
-        if bins[-2] * template.delta_f > 600:
-            return numpy.ones(len(snrv))
+
         # This is implemented slowly, so let's not call it often, OK?
         chisq = numpy.ones(len(snrv))
         for i in range(len(snrv)):
@@ -436,22 +444,36 @@ class SingleDetLatChisq(SingleDetPowerChisq):
             time = float(template.epoch) + dt * indices[i]
             stilde_shift = apply_fseries_time_shift(stilde, -time)
 
+            qwindow = 50
             chisq[i] = 0
-            for offset in [75, 100, 125, 150, 225]:
-                fcen = bins[-2] * template.delta_f + offset
-                flow = max(kmin * template.delta_f, fcen - 50)
-                fhigh = fcen + 50
+            fpeak = (bins[-2] * 2.0 - bins[-3]) * template.delta_f
+            fstop = len(htilde) * htilde.delta_f * 0.9
+            dof = 0
+            for q, offset in values.split('-'):
+                dof += 2
+                fcen = fpeak + offset
+                flow = max(kmin * template.delta_f, fcen - qwindow)
+                fhigh = fcen + qwindow
+
+                # Don't go up to Nyquist
+                if fhigh > fstop:
+                    continue
+
                 kmin = int(flow / template.delta_f)
                 kmax = int(fhigh / template.delta_f)
 
-                gtem = sinegauss.fd_sine_gaussian(1.0, 30, fcen, flow,
-                                              len(template) * template.delta_f,
-                                              template.delta_f).astype(numpy.complex64)
+                #Calculate sing-gaussian tile
+                gtem = sinegauss.fd_sine_gaussian(1.0, q, fcen, flow,
+                                      len(template) * template.delta_f,
+                                      template.delta_f).astype(numpy.complex64)
                 gsigma = sigma(gtem, psd=psd,
                                      low_frequency_cutoff=flow, 
                                      high_frequency_cutoff=fhigh)
-                gsnr = (gtem[kmin:kmax] * stilde_shift[kmin:kmax]).sum() * 4.0 * gtem.delta_f / gsigma
-                chisq[i] += abs(gsnr)**2.0 / 10.0
+                #Calculate the SNR of the tile
+                gsnr = (gtem[kmin:kmax] * stilde_shift[kmin:kmax]).sum() 
+                gnsr *= 4.0 * gtem.delta_f / gsigma
+                chisq[i] += abs(gsnr)**2.0
+            chisq[i] /= dof
         print chisq
         return chisq
 
