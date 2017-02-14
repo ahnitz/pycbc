@@ -395,7 +395,7 @@ class SingleDetLatChisq(SingleDetPowerChisq):
     def __init__(self, bank, num_bins=0,
                        snr_threshold=None,
                        chisq_locations=None):
-        if chisq_threshold:
+        if snr_threshold:
             self.do = True
             self.num_bins = num_bins
         else:
@@ -405,8 +405,9 @@ class SingleDetLatChisq(SingleDetPowerChisq):
         self.params = {}
         for descr in chisq_locations:
             region, values = descr.split(":")
-            subtable = bank.table.parse_boolargs(region)
-            for h in subtable['template_hash'][:]
+            mask = bank.table.parse_boolargs([(1, region), (0, 'else')])[0]
+            hashes = bank.table['template_hash'][mask.astype(bool)]
+            for h in hashes:
                 self.params[h] = values
 
     def values(self, stilde, template, psd, snrv, snr_norm, indices):
@@ -417,10 +418,10 @@ class SingleDetLatChisq(SingleDetPowerChisq):
         chisq: Array
             Chisq values, one for each sample index
         """
-        if template.param.template_hash not in self.params:
+        if template.params.template_hash not in self.params:
             return numpy.ones(len(snrv))
         
-        values = self.params[template.sparam.template_hash].split(',')
+        values = self.params[template.params.template_hash].split(',')
 
         from pycbc.waveform.utils import apply_fseries_time_shift
         from pycbc.filter import sigma            
@@ -435,7 +436,7 @@ class SingleDetLatChisq(SingleDetPowerChisq):
         chisq = numpy.ones(len(snrv))
         for i in range(len(snrv)):
             snr = abs(snrv[i] * snr_norm)
-            if snr < self.chisq_threshold:
+            if snr < self.snr_threshold:
                 continue
 
             N = (len(template) - 1) * 2
@@ -447,10 +448,11 @@ class SingleDetLatChisq(SingleDetPowerChisq):
             qwindow = 50
             chisq[i] = 0
             fpeak = (bins[-2] * 2.0 - bins[-3]) * template.delta_f
-            fstop = len(htilde) * htilde.delta_f * 0.9
+            fstop = len(template) * template.delta_f * 0.9
             dof = 0
-            for q, offset in values.split('-'):
-                dof += 2
+            for descr in values:
+                q, offset = descr.split('-')
+                q, offset = float(q), float(offset)
                 fcen = fpeak + offset
                 flow = max(kmin * template.delta_f, fcen - qwindow)
                 fhigh = fcen + qwindow
@@ -471,10 +473,11 @@ class SingleDetLatChisq(SingleDetPowerChisq):
                                      high_frequency_cutoff=fhigh)
                 #Calculate the SNR of the tile
                 gsnr = (gtem[kmin:kmax] * stilde_shift[kmin:kmax]).sum() 
-                gnsr *= 4.0 * gtem.delta_f / gsigma
+                gsnr *= 4.0 * gtem.delta_f / gsigma
                 chisq[i] += abs(gsnr)**2.0
+                dof += 2
             chisq[i] /= dof
-        print chisq
+            logging.info('Found chisq %s', chisq[i])
         return chisq
 
 class SingleDetSkyMaxPowerChisq(SingleDetPowerChisq):

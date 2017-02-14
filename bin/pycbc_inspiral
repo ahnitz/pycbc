@@ -281,10 +281,6 @@ with ctx:
 
     power_chisq = vetoes.SingleDetPowerChisq(opt.chisq_bins, opt.chisq_snr_threshold)
 
-    lat_chisq = vetoes.SingleDetLatChisq(opt.chisq_bins,
-                                             opt.lat_snr_threshold,
-                                             opt.lat_chisq_locations)                                             
-                                             
     autochisq = vetoes.SingleDetAutoChisq(opt.autochi_stride,
                                  opt.autochi_number_points,
                                  onesided=opt.autochi_onesided,
@@ -304,6 +300,10 @@ with ctx:
         taper=opt.taper_template, approximant=opt.approximant,
         out=template_mem, max_template_length=opt.max_template_length)
 
+    lat_chisq = vetoes.SingleDetLatChisq(bank, opt.chisq_bins,
+                                             opt.lat_snr_threshold,
+                                             opt.lat_chisq_locations)                                             
+                                             
     ntemplates = len(bank)
     nfilters = 0
 
