@@ -542,7 +542,7 @@ class SingleDetTriggers(object):
 
     @property
     def lchisq(self):
-        return np.array(self.trigs['lchisq'])[self.mask]
+        return np.array(self.trigs['lat_chisq'])[self.mask]
 
     @property
     def u_vals(self):

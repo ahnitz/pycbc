@@ -203,7 +203,6 @@ def bluesnr(snr, bchisq, lchisq):
     t = numpy.array(lchisq > 5, ndmin=1)
     if len(t) > 0:
         nsnr[t] = 4
-
     if len(nsnr) > 1:
         return nsnr
     else:

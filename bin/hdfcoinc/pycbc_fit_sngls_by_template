@@ -140,7 +140,7 @@ chisq = trigf[args.ifo+'/chisq'][:]
 chisq_dof = trigf[args.ifo+'/chisq_dof'][:]
 rchisq = chisq / (2 * chisq_dof - 2)
 try:
-    lchisq = trigf[args.ifo+'/lat_chisq'][:][aboveminth]
+    lchisq = trigf[args.ifo+'/lat_chisq'][:]
 except:
     lchisq = None
 
