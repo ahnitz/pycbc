@@ -17,12 +17,13 @@ parser.add_argument('--low-frequency-cutoff', type=float)
 parser.add_argument('--enable-sigma-bound', action='store_true')
 parser.add_argument('--tau0-threshold', type=float)
 parser.add_argument('--permissive')
+parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--tolerance', type=float)
 parser.add_argument('--max-mtotal', type=float)
 pycbc.psd.insert_psd_option_group(parser)
 args = parser.parse_args()
 pycbc.init_logging(args.verbose)
-numpy.random.seed(0)
+numpy.random.seed(args.seed)
 
 class Shrinker(object):
     def __init__(self, data):
@@ -193,6 +194,7 @@ if args.input_file:
     params = {}
     for k in f:
         params[k] = f[k][:]
+    logging.info('Starting with %s templates', len(params[k]))
     bank, _ = bank.round(gen, params, args.minimal_match)
 
 while conv > tolerance:

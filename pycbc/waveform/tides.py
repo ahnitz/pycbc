@@ -22,7 +22,7 @@ def nonlinear_tidal_spa(**kwds):
     tmplt = spa_tmplt.spa_tmplt(**kwds)
 
     # Add the phasing difference from the nonlinear tides
-    kmin = (kwds['f0'] / tmplt.delta_f)
+    kmin = int((kwds['f0'] / tmplt.delta_f))
     f = numpy.arange(kmin, len(tmplt)) * tmplt.delta_f
     tmplt[kmin:] *= Array(numpy.exp(1.0j * nonlinear_phase_difference(f,
                kwds['f0'], kwds['A'], kwds['n'], kwds['mass1'], kwds['mass2'])), dtype=tmplt.dtype)
