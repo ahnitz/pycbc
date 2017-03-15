@@ -207,7 +207,6 @@ while conv > tolerance:
     params = {}
     for name, pmin, pmax in zip(args.params, args.min, args.max):
         params[name] = numpy.random.uniform(pmin, pmax, size=size)
-
     params['approximant'] = numpy.array([args.approximant]*len(params[name]))
 
     # Filter out stuff
