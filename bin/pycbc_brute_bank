@@ -43,9 +43,8 @@ class MetricBank(object):
     def __len__(self):
         return len(self.waveforms)
 
-    def insert(self, hp, matches):
+    def insert(self, hp):
         self.waveforms.append(hp)
-        hp.matches = numpy.array(matches, dtype=numpy.float32)
 
     def __getitem__(self, index):
         return self.waveforms[index]
@@ -85,32 +84,37 @@ class MetricBank(object):
             matches = numpy.ones(len(self))
             r = self.range()
 
+        msig = len(r)
+
         #Apply tua0 threshold
         if args.tau0_threshold:
             hp.tau0, _ = pycbc.pnutils.mass1_mass2_to_tau0_tau3(
                                             hp.params['mass1'], 
                                             hp.params['mass2'], 15.0)
             r = r[abs(self.tau0()[r] - hp.tau0) < args.tau0_threshold]
+        mtau = len(r)
 
         # Try to do some actual matches
-        inc = Shrinker(r)                                
+        inc = Shrinker(r*1)         
         while 1:
             j = inc.pop()
             if j is None:
-                hp.mnum = mnum
-                hp.mmax = mmax
-                hp.matches = matches
-                return False            
+                hp.matches = matches[r]
+                hp.indices = r
+                logging.info("Template is Added MaxMatch:%0.3f BankSize:%i "
+                             "AfterSigma:%i AfterTau0:%i Matches:%i"
+                              % (mmax, len(self), msig, mtau, mnum))
+                return False
 
             hc = self[j]
             m = hp.gen.match(hp, hc)
             matches[j] = m
             mnum += 1
             
-            # Update bounding match values
+            # Update bounding match values, apply triangle inequality
             maxmatches = hc.matches - m + 1.10
-            update = maxmatches < matches[0:j]
-            matches[0:j][update] = maxmatches[update]
+            update = numpy.where(maxmatches < matches[hc.indices])[0]
+            matches[hc.indices[update]] = maxmatches[update]
 
             # Update where to calculate matches
             skip_threshold = 1 - (1 - hp.threshold) * 2.0
@@ -136,9 +140,8 @@ class MetricBank(object):
             hp.gen = gen
             hp.threshold = threshold
             if hp not in self:
-                print("ADDING TEMPLATE: %0.3f %i %i" %(hp.mmax, len(self), hp.mnum))
                 num_added += 1
-                self.insert(hp, hp.matches)
+                self.insert(hp)
 
         return bank, num_added / float(num_tried)
 
@@ -159,7 +162,8 @@ class GenUniformWaveform(object):
         self.md2 = q._data[0:100]
 
     def generate(self, **kwds):
-        hp, hc = pycbc.waveform.get_fd_waveform(delta_f=self.delta_f, f_lower=self.f_lower, **kwds)
+        hp, hc = pycbc.waveform.get_fd_waveform(delta_f=self.delta_f, 
+                                                f_lower=self.f_lower, **kwds)
         if 'fratio' in kwds:
             hp = hc * kwds['fratio'] + hp * (1 - kwds['fratio'])
         hp.resize(self.flen)
@@ -186,7 +190,8 @@ else:
 conv = 1
 size = int(1.0 / tolerance)
 
-gen = GenUniformWaveform(args.buffer_length, args.sample_rate, args.low_frequency_cutoff)
+gen = GenUniformWaveform(args.buffer_length, 
+            args.sample_rate, args.low_frequency_cutoff)
 bank = MetricBank()
 
 if args.input_file:
@@ -213,7 +218,8 @@ while conv > tolerance:
 
     blen = len(bank)
     bank, conv = bank.round(gen, params, args.minimal_match)
-    logging.info("Round: %s Size: %s conv: %s added: %s", r, len(bank), conv, len(bank) - blen)
+    logging.info("Round: %s Size: %s conv: %s added: %s",
+                 r, len(bank), conv, len(bank) - blen)
 
 o = h5py.File(args.output_file, 'w')
 for k in params:

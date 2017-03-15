@@ -260,8 +260,8 @@ def get_version_info():
 
     # If this is a release or another kind of source distribution of PyCBC
     except:
-        version = '1.7.0dev'
-        release = 'False'
+        version = '1.6.3'
+        release = 'True'
         date = hash = branch = tag = author = committer = status = builder = build_date = ''
 
         with open('pycbc/version.py', 'w') as f:
@@ -350,13 +350,12 @@ setup (
                'bin/minifollowups/pycbc_page_snglinfo',
                'bin/minifollowups/pycbc_plot_trigger_timeseries',
                'bin/pycbc_banksim',
+               'bin/pycbc_brute_bank',
                'bin/pycbc_banksim_combine_banks',
                'bin/pycbc_banksim_match_combine',
                'bin/pycbc_faithsim',
                'bin/pycbc_inspiral',
                'bin/pycbc_inspiral_skymax',
-               'bin/pycbc_live',
-               'bin/pycbc_live_nagios_monitor',
                'bin/pycbc_single_template',
                'bin/pycbc_multi_inspiral',
                'bin/pycbc_make_banksim',
@@ -438,7 +437,6 @@ setup (
                'bin/inference/pycbc_inference_plot_acf',
                'bin/inference/pycbc_inference_plot_acl',
                'bin/inference/pycbc_inference_plot_corner',
-               'bin/inference/pycbc_inference_plot_geweke',
                'bin/inference/pycbc_inference_plot_movie',
                'bin/inference/pycbc_inference_plot_posterior',
                'bin/inference/pycbc_inference_plot_prior',
@@ -455,7 +453,6 @@ setup (
                'bin/workflows/pycbc_create_bank_verifier_workflow',
                'bin/pycbc_compress_bank',
                'bin/pycbc_ringinj',
-               'tools/einsteinathome/pycbc_build_eah.sh'
                ],
     packages = [
                'pycbc',
