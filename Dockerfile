@@ -1,15 +1,9 @@
 FROM centos:centos7
 
-RUN curl http://download.pegasus.isi.edu/wms/download/rhel/7/pegasus.repo > /etc/yum.repos.d/pegasus.repo
 RUN rpm -ivh http://software.ligo.org/lscsoft/scientific/7.2/x86_64/production/lscsoft-production-config-1.3-1.el7.noarch.rpm
-RUN yum clean all
-RUN yum makecache
-RUN yum update
 RUN yum -y install lscsoft-backports-config
 RUN yum -y install lscsoft-epel-config
 RUN yum -y install lscsoft-ius-config
-RUN yum clean all
-RUN yum makecache
 RUN yum -y install git2u-all lscsoft-all
 RUN yum install -y zlib-devel libpng-devel libjpeg-devel libsqlite3-dev sqlite-devel db4-devel
 RUN yum -y install tkinter libpng-devel lynx telnet
