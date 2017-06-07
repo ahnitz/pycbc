@@ -131,6 +131,12 @@ class FrequencySeries(Array):
         return self.epoch
 
     @property
+    def end_time(self):
+        """Return the end time of this vector
+        """
+        return self.start_time + self.duration
+
+    @property
     def duration(self):
         """Return the time duration of this vector
         """
