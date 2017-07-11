@@ -100,12 +100,10 @@ class SingleDetSGChisq(SingleDetPowerChisq):
 
         if template.params.template_hash not in self.params:
             return numpy.ones(len(snrv))
-        values = self.params[template.params.template_hash].split(',')
-        
-        # Get the chisq bins to use as the frequency reference point
-        bins = self.cached_chisq_bins(template, psd)
 
         # This is implemented slowly, so let's not call it often, OK?
+        w = 0.25
+        stilde = stilde * psd
         chisq = numpy.ones(len(snrv))
         for i, snrvi in enumerate(snrv):
             #Skip if newsnr too low
@@ -114,65 +112,19 @@ class SingleDetSGChisq(SingleDetPowerChisq):
             if nsnr < self.snr_threshold:
                 continue
 
-            N = (len(template) - 1) * 2
-            dt = 1.0 / (N * template.delta_f)
-            kmin = int(template.f_lower / psd.delta_f)
+            # Subtract template from data        
             time = float(template.epoch) + dt * indices[i]
-            # Shift the time of interest to be centered on 0
-            stilde_shift = apply_fseries_time_shift(stilde, -time)
+            scale = snrv[i] * snr_norm / (template.sigmasq(psd)) ** 0.5
+            stilde -= scale * apply_fseries_time_shift(template, time)
+            ts = stilde.to_timeseries()
 
-            # Only apply the sine-Gaussian in a +-50 Hz range around the 
-            # central frequency
-            qwindow = 50
-            chisq[i] = 0
-            
-            # Estimate the maximum frequency up to which the waveform has
-            # power by approximating power per frequency
-            # as constant over the last 2 chisq bins. We cannot use the final
-            # chisq bin edge as it does not have to be where the waveform
-            # terminates.
-            fstep = (bins[-2] - bins[-3])
-            fpeak = (bins[-2] + fstep) * template.delta_f
-            
-            # This is 90% of the Nyquist frequency of the data
-            # This allows us to avoid issues near Nyquist due to resample
-            # Filtering
-            fstop = len(stilde) * stilde.delta_f * 0.9
-            
-            dof = 0
-            # Calculate the sum of SNR^2 for the sine-Gaussians specified
-            for descr in values:
-                # Get the q and frequency offset from the descriptor
-                q, offset = descr.split('-')
-                q, offset = float(q), float(offset)
-                fcen = fpeak + offset
-                flow = max(kmin * template.delta_f, fcen - qwindow)
-                fhigh = fcen + qwindow
+            psd = ts.time_slice(time - w * 16, time + w * 16).psd(w)
+            p = ts.time_slice(et - w / 2, et + w / 2).psd(w)
+            kmin = int(20 / p.delta_f)
+            kmax = int(400 / p.delta_f)
+            pwr = (p / psd)[kmin:kmax].sum() * p.delta_f / 380
 
-                # If any sine-gaussian tile has an upper frequency near 
-                # nyquist return 1 instead.
-                if fhigh > fstop:
-                    return numpy.ones(len(snrv))
-
-                kmin = int(flow / template.delta_f)
-                kmax = int(fhigh / template.delta_f)
-
-                #Calculate sine-gaussian tile
-                gtem = sinegauss.fd_sine_gaussian(1.0, q, fcen, flow,
-                                      len(template) * template.delta_f,
-                                      template.delta_f).astype(numpy.complex64)
-                gsigma = sigma(gtem, psd=psd,
-                                     low_frequency_cutoff=flow, 
-                                     high_frequency_cutoff=fhigh)
-                #Calculate the SNR of the tile
-                gsnr = (gtem[kmin:kmax] * stilde_shift[kmin:kmax]).sum()
-                gsnr *= 4.0 * gtem.delta_f / gsigma
-                chisq[i] += abs(gsnr)**2.0
-                dof += 2
-            if dof == 0:
-                chisq[i] = 1
-            else:
-                chisq[i] /= dof
-            logging.info('Found chisq %s', chisq[i])
+            chisq[i] = pwr
+            logging.info('Found Residucal chisq %s', chisq[i])
         return chisq
 
