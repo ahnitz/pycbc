@@ -454,6 +454,35 @@ get_td_waveform.__doc__ = get_td_waveform.__doc__.format(
     params=parameters.td_waveform_params.docstr(prefix="    ",
            include_label=False).lstrip(' '))
 
+def get_dopshifted_waveform(**kwargs):
+    """Return a doppler-shifted time domain gravitational waveform.
+    Parameters
+    ----------
+    {params}
+    a: Angluar acceleration producing doppler shift in waveform.
+    vc: Velocity term for doppler conversion, must be <= 1.
+    """
+ 
+    approx = kwargs["approximant"].replace("doppler", "")
+    
+    hp, hc = waveform.get_td_waveform(**dict(kwargs, approximant=approx))
+    a = kwargs["a"]
+    vc = kwargs["vc"]
+    if vc >= 1.:
+        raise ValueError("vc cannot be greater than or equal to 1")
+    t = hp.sample_times.numpy()
+    v = (a*t + vc) / ((1. + (a*t + vc)**2.)**(1./2))
+    t_shifted = t * (1. + v)
+    amp = wfutils.amplitude_from_polarizations(hp, hc)
+    p = wfutils.phase_from_polarizations(hp, hc, remove_start_phase=False)
+    
+    f1 = interpolate.interp1d(x=t_shifted, y=np.array(amp), bounds_error=False, fill_value=0.)
+    f2 = interpolate.interp1d(x=t_shifted, y=np.array(p), bounds_error=False, fill_value=0.)
+    
+    amps = f1(t)
+    ps = f2(t)
+    return types.TimeSeries((amps * np.cos(ps)), delta_t=hp.delta_t, epoch=t_shifted[0])
+
 def get_fd_waveform(template=None, **kwargs):
     """Return a frequency domain gravitational waveform.
 

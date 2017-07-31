@@ -282,6 +282,11 @@ class TDomainCBCGenerator(BaseCBCGenerator):
             pass
         return hp, hc
 
+class DopplerTDomain(TDomainCBCGenerator):
+    """Uses TDDomain generator to create doppler-shifted time domain waveforms."""
+    def _init_(self, variable_args=(), **frozen_params):
+        super(TDomainCBCGenerator, self).__init__(waveform.get_dopshifted_waveform,
+            variable_args=variable_args, **frozen_params)
 
 class FDomainMassSpinRingdownGenerator(BaseGenerator):
     """Uses ringdown.get_fd_from_final_mass_spin as a generator function to
@@ -568,3 +573,7 @@ def select_waveform_generator(approximant):
         raise ValueError("Time domain ringdowns not supported")
     else:
         raise ValueError("%s is not a valid approximant." % approximant)
+
+    # check if doppler-shifted waveform
+    elif approximant.startswith("doppler")
+    	return DopplerTDomain
