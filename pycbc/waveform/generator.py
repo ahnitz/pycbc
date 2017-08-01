@@ -571,9 +571,10 @@ def select_waveform_generator(approximant):
     # otherwise waveform approximant is not supported
     elif approximant in ringdown.ringdown_td_approximants:
         raise ValueError("Time domain ringdowns not supported")
+    
+    # check if doppler-shifted waveform
+    elif approximant.startswith("doppler"):
+    	return DopplerTDomain
+
     else:
         raise ValueError("%s is not a valid approximant." % approximant)
-
-    # check if doppler-shifted waveform
-    elif approximant.startswith("doppler")
-    	return DopplerTDomain
