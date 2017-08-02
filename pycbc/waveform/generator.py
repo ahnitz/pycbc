@@ -156,6 +156,7 @@ class BaseCBCGenerator(BaseGenerator):
     """
     possible_args = set(parameters.td_waveform_params +
                         parameters.fd_waveform_params +
+			['a'] + ['vc'] +
                         ['taper'])
     def __init__(self, generator, variable_args=(), **frozen_params):
         super(BaseCBCGenerator, self).__init__(generator,
@@ -285,7 +286,7 @@ class TDomainCBCGenerator(BaseCBCGenerator):
 class DopplerTDomain(TDomainCBCGenerator):
     """Uses TDDomain generator to create doppler-shifted time domain waveforms."""
     def __init__(self, variable_args=(), **frozen_params):
-        super(DopplerTDomain, self).__init__(waveform.get_dopshifted_waveform,
+        super(TDomainCBCGenerator, self).__init__(waveform.get_dopshifted_waveform,
             variable_args=variable_args, **frozen_params)
 
 class FDomainMassSpinRingdownGenerator(BaseGenerator):

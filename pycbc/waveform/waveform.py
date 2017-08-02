@@ -37,6 +37,7 @@ from pycbc.waveform import utils as wfutils
 from pycbc.waveform import parameters
 from pycbc.filter import interpolate_complex_frequency, resample_to_delta_t
 import pycbc
+from scipy import interpolate
 from spa_tmplt import spa_tmplt, spa_tmplt_norm, spa_tmplt_end, \
                       spa_tmplt_precondition, spa_amplitude_factor, \
                       spa_length_in_time
@@ -465,7 +466,7 @@ def get_dopshifted_waveform(**kwargs):
  
     approx = kwargs["approximant"].replace("doppler", "")
     
-    hp, hc = waveform.get_td_waveform(**dict(kwargs, approximant=approx))
+    hp, hc = get_td_waveform(**dict(kwargs, approximant=approx))
     a = kwargs["a"]
     vc = kwargs["vc"]
     if vc >= 1.:
@@ -476,12 +477,14 @@ def get_dopshifted_waveform(**kwargs):
     amp = wfutils.amplitude_from_polarizations(hp, hc)
     p = wfutils.phase_from_polarizations(hp, hc, remove_start_phase=False)
     
-    f1 = interpolate.interp1d(x=t_shifted, y=np.array(amp), bounds_error=False, fill_value=0.)
-    f2 = interpolate.interp1d(x=t_shifted, y=np.array(p), bounds_error=False, fill_value=0.)
+    f1 = interpolate.interp1d(x=t_shifted, y=numpy.array(amp), bounds_error=False, fill_value=0.)
+    f2 = interpolate.interp1d(x=t_shifted, y=numpy.array(p), bounds_error=False, fill_value=0.)
     
     amps = f1(t)
     ps = f2(t)
-    return types.TimeSeries((amps * np.cos(ps)), delta_t=hp.delta_t, epoch=t_shifted[0])
+    hp =  TimeSeries((amps * numpy.cos(ps)), delta_t=hp.delta_t, epoch=t_shifted[0])
+    hc =  TimeSeries((amps * numpy.sin(ps)), delta_t=hp.delta_t, epoch=t_shifted[0])
+    return hp, hc 
 
 def get_fd_waveform(template=None, **kwargs):
     """Return a frequency domain gravitational waveform.
