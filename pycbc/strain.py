@@ -31,6 +31,7 @@ from pycbc.frame import read_frame, query_and_read_frame
 from pycbc.inject import InjectionSet, SGBurstInjectionSet, RingdownInjectionSet
 from pycbc.filter import resample_to_delta_t, highpass, make_frequency_series
 from pycbc.filter.zpk import filter_zpk
+from pycbc.waveform.spa_tmplt import spa_distance
 import pycbc.psd
 import pycbc.fft
 import pycbc.events
@@ -327,13 +328,17 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
         if opt.fake_strain == 'zeroNoise':
             logging.info("Making zero-noise time series")
             strain = TimeSeries(pycbc.types.zeros(tlen),
-                                delta_t=1.0/opt.sample_rate)
+                                delta_t=1.0/opt.sample_rate,
+                                epoch=opt.gps_start_time)
         else:
             logging.info("Making colored noise")
-            strain = pycbc.noise.noise_from_psd(tlen, 1.0/opt.sample_rate,
-                                                strain_psd,
-                                                seed=opt.fake_strain_seed)
-        strain._epoch = lal.LIGOTimeGPS(opt.gps_start_time)
+            from pycbc.noise.reproduceable import colored_noise
+            strain = colored_noise(strain_psd, opt.gps_start_time,
+                                          opt.gps_end_time,
+                                          seed=opt.fake_strain_seed, 
+                                          low_frequency_cutoff=opt.strain_high_pass)
+            strain = resample_to_delta_t(strain, 1.0/opt.sample_rate)
+
 
         if opt.injection_file:
             logging.info("Applying injections")
@@ -1319,27 +1324,28 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         s = e - ((self.psd_samples + 1) * self.psd_segment_length / 2) * self.sample_rate
         psd = pycbc.psd.welch(self.strain[s:e], seg_len=seg_len, seg_stride=seg_len / 2)
 
-        from pycbc.waveform.spa_tmplt import spa_distance
         psd.dist = spa_distance(psd, 1.4, 1.4, self.low_frequency_cutoff) * pycbc.DYN_RANGE_FAC
 
         # If the new psd is similar to the old one, don't replace it
         if self.psd and self.psd_recalculate_difference:
             if abs(self.psd.dist - psd.dist) / self.psd.dist < self.psd_recalculate_difference:
-                logging.info("Skipping Recalculation of PSD, %s-%s", self.psd.dist, psd.dist)
+                logging.info("Skipping recalculation of %s PSD, %s-%s",
+                             self.detector, self.psd.dist, psd.dist)
                 return True
         
         # If the new psd is *really* different than the old one, return an error
         if self.psd and self.psd_abort_difference:
             if abs(self.psd.dist - psd.dist) / self.psd.dist > self.psd_abort_difference:
-                logging.info("PSD is CRAZY, aborting!!!!, %s-%s", self.psd.dist, psd.dist)
+                logging.info("%s PSD is CRAZY, aborting!!!!, %s-%s",
+                             self.detector, self.psd.dist, psd.dist)
                 self.psd = psd
                 self.psds = {}  
                 return False
 
         # If the new estimate replaces the current one, invalide the ineterpolate PSDs
         self.psd = psd
-        self.psds = {}     
-        logging.info("Recalculating PSD, %s", psd.dist)  
+        self.psds = {}
+        logging.info("Recalculating %s PSD, %s", self.detector, psd.dist)
         return True   
 
     def overwhitened_data(self, delta_f):
@@ -1459,7 +1465,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
 
         # We have given up so there is no time series
         if ts is None:
-            logging.info("Giving on up frame...")
+            logging.info("%s frame is late, giving up", self.detector)
             self.null_advance_strain(blocksize)
             if self.state:
                 self.state.null_advance(blocksize)
@@ -1477,7 +1483,8 @@ class StrainBuffer(pycbc.frame.DataBuffer):
             self.null_advance_strain(blocksize)
             if self.dq:
                 self.dq.null_advance(blocksize)
-            logging.info("Time has invalid data, resetting buffer")
+            logging.info("%s time has invalid data, resetting buffer",
+                         self.detector)
             return False
 
         # Also advance the dq vector in lockstep
@@ -1508,7 +1515,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         
         # taper beginning if needed
         if self.taper_immediate_strain:
-            logging.info("tapering start of strain block")
+            logging.info("Tapering start of %s strain block", self.detector)
             strain = gate_data(strain, [(strain.start_time, 0., self.autogating_pad)])
             self.taper_immediate_strain = False
 

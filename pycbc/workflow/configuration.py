@@ -1,4 +1,4 @@
-# Copyright (C) 2013  Ian Harry
+# Copyright (C) 2013,2017 Ian Harry, Duncan Brown
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the
@@ -29,68 +29,204 @@ https://ldas-jobs.ligo.caltech.edu/~cbc/docs/pycbc/ahope/initialization_inifile.
 
 import os
 import re
-import logging
-import urllib2
+import stat
+import shutil
 import time
+import logging
+import urlparse
+import cookielib
+import requests
 import distutils.spawn
 import ConfigParser
 import itertools
 import pycbc_glue.pipeline
+
+from cookielib import (_warn_unhandled_exception, LoadError, Cookie)
+from bs4 import BeautifulSoup
+
+def _really_load(self, f, filename, ignore_discard, ignore_expires):
+    """
+    This function is required to monkey patch MozillaCookieJar's _really_load
+    function which does not understand the curl format cookie file created
+    by ecp-cookie-init. It patches the code so that #HttpOnly_ get loaded.
+
+    https://bugs.python.org/issue2190
+    https://bugs.python.org/file37625/httponly.patch
+    """
+    now = time.time()
+
+    magic = f.readline()
+    if not re.search(self.magic_re, magic):
+        f.close()
+        raise LoadError(
+            "%r does not look like a Netscape format cookies file" %
+            filename)
+
+    try:
+        while 1:
+            line = f.readline()
+            if line == "": break
+
+            # last field may be absent, so keep any trailing tab
+            if line.endswith("\n"): line = line[:-1]
+
+            sline = line.strip()
+            # support HttpOnly cookies (as stored by curl or old Firefox).
+            if sline.startswith("#HttpOnly_"):
+                line = sline[10:]
+            # skip comments and blank lines XXX what is $ for?
+            elif (sline.startswith(("#", "$")) or sline == ""):
+                continue
+
+            domain, domain_specified, path, secure, expires, name, value = \
+                    line.split("\t")
+            secure = (secure == "TRUE")
+            domain_specified = (domain_specified == "TRUE")
+            if name == "":
+                # cookies.txt regards 'Set-Cookie: foo' as a cookie
+                # with no name, whereas cookielib regards it as a
+                # cookie with no value.
+                name = value
+                value = None
+
+            initial_dot = domain.startswith(".")
+            assert domain_specified == initial_dot
+
+            discard = False
+            if expires == "":
+                expires = None
+                discard = True
+
+            # assume path_specified is false
+            c = Cookie(0, name, value,
+                       None, False,
+                       domain, domain_specified, initial_dot,
+                       path, False,
+                       secure,
+                       expires,
+                       discard,
+                       None,
+                       None,
+                       {})
+            if not ignore_discard and c.discard:
+                continue
+            if not ignore_expires and c.is_expired(now):
+                continue
+            self.set_cookie(c)
+
+    except IOError:
+        raise
+    except Exception:
+        _warn_unhandled_exception()
+        raise LoadError("invalid Netscape format cookies file %r: %r" %
+                        (filename, line))
+
+# Now monkey patch the code
+cookielib.MozillaCookieJar._really_load = _really_load # noqa
+
+ecp_cookie_error = """The attempt to download the file at
+
+{}
+
+was redirected to the git.ligo.org sign-in page. This means that you likely
+forgot to initialize your ECP cookie or that your LIGO.ORG credentials are
+otherwise invalid. Create a valid ECP cookie for git.ligo.org by running
+
+ecp-cookie-init LIGO.ORG https://git.ligo.org/users/auth/shibboleth/callback albert.einstein
+
+before attempting to download files from git.ligo.org.
+"""
 
 def resolve_url(url, directory=None, permissions=None):
     """
     Resolves a URL to a local file, and returns the path to
     that file.
     """
+
+    u = urlparse.urlparse(url)
+
+    # create the name of the destination file
     if directory is None:
         directory = os.getcwd()
-        
-    # If the "url" is really a path, allow this to work as well and simply
-    # return
-    if os.path.isfile(url):
-        return os.path.abspath(url)
+    filename = os.path.join(directory,os.path.basename(u.path))
 
-    if url.startswith('http://') or url.startswith('https://') or \
-       url.startswith('file://'):
-        filename = url.split('/')[-1]
-        filename = os.path.join(directory, filename)
-        succeeded = False
-        num_tries = 5
-        t_sleep   = 10
+    if u.scheme == '' or u.scheme == 'file':
+        # for regular files, make a direct copy
+        if os.path.isfile(u.path):
+            if os.path.isfile(filename):
+                # check to see if src and dest are the same file
+                src_inode = os.stat(u.path)[stat.ST_INO]
+                dst_inode = os.stat(filename)[stat.ST_INO]
+                if src_inode != dst_inode:
+                    shutil.copy(u.path, filename)
+            else:
+                shutil.copy(u.path, filename)
+        else:
+            errmsg  = "Cannot open file %s from URL %s" % (u.path, url)
+            raise ValueError(errmsg)
 
-        while not succeeded and num_tries > 0: 
-            try:
-                response = urllib2.urlopen(url)
-                result   = response.read()
-                out_file = open(filename, 'w')
-                out_file.write(result)
-                out_file.close()
-                succeeded = True
-            except:
-                logging.warn("Unable to download %s, retrying" % url)
-                time.sleep(t_sleep)
-                num_tries -= 1
-                t_sleep   *= 2
-                
-        if not succeeded:
-            errMsg  = "Unable to download %s " % (url)
-            raise ValueError(errMsg)
+    elif u.scheme == 'http' or u.scheme == 'https':
+        s = requests.Session()
+        s.mount(str(u.scheme)+'://', 
+            requests.adapters.HTTPAdapter(max_retries=5))
 
-    elif url.find('://') != -1:
+        # look for an ecp cookie file and load the cookies
+        cookie_dict = {}
+        ecp_file = '/tmp/ecpcookie.u%d' % os.getuid()
+        if os.path.isfile(ecp_file):
+            cj = cookielib.MozillaCookieJar()
+            cj.load(ecp_file, ignore_discard=True, ignore_expires=True)
+        else:
+            cj = []
+
+        for c in cj: 
+            if c.domain == u.netloc:
+                # load cookies for this server
+                cookie_dict[c.name] = c.value
+            elif u.netloc == "code.pycbc.phy.syr.edu" and \
+              c.domain == "git.ligo.org":
+                # handle the redirect for code.pycbc to git.ligo.org
+                cookie_dict[c.name] = c.value
+
+        r = s.get(url, cookies=cookie_dict, allow_redirects=True)
+        if r.status_code != 200:
+            errmsg = "Unable to download %s\nError code = %d" % (url,
+                r.status_code)
+            raise ValueError(errmsg)
+
+        # if we are downloading from git.ligo.org, check that we
+        # did not get redirected to the sign-in page
+        if u.netloc == 'git.ligo.org' or u.netloc == 'code.pycbc.phy.syr.edu':
+            soup = BeautifulSoup(r.content, 'html.parser')
+            desc = soup.findAll(attrs={"property":"og:url"})
+            if len(desc) and \
+              desc[0]['content'] == 'https://git.ligo.org/users/sign_in':
+                raise ValueError(ecp_cookie_error.format(url))
+
+        output_fp = open(filename, 'w')
+        output_fp.write(r.content)
+        output_fp.close()
+
+    else:
         # TODO: We could support other schemes such as gsiftp by
         # calling out to globus-url-copy
-        errMsg  = "%s: Only supported URL schemes are\n" % (url)
-        errMsg += "   file: http: https:" 
-        raise ValueError(errMsg)
-    else:
-        filename = url
+        errmsg  = "Unknown URL scheme: %s\n" % (u.scheme)
+        errmsg += "Currently supported are: file, http, and https." 
+        raise ValueError(errmsg)
 
     if not os.path.isfile(filename):
-        errMsg = "File %s does not exist." %(url)
-        raise ValueError(errMsg)
+        errmsg = "Error trying to create file %s from %s" % (filename,url)
+        raise ValueError(errmsg)
 
     if permissions:
-        os.chmod(filename, permissions)
+        if os.access(filename, os.W_OK):
+            os.chmod(filename, permissions)
+        else:
+            # check that the file has at least the permissions requested
+            s = os.stat(filename)[stat.ST_MODE]
+            if (s & permissions) != permissions:
+                errmsg = "Could not change permissions on %s (read-only)" % url
+                raise ValueError(errmsg)
 
     return filename
 
@@ -238,9 +374,9 @@ class WorkflowConfigParser(pycbc_glue.pipeline.DeepCopyableConfigParser):
         # Do overrides from command line
         for override in overrideTuples:
             if len(override) not in [2,3]:
-                errMsg = "Overrides must be tuples of length 2 or 3."
-                errMsg = "Got %s." % (str(override) )
-                raise ValueError(errMsg)
+                errmsg = "Overrides must be tuples of length 2 or 3."
+                errmsg = "Got %s." % (str(override) )
+                raise ValueError(errmsg)
             section = override[0]
             option = override[1]
             value = ''
@@ -415,9 +551,9 @@ class WorkflowConfigParser(pycbc_glue.pipeline.DeepCopyableConfigParser):
             if testList[0] == 'which':
                 newString = distutils.spawn.find_executable(testList[1])
                 if not newString:
-                    errMsg = "Cannot find exe %s in your path " %(testList[1])
-                    errMsg += "and you specified ${which:%s}." %(testList[1])
-                    raise ValueError(errMsg)
+                    errmsg = "Cannot find exe %s in your path " %(testList[1])
+                    errmsg += "and you specified ${which:%s}." %(testList[1])
+                    raise ValueError(errmsg)
 
         return newString
 

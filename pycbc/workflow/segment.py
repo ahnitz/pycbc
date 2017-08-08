@@ -29,7 +29,7 @@ https://ldas-jobs.ligo.caltech.edu/~cbc/docs/pycbc/ahope/segments.html
 
 import os, sys, shutil, stat, copy, itertools
 import logging
-import urllib2, urlparse
+import urlparse
 import lal
 from pycbc_glue import segments, segmentsUtils
 from pycbc_glue.ligolw import utils, table, lsctables, ligolw
@@ -401,11 +401,7 @@ def setup_segment_generation(workflow, out_dir, tag=None):
                                      "segments-veto-definer-url", [tag])
         vetoDefBaseName = os.path.basename(vetoDefUrl)
         vetoDefNewPath = os.path.join(out_dir, vetoDefBaseName)
-        response = urllib2.urlopen(vetoDefUrl)
-        html = response.read()
-        out_file = open(vetoDefNewPath, 'w')
-        out_file.write(html)
-        out_file.close()
+        resolve_url(vetoDefUrl,out_dir)
         # and update location
         cp.set("workflow-segments", "segments-veto-definer-file",
                 vetoDefNewPath)
@@ -1008,8 +1004,7 @@ def find_playground_segments(segs):
 
     return outlist
 
-def get_triggered_coherent_segment(workflow, out_dir, sciencesegs,
-                                   sngl_ifo=False):
+def get_triggered_coherent_segment(workflow, sciencesegs):
     """
     Construct the coherent network on and off source segments. Can switch to
     construction of segments for a single IFO search when coherent segments
@@ -1019,13 +1014,8 @@ def get_triggered_coherent_segment(workflow, out_dir, sciencesegs,
     -----------
     workflow : pycbc.workflow.core.Workflow
         The workflow instance that the calculated segments belong to.
-    out_dir : str
-        The directory in which output will be stored.
     sciencesegs : dict
         Dictionary of all science segments within analysis time.
-    sngl_ifo : bool, optional (default=False)
-        If true, will fall back on single IFO segments if coherent segments
-        do not match the required criteria.
 
     Returns
     --------
@@ -1192,15 +1182,15 @@ def generate_triggered_segment(workflow, out_dir, sciencesegs):
         offsource = {}
         for ifo_combo in ifo_combos:
             ifos = "".join(ifo_combo)
-            logging.info("Calculating optimal segment for %s." % ifos)
+            logging.info("Calculating optimal segment for %s.", ifos)
             segs = segments.segmentlistdict({ifo: scisegs[ifo]
                                              for ifo in ifo_combo})
             onsource[ifos], offsource[ifos] = get_triggered_coherent_segment(\
-                    workflow, out_dir, segs)
+                    workflow, segs)
 
         # Which combination gives the longest coherent segment?
-        valid_combs = [ifos for ifos in onsource.keys()
-                       if onsource[ifos] is not None]
+        valid_combs = [iifos for iifos in onsource.keys()
+                       if onsource[iifos] is not None]
         
         if len(valid_combs) == 0:
             # If none, offsource dict will contain segments showing criteria
@@ -1213,7 +1203,7 @@ def generate_triggered_segment(workflow, out_dir, sciencesegs):
             else:
                 best_comb = offsource.keys()[0]
             logging.info("No combination of %d IFOs with suitable science "
-                         "segment." % num_ifos)
+                         "segment.", num_ifos)
         else:
             # Identify best analysis segment
             if len(valid_combs) > 1:
@@ -1275,13 +1265,7 @@ def save_veto_definer(cp, out_dir, tags=None):
     veto_def_new_path = os.path.abspath(os.path.join(out_dir,
                                         veto_def_base_name))
     # Don't need to do this if already done
-    if veto_def_url == veto_def_new_path:
-        return
-    response = urllib2.urlopen(veto_def_url)
-    html = response.read()
-    out_file = open(veto_def_new_path, 'w')
-    out_file.write(html)
-    out_file.close()
+    resolve_url(veto_def_url,out_dir)
 
     # and update location
     cp.set("workflow-segments", "segments-veto-definer-file", veto_def_new_path)

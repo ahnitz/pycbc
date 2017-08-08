@@ -54,6 +54,7 @@ extra_bank=""
 extra_approx=""
 processing_scheme=""
 lal_data_path="."
+albert="http://albert.phys.uwm.edu/download"
 
 # defaults, possibly overwritten by OS-specific settings
 build_ssl=false
@@ -275,6 +276,8 @@ usage="
 
     --no-cleanup                    keep build directories after successful build for later inspection
 
+    --download-url=<url>            download test frame, template bank, and roms from <url>
+
     --with-extra-libs=<url>         add extra files from a tar file at <url> to the bundles
 
     --with-extra-bank=<file>        run pycbc_inspiral again with an extra template bank
@@ -341,6 +344,7 @@ for i in $*; do
                     echo $now > "$SOURCE/last_sunday_build"
                 fi
             fi ;;
+        --download-url=*) albert="`echo $i|sed 's/^--download-url=//'`";;
         --with-extra-libs=*) extra_libs="`echo $i|sed 's/^--with-extra-libs=//'`";;
         --with-extra-bank=*) extra_bank="$extra_bank `echo $i|sed 's/^--with-extra-bank=//'`";;
         --with-extra-approximant=*) extra_approx="${extra_approx}`echo $i|sed 's/^--with-extra-approximant=//'` ";;
@@ -389,7 +393,6 @@ echo "WORKSPACE='$WORKSPACE'" # for Jenkins jobs
 pypi="https://pypi.python.org/packages"
 gitlab="https://gitlab.aei.uni-hannover.de/einsteinathome"
 atlas="https://www.atlas.aei.uni-hannover.de/~bema"
-albert="http://albert.phys.uwm.edu/download"
 duncan="https://www.atlas.aei.uni-hannover.de/~dbrown"
 aei="http://www.aei.mpg.de/~bema"
 
@@ -1001,11 +1004,11 @@ if test "x$pycbc_fetch_ref" != "x" ; then
     git checkout FETCH_HEAD
 fi
 
-echo -e "[`date`] install pkgconfig beforehand"
+echo -e "[`date`] install pkgconfig and six beforehand"
 pip install `grep -w ^pkgconfig requirements.txt||echo pkgconfig==1.1.0`
+pip install `grep -w ^six requirements.txt||echo 'six>=1.9.0'`
 if $pyinstaller21_hacks; then
-    echo -e "[`date`] install six and matplotlib beforehand"
-    pip install `grep -w ^six requirements.txt||echo 'six>=1.9.0'`
+    echo -e "[`date`] install matplotlib beforehand"
     pip install `grep ^matplotlib== requirements.txt||echo matplotlib==1.4.3`
     p="`grep -w ^setuptools requirements.txt||true`"
     if test ".$p" != "."; then
@@ -1236,6 +1239,8 @@ cd test
 
 if $run_analysis; then
 echo -e "\\n\\n>> [`date`] running analysis" >&3
+
+echo -e "\\n\\n>> [`date`] downloading LOSC frame data" >&3
 p="H-H1_LOSC_4_V1-1126257414-4096.gwf"
 md5="a7d5cbd6ef395e8a79ef29228076d38d"
 if check_md5 "$p" "$md5"; then
@@ -1251,6 +1256,7 @@ frames="$PWD/$p"
 # free some space by removing a possible old ROM tarball
 rm -f lal-data-r7.tar.gz
 
+echo -e "\\n\\n>> [`date`] downloading ROM data" >&3
 failed=false
 while read f md5; do
     if check_md5 "$f" "$md5"; then
@@ -1296,6 +1302,7 @@ if $failed; then
 fi
 
 #fb5ec108c69f9e424813de104731370c  H1L1-PREGEN_TMPLTBANK_SPLITBANK_BANK16-1126051217-3331800-short2k.xml.gz
+echo -e "\\n\\n>> [`date`] downloading template bank" >&3
 p="H1L1-SBANK_FOR_GW150914ER10.xml.gz"
 md5="c24f5513d3066b4f637daffb6aa20fec"
 if check_md5 "$p" "$md5"; then

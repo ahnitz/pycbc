@@ -38,6 +38,7 @@ from pycbc.io.inference_hdf import InferenceFile
 from pycbc.waveform import generator
 from pycbc.inference import option_utils
 from pycbc.inference import prior
+from pycbc.inference import burn_in
 
 # command line usage
 parser = argparse.ArgumentParser(usage=__file__ + " [--options]",
@@ -93,10 +94,12 @@ parser.add_argument("--save-psd", action="store_true", default=False,
                     help="Save the psd of each ifo to the output file.")
 parser.add_argument("--checkpoint-interval", type=int, default=None,
                     help="Number of iterations to take before saving new "
-                         "samples to file.")
+                         "samples to file, calculating ACL, and updating "
+                         "burn-in estimate.")
 parser.add_argument("--checkpoint-fast", action="store_true",
-                    help="Do not calculate derived data (eg. ACL or evidence) "
-                         "after each checkpoint. Calculate them at the end.")
+                    help="Do not calculate ACL after each checkpoint, only at "
+                         "the end. Not applicable if n-independent-samples "
+                         "have been specified.")
 
 # verbose option
 parser.add_argument("--verbose", action="store_true", default=False,
@@ -127,8 +130,32 @@ if os.path.exists(opts.output_file) and not opts.force:
     raise OSError("output-file already exists; use --force if you wish to "
                   "overwrite it.")
 
+# check for how many iterations to run
+max_iterations = opts.niterations
+if opts.niterations is not None and opts.n_independent_samples is not None:
+    raise ValueError("Must specify either niterations or n-independent-"
+                     "samples, not both")
+elif opts.niterations is not None:
+    get_nsamples = opts.niterations
+elif opts.n_independent_samples is not None:
+    if opts.checkpoint_interval is None:
+        raise ValueError("n-independent-samples requires a checkpoint-"
+                         "interval; see help")
+    get_nsamples = opts.n_independent_samples
+else:
+    raise ValueError("Must specify niterations or n-independent-samples; "
+                     "see --help")
+
 # setup log
 pycbc.init_logging(opts.verbose)
+
+# warn user about options that will be removed
+if opts.skip_burn_in:
+    logging.warning("DEPRECATION WARNING: Option --skip-burn-in has been "
+                    "deprecated and does nothing. "
+                    "If you wish to use no burn in, simply do not "
+                    "provide a burn-in-function. This option will be removed "
+                    "in future versions.")
 
 # set seed
 numpy.random.seed(opts.seed)
@@ -198,6 +225,9 @@ with ctx:
                         replace_parameters=replace_parameters,
                         sampling_transforms=sampling_transforms)
 
+    burn_in_eval = burn_in.BurnIn(opts.burn_in_function,
+                                min_iterations=opts.min_burn_in)
+
     # create sampler that will run
     sampler = option_utils.sampler_from_cli(opts, likelihood)
 
@@ -232,43 +262,6 @@ with ctx:
         p0 = None
     sampler.set_p0(samples=p0, prior=init_prior)
 
-    # setup checkpointing
-    if opts.checkpoint_interval:
-
-        # determine intervals to run sampler until we save the new samples 
-        intervals = [i for i in range(0, opts.niterations,
-                                      opts.checkpoint_interval)]
-
-        # determine if there is a small bit at the end
-        remainder = opts.niterations % opts.checkpoint_interval
-        if remainder:
-            intervals += [intervals[-1] + remainder]
-        else:
-            intervals += [opts.niterations]
-
-    # if not checkpointing then set intervals to run sampler in one call
-    else:
-        intervals = [0, opts.niterations]
-
-    intervals = numpy.array(intervals)
-
-    # check if user wants to burn in
-    if not opts.skip_burn_in:
-        logging.info("Burn in")
-        sampler.burn_in()
-        n_burnin = sampler.burn_in_iterations
-        logging.info("Used %i burn in samples", n_burnin)
-        with InferenceFile(opts.output_file, "a") as fp:
-            # write the burn in results
-            sampler.write_results(fp,
-                                  max_iterations=opts.niterations + n_burnin)
-    else:
-        n_burnin = 0
-
-
-    # increase the intervals to account for the burn in
-    intervals += n_burnin
-
     # if getting samples from file then put sampler and random number generator
     # back in its former state
     if opts.samples_file:
@@ -276,16 +269,52 @@ with ctx:
             sampler.set_state_from_file(fp)
             numpy.random.set_state(fp.read_random_state())
 
-    # loop over number of checkpoints
-    for i, start in enumerate(intervals[:-1]):
+    # run sampler's burn in if it is in the list of burn in functions
+    n_sampler_burn_in = 0
+    if "use_sampler" in burn_in_eval.burn_in_functions:
+        # remove the sampler's burn in so we don't run more than once
+        burn_in_eval.burn_in_functions.pop("use_sampler")
+        with InferenceFile(opts.output_file, "a") as fp:
+            logging.info("Running sampler's burn in function")
+            burnidx = burn_in.use_sampler(sampler, fp)
+            sampler.write_burn_in_iterations(fp, burnidx)
+            # write the burn in results
+            n_sampler_burn_in = burnidx.max()
+            if max_iterations is not None:
+                max_iterations += n_sampler_burn_in
+            logging.info("Writing burn in samples to file")
+            sampler.write_results(fp, max_iterations=max_iterations)
+            try:
+                sampler.write_state(fp)
+            except NotImplementedError:
+                logging.warn("Writing state is not implemented for %s",
+                             sampler.name)
+            # increase the number of iterations
 
-        end = intervals[i + 1]
+    # run sampler until we have the desired number of samples
+    nsamples = 0
+    interval = opts.checkpoint_interval
+    if interval is None:
+        interval = get_nsamples
+    # start keeps track of the number of iterations we have advances (which
+    # may not be the same as the number of samples, if we are using
+    # n-independent-samples)
+    start = n_sampler_burn_in
+
+    while nsamples < get_nsamples:
+
+        end = start + interval
+
+        # adjust the interval if we would go past the number of iterations
+        if opts.n_independent_samples is None and end > get_nsamples:
+            interval = get_nsamples - start
+            end = start + interval
 
         # run sampler and set initial values to None so that sampler
         # picks up from where it left off next call
-        logging.info("Running sampler for %i to %i out of %i iterations",
-                     start - n_burnin, end - n_burnin, opts.niterations)
-        sampler.run(end - start)
+        logging.info("Running sampler for {} to {} iterations".format(start,
+                                                                      end))
+        sampler.run(interval)
 
         # write new samples
         with InferenceFile(opts.output_file, "a") as fp:
@@ -293,9 +322,12 @@ with ctx:
             logging.info("Writing results to file")
             sampler.write_results(fp, start_iteration=start,
                                   end_iteration=end,
-                                  max_iterations=opts.niterations + n_burnin)
+                                  max_iterations=max_iterations)
             logging.info("Writing state to file")
             fp.write_random_state()
+
+            logging.info("Updating burn in")
+            burn_in_eval.update(sampler, fp)
 
             # include a try-except statement because all samples might not
             # have this implemented
@@ -305,23 +337,35 @@ with ctx:
                 logging.warn("Writing state is not implemented for %s",
                              sampler.name)
 
-            if not opts.checkpoint_fast or end == opts.niterations:
-
-                # compute the acls and write
+            # compute the acls and write
+            if opts.n_independent_samples is not None or end >= get_nsamples \
+                    or not opts.checkpoint_fast:
                 logging.info("Computing acls")
                 sampler.write_acls(fp, sampler.compute_acls(fp))
 
-                # compute evidence, if supported
-                try:
-                    lnz, dlnz = sampler.calculate_logevidence(fp)
-                    logging.info("Saving evidence")
-                    sampler.write_logevidence(fp, lnz, dlnz)
-                except NotImplementedError:
-                    pass
+            # update nsamples for next loop
+            if opts.n_independent_samples is not None:
+                with InferenceFile(opts.output_file, 'r') as fp:
+                    nsamples = fp.n_independent_samples
+                logging.info("Have {} independent samples".format(nsamples))
+            else:
+                nsamples += interval
 
             # clear the in-memory chain to save memory
             logging.info("Clearing chain")
             sampler.clear_chain()
+
+            start = end
+
+    # compute evidence, if supported
+    with InferenceFile(opts.output_file, 'a') as fp:
+        try:
+            lnz, dlnz = sampler.calculate_logevidence(fp)
+            logging.info("Saving evidence")
+            sampler.write_logevidence(fp, lnz, dlnz)
+        except NotImplementedError:
+            pass
+
 
 # exit
 logging.info("Done")

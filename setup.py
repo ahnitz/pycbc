@@ -62,7 +62,7 @@ install_requires =  setup_requires + ['Mako>=1.0.1',
                       'weave>=0.16.0',
                       'unittest2',
                       'matplotlib>=1.3.1',
-                      'numpy>=1.6.4',
+                      'numpy>=1.9.0',
                       'pillow',
                       'h5py>=2.5',
                       'jinja2',
@@ -72,6 +72,9 @@ install_requires =  setup_requires + ['Mako>=1.0.1',
                       'kombine==0.8.1',
                       'emcee>=2.2.0',
                       'corner>=2.0.1',
+                      'requests>=1.2.1',
+                      'beautifulsoup4>=4.6.0',
+                      'astropy>=2.0.1'
                       ]
 
 #FIXME Remove me when we bump to h5py > 2.5
@@ -268,8 +271,8 @@ def get_version_info():
 
     # If this is a release or another kind of source distribution of PyCBC
     except:
-        version = '1.8.0dev'
-        release = 'False'
+        version = '1.7.5'
+        release = 'True'
         date = hash = branch = tag = author = committer = status = builder = build_date = ''
 
         with open('pycbc/version.py', 'w') as f:
@@ -340,6 +343,7 @@ setup (
     name = 'PyCBC',
     version = VERSION,
     description = 'Analyze gravitational-wave data, find signals, and study their parameters.',
+    long_description = open('descr.txt').read(),
     author = 'Ligo Virgo Collaboration - PyCBC team',
     author_email = 'alex.nitz@ligo.org',
     url = 'https://ligo-cbc.github.io',
@@ -391,6 +395,7 @@ setup (
                'bin/pycbc_optimal_snr',
                'bin/pycbc_fit_sngl_trigs',
                'bin/pycbc_randomize_inj_dist_by_optsnr',
+               'bin/pycbc_create_injections',
                'bin/hdfcoinc/pycbc_calculate_psd',
                'bin/hdfcoinc/pycbc_average_psd',
                'bin/hdfcoinc/pycbc_coinc_mergetrigs',
@@ -432,6 +437,7 @@ setup (
                'bin/hdfcoinc/pycbc_fit_sngls_by_template',
                'bin/hdfcoinc/pycbc_fit_sngls_over_param',
                'bin/hdfcoinc/pycbc_fit_sngls_binned',
+               'bin/hdfcoinc/pycbc_template_recovery_hist',
                'bin/hwinj/pycbc_generate_hwinj',
                'bin/hwinj/pycbc_generate_hwinj_from_xml',
                'bin/hwinj/pycbc_plot_hwinj',
@@ -444,6 +450,7 @@ setup (
                'bin/pycbc_condition_strain',
                'bin/workflows/pycbc_make_inference_workflow',
                'bin/inference/pycbc_inference',
+               'bin/inference/pycbc_inference_extract_samples',
                'bin/inference/pycbc_inference_plot_acceptance_rate',
                'bin/inference/pycbc_inference_plot_acf',
                'bin/inference/pycbc_inference_plot_acl',

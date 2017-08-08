@@ -189,6 +189,22 @@ class _BaseSampler(object):
         fp.attrs['log_evidence'] = lnz
         fp.attrs['dlog_evidence'] = dlnz
 
+    @staticmethod
+    def write_burn_in_iterations(fp, burn_in_iterations):
+        """Writes the burn in iterations to the given file.
+
+        Parameters
+        ----------
+        fp : InferenceFile
+            A file handler to an open inference file.
+        burn_in_iterations : array
+            Array of values giving the iteration of the burn in of each walker.
+        """
+        try:
+            fp['burn_in_iterations'][:] = burn_in_iterations
+        except KeyError:
+            fp['burn_in_iterations'] = burn_in_iterations
+        fp.attrs['burn_in_iterations'] = burn_in_iterations.max()
 
 class BaseMCMCSampler(_BaseSampler):
     """This class is used to construct the MCMC sampler from the kombine-like
@@ -201,9 +217,6 @@ class BaseMCMCSampler(_BaseSampler):
     likelihood_evaluator : likelihood class
         An instance of the likelihood class from the
         pycbc.inference.likelihood module.
-    min_burn_in : {None, int}
-        Set the minimum number of burn in iterations to use. If None,
-        `burn_in_iterations` will be initialized to `0`.
 
     Attributes
     ----------
@@ -217,16 +230,14 @@ class BaseMCMCSampler(_BaseSampler):
     """
     name = None
 
-    def __init__(self, sampler, likelihood_evaluator, min_burn_in=None):
+    def __init__(self, sampler, likelihood_evaluator):
         self._sampler = sampler
         self._pos = None
         self._p0 = None
         self._currentblob = None
         self._nwalkers = None
-        if min_burn_in is None:
-            min_burn_in = 0
-        self.burn_in_iterations = min_burn_in
         self._lastclear = 0
+        self.burn_in_iterations = None
         # initialize
         super(BaseMCMCSampler, self).__init__(likelihood_evaluator)
 
@@ -350,11 +361,11 @@ class BaseMCMCSampler(_BaseSampler):
         super(BaseMCMCSampler, self).write_metadata(fp)
         # add info about walkers, burn in
         fp.attrs["nwalkers"] = self.nwalkers
-        fp.attrs['burn_in_iterations'] = self.burn_in_iterations
 
-    def _write_samples_group(self, fp, samples_group, parameters, samples,
-                             start_iteration=0, end_iteration=None,
-                             max_iterations=None):
+    @staticmethod
+    def write_samples_group(fp, samples_group, parameters, samples,
+                            start_iteration=0, end_iteration=None,
+                            index_offset=0, max_iterations=None):
         """Writes samples to the given file.
 
         Results are written to:
@@ -379,30 +390,34 @@ class BaseMCMCSampler(_BaseSampler):
             Write results starting from the given iteration.
         end_iteration : {None, int}
             Write results up to the given iteration.
-        max_iterations : {None, int}
-            If samples have not previously been written to the file, a new
-            dataset will be created. By default, the size of this dataset will
-            be whatever the length of the sampler's chain is at this point. If
-            you intend to run more iterations, set this value to that size so
-            that the array in the file will be large enough to accomodate
-            future data.
+        index_offset : int, optional
+            Write the samples to the arrays on disk starting at
+            `start_iteration` + `index_offset`. For example, if
+            `start_iteration=0`, `end_iteration=1000` and `index_offset=500`,
+            then `samples[0:1000]` will be written to indices `500:1500` in the
+            arrays on disk. This is needed if you are adding new samples to
+            a chain that was previously written to file, and you want to
+            preserve the history (e.g., after a checkpoint). Default is 0.
+        max_iterations : int, optional
+            Set the maximum size that the arrays in the hdf file may be resized
+            to. Only applies if the samples have not previously been written
+            to file. The default (None) is to use the maximum size allowed by
+            h5py.
         """
         # due to clearing memory, there can be a difference between indices in
         # memory and on disk
         nwalkers, niterations = samples.shape
-        niterations += self._lastclear
+        niterations += index_offset
         fa = start_iteration # file start index
         if end_iteration is None:
             end_iteration = niterations
         fb = end_iteration # file end index
-        ma = fa - self._lastclear # memory start index
-        mb = fb - self._lastclear # memory end index
+        ma = fa - index_offset # memory start index
+        mb = fb - index_offset # memory end index
 
         if max_iterations is not None and max_iterations < niterations:
             raise IndexError("The provided max size is less than the "
                              "number of iterations")
-        elif max_iterations is None:
-            max_iterations = niterations
 
         group = samples_group + '/{name}/walker{wi}'
 
@@ -444,13 +459,11 @@ class BaseMCMCSampler(_BaseSampler):
             Write results starting from the given iteration.
         end_iteration : {None, int}
             Write results up to the given iteration.
-        max_iterations : {None, int}
-            If samples have not previously been written to the file, a new
-            dataset will be created. By default, the size of this dataset will
-            be whatever the length of the sampler's chain is at this point. If
-            you intend to run more iterations, set this value to that size so
-            that the array in the file will be large enough to accomodate
-            future data.
+        max_iterations : int, optional
+            Set the maximum size that the arrays in the hdf file may be resized
+            to. Only applies if the samples have not previously been written
+            to file. The default (None) is to use the maximum size allowed by
+            h5py.
         samples_group : str
             Name of samples group to write.
         """
@@ -459,10 +472,11 @@ class BaseMCMCSampler(_BaseSampler):
         parameters = self.variable_args
         samples_group = fp.samples_group
         # write data
-        self._write_samples_group(
+        self.write_samples_group(
                          fp, samples_group, parameters, samples,
                          start_iteration=start_iteration,
                          end_iteration=end_iteration,
+                         index_offset=self._lastclear,
                          max_iterations=max_iterations)
 
     def write_likelihood_stats(self, fp, start_iteration=0, end_iteration=None,
@@ -486,13 +500,11 @@ class BaseMCMCSampler(_BaseSampler):
             Write results starting from the given iteration.
         end_iteration : {None, int}
             Write results up to the given iteration.
-        max_iterations : {None, int}
-            If the stats have not previously been written to the file, a new
-            dataset will be created. By default, the size of this dataset will
-            be whatever the length of the sampler's chain is at this point. If
-            you intend to run more iterations, set this value to that size so
-            that the array in the file will be large enough to accomodate
-            future data.
+        max_iterations : int, optional
+            Set the maximum size that the arrays in the hdf file may be resized
+            to. Only applies if the samples have not previously been written
+            to file. The default (None) is to use the maximum size allowed by
+            h5py.
 
         Returns
         -------
@@ -509,10 +521,11 @@ class BaseMCMCSampler(_BaseSampler):
         parameters = samples.fieldnames
         samples_group = fp.stats_group
         # write data
-        self._write_samples_group(
+        self.write_samples_group(
                          fp, samples_group, parameters, samples,
                          start_iteration=start_iteration,
                          end_iteration=end_iteration,
+                         index_offset=self._lastclear,
                          max_iterations=max_iterations)
         return samples
 
@@ -525,13 +538,11 @@ class BaseMCMCSampler(_BaseSampler):
         -----------
         fp : InferenceFile
             A file handler to an open inference file.
-        max_iterations : {None, int}
-            If acceptance fraction have not previously been written to the
-            file, a new dataset will be created. By default, the size of this
-            dataset will be whatever the length of the sampler's chain is at
-            this point. If you intend to run more iterations, set this value
-            to that size so that arrays in the file will be large enough to
-            accomodate future data.
+        max_iterations : int, optional
+            Set the maximum size that the arrays in the hdf file may be resized
+            to. Only applies if the acceptance fraction has not previously been
+            written to the file. The default (None) is to use the maximum size
+            allowed by h5py.
         """
         dataset_name = "acceptance_fraction"
         acf = self.acceptance_fraction
@@ -542,8 +553,6 @@ class BaseMCMCSampler(_BaseSampler):
         if max_iterations is not None and max_iterations < acf.size:
             raise IndexError("The provided max size is less than the "
                              "number of iterations")
-        elif max_iterations is None:
-            max_iterations = acf.size
 
         try:
             if end_iteration > fp[dataset_name].size:
@@ -573,13 +582,11 @@ class BaseMCMCSampler(_BaseSampler):
             Write results starting from the given iteration.
         end_iteration : {None, int}
             Write results up to the given iteration.
-        max_iterations : {None, int}
-            If results have not previously been written to the
-            file, new datasets will be created. By default, the size of these
-            datasets will be whatever the length of the sampler's chain is at
-            this point. If you intend to run more iterations in the future,
-            set this value to that size so that the array in the file will be
-            large enough to accomodate future data.
+        max_iterations : int, optional
+            Set the maximum size that the arrays in the hdf file may be resized
+            to. Only applies if the acceptance fraction has not previously been
+            written to the file. The default (None) is to use the maximum size
+            allowed by h5py.
         """
         self.write_metadata(fp)
         self.write_chain(fp, start_iteration=start_iteration,
@@ -718,6 +725,24 @@ class BaseMCMCSampler(_BaseSampler):
                                 iteration=iteration, walkers=walkers,
                                 flatten=flatten)
 
+    @classmethod
+    def n_independent_samples(cls, fp):
+        """Returns the number of independent samples stored in a file.
+
+        Parameters
+        -----------
+        fp : InferenceFile
+            An open file handler to read.
+
+        Returns
+        -------
+        int
+            The number of independent samples.
+        """
+        # we'll just read a single parameter from the file
+        samples = cls.read_samples(fp, fp.variable_args[0])
+        return samples.size
+
     @staticmethod
     def read_acceptance_fraction(fp, thin_start=None, thin_interval=None,
                                  thin_end=None, iteration=None):
@@ -765,10 +790,76 @@ class BaseMCMCSampler(_BaseSampler):
         return acfs
 
     @classmethod
+    def compute_acfs(cls, fp, start_index=None, end_index=None,
+                     per_walker=False, walkers=None, parameters=None):
+        """Computes the autocorrleation function of the variable args in the
+        given file.
+
+        By default, parameter values are averaged over all walkers at each
+        iteration. The ACF is then calculated over the averaged chain. An
+        ACF per-walker will be returned instead if ``per_walker=True``.
+
+        Parameters
+        -----------
+        fp : InferenceFile
+            An open file handler to read the samples from.
+        start_index : {None, int}
+            The start index to compute the acl from. If None, will try to use
+            the number of burn-in iterations in the file; otherwise, will start
+            at the first sample.
+        end_index : {None, int}
+            The end index to compute the acl to. If None, will go to the end
+            of the current iteration.
+        per_walker : optional, bool
+            Return the ACF for each walker separately. Default is False.
+        walkers : optional, int or array
+            Calculate the ACF using only the given walkers. If None (the
+            default) all walkers will be used.
+        parameters : optional, str or array
+            Calculate the ACF for only the given parameters. If None (the
+            default) will calculate the ACF for all of the variable args.
+
+        Returns
+        -------
+        FieldArray
+            A ``FieldArray`` of the ACF vs iteration for each parameter. If
+            `per-walker` is True, the FieldArray will have shape
+            ``nwalkers x niterations``.
+        """
+        acfs = {}
+        if parameters is None:
+            parameters = fp.variable_args
+        if isinstance(parameters, str) or isinstance(parameters, unicode):
+            parameters = [parameters]
+        for param in parameters:
+            if per_walker:
+                # just call myself with a single walker
+                if walkers is None:
+                    walkers = numpy.arange(fp.nwalkers)
+                arrays = [cls.compute_acfs(fp, start_index=start_index,
+                                           end_index=end_index,
+                                           per_walker=False, walkers=ii,
+                                           parameters=param)[param]
+                          for ii in walkers]
+                acfs[param] = numpy.vstack(arrays)
+            else:
+                samples = cls.read_samples(fp, param,
+                                           thin_start=start_index,
+                                           thin_interval=1, thin_end=end_index,
+                                           walkers=walkers,
+                                           flatten=False)[param]
+                samples = samples.mean(axis=0)
+                acfs[param] = autocorrelation.calculate_acf(samples).numpy()
+        return FieldArray.from_kwargs(**acfs)
+
+    @classmethod
     def compute_acls(cls, fp, start_index=None, end_index=None):
-        """Computes the autocorrleation length for all variable args and all
-        walkers in the given file. If the returned acl is inf, will default
-        to the number of requested iterations.
+        """Computes the autocorrleation length for all variable args in the
+        given file.
+
+        Parameter values are averaged over all walkers at each iteration.
+        The ACL is then calculated over the averaged chain. If the returned ACL
+        is `inf`,  will default to the number of current iterations.
 
         Parameters
         -----------
@@ -784,68 +875,53 @@ class BaseMCMCSampler(_BaseSampler):
 
         Returns
         -------
-        FieldArray
-            An nwalkers-long `FieldArray` containing the acl for each walker
-            and each variable argument, with the variable arguments as fields.
+        dict
+            A dictionary giving the ACL for each parameter.
         """
         acls = {}
-        if end_index is None:
-            end_index = fp.niterations
-        widx = numpy.arange(fp.nwalkers)
         for param in fp.variable_args:
-            these_acls = []
-            for wi in widx:
-                samples = cls.read_samples(fp, param,
+            samples = cls.read_samples(fp, param,
                                            thin_start=start_index,
                                            thin_interval=1, thin_end=end_index,
-                                           walkers=wi)[param]
-                acl = autocorrelation.calculate_acl(samples)
-                these_acls.append(min(acl, samples.size))
-            acls[param] = numpy.array(these_acls, dtype=int)
-        return FieldArray.from_kwargs(**acls)
+                                           flatten=False)[param]
+            samples = samples.mean(axis=0)
+            acl = autocorrelation.calculate_acl(samples)
+            if numpy.isinf(acl):
+                acl = samples.size
+            acls[param] = acl
+        return acls
 
     @staticmethod
     def write_acls(fp, acls):
-        """Writes the given autocorrelation lengths to the given file. The acl
-        of each walker and each parameter is saved to
-        `fp[fp.samples_group/{param}/walker{i}].attrs['acl']`; the maximum
-        over all the walkers for a given param is saved to
+        """Writes the given autocorrelation lengths to the given file.
+        
+        The ACL of each parameter is saved to
         `fp[fp.samples_group/{param}].attrs['acl']`; the maximum over all the
-        parameters and all of the walkers is saved to the file's 'acl'
-        attribute.
+        parameters is saved to the file's 'acl' attribute.
 
         Parameters
         ----------
         fp : InferenceFile
             An open file handler to write the samples to.
-        acls : FieldArray
-            An array of autocorrelation lengths (the sort of thing returned by
-            `compute_acls`).
+        acls : dict
+            A dictionary of ACLs keyed by the parameter.
 
         Returns
         -------
-        acl
+        ACL
             The maximum of the acls that was written to the file.
         """
         # write the individual acls
         pgroup = fp.samples_group + '/{param}'
-        group = pgroup + '/walker{wi}'
-        max_acls = []
-        for param in acls.fieldnames:
-            max_acl = 0
-            for wi, acl in enumerate(acls[param]):
-                fp[group.format(param=param, wi=wi)].attrs['acl'] = acl
-                max_acl = max(max_acl, acl)
-            max_acls.append(max_acl)
-            # write the maximum over the params
-            fp[pgroup.format(param=param)].attrs['acl'] = max_acl
+        for param in acls:
+            fp[pgroup.format(param=param)].attrs['acl'] = acls[param]
         # write the maximum over all params
-        fp.attrs['acl'] = max(max_acls)
+        fp.attrs['acl'] = max(acls.values())
         return fp.attrs['acl']
 
     @staticmethod
     def read_acls(fp):
-        """Reads the acls of all the walker chains saved in the given file.
+        """Reads the acls of all the parameters in the given file.
 
         Parameters
         ----------
@@ -854,18 +930,12 @@ class BaseMCMCSampler(_BaseSampler):
 
         Returns
         -------
-        FieldArray
-            An nwalkers-long `FieldArray` containing the acl for each walker
-            and each variable argument, with the variable arguments as fields.
+        dict
+            A dictionary of the ACLs, keyed by the parameter name.
         """
-        group = fp.samples_group + '/{param}/walker{wi}'
-        widx = numpy.arange(fp.nwalkers)
-        arrays = {}
-        for param in fp.variable_args:
-            arrays[param] = numpy.array([
-                fp[group.format(param=param, wi=wi)].attrs['acl']
-                for wi in widx])
-        return FieldArray.from_kwargs(**arrays)
+        group = fp.samples_group + '/{param}'
+        return {param: fp[group.format(param=param)]
+                for param in fp.variable_args}
 
     def write_state(self, fp):
         """ Saves the state of the sampler in a file.

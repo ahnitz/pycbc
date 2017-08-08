@@ -245,11 +245,9 @@ def datafind_connection(server=None):
         cert_file, key_file = None, None
 
     # Is a port specified in the server URL
-    server, port = datafind_server.split(':',1)
-    if port == "":
-        port = None
-    else:
-        port = int(port)
+    dfs_fields = datafind_server.split(':', 1)
+    server = dfs_fields[0]
+    port = int(dfs_fields[1]) if len(dfs_fields) == 2 else None
 
     # Open connection to the datafind server
     if cert_file and key_file:
@@ -432,6 +430,7 @@ class DataBuffer(object):
         self.read_pos = start_time
         self.force_update_cache = force_update_cache
         self.increment_update_cache = increment_update_cache
+        self.detector = channel_name.split(':')[0]
 
         self.update_cache()
         self.channel_type, self.raw_sample_rate = self._retrieve_metadata(self.stream, self.channel_name)
@@ -505,7 +504,7 @@ class DataBuffer(object):
                               epoch=self.read_pos, 
                               dtype=dtype)     
         except Exception:
-            raise RuntimeError('Cannot read requested frame data') 
+            raise RuntimeError('Cannot read {0} frame data'.format(self.channel_name))
 
     def null_advance(self, blocksize):
         """Advance and insert zeros
@@ -612,12 +611,10 @@ class DataBuffer(object):
             if lal.GPSTimeNow() > timeout + self.raw_buffer.end_time:
                 # The frame is not there and it should be by now, so we give up
                 # and treat it as zeros
-                logging.info('Frame missing, giving up...')
                 DataBuffer.null_advance(self, blocksize)
                 return None
             else:
                 # I am too early to give up on this frame, so we should try again
-                logging.info('Frame missing, waiting a bit more...')
                 time.sleep(1)
                 return self.attempt_advance(blocksize, timeout=timeout)
 
@@ -699,7 +696,7 @@ class StatusBuffer(DataBuffer):
         """
         sr = self.raw_buffer.sample_rate
         s = int((start_time - self.raw_buffer.start_time) * sr)
-        e = s + int(duration * sr)
+        e = s + int(duration * sr) + 1
         data = self.raw_buffer[s:e]
         return self.check_valid(data, flag=flag)
 
@@ -750,10 +747,9 @@ class StatusBuffer(DataBuffer):
             Returns True if all of the status information if valid,
             False if any is not.
         """
-        if self.increment_update_cache:
-            self.update_cache_by_increment(blocksize)
-
         try:
+            if self.increment_update_cache:
+                self.update_cache_by_increment(blocksize)
             ts = DataBuffer.advance(self, blocksize)
             return self.check_valid(ts)
         except RuntimeError:

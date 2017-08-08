@@ -26,7 +26,7 @@ export XDG_CACHE_HOME=${BUILD}/.cache
 
 # run the einstein at home build and test script
 pushd ${BUILD}
-${LOCAL}/tools/einsteinathome/pycbc_build_eah.sh ${LALSUITE_CODE} ${PYCBC_CODE} --clean-pycbc --silent-build
+${LOCAL}/tools/einsteinathome/pycbc_build_eah.sh ${LALSUITE_CODE} ${PYCBC_CODE} --clean-pycbc --silent-build --download-url=https://git.ligo.org/ligo-cbc/pycbc-software/raw/710a51f4770cbba77f61dfb798472bebe6c43d38/travis
 popd
 
 # setup the pycbc environment to run the additional travis tests
@@ -63,8 +63,8 @@ pip install git+https://github.com/ligo-cbc/sphinxcontrib-programoutput.git#egg=
 
 # get library needed to build documentation
 wget_opts="-c --passive-ftp --no-check-certificate --tries=5 --timeout=30"
-primary_url="https://code.pycbc.phy.syr.edu/ligo-cbc/pycbc-software/download/b3680bfb627a7350f29d31c7d91c4e09ff8a9fdc/x86_64/composer_xe_2015.0.090"
-secondary_url="https://www.atlas.aei.uni-hannover.de/~dbrown/x86_64/composer_xe_2015.0.090"
+primary_url="https://git.ligo.org/ligo-cbc/pycbc-software/raw/cea5bd67440f6c3195c555a388def3cc6d695a5c/x86_64/composer_xe_2015.0.090"
+secondary_url="https://www.atlas.aei.uni-hannover.de/~dbrown/cea5bd67440f6c3195c555a388def3cc6d695a5c/x86_64/composer_xe_2015.0.090"
 p="libmkl_rt.so"
 pushd ${BUILD}/pycbc-sources
 set +e

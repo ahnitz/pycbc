@@ -130,6 +130,12 @@ class FrequencySeries(Array):
         """
         return self.epoch
 
+    @start_time.setter
+    def start_time(self, time):
+        """ Set the start time
+        """
+        self._epoch = _lal.LIGOTimeGPS(time)
+
     @property
     def end_time(self):
         """Return the end time of this vector
@@ -460,7 +466,81 @@ class FrequencySeries(Array):
                            delta_t=delta_t)
         ifft(tmp, f)
         return f
-            
+
+    @_noreal
+    def cyclic_time_shift(self, dt):
+        """Shift the data by a given number of seconds
+        
+        Shift the data in the time domain a given number of seconds. This may
+        be smaller than the intrinsic sample rate of the data. Note that
+        data will be cycliclly rotated, so if you shift by 2 seconds, the
+        final 2 seconds of your data will now be at the beginning of the
+        data set.
+
+        Parameters
+        ----------
+        dt : float
+            Amount of time to shift the vector.
+
+        Returns
+        -------
+        data : pycbc.types.FrequencySeries
+            The time shifted frequency series.
+        """
+        from pycbc.waveform import apply_fseries_time_shift
+        data = apply_fseries_time_shift(self, dt)
+        data.start_time = self.start_time - dt
+        return data
+
+    def match(self, other, psd=None,
+              low_frequency_cutoff=None, high_frequency_cutoff=None):
+        """ Return the match between the two TimeSeries or FrequencySeries.
+
+        Return the match between two waveforms. This is equivelant to the overlap
+        maximized over time and phase. By default, the other vector will be
+        resized to match self. Beware, this may remove high frequency content or the
+        end of the vector.
+
+        Parameters
+        ----------
+        other : TimeSeries or FrequencySeries
+            The input vector containing a waveform.
+        psd : Frequency Series
+            A power spectral density to weight the overlap.
+        low_frequency_cutoff : {None, float}, optional
+            The frequency to begin the match.
+        high_frequency_cutoff : {None, float}, optional
+            The frequency to stop the match.
+        index: int
+            The number of samples to shift to get the match.
+
+        Returns
+        -------
+        match: float
+        index: int
+            The number of samples to shift to get the match.
+        """
+        from pycbc.types import TimeSeries
+        from pycbc.filter import match
+
+        if isinstance(other, TimeSeries):
+            if other.duration != self.duration:
+                other = other.copy()
+                other.resize(int(other.sample_rate * self.duration))
+
+            other = other.to_frequencyseries()
+        
+        if len(other) != len(self):
+            other = other.copy()
+            other.resize(len(self))
+
+        if psd is not None and len(psd) > len(self):
+            psd = psd.copy()
+            psd.resize(len(self))
+
+        return match(self, other, psd=psd,
+                     low_frequency_cutoff=low_frequency_cutoff,
+                     high_frequency_cutoff=high_frequency_cutoff)
 
 def load_frequencyseries(path, group=None):
     """

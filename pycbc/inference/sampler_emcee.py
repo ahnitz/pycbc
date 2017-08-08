@@ -52,15 +52,12 @@ class EmceeEnsembleSampler(BaseMCMCSampler):
         Number of walkers to use in sampler.
     pool : function with map, Optional
         A provider of a map function that allows a function call to be run
-        over multiple sets of arguments and possibly maps them to cores/nodes/etc.
-    burn_in_iterations : {None, int}, Optional
-        Set the number of burn in iterations to use. If None,
-        `burn_in_ieterations` will be initialized to 0.
+        over multiple sets of arguments and possibly maps them to
+        cores/nodes/etc.
     """
     name = "emcee"
 
     def __init__(self, likelihood_evaluator, nwalkers, pool=None,
-                 burn_in_iterations=None,
                  likelihood_call=None):
         try:
             import emcee
@@ -76,7 +73,7 @@ class EmceeEnsembleSampler(BaseMCMCSampler):
                                         pool=pool)
         # initialize
         super(EmceeEnsembleSampler, self).__init__(
-              sampler, likelihood_evaluator, min_burn_in=burn_in_iterations)
+              sampler, likelihood_evaluator)
         self._nwalkers = nwalkers
 
     @classmethod
@@ -97,16 +94,8 @@ class EmceeEnsembleSampler(BaseMCMCSampler):
         EmceeEnsembleSampler
             An emcee sampler initialized based on the given arguments.
         """
-        # check that if not skipping burn in, more than one burn in iteration
-        # has been specified
-        if not opts.skip_burn_in and (
-                opts.min_burn_in is None or opts.min_burn_in == 0):
-            raise ValueError("{name} requires that you provide a ".format(
-                name=cls.name) + " non-zero --min-burn-in if not skipping "
-                "burn-in")
         return cls(likelihood_evaluator, opts.nwalkers,
-                   pool=pool, likelihood_call=likelihood_call,
-                   burn_in_iterations=opts.min_burn_in)
+                   pool=pool, likelihood_call=likelihood_call)
 
     @property
     def lnpost(self):
@@ -157,25 +146,6 @@ class EmceeEnsembleSampler(BaseMCMCSampler):
         # update the positions
         self._pos = p
         return p, lnpost, rstate
-
-    def burn_in(self, **kwargs):
-        """Advance the ensemble by the number of the sampler's
-        `burn_in_iterations`.
-
-        Returns
-        -------
-        p : numpy.array
-            An array of current walker positions with shape (nwalkers, ndim).
-        lnpost : {None, numpy.array}
-            The list of log posterior probabilities for the walkers at
-            positions p, with shape (nwalkers, ndim).
-        rstate :
-            The current state of the random number generator.
-        """
-        if self.burn_in_iterations == 0:
-            raise ValueError("must specify a non-zero number of iterations "
-                             "to burn in")
-        return self.run(self.burn_in_iterations, **kwargs)
 
     # Emcee defines acceptance fraction differently, so have to override
     # write functions
@@ -234,13 +204,11 @@ class EmceeEnsembleSampler(BaseMCMCSampler):
             Write results starting from the given iteration.
         end_iteration : {None, int}
             Write results up to the given iteration.
-        max_iterations : {None, int}
-            If results have not previously been written to the
-            file, new datasets will be created. By default, the size of these
-            datasets will be whatever the length of the sampler's chain is at
-            this point. If you intend to run more iterations in the future,
-            set this value to that size so that the array in the file will be
-            large enough to accomodate future data.
+        max_iterations : int, optional
+            Set the maximum size that the arrays in the hdf file may be resized
+            to. Only applies if the samples have not previously been written
+            to file. The default (None) is to use the maximum size allowed by
+            h5py.
         """
         self.write_metadata(fp)
         self.write_chain(fp, start_iteration=start_iteration,
@@ -254,36 +222,23 @@ class EmceeEnsembleSampler(BaseMCMCSampler):
 # This is needed for two reason
 # 1) pools freeze state when created and so classes *cannot be updated*
 # 2) methods cannot be pickled. 
-class _callable(object):
-    """ Create a callable function from an instance and method name"""
-    def __init__(self, instance, method_name):
-        self.instance = instance
-        self.method_name = method_name
-
-    def __call__(self, *args, **kwds):
-        return getattr(self.instance, self.method_name)(*args, **kwds)
-
-
 class _callprior(object):
     """Calls the likelihood function's prior function, and ensures that no
     metadata is returned."""
-    def __init__(self, likelihood_evaluator):
-        self.instance = likelihood_evaluator
+    def __init__(self, likelihood_call):
+        self.callable = likelihood_call
 
     def __call__(self, args):
-        out = self.instance.evaluate(args, callfunc='prior')
-        if self.instance.return_meta:
-            out = out[0]
-        return out
+        return self.callable(args, callfunc='prior')[0]
 
 class _callloglikelihood(object):
     """Calls the likelihood function's loglikelihood function.
     """
-    def __init__(self, likelihood_evaluator):
-        self.instance = likelihood_evaluator
+    def __init__(self, likelihood_call):
+        self.callable = likelihood_call
 
     def __call__(self, args):
-        return self.instance.evaluate(args, callfunc='loglikelihood')
+        return self.callable(args, callfunc='loglikelihood')
 
 
 class EmceePTSampler(BaseMCMCSampler):
@@ -303,30 +258,30 @@ class EmceePTSampler(BaseMCMCSampler):
         A provider of a map function that allows a function call to be run
         over multiple sets of arguments and possibly maps them to
         cores/nodes/etc.
-    burn_in_iterations : {None, int}, Optional
-        Set the number of burn in iterations to use. If None,
-        `burn_in_ieterations` will be initialized to 0.
     """
     name = "emcee_pt"
 
     def __init__(self, likelihood_evaluator, ntemps, nwalkers, pool=None,
-                 burn_in_iterations=None):
+                 likelihood_call=None):
 
         try:
             import emcee
         except ImportError:
             raise ImportError("emcee is not installed.")
 
+        if likelihood_call is None:
+            likelihood_call = likelihood_evaluator
+
         # construct the sampler: PTSampler needs the likelihood and prior
         # functions separately
         ndim = len(likelihood_evaluator.variable_args)
         sampler = emcee.PTSampler(ntemps, nwalkers, ndim,
-                                  _callloglikelihood(likelihood_evaluator),
-                                  _callprior(likelihood_evaluator),
+                                  _callloglikelihood(likelihood_call),
+                                  _callprior(likelihood_call),
                                   pool=pool)
         # initialize
         super(EmceePTSampler, self).__init__(
-              sampler, likelihood_evaluator, min_burn_in=burn_in_iterations)
+              sampler, likelihood_evaluator)
         self._nwalkers = nwalkers
         self._ntemps = ntemps
 
@@ -348,14 +303,8 @@ class EmceePTSampler(BaseMCMCSampler):
         EmceePTSampler
             An emcee sampler initialized based on the given arguments.
         """
-        # check that if not skipping burn in, more than one burn in iteration
-        # has been specified
-        if not opts.skip_burn_in and (
-                opts.min_burn_in is None or opts.min_burn_in == 0):
-            raise ValueError("%s requires that you provide a non-zero " % (
-                cls.name) + "--min-burn-in if not skipping burn-in")
         return cls(likelihood_evaluator, opts.ntemps, opts.nwalkers,
-                   pool=pool, burn_in_iterations=opts.min_burn_in)
+                   pool=pool, likelihood_call=likelihood_call)
 
     @property
     def ntemps(self):
@@ -471,25 +420,6 @@ class EmceePTSampler(BaseMCMCSampler):
         self._pos = p
         return p, lnpost, rstate
 
-    def burn_in(self, **kwargs):
-        """Advance the ensemble by the number of the sampler's
-        `burn_in_iterations`.
-
-        Returns
-        -------
-        p : numpy.array
-            An array of current walker positions with shape (nwalkers, ndim).
-        lnpost : {None, numpy.array}
-            The list of log posterior probabilities for the walkers at
-            positions p, with shape (nwalkers, ndim).
-        rstate :
-            The current state of the random number generator.
-        """
-        if self.burn_in_iterations == 0:
-            raise ValueError("must specify a non-zero number of iterations "
-                             "to burn in")
-        return self.run(self.burn_in_iterations, **kwargs)
-
     # read/write functions
 
     # add ntemps and betas to metadata
@@ -559,10 +489,10 @@ class EmceePTSampler(BaseMCMCSampler):
             arrays.append(fp[group.format(tk=tk)][wmask])
         return numpy.vstack(arrays)
 
-    def _write_samples_group(self, fp, samples_group, parameters, samples,
+    @staticmethod
+    def write_samples_group(fp, samples_group, parameters, samples,
                              start_iteration=0, end_iteration=None,
-                             max_iterations=None,
-                             apply_boundary_conditions=False):
+                             index_offset=0, max_iterations=None):
         """Writes samples to the given file.
 
         Results are written to:
@@ -588,30 +518,34 @@ class EmceePTSampler(BaseMCMCSampler):
             Write results starting from the given iteration.
         end_iteration : {None, int}
             Write results up to the given iteration.
-        max_iterations : {None, int}
-            If samples have not previously been written to the file, a new
-            dataset will be created. By default, the size of this dataset will
-            be whatever the length of the sampler's chain is at this point. If
-            you intend to run more iterations, set this value to that size so
-            that the array in the file will be large enough to accomodate
-            future data.
+        index_offset : int, optional
+            Write the samples to the arrays on disk starting at
+            `start_iteration` + `index_offset`. For example, if
+            `start_iteration=0`, `end_iteration=1000` and `index_offset=500`,
+            then `samples[0:1000]` will be written to indices `500:1500` in the
+            arrays on disk. This is needed if you are adding new samples to
+            a chain that was previously written to file, and you want to
+            preserve the history (e.g., after a checkpoint). Default is 0.
+        max_iterations : int, optional
+            Set the maximum size that the arrays in the hdf file may be resized
+            to. Only applies if the samples have not previously been written
+            to file. The default (None) is to use the maximum size allowed by
+            h5py.
         """
         ntemps, nwalkers, niterations = samples.shape
         # due to clearing memory, there can be a difference between indices in
         # memory and on disk
-        niterations += self._lastclear
+        niterations += index_offset
         fa = start_iteration # file start index
         if end_iteration is None:
             end_iteration = niterations
         fb = end_iteration # file end index
-        ma = fa - self._lastclear # memory start index
-        mb = fb - self._lastclear # memory end index
+        ma = fa - index_offset # memory start index
+        mb = fb - index_offset # memory end index
 
         if max_iterations is not None and max_iterations < niterations:
             raise IndexError("The provided max size is less than the "
                              "number of iterations")
-        elif max_iterations is None:
-            max_iterations = niterations
 
         group = samples_group + '/{name}/temp{tk}/walker{wi}'
 
@@ -652,13 +586,11 @@ class EmceePTSampler(BaseMCMCSampler):
             Write results starting from the given iteration.
         end_iteration : {None, int}
             Write results up to the given iteration.
-        max_iterations : {None, int}
-            If results have not previously been written to the
-            file, new datasets will be created. By default, the size of these
-            datasets will be whatever the length of the sampler's chain is at
-            this point. If you intend to run more iterations in the future,
-            set this value to that size so that the array in the file will be
-            large enough to accomodate future data.
+        max_iterations : int, optional
+            Set the maximum size that the arrays in the hdf file may be resized
+            to. Only applies if the samples have not previously been written
+            to file. The default (None) is to use the maximum size allowed by
+            h5py.
         """
         self.write_metadata(fp)
         self.write_chain(fp, start_iteration=start_iteration,
@@ -714,7 +646,7 @@ class EmceePTSampler(BaseMCMCSampler):
 
         # get the slice to use
         if iteration is not None:
-            get_index = iteration
+            get_index = [iteration]
         else:
             if thin_end is None:
                 # use the number of current iterations
@@ -809,10 +741,112 @@ class EmceePTSampler(BaseMCMCSampler):
                 walkers=walkers, flatten=flatten)
 
     @classmethod
+    def compute_acfs(cls, fp, start_index=None, end_index=None,
+                     per_walker=False, walkers=None, parameters=None,
+                     temps=None):
+        """Computes the autocorrleation function of the variable args in the
+        given file.
+
+        By default, parameter values are averaged over all walkers at each
+        iteration. The ACF is then calculated over the averaged chain for each
+        temperature. An ACF per-walker will be returned instead if
+        ``per_walker=True``.
+
+        Parameters
+        -----------
+        fp : InferenceFile
+            An open file handler to read the samples from.
+        start_index : {None, int}
+            The start index to compute the acl from. If None, will try to use
+            the number of burn-in iterations in the file; otherwise, will start
+            at the first sample.
+        end_index : {None, int}
+            The end index to compute the acl to. If None, will go to the end
+            of the current iteration.
+        per_walker : optional, bool
+            Return the ACF for each walker separately. Default is False.
+        walkers : optional, int or array
+            Calculate the ACF using only the given walkers. If None (the
+            default) all walkers will be used.
+        parameters : optional, str or array
+            Calculate the ACF for only the given parameters. If None (the
+            default) will calculate the ACF for all of the variable args.
+        temps : optional, (list of) int or 'all'
+            The temperature index (or list of indices) to retrieve. If None
+            (the default), the ACF will only be computed for the coldest (= 0)
+            temperature chain. To compute an ACF for all temperates pass 'all',
+            or a list of all of the temperatures.
+
+        Returns
+        -------
+        FieldArray
+            A ``FieldArray`` of the ACF vs iteration for each parameter. If
+            `per-walker` is True, the FieldArray will have shape
+            ``ntemps x nwalkers x niterations``. Otherwise, the returned
+            array will have shape ``ntemps x niterations``.
+        """
+        acfs = {}
+        if parameters is None:
+            parameters = fp.variable_args
+        if isinstance(parameters, str) or isinstance(parameters, unicode):
+            parameters = [parameters]
+        if isinstance(temps, int):
+            temps = [temps]
+        elif temps == 'all':
+            temps = numpy.arange(fp.ntemps)
+        elif temps is None:
+            temps = [0]
+        for param in parameters:
+            subacfs = []
+            for tk in temps:
+                if per_walker:
+                    # just call myself with a single walker
+                    if walkers is None:
+                        walkers = numpy.arange(fp.nwalkers)
+                    arrays = [cls.compute_acfs(fp, start_index=start_index,
+                                               end_index=end_index,
+                                               per_walker=False, walkers=ii,
+                                               parameters=param,
+                                               temps=tk)[param][0,:]
+                              for ii in walkers]
+                    # we'll stack all of the walker arrays to make a single
+                    # nwalkers x niterations array; when these are stacked
+                    # below, we'll get a ntemps x nwalkers x niterations array
+                    subacfs.append(numpy.vstack(arrays))
+                else:
+                    samples = cls.read_samples(fp, param,
+                                               thin_start=start_index,
+                                               thin_interval=1,
+                                               thin_end=end_index,
+                                               walkers=walkers, temps=tk,
+                                               flatten=False)[param]
+                    # contract the walker dimension using the mean, and flatten
+                    # the (length 1) temp dimension
+                    samples = samples.mean(axis=1)[0,:]
+                    thisacf = autocorrelation.calculate_acf(samples).numpy()
+                    subacfs.append(thisacf)
+            # stack the temperatures
+            # FIXME: the following if/else can be condensed to a single line
+            # using numpy.stack, once the version requirements are bumped to
+            # numpy >= 1.10
+            if per_walker:
+                nw, ni = subacfs[0].shape
+                acfs[param] = numpy.zeros((len(temps), nw, ni), dtype=float)
+                for tk in range(len(temps)):
+                    acfs[param][tk,...] = subacfs[tk]
+            else:
+                acfs[param] = numpy.vstack(subacfs)
+        return FieldArray.from_kwargs(**acfs)
+
+    @classmethod
     def compute_acls(cls, fp, start_index=None, end_index=None):
-        """Computes the autocorrleation length for all variable args for all
-        walkers for all temps in the given file. If the returned acl is inf,
-        will default to the number of requested iterations.
+        """Computes the autocorrleation length for all variable args and
+        temperatures in the given file.
+        
+        Parameter values are averaged over all walkers at each iteration and
+        temperature.  The ACL is then calculated over the averaged chain. If
+        the returned ACL is `inf`,  will default to the number of current
+        iterations.
 
         Parameters
         -----------
@@ -829,40 +863,39 @@ class EmceePTSampler(BaseMCMCSampler):
         Returns
         -------
         FieldArray
-            An ntemps x nwalkers `FieldArray` containing the acl for each
-            walker and temp for each variable argument, with the variable
-            arguments as fields.
+            An ntemps-long `FieldArray` containing the ACL for each temperature
+            and for each variable argument, with the variable arguments as
+            fields.
         """
         acls = {}
         if end_index is None:
             end_index = fp.niterations
         tidx = numpy.arange(fp.ntemps)
-        widx = numpy.arange(fp.nwalkers)
         for param in fp.variable_args:
-            these_acls = numpy.zeros((fp.ntemps, fp.nwalkers), dtype=int)
+            these_acls = numpy.zeros(fp.ntemps, dtype=int)
             for tk in tidx:
-                for wi in widx:
-                    samples = cls.read_samples(
-                            fp, param,
-                            thin_start=start_index, thin_interval=1,
-                            thin_end=end_index,
-                            walkers=wi, temps=tk)[param]
-                    acl = autocorrelation.calculate_acl(samples)
-                    these_acls[tk, wi] = int(min(acl, samples.size))
+                samples = cls.read_samples(fp, param, thin_start=start_index,
+                                           thin_interval=1, thin_end=end_index,
+                                           temps=tk, flatten=False)[param]
+                # contract the walker dimension using the mean, and flatten
+                # the (length 1) temp dimension
+                samples = samples.mean(axis=1)[0,:]
+                acl = autocorrelation.calculate_acl(samples)
+                if numpy.isinf(acl):
+                    acl = samples.size
+                these_acls[tk] = acl
             acls[param] = these_acls
         return FieldArray.from_kwargs(**acls)
 
     @staticmethod
     def write_acls(fp, acls):
-        """Writes the given autocorrelation lengths to the given file. The acl
-        of each walker at each temperature and each parameter is saved to
-        `fp[fp.samples_group/{param}/temp{k}/walker{i}].attrs['acl']`; the
-        maximum over all the walkers for a given temperature and param is
-        saved to `fp[fp.samples_group/{param}/temp{k}].attrs['acl']`; the
-        maximum over all of the temperatures and walkers is saved to
-        `fp[fp.samples_group/{param}].attrs['acl']`; the maximum over all the
-        parameters, temperatures, and walkers is saved to the file's 'acl'
-        attribute.
+        """Writes the given autocorrelation lengths to the given file.
+        
+        The acl of each parameter at each temperature is saved to
+        ``fp[fp.samples_group/{param}/temp{k}].attrs['acl']``; the maximum over
+        all temperatures is saved to
+        ``fp[fp.samples_group/{param}].attrs['acl']``; the maximum over all the
+        parameters and temperatures is saved to the file's 'acl' attribute.
 
         Parameters
         ----------
@@ -880,29 +913,19 @@ class EmceePTSampler(BaseMCMCSampler):
         # write the individual acls
         pgroup = fp.samples_group + '/{param}'
         tgroup = pgroup + '/temp{tk}'
-        group = tgroup + '/walker{wi}'
         tidx = numpy.arange(fp.ntemps)
         overall_max = 0
+        param_acls = {}
         for param in acls.fieldnames:
             max_acls = []
+            aclp = acls[param]
             for tk in tidx:
-                max_acl = 0
-                for wi, acl in enumerate(acls[param][tk, :]):
-                    fp[group.format(param=param, tk=tk,
-                                    wi=wi)].attrs['acl'] = acl
-                    max_acl = max(max_acl, acl)
-                # write the maximum over the walkers
-                fp[tgroup.format(param=param, tk=tk)].attrs['acl'] = max_acl
-                max_acls.append(max_acl)
-            # write the maximum over the temperatures
-            this_max = max(max_acls)
-            fp[pgroup.format(param=param)].attrs['acl'] = this_max
-            overall_max = max(overall_max, this_max)
-            # write the maximum over the params
-            fp[pgroup.format(param=param)].attrs['acl'] = max_acl
-        # write the maximum over all params
-        fp.attrs['acl'] = overall_max
-        return fp.attrs['acl']
+                # write the acl for this temperature
+                fp[tgroup.format(param=param, tk=tk)].attrs['acl'] = aclp[tidx]
+            # save the maximum
+            param_acls[param] = aclp.max()
+        # use the parent class to write the acls overs the temps
+        return super(EmceePTSampler, self).write_acls(fp, acls)
 
     @staticmethod
     def read_acls(fp):
@@ -916,17 +939,15 @@ class EmceePTSampler(BaseMCMCSampler):
         Returns
         -------
         FieldArray
-            An ntemps x nwalkers `FieldArray` containing the acls for
-            every temp and walker, with the variable arguments as fields.
+            An ntemps-long ``FieldArray`` containing the acls for every
+            temperature, with the variable arguments as fields.
         """
-        group = fp.samples_group + '/{param}/temp{tk}/walker{wi}'
-        widx = numpy.arange(fp.nwalkers)
+        group = fp.samples_group + '/{param}/temp{tk}'
         tidx = numpy.arange(fp.ntemps)
         arrays = {}
         for param in fp.variable_args:
             arrays[param] = numpy.array([
-                [fp[group.format(param=param, tk=tk, wi=wi)].attrs['acl']
-                    for wi in widx]
+                fp[group.format(param=param, tk=tk)].attrs['acl']
                 for tk in tidx])
         return FieldArray.from_kwargs(**arrays)
 

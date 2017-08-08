@@ -20,6 +20,7 @@
 import logging
 import numpy
 import pycbc.inference.sampler
+from pycbc.inference import burn_in
 from pycbc import conversions
 from pycbc import transforms
 from pycbc.distributions import bounded
@@ -82,7 +83,7 @@ def config_parser_from_cli(opts):
     return WorkflowConfigParser(opts.config_files, overrides)
 
 
-def read_args_from_config(cp, section_group=None):
+def read_args_from_config(cp, section_group=None, prior_section='prior'):
     """Given an open config file, loads the static and variable arguments to
     use in the parameter estmation run.
 
@@ -96,6 +97,8 @@ def read_args_from_config(cp, section_group=None):
         variable arguments will be retrieved from section
         `[foo_variable_args]`. If None, no prefix will be appended to section
         names.
+    prior_section : str, optional
+        Check that priors exist in the given section. Default is 'prior.'
 
     Returns
     -------
@@ -112,7 +115,8 @@ def read_args_from_config(cp, section_group=None):
 
     # sanity check that each parameter in [variable_args] has a priors section
     variable_args = cp.options("{}variable_args".format(section_prefix))
-    subsections = cp.get_subsections("{}prior".format(section_prefix))
+    subsections = cp.get_subsections("{}{}".format(section_prefix,
+                                                   prior_section))
     tags = numpy.concatenate([tag.split("+") for tag in subsections])
     if not any(param in tags for param in variable_args):
         raise KeyError("You are missing a priors section in the config file.")
@@ -157,10 +161,11 @@ def read_args_from_config(cp, section_group=None):
 
     return variable_args, static_args, cons
 
-def read_sampling_args_from_config(cp, section_group=None):
+def read_sampling_args_from_config(cp, section_group=None,
+                                   section='sampling_parameters'):
     """Reads sampling parameters from the given config file.
 
-    Parameters are read from the `[({section_group}_)sampling_params]` section.
+    Parameters are read from the `[({section_group}_){section}]` section.
     The options should list the variable args to transform; the parameters they
     point to should list the parameters they are to be transformed to for
     sampling. If a multiple parameters are transformed together, they should
@@ -185,6 +190,8 @@ def read_sampling_args_from_config(cp, section_group=None):
         An open config parser to read from.
     section_group : str, optional
         Append `{section_group}_` to the section name. Default is None.
+    section : str, optional
+        The name of the section. Default is 'sampling_parameters'.
 
     Returns
     -------
@@ -197,7 +204,7 @@ def read_sampling_args_from_config(cp, section_group=None):
         section_prefix = '{}_'.format(section_group)
     else:
         section_prefix = ''
-    section = section_prefix + 'sampling_parameters'
+    section = section_prefix + section
     replaced_params = set()
     sampling_params = set()
     for args in cp.options(section):
@@ -228,8 +235,19 @@ def add_sampler_option_group(parser):
     sampler_group.add_argument("--sampler", required=True,
         choices=pycbc.inference.sampler.samplers.keys(),
         help="Sampler class to use for finding posterior.")
-    sampler_group.add_argument("--niterations", type=int, required=True,
-        help="Number of iterations to perform after burn in.")
+    sampler_group.add_argument("--niterations", type=int,
+        help="Number of iterations to perform. If 'use_sampler' is given to "
+             "burn-in-function, this will be counted after the sampler's burn "
+             "function has run. Otherwise, this is the total number of "
+             "iterations, including any burn in.")
+    sampler_group.add_argument("--n-independent-samples", type=int,
+        help="Run the sampler until the specified number of "
+             "independent samples is obtained, at minimum. Requires "
+             "checkpoint-interval. At each checkpoint the burn-in iteration "
+             "and ACL is updated. The number of independent samples is the "
+             "number of samples across all walkers starting at the "
+             "burn-in-iteration and skipping every `ACL`th iteration. "
+             "Either this or niteration should be specified (but not both).")
     # sampler-specific options
     sampler_group.add_argument("--nwalkers", type=int, default=None,
         help="Number of walkers to use in sampler. Required for MCMC "
@@ -237,16 +255,20 @@ def add_sampler_option_group(parser):
     sampler_group.add_argument("--ntemps", type=int, default=None,
         help="Number of temperatures to use in sampler. Required for parallel "
              "tempered MCMC samplers.")
-    sampler_group.add_argument("--min-burn-in", type=int, default=None,
+    sampler_group.add_argument("--burn-in-function", default=None, nargs='+',
+        choices=burn_in.burn_in_functions.keys(),
+        help="Use the given function to determine when chains are burned in. "
+             "If none provided, no burn in will be estimated. "
+             "If multiple functions are provided, will use the maximum "
+             "iteration from all functions.")
+    sampler_group.add_argument("--min-burn-in", type=int, default=0,
         help="Force the burn-in to be at least the given number of "
-             "iterations. If a sampler has an internal algorithm for "
-             "determining the burn-in size (e.g., kombine), and it returns "
-             "a value < this, the burn-in will be repeated until the "
-             "number of iterations is at least this value.")
+             "iterations.")
     sampler_group.add_argument("--skip-burn-in", action="store_true",
         default=False,
-        help="Do not burn in with sampler. An error will be raised if "
-             "min-burn-in is also provided.")
+        help="DEPRECATED. Turning this option on has no effect; "
+             "it will be removed in future versions. If no burn in is "
+             "desired, simply do not provide a burn-in-function argument.")
     sampler_group.add_argument("--update-interval", type=int, default=None,
         help="If using kombine, specify the number of steps to take between "
              "proposal updates. Note: for purposes of updating, kombine "
@@ -285,9 +307,6 @@ def sampler_from_cli(opts, likelihood_evaluator, pool=None):
         likelihood_call = None
 
     sclass = pycbc.inference.sampler.samplers[opts.sampler]
-    # check for consistency
-    if opts.skip_burn_in and opts.min_burn_in is not None:
-        raise ValueError("both skip-burn-in and min-burn-in specified")
 
     pool = choose_pool(mpi=opts.use_mpi, processes=opts.nprocesses)
 
@@ -472,7 +491,34 @@ def add_inference_results_option_group(parser):
     return results_reading_group
 
 
-def results_from_cli(opts, load_samples=True, walkers=None):
+def parse_parameters_opt(parameters):
+    """Parses the --parameters opt in the results_reading_group.
+
+    Parameters
+    ----------
+    parameters : list of str or None
+        The parameters to parse.
+    Returns
+    -------
+    parameters : list of str
+        The parameters.
+    labels : dict
+        A dictionary mapping parameters for which labels were provide to those
+        labels.
+    """
+    if parameters is None:
+        return None, {}
+    # load the labels
+    labels = {}
+    for ii,p in enumerate(parameters):
+        if len(p.split(':')) == 2:
+            p, label = p.split(':')
+            parameters[ii] = p
+            labels[p] = label
+    return parameters, labels
+
+
+def results_from_cli(opts, load_samples=True, **kwargs):
     """
     Loads an inference result file along with any labels associated with it
     from the command line options.
@@ -485,9 +531,10 @@ def results_from_cli(opts, load_samples=True, walkers=None):
         Load samples from the results file using the parameters, thin_start,
         and thin_interval specified in the options. The samples are returned
         as a FieldArray instance.
-    walkers : {None, (list of) int}
-        If loading samples, the walkers to load from. If None, will load from
-        all walkers.
+
+    \**kwargs :
+        All other keyword arguments are passed to the InferenceFile's
+        read_samples function.
 
     Returns
     -------
@@ -507,12 +554,13 @@ def results_from_cli(opts, load_samples=True, walkers=None):
                  else opts.parameters
 
     # load the labels
+    parameters, ldict = parse_parameters_opt(parameters)
+    # convert labels dict to list
     labels = []
-    for ii,p in enumerate(parameters):
-        if len(p.split(':')) == 2:
-            p, label = p.split(':')
-            parameters[ii] = p
-        else:
+    for p in parameters:
+        try:
+            label = ldict[p]
+        except KeyError:
             label = fp.read_label(p)
         labels.append(label)
 
@@ -523,11 +571,11 @@ def results_from_cli(opts, load_samples=True, walkers=None):
         file_parameters, ts = transforms.get_common_cbc_transforms(
                                                  parameters, fp.variable_args)
         # read samples from file
-        samples = fp.read_samples(
-            file_parameters, walkers=walkers,
+        samples = fp.read_samples(file_parameters,
             thin_start=opts.thin_start, thin_interval=opts.thin_interval,
             thin_end=opts.thin_end, iteration=opts.iteration,
-            samples_group=opts.parameters_group)
+            samples_group=opts.parameters_group,
+            **kwargs)
         # add parameters not included in file
         samples = transforms.apply_transforms(samples, ts)
     else:

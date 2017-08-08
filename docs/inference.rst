@@ -90,8 +90,8 @@ An example configuration file (named ``inference.ini``) is::
     [variable_args]
     ; waveform parameters that will vary in MCMC
     tc =
-    mchirp =
-    q =
+    mass1 =
+    mass2 =
     spin1_a =
     spin1_azimuthal =
     spin1_polar =
@@ -108,7 +108,8 @@ An example configuration file (named ``inference.ini``) is::
     [static_args]
     ; waveform parameters that will not change in MCMC
     approximant = IMRPhenomPv2
-    f_lower = 19.0
+    f_lower = 18
+    f_ref = 20
 
     [prior-tc]
     ; coalescence time prior
@@ -116,20 +117,20 @@ An example configuration file (named ``inference.ini``) is::
     min-tc = 1126259461.8
     max-tc = 1126259462.2
 
-    [prior-mchirp]
+    [prior-mass1]
     name = uniform
-    min-mchirp = 7.
-    max-mchirp = 40.
+    min-mass1 = 10.
+    max-mass1 = 80.
 
-    [prior-q]
+    [prior-mass2]
     name = uniform
-    min-q = 1.
-    max-q = 5.
+    min-mass2 = 10.
+    max-mass2 = 80.
 
     [prior-spin1_a]
     name = uniform
     min-spin1_a = 0.0
-    max-spin1_a = 0.9
+    max-spin1_a = 0.99
 
     [prior-spin1_polar+spin1_azimuthal]
     name = uniform_solidangle
@@ -139,7 +140,7 @@ An example configuration file (named ``inference.ini``) is::
     [prior-spin2_a]
     name = uniform
     min-spin2_a = 0.0
-    max-spin2_a = 0.9
+    max-spin2_a = 0.99
 
     [prior-spin2_polar+spin2_azimuthal]
     name = uniform_solidangle
@@ -147,8 +148,8 @@ An example configuration file (named ``inference.ini``) is::
     azimuthal-angle = spin2_azimuthal
 
     [prior-distance]
-    ; distance prior
-    name = uniform
+    ; following gives a uniform volume prior
+    name = uniform_radius
     min-distance = 10
     max-distance = 1000
 
@@ -168,6 +169,19 @@ An example configuration file (named ``inference.ini``) is::
     ; polarization prior
     name = uniform_angle
 
+    ;
+    ;   Sampling transforms
+    ;
+    [sampling_parameters]
+    ; parameters on the left will be sampled in
+    ; parametes on the right
+    mass1, mass2 : mchirp, q
+
+    [sampling_transforms-mchirp+q]
+    ; inputs mass1, mass2
+    ; outputs mchirp, q
+    name = mass1_mass2_to_mchirp_q
+
 An example of generating an injection::
 
     # define waveform parameters
@@ -181,7 +195,7 @@ An example of generating an injection::
     COA_PHASE=1.5
     POLARIZATION=1.75
     DISTANCE=100000 # in kpc
-    INJ_F_MIN=28.
+    INJ_F_MIN=18.
     TAPER="start"
 
     # path of injection file that will be created in the example
@@ -236,7 +250,7 @@ An example of running ``pycbc_inference`` to analyze the injection in fake data:
     IFOS="H1 L1"
     STRAIN="H1:aLIGOZeroDetHighPower L1:aLIGOZeroDetHighPower"
     SAMPLE_RATE=2048
-    F_MIN=30.
+    F_MIN=20
     N_UPDATE=500
     N_WALKERS=5000
     N_ITERATIONS=12000
@@ -341,18 +355,17 @@ Now run::
     # PSD estimation options
     PSD_ESTIMATION="H1:median L1:median"
     PSD_INVLEN=4
-    PSD_SEG_LEN=8
-    PSD_STRIDE=4
+    PSD_SEG_LEN=16
+    PSD_STRIDE=8
     PSD_DATA_LEN=1024
 
     # sampler parameters
     CONFIG_PATH=inference.ini
     OUTPUT_PATH=inference.hdf
-    SEGLEN=8
     IFOS="H1 L1"
     SAMPLE_RATE=2048
-    F_HIGHPASS=20
-    F_MIN=30.
+    F_HIGHPASS=15
+    F_MIN=20
     N_UPDATE=500
     N_WALKERS=5000
     N_ITERATIONS=12000
@@ -447,7 +460,7 @@ In this case, ``fp.read_samples`` will retrieve ``mass1`` and ``mass2`` (since t
 For more information, including the list of predefined derived parameters, see :py:class:`pycbc.io.InferenceFile`.
 
 =============================================================
-Plotting the posteriors (``pycbc_inference_plot_posteriors``)
+Plotting the posteriors (``pycbc_inference_plot_posterior``)
 =============================================================
 
 --------
@@ -455,18 +468,18 @@ Overview
 --------
 
 There is an executable that can plot the posteriors called
-``pycbc_inference_plot_posteriors``. You can use ``--plot-scatter``
+``pycbc_inference_plot_posterior``. You can use ``--plot-scatter``
 to plot a each sample as a point or ``--plot-density`` to plot a density map.
 
 By default the plotting executables will plot all the parameters in the input
-file. In order to specific a different set of variables to plot use the
-``--parameters`` option. Examples how to use this option are shown below.
+file. In order to specify a different set of variables to plot, use the
+``--parameters`` option. Examples for how to use this option are shown below.
 
 By default the plotting executables will plot samples beginning at the end of
 the burn in. If the burn-in was skipped, then it starts from the first sample.
 It will then use a sample every autocorrelation length along the chain.
-Examples how to plot a specific iteration or change how the thinning is
-performed is shown in the examples below.
+Examples on how to plot a specific iteration or change how the thinning is
+performed are shown in the examples below.
 
 You may plot a z-axis on the 2-D histograms using the ``--z-arg`` option.
 For a list of options use ``pycbc_inference_plot_posterior --help``.
@@ -490,7 +503,7 @@ An example of plotting the posteriors at a specific iteration::
         --parameters "ra*12/pi:$\alpha$ (h)" \
                      "dec*180/pi:$\delta$ (deg)" \
                      "polarization*180/pi:$\psi$ (deg)" \
-                     mchirp q spin1_a spin1_azimuthal spin1_polar \
+                     mass1 mass2 spin1_a spin1_azimuthal spin1_polar \
                      spin2_a spin2_azimuthal spin2_polar \
                      "inclination*180/pi:$\iota$ (deg)" distance \
                      "coa_phase*180/pi:$\phi_0$ (deg)" tc
@@ -518,7 +531,41 @@ There are also options for thinning the chains of samples from the command line,
         --parameters "ra*12/pi:$\alpha$ (h)" \
                      "dec*180/pi:$\delta$ (deg)" \
                      "polarization*180/pi:$\psi$ (deg)" \
-                     mchirp q spin1_a spin1_azimuthal spin1_polar \
+                     mass1 mass2 spin1_a spin1_azimuthal spin1_polar \
                      spin2_a spin2_azimuthal spin2_polar \
                      "inclination*180/pi:$\iota$ (deg)" distance \
                      "coa_phase*180/pi:$\phi_0$ (deg)" tc
+                     
+===============================================
+Making a movie (``pycbc_inference_plot_movie``)
+===============================================       
+
+``pycbc_inference_plot_movie`` is an executable similar to ``_plot_posterior`` that allows you to combine plots in to a small movie. Most options for ``_plot_movie`` are the same as ``_plot_posterior`` with a few differences. Again, the plotting executables will plot all the parameters in the input file unless the option ``--parameters`` is used to specify a set of parameters that you want to see. An example plotting every 20-th iteration into a directory called "movies"::
+
+    INPUT_FILE=inference.hdf
+    START_SAMPLE=1
+    END_SAMPLE=12000
+    FRAME_STEP=20
+    OUTPUT_PREFIX=frame
+    NPROCESSES=10
+    MOVIE_FILE=~/src/pycbc/movies/movie.mp4
+    DPI=100
+    
+    pycbc_inference_plot_movie \  
+        --input-file ${INPUT_FILE} \
+        --start-sample ${START_SAMPLE} \
+        --end-sample ${END_SAMPLE} \
+        --frame-step ${FRAME_STEP} \
+        --output-prefix ${OUTPUT_PREFIX} \
+        --nprocesses ${NPROCESSES} \
+        --movie-file ${MOVIE_FILE} \
+        --cleanup \
+        --plot-scatter \
+        --plot-marginal \
+        --z-arg snr \
+        --dpi ${DPI} \
+        --parameters mass1 mass2 spin1_a spin1_azimuthal spin1_polar \
+               	     spin2_a spin2_azimuthal spin2_polar \
+            
+This will create a 24-second movie for a selection of parameters. The option ``--cleanup`` deletes the individual frame files prefixed as specified by the variable ``OUTPUT_PREFIX``. This is optional. 
+For a list of options use ``pycbc_inference_plot_movie --help``.
