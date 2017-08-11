@@ -33,6 +33,7 @@ import lalsimulation as sim
 import h5py
 from pycbc.waveform import get_td_waveform, utils as wfutils
 from pycbc.waveform import ringdown_td_approximants
+from pycbc.waveform import get_dopshifted_waveform
 from pycbc_glue.ligolw import utils as ligolw_utils
 from pycbc_glue.ligolw import ligolw, table, lsctables
 from pycbc.types import float64, float32, TimeSeries
@@ -234,7 +235,11 @@ class _HDFInjectionSet(object):
             f_l = f_lower
 
         # compute the waveform time series
-        hp, hc = get_td_waveform(inj, delta_t=delta_t, f_lower=f_l,
+        if inj.approximant.startswith("doppler"):
+	    hp, hc = get_dopshifted_waveform(inj, delta_t=delta_t, f_lower=f_l,
+                                 **self.extra_args)
+	else:    
+            hp, hc = get_td_waveform(inj, delta_t=delta_t, f_lower=f_l,
                                  **self.extra_args)
 
         hp /= distance_scale
