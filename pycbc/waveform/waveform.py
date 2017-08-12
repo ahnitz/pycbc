@@ -455,7 +455,9 @@ get_td_waveform.__doc__ = get_td_waveform.__doc__.format(
     params=parameters.td_waveform_params.docstr(prefix="    ",
            include_label=False).lstrip(' '))
 
-def get_dopshifted_waveform(**kwargs):
+
+=======
+def get_dopshifted_waveform(template=None, **kwargs):
     """Return a doppler-shifted time domain gravitational waveform.
     Parameters
     ----------
@@ -464,9 +466,10 @@ def get_dopshifted_waveform(**kwargs):
     vc: Velocity term for doppler conversion, must be <= 1.
     """
  
-    approx = kwargs["approximant"].replace("doppler", "")
-    
-    hp, hc = get_td_waveform(**dict(kwargs, approximant=approx))
+
+    kwargs = props(template, **kwargs)
+    kwargs["approximant"] = kwargs["approximant"].replace("doppler", "")
+    hp, hc = get_td_waveform(**kwargs)
     a = kwargs["a"]
     vc = kwargs["vc"]
     if vc >= 1.:
@@ -476,7 +479,7 @@ def get_dopshifted_waveform(**kwargs):
     t_shifted = t * (1. + v)
     amp = wfutils.amplitude_from_polarizations(hp, hc)
     p = wfutils.phase_from_polarizations(hp, hc, remove_start_phase=False)
-    
+   
     f1 = interpolate.interp1d(x=t_shifted, y=amp.numpy(), bounds_error=False, fill_value=0.)
     f2 = interpolate.interp1d(x=t_shifted, y=p.numpy(), bounds_error=False, fill_value=0.)
     tsamples = numpy.arange(t_shifted[0], t_shifted[-1], hp.delta_t)
@@ -950,7 +953,7 @@ def get_waveform_filter_length_in_time(approximant, template=None, **kwargs):
     else:
         return None
 
-__all__ = ["get_td_waveform", "get_fd_waveform", "get_fd_waveform_sequence",
+__all__ = ["get_dopshifted_waveform", "get_td_waveform", "get_fd_waveform", "get_fd_waveform_sequence",
            "print_td_approximants", "print_fd_approximants",
            "td_approximants", "fd_approximants",
            "get_waveform_filter", "filter_approximants",
