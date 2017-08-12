@@ -477,13 +477,13 @@ def get_dopshifted_waveform(**kwargs):
     amp = wfutils.amplitude_from_polarizations(hp, hc)
     p = wfutils.phase_from_polarizations(hp, hc, remove_start_phase=False)
     
-    f1 = interpolate.interp1d(x=t_shifted, y=numpy.array(amp), bounds_error=False, fill_value=0.)
-    f2 = interpolate.interp1d(x=t_shifted, y=numpy.array(p), bounds_error=False, fill_value=0.)
-    
-    amps = f1(t)
-    ps = f2(t)
-    hp =  TimeSeries((amps * numpy.cos(ps)), delta_t=hp.delta_t, epoch=t_shifted[0])
-    hc =  TimeSeries((amps * numpy.sin(ps)), delta_t=hp.delta_t, epoch=t_shifted[0])
+    f1 = interpolate.interp1d(x=t_shifted, y=amp.numpy(), bounds_error=False, fill_value=0.)
+    f2 = interpolate.interp1d(x=t_shifted, y=p.numpy(), bounds_error=False, fill_value=0.)
+    tsamples = numpy.arange(t_shifted[0], t_shifted[-1], hp.delta_t)
+    amps = f1(tsamples)
+    ps = f2(tsamples)
+    hp =  TimeSeries((amps * numpy.cos(ps)), delta_t=hp.delta_t, epoch=tsamples[0])
+    hc =  TimeSeries((amps * numpy.sin(ps)), delta_t=hp.delta_t, epoch=tsamples[0])
     return hp, hc 
 
 def get_fd_waveform(template=None, **kwargs):
