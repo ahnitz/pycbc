@@ -36,12 +36,14 @@ class Detector(object):
     """A gravitaional wave detector
     """
     def __init__(self, detector_name):
+        self.name = str(detector_name)
 
         # Allow for duplicate detectors
         if 'DUPLICATE' in detector_name:
             self.real_name = detector_name[0:2]
-            
-        self.name = str(detector_name)
+        else:
+            self.real_name = self.name
+
         self.frDetector =  lalsimulation.DetectorPrefixToLALDetector(self.real_name)
         self.response = self.frDetector.response
         self.location = self.frDetector.location
