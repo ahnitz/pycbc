@@ -39,7 +39,7 @@ class Detector(object):
         self.name = str(detector_name)
 
         # Allow for duplicate detectors
-        if 'DUPLICATE' in detector_name:
+        if len(detector_name) > 2:
             self.real_name = detector_name[0:2]
         else:
             self.real_name = self.name
