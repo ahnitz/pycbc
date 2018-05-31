@@ -80,6 +80,11 @@ class FrequencySeries(Array):
         self._delta_f = delta_f
         self._epoch = epoch
 
+    def __getstate__(self):
+        d = self.__dict__
+        d['_epoch'] = float(self.start_time)
+        return d      
+
     def _return(self, ary):
         return FrequencySeries(ary, self._delta_f, epoch=self._epoch, copy=False)
 

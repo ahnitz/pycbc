@@ -58,6 +58,20 @@ class Shrinker(object):
         l = self.data[-1]
         self.data = self.data[:-1]
         return l
+        
+def do2(i):
+    try:
+        hp = gen.generate(**{key:params[key][i] for key in params})
+    except Exception as err:
+        print(err)
+        return None
+
+    hp.threshold = args.minimal_match
+    hp._epoch = 0
+    hp.view._epoch = 0
+    
+    if hp not in bank:
+        return hp
 
 class TriangleBank(object):
     """ A bank of templates that uses the triangle inequality to estimate
@@ -146,7 +160,7 @@ class TriangleBank(object):
                 return False
 
             hc = self[j]
-            m = hp.gen.match(hp, hc)
+            m = gen.match(hp, hc)
             matches[j] = m
             mnum += 1
             
@@ -167,18 +181,16 @@ class TriangleBank(object):
     def check_params(self, gen, params, threshold):
         num_tried = 0
         num_added = 0
-        for i in range(len(params.values()[0])):
-            num_tried += 1.0
+        
+        r = range(len(params.values()[0]))
+        num_tried += len(r)
 
-            try:
-                hp = gen.generate(**{key:params[key][i] for key in params})
-            except Exception as err:
-                print(err)
-                continue
-    
-            hp.gen = gen
-            hp.threshold = threshold
-            if hp not in self:
+        import multiprocessing
+        p = multiprocessing.Pool(10)
+        hps = p.map(do2, r)
+        
+        for hp in hps:
+            if hp is not None:
                 num_added += 1
                 self.insert(hp)
 
