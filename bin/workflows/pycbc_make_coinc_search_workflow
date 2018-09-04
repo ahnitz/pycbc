@@ -116,7 +116,8 @@ kwds = { 'title' : 'Search Workflow Duration (Wall Clock Time)',
 save_fig_with_metadata(time_str, time_file.storage_path, **kwds)
 
 # Get segments and find where the data is
-science_seg_file = wf.get_segments_file(workflow, 'science', 'segments-science',
+sci_seg_name = 'science'
+science_seg_file = wf.get_segments_file(workflow, sci_seg_name, 'segments-science',
                                         rdir['analysis_time/segment_data'])
 
 ssegs = {}
@@ -449,7 +450,7 @@ if workflow.cp.has_option_tags('workflow-matchedfilter',
 # make segment table and plot for summary page
 curr_files = [science_seg_file, analyzable_file,
               insp_files_seg_file]
-curr_names = [sci_seg_name, sci_ok_seg_name, analyzable_name,
+curr_names = [sci_seg_name, analyzable_name,
               trig_generated_name]
 seg_summ_table = wf.make_seg_table(workflow, curr_files, curr_names,
                         rdir['analysis_time/segments'], ['SUMMARY'],
@@ -465,7 +466,7 @@ curr_files = [insp_files_seg_file] + final_veto_file
 # Add in singular veto files
 curr_files = curr_files + [science_seg_file]
 curr_names = [trig_generated_name + '&' + veto_name\
-                   for veto_name in veto_names+final_veto_name]
+                   for veto_name in final_veto_name]
 # And SCIENCE - CAT 1 vetoes explicitly.
 curr_names += [sci_seg_name + '&' + 'VETO_CAT1']
 
@@ -476,9 +477,6 @@ veto_summ_table = wf.make_seg_table(workflow, curr_files, curr_names,
                                   'output time by the vetoes applied to the '
                                     'triggers.')
 
-# make veto definer table
-vetodef_table = wf.make_veto_table(workflow, rdir['analysis_time/veto_definer'])
-layout.single_layout(rdir['analysis_time/veto_definer'], ([vetodef_table]))
 
 ############################## Setup the injection runs #######################
 
