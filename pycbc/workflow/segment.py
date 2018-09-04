@@ -1389,3 +1389,60 @@ def file_needs_generating(file_path, cp, tags=None):
             err_msg += '"always", "if_not_present", "error_on_duplicate", '
             err_msg += '"never". Got %s.' %(generate_segment_files,)
             raise ValueError(err_msg)
+
+def get_segments_file(workflow, name, option_name, out_dir):
+    """Get cumulative segments from option name syntax for each ifo.
+
+    Use syntax of configparser string to define the resulting segment_file
+    e.x. option_name = up_flag1,up_flag2,up_flag3:down_flag1:down_flag2
+    Each ifo may have a different string and is stored separately in the file.
+
+    Parameters
+    ----------
+    workflow: pycbc.workflow.Workflow
+    name: string
+        Name of the segment list being created
+    option_name: str
+        Name of option in the associated config parser to get the flag list
+
+    returns
+    --------
+    seg_file: pycbc.workflow.SegFile
+        SegFile intance that points to the segment xml file on disk.
+    """
+    from pycbc.events.status import query_combined_flags
+    from pycbc.workflow import SegFile
+    make_analysis_dir(out_dir)
+    cp = workflow.cp
+    start = workflow.start_time
+    end = workflow.end_time
+
+    segments = {}
+    for ifo in workflow.ifos:
+        flag_str = cp.get_opt_tags("workflow-segments", option_name, [ifo])
+        
+        up, down = flag_str.split(':')
+        up = [s.strip() for s in up.split(',')]
+        down = [s.strip() for s in down.split(',')]
+
+        key = ifo + ':' + name
+        segments[key] = query_combined_flags(up, start, end, down)
+
+    return SegFile.from_segment_list_dict(name, segments)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
