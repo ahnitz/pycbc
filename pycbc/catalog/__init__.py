@@ -83,18 +83,15 @@ class Merger(object):
         strain: pycbc.types.TimeSeries
             Strain around the event.
         """
-        import tempfile, requests, shutil
+        import tempfile, shutil
+        from astropy.utils.data import get_readable_fileobj
         from pycbc.frame import read_frame
 
         channel = '%s:LOSC-STRAIN' % ifo
         url = self.data['frames'][ifo]
         f = tempfile.NamedTemporaryFile(suffix='.gwf')
-        r = requests.get(url, stream=True)
-
-        if r.status_code != 200:
-            raise ValueError("Could not download file, %s", r.status_code)
-
-        shutil.copyfileobj(r.raw, f)
+        with get_readable_fileobj(url, cache=True, encoding='binary') as r:
+            shutil.copyfileobj(r, f)
         f.flush()
         return read_frame(f.name, channel)
 
