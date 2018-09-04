@@ -1408,21 +1408,26 @@ def get_segments_file(workflow, name, option_name, out_dir):
     from pycbc.workflow import SegFile
     make_analysis_dir(out_dir)
     cp = workflow.cp
-    start = workflow.start_time
-    end = workflow.end_time
-
+    start = workflow.analysis_time[0]
+    end = workflow.analysis_time[1]
+    
     segments = {}
     for ifo in workflow.ifos:
         flag_str = cp.get_opt_tags("workflow-segments", option_name, [ifo])
         
-        up, down = flag_str.split(':')
+        if ':' in flag_str:
+            up, down = flag_str.split(':')
+            down = [s.strip() for s in down.split(',')]
+        else:
+            up = flag_str
+            down = None
+
         up = [s.strip() for s in up.split(',')]
-        down = [s.strip() for s in down.split(',')]
 
         key = ifo + ':' + name
-        segments[key] = query_combined_flags(up, start, end, down)
-
-    return SegFile.from_segment_list_dict(name, segments)
+        segments[key] = query_combined_flags(ifo, up, start, end, down)
+        logging.info("%s: got %s flags", ifo, option_name) 
+    return SegFile.from_segment_list_dict(name, segments, extension='.xml', directory=out_dir)
 
 
 

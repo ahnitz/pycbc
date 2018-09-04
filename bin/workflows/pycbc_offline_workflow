@@ -119,15 +119,19 @@ save_fig_with_metadata(time_str, time_file.storage_path, **kwds)
 science_seg_file = wf.get_segments_file(workflow, 'science', 'segments-science',
                                         rdir['analysis_time/segment_data'])
 
+ssegs = {}
+for ifo in workflow.ifos:
+    ssegs[ifo] = science_seg_file.segment_dict["%s:science" % ifo]
+
 datafind_files, analyzable_file, analyzable_segs, analyzable_name = \
                                            wf.setup_datafind_workflow(workflow,
-                                     science_seg_file.segment_dict, "datafind",
+                                     ssegs, "datafind",
                                      seg_file=science_seg_file)
 
-final_veto_name = 'vetoes'
-final_veto_file = wf.get_segments_file(workflow, final_veto_name,
+final_veto_name = ['vetoes']
+final_veto_file = wf.FileList([wf.get_segments_file(workflow, final_veto_name[0],
                                        'segments-vetoes',
-                                       rdir['analysis_time/segment_data'])
+                                       rdir['analysis_time/segment_data'])])
 
 
 # setup gating files if provided
