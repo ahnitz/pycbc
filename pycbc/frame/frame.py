@@ -110,10 +110,9 @@ def locations_to_cache(locations, latest=False):
 
             if file_extension in [".lcf", ".cache"]:
                 cache = lal.CacheImport(file_path)
-            elif file_extension == ".gwf":
+            else: 
+                # Assume single file in GWF format
                 cache = lalframe.FrOpen(str(dir_name), str(file_name)).cache
-            else:
-                raise TypeError("Invalid location name")
 
             cum_cache = lal.CacheMerge(cum_cache, cache)
     return cum_cache

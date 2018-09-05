@@ -84,16 +84,13 @@ class Merger(object):
             Strain around the event.
         """
         import tempfile, shutil
-        from astropy.utils.data import get_readable_fileobj
+        from astropy.utils.data import download_file
         from pycbc.frame import read_frame
 
         channel = '%s:LOSC-STRAIN' % ifo
         url = self.data['frames'][ifo]
-        f = tempfile.NamedTemporaryFile(suffix='.gwf')
-        with get_readable_fileobj(url, cache=True, encoding='binary') as r:
-            shutil.copyfileobj(r, f)
-        f.flush()
-        return read_frame(f.name, channel)
+        fname = download_file(url, cache=True)
+        return read_frame(fname, channel)
 
 class Catalog(object):
     """Manage a set of binary mergers"""
