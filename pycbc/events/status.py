@@ -77,7 +77,7 @@ def parse_veto_definer(veto_def_filename):
     return data
 
 def query_flag(ifo, segment_name, start_time, end_time,
-               source='any', server="https://segments.ligo.org",
+               source='any', server="segments.ligo.org",
                veto_definer=None):
     """Return the times where the flag is active 
 
@@ -145,7 +145,7 @@ def query_flag(ifo, segment_name, start_time, end_time,
         # We treat the veto definer name as if it were its own flag and
         # a process the flags in the veto definer
         flag_segments = segmentlist([])
-        if segment_name in veto_def[ifo]:
+        if veto_definer is not None and segment_name in veto_def[ifo]:
             for flag in veto_def[ifo][segment_name]:
                 segs = query("https", server, ifo, flag['name'],
                              flag['version'], 'active',
@@ -154,16 +154,22 @@ def query_flag(ifo, segment_name, start_time, end_time,
                     s, e = rseg[0] + flag['start_pad'], rseg[1] + flag['end_pad']
                     flag_segments.append(segment(s, e))
         else: # Standard case just query directly.
-            name, version = segment_name.split(':')
-            segs = query("https", server, ifo, name, version, 
-                  'active', start_time, end_time)[0]['active']
-            for rseg in segs:
-                s, e = rseg[0], rseg[1]
-                flag_segments.append(segment(s, e))
+            try:
+                name, version = segment_name.split(':')
+                segs = query("https", server, ifo, name, version, 
+                      'active', start_time, end_time)[0]['active']
+                for rseg in segs:
+                    s, e = rseg[0], rseg[1]
+                    flag_segments.append(segment(s, e))
+            except:
+                raise ValueError("Could not query flag, check name (%s) or times",
+                                 segment_name)
 
     return segmentlist(flag_segments).coalesce()
 
-def query_cumulative_flags(ifo, segment_names, start_time, end_time):
+def query_cumulative_flags(ifo, segment_names, start_time, end_time, 
+                           source='any', server="segments.ligo.org",
+                           veto_definer=None):
     """Return the times where any flag is active 
 
     Parameters
@@ -176,6 +182,14 @@ def query_cumulative_flags(ifo, segment_names, start_time, end_time):
         The starting gps time to begin querying from LOSC
     end_time: int 
         The end gps time of the query
+    source: str, Optional
+        Choice between "GWOSC" or "dqsegdb". If dqsegdb, the server option may
+        also be given. The default is to try GWOSC first then try dqsegdb.
+    server: str, Optional
+        The server path. Only used with dqsegdb atm.
+    veto_definer: str, Optional
+        The path to a veto definer to define groups of flags which
+        themselves define a set of segments.
 
     Returns
     ---------
@@ -184,14 +198,18 @@ def query_cumulative_flags(ifo, segment_names, start_time, end_time):
     """
     total_segs = None
     for flag_name in segment_names:
-        segs = query_flag(ifo, flag_name, start_time, end_time)
+        segs = query_flag(ifo, flag_name, start_time, end_time,                                       
+                          source=source, server=server,
+                          veto_definer=veto_definer)
         if total_segs is not None:
             total_segs = (total_segs + segs).coalesce()
         else:
             total_segs = segs
     return total_segs
 
-def query_combined_flags(ifo, up_flags, start_time, end_time, down_flags=None):
+def query_combined_flags(ifo, up_flags, start_time, end_time, down_flags=None,               
+                        source='any', server="segments.ligo.org",
+                        veto_definer=None):
     """Return the times where any "up" flag is active minus "down" flag times
 
     Parameters
@@ -206,13 +224,23 @@ def query_combined_flags(ifo, up_flags, start_time, end_time, down_flags=None):
         The end gps time of the query
     down flags: list of strings
         Flags which indicate times to subtract from the combined segments
+    source: str, Optional
+        Choice between "GWOSC" or "dqsegdb". If dqsegdb, the server option may
+        also be given. The default is to try GWOSC first then try dqsegdb.
+    server: str, Optional
+        The server path. Only used with dqsegdb atm.
+    veto_definer: str, Optional
+        The path to a veto definer to define groups of flags which
+        themselves define a set of segments.
 
     Returns
     ---------
     segments: glue.segments.segmentlist
         List of segments
     """
-    segments = query_cumulative_flags(ifo, up_flags, start_time, end_time)
+    segments = query_cumulative_flags(ifo, up_flags, start_time, end_time,
+                                      source=source, server=server,
+                                      veto_definer=veto_definer)
     down_flags = [] if down_flags is None else down_flags
     for flag_name in down_flags:
         mseg = query_flag(ifo, flag_name, start_time, end_time)

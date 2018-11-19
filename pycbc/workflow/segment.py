@@ -1281,6 +1281,7 @@ def save_veto_definer(cp, out_dir, tags=None):
 
     # and update location
     cp.set("workflow-segments", "segments-veto-definer-file", veto_def_new_path)
+    return veto_def_new_path
 
 def parse_cat_ini_opt(cat_str):
     """ Parse a cat str from the ini file into a list of sets """
@@ -1416,6 +1417,16 @@ def get_segments_file(workflow, name, option_name, out_dir):
     cp = workflow.cp
     start = workflow.analysis_time[0]
     end = workflow.analysis_time[1]
+
+    # Check for veto definer file
+    veto_definer = None
+    if cp.has_option("workflow-segments", "segments-veto-definer-url"):
+         veto_definer = save_veto_definer(workflow.cp, out_dir, [])
+
+    # Check for provided server
+    server = "segments.ligo.org"
+    if cp.has_option("workflow-segments", "segments-database-url"):
+        server = cp.get_opt("workflow-segments", "segments-database-url")
     
     segments = {}
     for ifo in workflow.ifos:
@@ -1426,7 +1437,9 @@ def get_segments_file(workflow, name, option_name, out_dir):
         down = [x[1:] for x in flags if x[0] == '-']        
 
         key = ifo + ':' + name
-        segments[key] = query_combined_flags(ifo, up, start, end, down)
+        segments[key] = query_combined_flags(ifo, up, start, end, down,
+                                             server=server,
+                                             veto_definer=veto_definer)
         logging.info("%s: got %s flags", ifo, option_name) 
 
     return SegFile.from_segment_list_dict(name, segments,
