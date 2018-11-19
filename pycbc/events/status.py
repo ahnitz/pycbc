@@ -135,7 +135,11 @@ def query_flag(ifo, segment_name, start_time, end_time,
                 raise ValueError(msg)
     elif source == 'dqsegdb':
         # Let's not hard require dqsegdb to be installed if we never get here.
-        from dqsegdb.apicalls import dqsegdbQueryTimes as query
+        try:
+            from dqsegdb.apicalls import dqsegdbQueryTimes as query
+        except ImportError:
+            raise ValueError("Could not query flag. DQSegdb is not installed" 
+                             "to additionally try there")
 
         # The veto definer will allow the use of MACRO names
         # These directly correspond the name defined in the veto definer file.
