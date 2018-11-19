@@ -22,7 +22,7 @@
 # =============================================================================
 #
 """ Utitlities to query the status of gravitational-wave instruments
-from public sources
+from public sources as well as dqsegdb.
 """
 
 from glue.segments import segmentlist
@@ -62,7 +62,7 @@ def query_flag(ifo, segment_name, start_time, end_time):
         return (data - negate).coalesce()
 
     duration = end_time - start_time
-    url = 'https://losc.ligo.org//timeline/segments/json/O1/{}_{}/{}/{}/'
+    url = 'https://www.gw-openscience.org/timeline/segments/json/O1/{}_{}/{}/{}/'
     url = url.format(ifo, segment_name, start_time, duration)
     
     try:
