@@ -1394,7 +1394,7 @@ def get_segments_file(workflow, name, option_name, out_dir):
     """Get cumulative segments from option name syntax for each ifo.
 
     Use syntax of configparser string to define the resulting segment_file
-    e.x. option_name = up_flag1,up_flag2,up_flag3:down_flag1:down_flag2
+    e.x. option_name = +up_flag1,+up_flag2,+up_flag3,-down_flag1,-down_flag2
     Each ifo may have a different string and is stored separately in the file.
 
     Parameters
@@ -1421,19 +1421,17 @@ def get_segments_file(workflow, name, option_name, out_dir):
     for ifo in workflow.ifos:
         flag_str = cp.get_opt_tags("workflow-segments", option_name, [ifo])
         
-        if ':' in flag_str:
-            up, down = flag_str.split(':')
-            down = [s.strip() for s in down.split(',')]
-        else:
-            up = flag_str
-            down = None
-
-        up = [s.strip() for s in up.split(',')]
+        flags = flag_str.replace(' ', '').strip().split(',')
+        up = [x[1:] for x in flags if x[0] == '+']  
+        down = [x[1:] for x in flags if x[0] == '-']        
 
         key = ifo + ':' + name
         segments[key] = query_combined_flags(ifo, up, start, end, down)
         logging.info("%s: got %s flags", ifo, option_name) 
-    return SegFile.from_segment_list_dict(name, segments, extension='.xml', directory=out_dir)
+
+    return SegFile.from_segment_list_dict(name, segments,
+                                          extension='.xml',
+                                          directory=out_dir)
 
 
 
