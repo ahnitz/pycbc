@@ -1445,20 +1445,3 @@ def get_segments_file(workflow, name, option_name, out_dir):
     return SegFile.from_segment_list_dict(name, segments,
                                           extension='.xml',
                                           directory=out_dir)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
