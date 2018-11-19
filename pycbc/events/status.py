@@ -127,7 +127,7 @@ def query_flag(ifo, segment_name, start_time, end_time,
         try:
             flag_segments = json.loads(urllib.urlopen(url).read())['segments']
         except:
-            msg = "Unable to find segments in GWOSC, check flag name or times")
+            msg = "Unable to find segments in GWOSC, check flag name or times"
             if source == 'any':
                 return query_flag(ifo, segment_name, start_time, end_time,
                                   source=='dqsegdb')
