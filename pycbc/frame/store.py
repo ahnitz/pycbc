@@ -17,10 +17,8 @@
 This modules contains functions for reading in data from hdf stores
 """
 from __future__ import division
-import h5py
-import numpy
+import h5py, numpy
 from pycbc.types import TimeSeries
-
 
 def read_store(fname, channel, start_time, end_time):
     """ Read time series data from hdf store
@@ -42,28 +40,33 @@ def read_store(fname, channel, start_time, end_time):
         Time series containing the requested data
 
     """
-    fhandle = h5py.File(fname, 'r')
-    if channel not in fhandle:
+    f = h5py.File(fname, 'r')
+    if channel not in f:
         raise ValueError('Could not find channel name {}'.format(channel))
 
     # Determine which segment data lies in (can only read contiguous data now)
-    starts = fhandle[channel]['segments']['start'][:]
-    ends = fhandle[channel]['segments']['end'][:]
+    starts = f[channel]['segments']['start'][:]
+    ends = f[channel]['segments']['end'][:]
 
     diff = start_time - starts
-    loc = numpy.where(diff >= 0)[0]
-    sidx = loc[diff[loc].argmin()]
+    l = numpy.where(diff >= 0)[0]
+    sidx = l[diff[l].argmin()]
 
     stime = starts[sidx]
     etime = ends[sidx]
 
+    print stime, etime, start_time, end_time
+
+    if stime > start_time:
+        raise ValueError("Cannot read data segment before {}".format(stime))
+
     if etime < end_time:
         raise ValueError("Cannot read data segment past {}".format(etime))
 
-    data = fhandle[channel][str(sidx)]
+    data = f[channel][str(sidx)]
     sample_rate = len(data) / (etime - stime)
 
-    start = int((start_time - stime) * sample_rate)
-    end = int((end_time - stime) * sample_rate)
-    return TimeSeries(data[start:end], delta_t=1.0/sample_rate,
+    s = int((start_time - stime) * sample_rate)
+    e = int((end_time - stime) * sample_rate)
+    return TimeSeries(data[s:e], delta_t=1.0/sample_rate,
                       epoch=start_time)
