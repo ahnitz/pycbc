@@ -87,7 +87,7 @@ def marginal_likelihood(wparam, trig_time, stilde, psd, fixed):
 
     logging.info('Precalculating Antenna pattern')
     fp, fc, dt = {}, {}, {}
-    for ifo in args.instruments:
+    for ifo in ifos:
         d = pycbc.detector.Detector(ifo)
 
         # We can ignore time here as we'll marginalize over the entier sky anyway
@@ -121,11 +121,11 @@ def marginal_likelihood(wparam, trig_time, stilde, psd, fixed):
             hh[ifo] = -0.5 * (4.0 * stilde[ifo].delta_f / norm[ifo]) ** 2.0
 
     off = dt[maxifo].copy()
-    for ifo in args.instruments:
+    for ifo in ifos:
         dt[ifo] -= off
 
     sh = {}
-    for ifo in args.instruments:
+    for ifo in ifos:
         idx = (dt[ifo] + (maxtime - snrs[ifo].start_time)) * snrs[ifo].sample_rate
         idx = idx.astype(numpy.int)
         sh[ifo] = snrs[ifo].take(idx) * 4.0 * stilde[ifo].delta_f
@@ -153,7 +153,7 @@ def marginal_likelihood(wparam, trig_time, stilde, psd, fixed):
     if not numpy.isfinite(a):
         a = numpy.exp(30**2.0 / 2.0)
         logging.warn('Integral too large, replacing with %s', a)
-    
+
     return (numpy.log(a) * 2) ** 0.5, (numpy.log(a + b) * 2) ** 0.5
 
 parser = argparse.ArgumentParser()
@@ -242,7 +242,10 @@ for i, (trigger_time, time_offsets, waveparams) in enumerate(zip(*triggers)):
     pad_start, pad_end = {}, {}
 
     # Allow an IFO to be excluded using a sentinel value
-    ifos = [ifo for ifo in args.instruments if time_offsets[ifo] != numpy.inf]
+    if args.instruments:
+        ifos = [ifo for ifo in args.instruments if time_offsets[ifo] != numpy.inf]
+    else:
+        ifos = list(time_offsets.dtype.names)
 
     # Determine what data we need to read and prepare
     for ifo in ifos:
