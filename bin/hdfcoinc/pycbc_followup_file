@@ -20,12 +20,18 @@ pycbc.init_logging(args.verbose)
 bank = h5py.File(args.bank_file, 'r')
 sfile = h5py.File(args.statmap_file, 'r')
 
-ifo1 = sfile.attrs['detector_1']
-ifo2 = sfile.attrs['detector_2']
+if 'detector_1' in sfile.attrs:
+    pivot = sfile.attrs['detector_1']
+    fixed = sfile.attrs['detector_2']
+    ifos = [pivot, fixed]
+else:
+    pivot = sfile.attrs['pivot']
+    fixed = sfile.attrs['fixed']
+    ifos = sfile.attrs['ifos'].split(' ')
+
 slide = sfile.attrs['timeslide_interval']
 
-odtype = [(ifo1, numpy.float64),
-         (ifo2, numpy.float64),]
+odtype = [(ifo, numpy.float64) for ifo in ifos]
 dtype = odtype + [('time', numpy.float64),
                   ('template_id', numpy.uint64),
          ]
@@ -38,18 +44,25 @@ else:
 values = []
 for k in sfile:
     if k in sections:
-        t1 = sfile[k]['time1'][:].astype(numpy.float64)
-        t2 = sfile[k]['time2'][:].astype(numpy.float64)
+        if 'detector_1' in sfile.attrs:
+            tpivot = sfile[k]['time1'][:].astype(numpy.float64)
+            tfixed = sfile[k]['time2'][:].astype(numpy.float64)
+        else:
+            tpivot = sfile[k][pivot]['time'][:].astype(numpy.float64)
+            tfixed = sfile[k][fixed]['time'][:].astype(numpy.float64)
 
         template = sfile[k]['template_id'][:]
 
-        value = numpy.zeros(len(t1), dtype=dtype)
+        value = numpy.zeros(len(tpivot), dtype=dtype)
 
         if k is not 'foreground':
-            t2 += sfile[k]['timeslide_id'][:] * slide
-            value[ifo2] = -sfile[k]['timeslide_id'][:] * slide
+            tfixed += sfile[k]['timeslide_id'][:] * slide
+            for ifo in ifos:
+                if ifo == pivot:
+                    continue
+                value[ifo] = -sfile[k]['timeslide_id'][:] * slide
 
-        value['time'] = 0.5 * (t1 + t2)
+        value['time'] = 0.5 * (tpivot + tfixed)
         value['template_id'] = template
 
         if args.min_stat:
@@ -68,8 +81,8 @@ f.attrs['sections'] = sections
 f['time'] = values['time']
 
 offsets = numpy.zeros(len(values), dtype=odtype)
-offsets[ifo1] = values[ifo1]
-offsets[ifo2] = values[ifo2]
+for ifo in ifos:
+    offsets[ifo] = values[ifo]
 f['offsets'] = offsets
 
 wdtype = [(k, numpy.float64) for k in bank]
