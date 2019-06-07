@@ -178,7 +178,12 @@ class PyCBCMultiifoStatMapInjExecutable(Executable):
         node = Node(self)
         node.set_memory(5000)
         node.add_input_list_opt('--zero-lag-coincs', zerolag)
-        node.add_input_list_opt('--full-data-background', full_data)
+
+        if isinstance(full_data, list):
+            node.add_input_list_opt('--full-data-background', full_data)
+        else:
+            node.add_input_opt('--full-data-background', full_data)
+
         node.add_input_list_opt('--mixed-coincs-inj-full', injfull)
         node.add_input_list_opt('--mixed-coincs-full-inj', fullinj)
         node.add_opt('--ifos', ifos)
