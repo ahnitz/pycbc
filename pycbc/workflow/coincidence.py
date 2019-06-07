@@ -141,7 +141,11 @@ class PyCBCStatMapExecutable(Executable):
 
         node = Node(self)
         node.set_memory(5000)
-        node.add_input_list_opt('--coinc-files', coinc_files)
+        if isinstance(coinc_files, list):
+            node.add_input_list_opt('--coinc-files', coinc_files)
+        else:
+            node.add_input_opt('--coinc-files', coinc_files)
+
         node.new_output_file_opt(seg, '.hdf', '--output-file', tags=tags)
         return node
 
