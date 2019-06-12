@@ -192,6 +192,7 @@ pycbc.init_logging(args.verbose)
 ctx = pycbc.scheme.from_cli(args)
 
 ###############################################################################
+all_ifos = args.instruments
 
 ofile = h5py.File(args.output_file, 'w')
 if args.input_file:
@@ -205,15 +206,17 @@ if args.input_file:
     wparams = f['waveparams'][start:end:stride]
     triggers = (f['time'][start:end:stride], f['offsets'][start:end:stride],
                 [dict(zip(wparams.dtype.names, x)) for x in wparams])
+    if not args.instruments:
+        all_ifos = list(f['offsets'][:].dtype.names)
 
 elif args.trigger_time:
     waveparams = params_from_waveformstr(args.template_parameters)
-    toffset = {ifo:0 for ifo in args.instruments}
+    toffset = {ifo:0 for ifo in all_ifos}
     triggers = ([args.trigger_time], [toffset], [waveparams])
 
 if args.adjust_psd_center:
     segs = {}
-    for ifo in args.instruments:
+    for ifo in all_ifos:
         f = h5py.File(args.hdf_store[ifo], 'r')
         segs[ifo] = (f[args.channel_name[ifo]]['segments/start'][:],
                      f[args.channel_name[ifo]]['segments/end'][:])
@@ -242,10 +245,7 @@ for i, (trigger_time, time_offsets, waveparams) in enumerate(zip(*triggers)):
     pad_start, pad_end = {}, {}
 
     # Allow an IFO to be excluded using a sentinel value
-    if args.instruments:
-        ifos = [ifo for ifo in args.instruments if time_offsets[ifo] != numpy.inf]
-    else:
-        ifos = list(time_offsets.dtype.names)
+    ifos = [ifo for ifo in all_ifos if time_offsets[ifo] != numpy.inf]
 
     # Determine what data we need to read and prepare
     for ifo in ifos:
