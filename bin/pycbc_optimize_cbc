@@ -1,0 +1,370 @@
+#!/bin/env python
+"""Followup a candidate"""
+import h5py, numpy, argparse, logging, time
+import healpy
+import scipy.special, scipy.integrate
+import numpy.random
+import pycbc.version, pycbc.strain, pycbc.waveform, pycbc.pnutils, pycbc.filter
+import pycbc.conversions, pycbc.types, pycbc.dq, pycbc.scheme, pycbc.detector
+import pycbc.vetoes
+from pycbc.events.ranking import newsnr
+from scipy.optimize import differential_evolution
+from pycbc.types.optparse import DictWithDefaultReturn
+
+def params_from_waveformstr(wstr):
+    wparams = {}
+    for param in wstr:
+        key, value = param.split(':')
+        try:
+            rvalue = float(value)
+        except ValueError:
+            rvalue = value
+        wparams[key] = rvalue
+    return wparams
+
+def getwf(wparam, fixed, flen, df):
+    mchirp, q, spin = wparam
+    p = fixed.copy()
+    p['mass1'] = pycbc.conversions.mass1_from_mchirp_q(mchirp, q)
+    p['mass2'] = pycbc.conversions.mass2_from_mchirp_q(mchirp, q)
+    p['spin1z'] = p['spin2z'] = spin
+
+    out = pycbc.types.zeros(flen, dtype=numpy.complex64)
+    hp = pycbc.waveform.get_waveform_filter(out, delta_f=df, **p)
+    return hp
+
+def network_snr(wparam, trig_time, stilde, psd, fixed, return_all=False):
+    p = psd.values()[0]
+    hp = getwf(wparam, fixed, len(p), p.delta_f)
+
+    corrs, snrs, norms, indices = {}, {}, {}, {}
+
+    with ctx:
+        nsnr = 0
+        for ifo in strain:
+            snr, corr, norm = pycbc.filter.matched_filter_core(
+                        hp, stilde[ifo], psd=psd[ifo],
+                        low_frequency_cutoff=fixed['f_lower'])
+
+            z = snr.time_slice(trig_time - 0.1, trig_time + 0.1) * norm
+            nsnr += abs(z).max() ** 2.0
+
+            if return_all:
+                sidx = round((z.start_time - snr.start_time) * snr.sample_rate)
+                indices[ifo] = abs(z).abs_arg_max() + int(sidx)
+                snrs[ifo] = snr.copy()
+                corrs[ifo] = corr.copy()
+                norms[ifo] = norm
+                logging.info('%s:SNR = %s', ifo, abs(z).max())
+
+    if not numpy.isfinite(nsnr):
+        logging.warning("network SNR wasn't a number")
+        nsnr = 0
+
+    if return_all:
+        return -nsnr ** 0.5, hp, corrs, snrs, norms, indices
+    else:
+        return -nsnr ** 0.5
+
+def coherent_snr(wparam, trig_time, stilde, psd, fixed):
+    pass
+
+def marginal_likelihood(wparam, trig_time, stilde, psd, fixed):
+    # Determines density of sky grid ##########################################
+    numpy.random.seed(0)
+    NSIDE = 15
+    DMAX = 4000
+    fiducial_time = 1000000000
+    pol = 0
+
+    def pix2radec(index):
+        theta, phi=healpy.pixelfunc.pix2ang(NSIDE, index)
+        return numpy.pi*2. - phi, numpy.pi/2 - theta
+
+    n = healpy.nside2npix(NSIDE)
+    logging.info('Using %s skypoints', n)
+    ra, dec = pix2radec(numpy.arange(0, n))
+
+    logging.info('Precalculating Antenna pattern')
+    fp, fc, dt = {}, {}, {}
+    for ifo in ifos:
+        d = pycbc.detector.Detector(ifo)
+
+        # We can ignore time here as we'll marginalize over the entier sky anyway
+        fp[ifo], fc[ifo] = d.antenna_pattern(ra, dec, pol, fiducial_time)
+        dt[ifo] = d.time_delay_from_earth_center(ra, dec, fiducial_time)
+
+    logging.info('Precalculating SNRs')
+    p = psd.values()[0]
+    fixed['distance'] = 1.0 / pycbc.DYN_RANGE_FAC
+    fixed['inclination'] = 0
+    hp = getwf(wparam, fixed, len(p), p.delta_f)
+
+    with ctx:
+        snrs, norm, hh = {}, {}, {}
+        maxtime = maxsnr = nsnr = 0
+        maxifo = ''
+        for ifo in stilde:
+            snr, corr, norm[ifo] = pycbc.filter.matched_filter_core(
+                        hp, stilde[ifo], psd=psd[ifo],
+                        low_frequency_cutoff=fixed['f_lower'])
+            snrs[ifo] = snr.time_slice(trig_time - 0.2, trig_time + 0.2).copy()
+            s = abs(snrs[ifo] * norm[ifo])
+            kmin = len(snrs[ifo]) // 4
+            kmax = kmin * 3
+            i = s[kmin:kmax].abs_arg_max()
+            nsnr += s[kmin:kmax][i] ** 2.0
+            if s[i] > maxsnr:
+                maxtime = s[kmin:kmax].sample_times[i]
+                maxsnr = s[kmin:kmax][i]
+                maxifo = ifo
+            hh[ifo] = -0.5 * (4.0 * stilde[ifo].delta_f / norm[ifo]) ** 2.0
+
+    off = dt[maxifo].copy()
+    for ifo in ifos:
+        dt[ifo] -= off
+
+    sh = {}
+    for ifo in ifos:
+        idx = (dt[ifo] + (maxtime - snrs[ifo].start_time)) * snrs[ifo].sample_rate
+        idx = idx.astype(numpy.int)
+        sh[ifo] = snrs[ifo].take(idx) * 4.0 * stilde[ifo].delta_f
+
+    def loglr(inc, dist):
+        shloglr = hhloglr = 0
+        ip = numpy.cos(inc)
+        ic = 0.5 * (1.0 + ip * ip) * 1.0j
+
+        iprior = numpy.sin(inc) / 2.0
+        dprior = dist ** 2.0 * 3.0 / DMAX ** 3.0
+
+        for ifo in fp:
+            htf = (fp[ifo] * ip + fc[ifo] * ic)
+            shloglr += sh[ifo] * htf / dist
+            hhloglr += hh[ifo] * abs(htf) ** 2.0 / dist ** 2.0
+
+        vloglr = numpy.log(scipy.special.i0e(abs(shloglr)))
+        vloglr += abs(shloglr) + hhloglr
+        return numpy.exp(vloglr).sum() * dprior * iprior
+
+    logging.info('Integrating Likelihood')
+    a, b = scipy.integrate.nquad(loglr, [(0, numpy.pi), (1, DMAX)],
+                                 opts={'epsrel':1e-2})
+    if not numpy.isfinite(a):
+        a = numpy.exp(30**2.0 / 2.0)
+        logging.warn('Integral too large, replacing with %s', a)
+
+    return (numpy.log(a) * 2) ** 0.5, (numpy.log(a + b) * 2) ** 0.5
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--version', action='version',
+    version=pycbc.version.git_verbose_msg)
+parser.add_argument('--verbose', action='store_true')
+parser.add_argument('--output-file')
+
+# Options related to getting trigger information from workflow products
+parser.add_argument('--input-file',
+    help="HDF File which gives the trigger followup information for a set")
+parser.add_argument('--start-index', type=int)
+parser.add_argument('--end-index', type=int)
+parser.add_argument('--stride', type=int, default=1)
+
+# Options to directly supply followup information
+parser.add_argument('--template-parameters', nargs='+')
+parser.add_argument('--trigger-time', type=float)
+parser.add_argument('--instruments', nargs='+',
+    help="Maximum set of instruments which may be used")
+
+parser.add_argument('--adjust-psd-center', action='store_true',
+    help="If using an hdf_store check the internal segments and "
+         "match the time to the available data")
+
+# Options related to data / signal processing options
+parser.add_argument('--low-frequency-cutoff', type=float)
+pycbc.strain.insert_strain_option_group_multi_ifo(parser, gps_times=False)
+pycbc.scheme.insert_processing_option_group(parser)
+
+#pycbc.vetoes.SingleDetSGChisq.insert_option_group(parser)
+#parser.add_argument('--chisq-bins')
+
+args = parser.parse_args()
+pycbc.init_logging(args.verbose)
+ctx = pycbc.scheme.from_cli(args)
+
+###############################################################################
+all_ifos = args.instruments
+
+ofile = h5py.File(args.output_file, 'w')
+if args.input_file:
+    f = h5py.File(args.input_file, 'r')
+    start = 0 if args.start_index is None else args.start_index
+    end = len(f['time']) if args.end_index is None else args.end_index
+    stride = args.stride
+    ofile.attrs['start_index'] = start
+    ofile.attrs['end_index' ] = end
+    ofile.attrs['stride'] = stride
+    wparams = f['waveparams'][start:end:stride]
+    triggers = (f['time'][start:end:stride], f['offsets'][start:end:stride],
+                [dict(zip(wparams.dtype.names, x)) for x in wparams])
+    if not args.instruments:
+        all_ifos = list(f['offsets'][:].dtype.names)
+
+elif args.trigger_time:
+    waveparams = params_from_waveformstr(args.template_parameters)
+    toffset = {ifo:0 for ifo in all_ifos}
+    triggers = ([args.trigger_time], [toffset], [waveparams])
+
+if args.adjust_psd_center:
+    segs = {}
+    for ifo in all_ifos:
+        f = h5py.File(args.hdf_store[ifo], 'r')
+        segs[ifo] = (f[args.channel_name[ifo]]['segments/start'][:],
+                     f[args.channel_name[ifo]]['segments/end'][:])
+
+
+stats = []
+for i, (trigger_time, time_offsets, waveparams) in enumerate(zip(*triggers)):
+    logging.info('Starting work on trigger %s/%s: %s', i, len(triggers[0]), trigger_time)
+    psdlen = 128
+    psdseg = 8
+
+    m1, m2 = waveparams['mass1'], waveparams['mass2']
+    mchirp = pycbc.conversions.mchirp_from_mass1_mass2(m1, m2)
+    waveparams['approximant'] = 'SPAtmplt' if mchirp < 3 else 'IMRPhenomD'
+    templatelen = pycbc.waveform.get_waveform_filter_length_in_time(**waveparams)
+    filterbuffer = templatelen + 4.0 + psdseg * 2
+    filterbuffer = pycbc.pnutils.nearest_larger_binary_number(filterbuffer)
+    logging.info('Template duration is %s seconds', templatelen)
+    logging.info('We need %s seconds to filter this waveform', filterbuffer)
+
+    args.gps_start_time = DictWithDefaultReturn()
+    args.gps_end_time = DictWithDefaultReturn()
+    psd_start, psd_end = {}, {}
+    filter_start, filter_end = {}, {}
+    data_start, data_end = {}, {}
+    pad_start, pad_end = {}, {}
+
+    # Allow an IFO to be excluded using a sentinel value
+    ifos = [ifo for ifo in all_ifos if time_offsets[ifo] != numpy.inf]
+
+    # Determine what data we need to read and prepare
+    for ifo in ifos:
+        # Choose filtering start / end times
+        filter_end[ifo] = int(trigger_time + psdseg + 2)
+        filter_start[ifo] = filter_end[ifo] - filterbuffer
+        logging.info('%s: Filter buffer goes from %s-%s',
+                     ifo, filter_start[ifo], filter_end[ifo])
+
+        pad = 0 if args.pad_data[ifo] is None else args.pad_data[ifo]
+
+        # Choose psd start / end times and recenter if needed #################
+        psd_start[ifo] = int(trigger_time - psdlen // 2)
+        if args.adjust_psd_center:
+            idx = numpy.searchsorted(segs[ifo][0], trigger_time + time_offsets[ifo]) - 1
+            start = segs[ifo][0][idx] - time_offsets[ifo]
+            end = segs[ifo][1][idx] - time_offsets[ifo]
+            logging.info('Must fit within %s-%s', start, end)
+            if start > psd_start[ifo] - pad:
+                psd_start[ifo] = start
+                logging.info('Adjusting psd start time')
+
+            if end < psd_start[ifo] + pad + psdlen:
+                psd_start[ifo] = end - pad - psdlen
+                logging.info('Adjusting psd end time')
+
+        psd_end[ifo] = psd_start[ifo] + psdlen
+        logging.info('%s: PSD data will be %s-%s', ifo, psd_start[ifo], psd_end[ifo])
+
+        # Figure out when we can read data and if zero padding needs to be done
+        data_start[ifo] = min(psd_start[ifo], filter_start[ifo]) - pad
+        data_end[ifo] = max(psd_end[ifo], filter_end[ifo]) + pad
+        logging.info('%s: Will need data from %s-%s', ifo, data_start[ifo], data_end[ifo])
+
+        pad_start[ifo], pad_end[ifo] = 0, 0
+        if args.adjust_psd_center:
+            if data_start[ifo] < start + pad:
+                pad_start[ifo] = start - data_start[ifo] + pad
+                data_start[ifo] = start + pad
+            if data_end[ifo] > end - pad:
+                pad_end[ifo] = data_end[ifo] - end + pad
+                data_end[ifo] = end - pad
+
+        args.gps_start_time[ifo] = data_start[ifo] + pad + time_offsets[ifo]
+        args.gps_end_time[ifo] = data_end[ifo] - pad + time_offsets[ifo]
+        logging.info('%s: actually reading %s-%s',
+                     ifo, data_start[ifo] + time_offsets[ifo],
+                     data_end[ifo] + time_offsets[ifo])
+
+    logging.info('Calculating Strain around trigger')
+    strain = pycbc.strain.from_cli_multi_ifos(args, ifos,
+                                              dyn_range_fac=pycbc.DYN_RANGE_FAC)
+
+    # Undo any time offsets for slides
+    stilde = {}
+    psd = {}
+    for ifo in strain:
+        strain[ifo].start_time = data_start[ifo] + pad
+
+        # apply zero padding if needed.
+        tpad = pad_start[ifo] + pad_end[ifo]
+        if tpad > 0:
+            logging.info('Applying zero padding')
+            strain[ifo].resize(len(strain[ifo]) + strain[ifo].sample_rate * tpad)
+            strain[ifo] = strain[ifo].cyclic_time_shift(pad_start[ifo])
+
+        spart = strain[ifo].time_slice(filter_start[ifo], min(filter_end[ifo], strain[ifo].end_time))
+        stilde[ifo] = spart.to_frequencyseries()
+
+        logging.info('Calculating PSD around time')
+        spart = strain[ifo].time_slice(psd_start[ifo], min(psd_end[ifo], strain[ifo].end_time))
+        psd[ifo] = spart.filter_psd(psdseg, stilde[ifo].delta_f,
+                                    args.low_frequency_cutoff)
+
+    logging.info('Optimizing Parameters')
+    minchirp = mchirp * (1 - mchirp / 200.0) # need better way to set limits
+    maxchirp = mchirp * (1 + mchirp / 200.0)
+    minchirp = 1 if minchirp < 1 else minchirp
+    maxchirp = 80 if maxchirp > 80 else maxchirp
+
+    q = max(m1 / m2, m2 / m1)
+    minq, maxq = q * 0.7, q * 1.5
+    minq = 1.0 if minq < 1 else minq
+    maxq = 100 if maxq > 100 else maxq
+    logging.info('Using chirp mass range %s-%s', minchirp, maxchirp)
+    logging.info('Using mass ratio range %s-%s', minq, maxq)
+    bounds = [(minchirp, maxchirp), (minq, maxq), (-.98, 0.98)]
+
+    logging.info('Optimizing intrinsic parameters')
+    result = differential_evolution(network_snr, bounds, popsize=20,
+                                    args=(trigger_time, stilde, psd, waveparams),
+                                    disp=args.verbose, seed=0)
+    optparam = result['x']
+    logging.info(result)
+
+    logging.info('Running Signal-Consistency Tests')
+    _,  hp, corrs, snrs, norms, indices = network_snr(
+                            optparam, trigger_time, stilde, psd, waveparams,
+                            return_all=True)
+    chis = []
+    for ifo in strain:
+        for num_bins in [8, 20, 65]:
+            chi = pycbc.vetoes.power_chisq(hp, stilde[ifo], num_bins, psd[ifo],
+                                 low_frequency_cutoff=waveparams['f_lower'])
+            chi /= 2 * num_bins - 2
+            chi = chi[indices[ifo]]
+            chis.append(chi)
+            logging.info('%s: Chisq: %s - %s', ifo, num_bins, chi)
+    chiv = max(chis) if max(chis) > 1.3 else 1.0
+
+    logging.info('Calculating marginal likelihood')
+    msnr, smax = marginal_likelihood(optparam, trigger_time, stilde, psd, waveparams)
+    logging.info('Marginal Likelihood = %s, %s', msnr, smax)
+
+
+    logging.info('Assigning Ranking Statistic')
+    stat = newsnr(msnr, chiv)
+    logging.info('Ranking Statistic = %s', stat)
+    stats.append(stat)
+
+ofile['stat'] = numpy.array(stats)
+logging.info('Done')
