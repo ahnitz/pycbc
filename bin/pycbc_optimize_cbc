@@ -11,6 +11,7 @@ from pycbc.events.ranking import newsnr
 from scipy.optimize import differential_evolution
 from pycbc.types.optparse import DictWithDefaultReturn
 
+numpy.random.seed(0)
 def params_from_waveformstr(wstr):
     wparams = {}
     for param in wstr:
@@ -46,7 +47,7 @@ def network_snr(wparam, trig_time, stilde, psd, fixed, return_all=False):
                         hp, stilde[ifo], psd=psd[ifo],
                         low_frequency_cutoff=fixed['f_lower'])
 
-            z = snr.time_slice(trig_time - 0.1, trig_time + 0.1) * norm
+            z = snr.time_slice(trig_time - 0.07, trig_time + 0.07) * norm
             nsnr += abs(z).max() ** 2.0
 
             if return_all:
@@ -95,30 +96,23 @@ def marginal_likelihood(wparam, trig_time, stilde, psd, fixed):
         dt[ifo] = d.time_delay_from_earth_center(ra, dec, fiducial_time)
 
     logging.info('Precalculating SNRs')
-    p = psd.values()[0]
     fixed['distance'] = 1.0 / pycbc.DYN_RANGE_FAC
     fixed['inclination'] = 0
-    hp = getwf(wparam, fixed, len(p), p.delta_f)
 
-    with ctx:
-        snrs, norm, hh = {}, {}, {}
-        maxtime = maxsnr = nsnr = 0
-        maxifo = ''
-        for ifo in stilde:
-            snr, corr, norm[ifo] = pycbc.filter.matched_filter_core(
-                        hp, stilde[ifo], psd=psd[ifo],
-                        low_frequency_cutoff=fixed['f_lower'])
-            snrs[ifo] = snr.time_slice(trig_time - 0.2, trig_time + 0.2).copy()
-            s = abs(snrs[ifo] * norm[ifo])
-            kmin = len(snrs[ifo]) // 4
-            kmax = kmin * 3
-            i = s[kmin:kmax].abs_arg_max()
-            nsnr += s[kmin:kmax][i] ** 2.0
-            if s[i] > maxsnr:
-                maxtime = s[kmin:kmax].sample_times[i]
-                maxsnr = s[kmin:kmax][i]
-                maxifo = ifo
-            hh[ifo] = -0.5 * (4.0 * stilde[ifo].delta_f / norm[ifo]) ** 2.0
+    hh = {}
+    maxtime = maxsnr = nsnr = 0
+    maxifo = ''
+
+    nsnr, hp, _, snrs, norms, indices = network_snr(wparam, trig_time,
+                stilde, psd, fixed, return_all=True)
+
+    for ifo in stilde:
+        i = indices[ifo]
+        if snrs[ifo][i] > maxsnr:
+            maxtime = snrs[ifo].sample_times[i]
+            maxsnr = snrs[ifo][i]
+            maxifo = ifo
+        hh[ifo] = -0.5 * (4.0 * stilde[ifo].delta_f / norms[ifo]) ** 2.0
 
     off = dt[maxifo].copy()
     for ifo in ifos:
@@ -130,6 +124,8 @@ def marginal_likelihood(wparam, trig_time, stilde, psd, fixed):
         idx = idx.astype(numpy.int)
         sh[ifo] = snrs[ifo].take(idx) * 4.0 * stilde[ifo].delta_f
 
+    dlimit = (hh[maxifo] * -2.0) ** 0.5 / 5.0 # Integrate only out to SNR 5 in the loudest IFO
+
     def loglr(inc, dist):
         shloglr = hhloglr = 0
         ip = numpy.cos(inc)
@@ -140,19 +136,19 @@ def marginal_likelihood(wparam, trig_time, stilde, psd, fixed):
 
         for ifo in fp:
             htf = (fp[ifo] * ip + fc[ifo] * ic)
-            shloglr += sh[ifo] * htf / dist
-            hhloglr += hh[ifo] * abs(htf) ** 2.0 / dist ** 2.0
+            shloglr += sh[ifo] * htf
+            hhloglr += hh[ifo] * abs(htf) ** 2.0
 
-        vloglr = numpy.log(scipy.special.i0e(abs(shloglr)))
-        vloglr += abs(shloglr) + hhloglr
+        vloglr = numpy.log(scipy.special.i0e(abs(shloglr / dist)))
+        vloglr += abs(shloglr / dist) + hhloglr / dist ** 2.0
         return numpy.exp(vloglr).sum() * dprior * iprior
 
     logging.info('Integrating Likelihood')
-    a, b = scipy.integrate.nquad(loglr, [(0, numpy.pi), (1, DMAX)],
+    a, b = scipy.integrate.nquad(loglr, [(0, numpy.pi), (1, dlimit)],
                                  opts={'epsrel':1e-2})
     if not numpy.isfinite(a):
-        a = numpy.exp(30**2.0 / 2.0)
-        logging.warn('Integral too large, replacing with %s', a)
+        logging.warn('Integral too large, replacing with %s', nsnr)
+        return nsnr**0.5, 0
 
     return (numpy.log(a) * 2) ** 0.5, (numpy.log(a + b) * 2) ** 0.5
 
@@ -174,6 +170,7 @@ parser.add_argument('--template-parameters', nargs='+')
 parser.add_argument('--trigger-time', type=float)
 parser.add_argument('--instruments', nargs='+',
     help="Maximum set of instruments which may be used")
+parser.add_argument('--skip-above-stat', type=float)
 
 parser.add_argument('--adjust-psd-center', action='store_true',
     help="If using an hdf_store check the internal segments and "
@@ -204,8 +201,9 @@ if args.input_file:
     ofile.attrs['end_index' ] = end
     ofile.attrs['stride'] = stride
     wparams = f['waveparams'][start:end:stride]
+    ostats = f['stat'][start:end:stride]
     triggers = (f['time'][start:end:stride], f['offsets'][start:end:stride],
-                [dict(zip(wparams.dtype.names, x)) for x in wparams])
+                [dict(zip(wparams.dtype.names, x)) for x in wparams], ostats)
     if not args.instruments:
         all_ifos = list(f['offsets'][:].dtype.names)
 
@@ -223,14 +221,21 @@ if args.adjust_psd_center:
 
 
 stats = []
-for i, (trigger_time, time_offsets, waveparams) in enumerate(zip(*triggers)):
+for i, (trigger_time, time_offsets, waveparams, ostat) in enumerate(zip(*triggers)):
+    if args.skip_above_stat and ostat > args.skip_above_stat:
+        stats.append(ostat)
+        continue
+
     logging.info('Starting work on trigger %s/%s: %s', i, len(triggers[0]), trigger_time)
     psdlen = 128
     psdseg = 8
 
+    print waveparams, ostat
+
     m1, m2 = waveparams['mass1'], waveparams['mass2']
     mchirp = pycbc.conversions.mchirp_from_mass1_mass2(m1, m2)
     waveparams['approximant'] = 'SPAtmplt' if mchirp < 3 else 'IMRPhenomD'
+
     templatelen = pycbc.waveform.get_waveform_filter_length_in_time(**waveparams)
     filterbuffer = templatelen + 4.0 + psdseg * 2
     filterbuffer = pycbc.pnutils.nearest_larger_binary_number(filterbuffer)
@@ -321,40 +326,32 @@ for i, (trigger_time, time_offsets, waveparams) in enumerate(zip(*triggers)):
                                     args.low_frequency_cutoff)
 
     logging.info('Optimizing Parameters')
-    minchirp = mchirp * (1 - mchirp / 200.0) # need better way to set limits
-    maxchirp = mchirp * (1 + mchirp / 200.0)
+    minchirp = mchirp * (1 - mchirp / 300.0)
+    maxchirp = mchirp * (1 + mchirp / 300.0)
     minchirp = 1 if minchirp < 1 else minchirp
     maxchirp = 80 if maxchirp > 80 else maxchirp
 
     q = max(m1 / m2, m2 / m1)
-    minq, maxq = q * 0.7, q * 1.5
+    minq, maxq = q * 0.9, q * 1.1
     minq = 1.0 if minq < 1 else minq
     maxq = 100 if maxq > 100 else maxq
+
+    from pycbc.conversions import chi_eff
+    xe = chi_eff(m1, m2, waveparams['spin1z'], waveparams['spin2z'])
+    xemax = min(xe + 0.1, .98)
+    xemin = max(xe - 0.1, -0.98)
+
     logging.info('Using chirp mass range %s-%s', minchirp, maxchirp)
     logging.info('Using mass ratio range %s-%s', minq, maxq)
-    bounds = [(minchirp, maxchirp), (minq, maxq), (-.98, 0.98)]
+    bounds = [(minchirp, maxchirp), (minq, maxq), (xemin, xemax)]
 
     logging.info('Optimizing intrinsic parameters')
-    result = differential_evolution(network_snr, bounds, popsize=20,
-                                    args=(trigger_time, stilde, psd, waveparams),
+    result = differential_evolution(network_snr, bounds, popsize=15,
+                                    args=(trigger_time, stilde,
+                                    psd, waveparams),
                                     disp=args.verbose, seed=0)
     optparam = result['x']
     logging.info(result)
-
-    logging.info('Running Signal-Consistency Tests')
-    _,  hp, corrs, snrs, norms, indices = network_snr(
-                            optparam, trigger_time, stilde, psd, waveparams,
-                            return_all=True)
-    chis = []
-    for ifo in strain:
-        for num_bins in [8, 20, 65]:
-            chi = pycbc.vetoes.power_chisq(hp, stilde[ifo], num_bins, psd[ifo],
-                                 low_frequency_cutoff=waveparams['f_lower'])
-            chi /= 2 * num_bins - 2
-            chi = chi[indices[ifo]]
-            chis.append(chi)
-            logging.info('%s: Chisq: %s - %s', ifo, num_bins, chi)
-    chiv = max(chis) if max(chis) > 1.3 else 1.0
 
     logging.info('Calculating marginal likelihood')
     msnr, smax = marginal_likelihood(optparam, trigger_time, stilde, psd, waveparams)
@@ -362,8 +359,8 @@ for i, (trigger_time, time_offsets, waveparams) in enumerate(zip(*triggers)):
 
 
     logging.info('Assigning Ranking Statistic')
-    stat = newsnr(msnr, chiv)
-    logging.info('Ranking Statistic = %s', stat)
+    stat = msnr
+    logging.info('Ranking Statistic = %s vs %s', stat, ostat)
     stats.append(stat)
 
 ofile['stat'] = numpy.array(stats)
