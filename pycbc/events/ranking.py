@@ -21,7 +21,7 @@ def newsnr_sgveto_psdvar_scaled(snr, bchisq, sgchisq, psd_var_val):
         
 def newsnr_sgveto_psdvar_scaled_threshold(snr, bchisq, sgchisq, psd_var_val):
     """ Combined SNR derived from NewSNR and Sine-Gaussian Chisq"""
-    nsnr = newnsr_sgveto_psdvar_scaled(snr, bchisq, sgchisq, psd_var_val)
+    nsnr = newsnr_sgveto_psdvar_scaled(snr, bchisq, sgchisq, psd_var_val)
     nsnr = numpy.array(nsnr, ndmin=1)
     nsnr[bchisq > 2.0] = 1
     
