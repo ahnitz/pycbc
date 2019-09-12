@@ -18,6 +18,7 @@ parser.add_argument('--relative-sensitivities', nargs='+', type=float)
 parser.add_argument('--seed', type=int, default=124)
 parser.add_argument('--output-file')
 parser.add_argument('--verbose', action='store_true')
+parser.add_argument('--bin-density', type=int, default=1)
 parser.add_argument('--smoothing-sigma', type=int, default=2)
 parser.add_argument('--timing-uncertainty', type=float, default=.001,
                     help="Timing uncertainty to set bin size and smoothing interval")
@@ -25,15 +26,15 @@ parser.add_argument('--phase-uncertainty', type=float, default=0.25,
                     help="Phase uncertainty used to set bin size and smoothing")
 parser.add_argument('--snr-reference', type=float, default=5, 
                     help="Reference SNR to scale SNR uncertainty")
-parser.add_argument('--snr-uncertainty', type=float, default=1.4, 
+parser.add_argument('--snr-uncertainty', type=float, default=1.0, 
                     help="SNR uncertainty to set bin size and smoothing")
 args = parser.parse_args()
 
-twidth = args.timing_uncertainty  # approximate timing error at lower SNRs
-pwidth = args.phase_uncertainty   # approximate phase error at lower SNRs
-serr = args.snr_uncertainty   #
+twidth = args.timing_uncertainty / args.bin_density # approximate timing error at lower SNRs
+serr = args.snr_uncertainty  / args.bin_density * 2 ** 0.5#
 sref = args.snr_reference     # Reference SNR for bin smoothing
 swidth = serr / sref
+pwidth = numpy.arctan(args.snr_uncertainty * args.bin_density / sref) / args.bin_density # approximate phase error at lower SNRs
 
 srbmax = int((args.snr_ratio / swidth))
 srbmin = int((1.0 / args.snr_ratio) / swidth)
@@ -41,8 +42,8 @@ srbmin = int((1.0 / args.snr_ratio) / swidth)
 # Apply a simple smoothing to help account for
 # measurement errors for weak signals
 def smooth_param(data, sigma, index):
-    bins = numpy.arange(-args.smoothing_sigma, args.smoothing_sigma+1)
-    kernel = norm.pdf(bins)
+    bins = numpy.arange(-args.smoothing_sigma * args.bin_density, args.smoothing_sigma * args.bin_density+1)
+    kernel = norm.pdf(bins, scale=args.bin_density)
     
     nweights = {}
     
@@ -125,7 +126,7 @@ for k in range(chunks):
     # use first ifo as reference for weights
     bind = [a[keep] for a in bind]
     
-    w = data[args.ifos[0]]['s'][keep] ** 3            
+    w = data[args.ifos[0]]['s'][keep] ** 3.0          
     for i, key in enumerate(zip(*bind)):
         if key not in weights:
             weights[key] = 0
@@ -134,15 +135,6 @@ for k in range(chunks):
     ol = l
     l = len(weights.values())
     logging.info('%s, %s, %s, %s', l, l - ol, (l - ol) / float(size), l / float(nsamples))
-
-# Get normalizations for different amplitude ratio thresholds 
-normv = {}
-for key in weights:
-    rvals = tuple(list(key)[2::3])
-    if key not in normv:
-        normv[rvals] = 0
-    normv[rvals] = max(normv[rvals], weights[key])
-print normv, srbmin, srbmax
 
 logging.info('applying smoothing')
 # apply smoothing iteratively
@@ -155,12 +147,22 @@ for i, ifo in enumerate(range(len(args.ifos)-1)):
     weights = smooth_param(weights, swidth, i*3 + 2)    
 logging.info('smoothing done: %s', len(weights))
 
+# Get normalizations for different amplitude ratio thresholds 
+normv = {}
+for key in weights:
+    rvals = tuple(list(key)[2::3])
+    if rvals not in normv:
+        normv[rvals] = 0
+    m = max(normv[rvals], weights[key])
+
+    normv[rvals] = m
+
 # save dict to hdf5 file as key + value array
 f = h5py.File(args.output_file, 'w')
 keys = numpy.array(weights.keys())
 values = numpy.array(weights.values())
 f['param_bin'] = keys
-f['weights'] = values
+f['weights'] = values / values.max()
 
 f.attrs['sensitivity_ratios'] = args.relative_sensitivities
 f.attrs['srbmin'] = srbmin
