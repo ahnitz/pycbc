@@ -28,6 +28,8 @@ parser.add_argument('--snr-reference', type=float, default=5,
                     help="Reference SNR to scale SNR uncertainty")
 parser.add_argument('--snr-uncertainty', type=float, default=1.0, 
                     help="SNR uncertainty to set bin size and smoothing")
+parser.add_argument('--threshold', type=float, default=1e-10)
+parser.add_argument('--batch-size', type=int, default=1000000)
 args = parser.parse_args()
 
 twidth = args.timing_uncertainty / args.bin_density # approximate timing error at lower SNRs
@@ -41,7 +43,8 @@ srbmin = int((1.0 / args.snr_ratio) / swidth)
 
 # Apply a simple smoothing to help account for
 # measurement errors for weak signals
-def smooth_param(data, sigma, index):
+def smooth_param(data, index):
+    mref = max(data.values())
     bins = numpy.arange(-args.smoothing_sigma * args.bin_density, args.smoothing_sigma * args.bin_density+1)
     kernel = norm.pdf(bins, scale=args.bin_density)
     
@@ -49,10 +52,17 @@ def smooth_param(data, sigma, index):
     
     # This is massively redundant as many points may be 
     # recalculated, but it's straightforward.
-    for key in weights:
+    for i, key in enumerate(data):
+        if data[key] / mref < args.threshold:
+            continue
+    
         for a in bins:
             nkey = list(key)
             nkey[index] += a
+            tnkey = tuple(nkey)
+            
+            if tnkey in nweights:
+                continue
             
             weight = 0
             for b, w in zip(bins, kernel):
@@ -62,9 +72,8 @@ def smooth_param(data, sigma, index):
                 
                 if wkey in data:
                     weight += data[wkey] * w
-                
-            nweights[tuple(nkey)] = weight
             
+            nweights[tnkey] = weight
     return nweights
     
 d = {ifo: pycbc.detector.Detector(ifo) for ifo in args.ifos}
@@ -72,7 +81,7 @@ d = {ifo: pycbc.detector.Detector(ifo) for ifo in args.ifos}
 pycbc.init_logging(args.verbose)
 
 numpy.random.seed(args.seed)
-size = 1000000
+size = args.batch_size
 chunks = int(args.sample_size / size) + 1
 
 l = 0
@@ -140,11 +149,11 @@ logging.info('applying smoothing')
 # apply smoothing iteratively
 for i, ifo in enumerate(range(len(args.ifos)-1)):
     logging.info('%s-time', len(weights))
-    weights = smooth_param(weights, twidth, i*3 + 0)
+    weights = smooth_param(weights, i*3 + 0)
     logging.info('%s-phase', len(weights))
-    weights = smooth_param(weights, pwidth, i*3 + 1)
+    weights = smooth_param(weights, i*3 + 1)
     logging.info('%s-amp', len(weights))
-    weights = smooth_param(weights, swidth, i*3 + 2)    
+    weights = smooth_param(weights, i*3 + 2)    
 logging.info('smoothing done: %s', len(weights))
 
 # Get normalizations for different amplitude ratio thresholds 
@@ -154,15 +163,22 @@ for key in weights:
     if rvals not in normv:
         normv[rvals] = 0
     m = max(normv[rvals], weights[key])
-
     normv[rvals] = m
 
 # save dict to hdf5 file as key + value array
 f = h5py.File(args.output_file, 'w')
 keys = numpy.array(weights.keys())
 values = numpy.array(weights.values())
-f['param_bin'] = keys
-f['weights'] = values / values.max()
+values /= values.max()
+
+# Theshold to keep saved bins to a reasonable amount
+l = values > args.threshold
+keys = keys[l].astype(numpy.int16)
+values = values[l].astype(numpy.float32)
+logging.info('Final length: %s', len(keys))
+
+f.create_dataset('param_bin', data=keys, compression='gzip', compression_opts=3)
+f.create_dataset('weights', data=values, compression='gzip', compression_opts=3)
 
 f.attrs['sensitivity_ratios'] = args.relative_sensitivities
 f.attrs['srbmin'] = srbmin
