@@ -317,26 +317,30 @@ class PhaseTDNewStatistic(NewSNRStatistic):
         logging.info("Using signal histogram %s for ifos %s", name, ifos)
         histfile = self.files[name]
 
-        self.weights = histfile['weights'][:]
-        
-        param = histfile['param_bin'][:]
-        ncol = param.shape[1]
-        self.pdtype = [('c%s' % i, int) for i in range(ncol)]
-        self.param_bin = numpy.zeros(len(self.weights), dtype=self.pdtype)
-        for i in range(ncol):
-            self.param_bin['c%s' % i] = param[:,i]
-        
-        l = self.param_bin.argsort()
-        self.param_bin = self.param_bin[l]
-        self.weights = self.weights[l]
-        
-        self.max_penalty = self.weights.min()
-        
-        self.hist = {}
         
         # This order matters, we need to retrieve the order used to 
         # generate the histogram as the first ifos if the reference
         self.hist_ifos = histfile.attrs['ifos']
+
+        self.weights = {}
+        self.param_bin = {}
+        for ifo in self.hist_ifos:
+            self.weights[ifo] = histfile[ifo]['weights'][:]
+ 
+            param = histfile['param_bin'][:]
+            ncol = param.shape[1]
+            self.pdtype = [('c%s' % i, int) for i in range(ncol)]
+            self.param_bin[ifo] = numpy.zeros(len(self.weights[ifo]), dtype=self.pdtype)
+            for i in range(ncol):
+                self.param_bin[ifo]['c%s' % i] = param[:,i]
+            
+            l = self.param_bin[ifo].argsort()
+            self.param_bin[ifo] = self.param_bin[ifo][l]
+            self.weights[ifo] = self.weights[l]
+            
+            self.max_penalty = self.weights[ifo].min()
+        
+        self.hist = {}
 
         # Bin boundaries are stored in the hdf file
         self.twidth = histfile.attrs['twidth']
@@ -394,65 +398,61 @@ class PhaseTDNewStatistic(NewSNRStatistic):
             self.get_hist()
         else:
             logging.info("Using pre-set signal histogram")
-        
-        # Get reference ifo information   
-        ref_ifo = self.hist_ifos[0]   
-        ref = stats[ref_ifo]
-        pref = numpy.array(ref['coa_phase'], ndmin=1)
-        tref = numpy.array(ref['end_time'], ndmin=1)
-        sref = numpy.array(ref['snr'], ndmin=1)
-        sigref = numpy.array(ref['sigmasq'], ndmin=1) ** 0.5
-        senseref = self.relsense[self.hist_ifos[0]]
-        
-        binned = []
-        for ifo in self.hist_ifos[1:]:
-            sc = stats[ifo]
-            p = numpy.array(sc['coa_phase'], ndmin=1)
-            t = numpy.array(sc['end_time'], ndmin=1)
-            s = numpy.array(sc['snr'], ndmin=1)
             
-            sense = self.relsense[ifo]
-            sig = numpy.array(sc['sigmasq'], ndmin=1) ** 0.5
+        # Figure out which weights each trigger will use
+        snrs = numpy.array([numpy.array(stats[ifo]['snr'], ndmin=1) for ifo in self.ifos])
+        smin = numpy.argmin(snrs, axis=1)
+        rtypes = {ifo:numpy.where(smin == j)[0] for j, ifo in enumerate(self.ifos)}
+        
+        # Get reference ifo information 
+        rate = numpy.zeros(len(shift), dtype=numpy.float32)
+        for ref_ifo in self.ifos:
+            rtype = rtypes[ref_ifo]
+            ref = stats[ref_ifo]
+            pref = numpy.array(ref['coa_phase'], ndmin=1)
+            tref = numpy.array(ref['end_time'], ndmin=1)
+            sref = numpy.array(ref['snr'], ndmin=1)
+            sigref = numpy.array(ref['sigmasq'], ndmin=1) ** 0.5
+            senseref = self.relsense[self.hist_ifos[0]]
             
-            # Calculate differences
-            pdif = (pref - p) % (numpy.pi * 2.0)
-            tdif = shift * to_shift[ref_ifo] + tref - shift * to_shift[ifo] - t
-            sdif = s / sref * sense / senseref * sigref / sig
+            binned = []
+            for ifo in self.hist_ifos[1:]:
+                sc = stats[ifo]
+                p = numpy.array(sc['coa_phase'], ndmin=1)
+                t = numpy.array(sc['end_time'], ndmin=1)
+                s = numpy.array(sc['snr'], ndmin=1)
                 
-            # Put into bins
-            tbin = (tdif / self.twidth).astype(numpy.int)
-            pbin = (pdif / self.pwidth).astype(numpy.int)
-            sbin = (sdif / self.swidth).astype(numpy.int)
-            binned += [tbin, pbin, sbin]
+                sense = self.relsense[ifo]
+                sig = numpy.array(sc['sigmasq'], ndmin=1) ** 0.5
+                
+                # Calculate differences
+                pdif = (pref - p) % (numpy.pi * 2.0)
+                tdif = shift * to_shift[ref_ifo] + tref - shift * to_shift[ifo] - t
+                sdif = s / sref * sense / senseref * sigref / sig
+                    
+                # Put into bins
+                tbin = (tdif / self.twidth).astype(numpy.int)
+                pbin = (pdif / self.pwidth).astype(numpy.int)
+                sbin = (sdif / self.swidth).astype(numpy.int)
+                binned += [tbin, pbin, sbin]
 
-        # convert binned to same dtype as stored in hist
-        nbinned = numpy.zeros(len(pbin), dtype=self.pdtype)
-        for i in range(len(binned)):
-            nbinned['c%s' % i] = binned[i]
-        
-        # Read signal weight from precalculated histogram
-        l = numpy.searchsorted(self.param_bin, nbinned)
-        l[l == len(self.weights)] = 0
-        rate = self.weights[l]
-        
-        # These weren't in our histogram so give them max penalty instead
-        # of random value
-        missed = numpy.where(self.param_bin[l] != nbinned)[0]       
-        rate[missed] = self.max_penalty
-
-        #if len(tref) > 0 and abs(tref - 1187058327).min() < 1:
-        #    i = abs(tref - 1187058327).argmin()
-        ##    t = numpy.zeros(1, dtype=self.pdtype)
-        #    t[0][0] = 17
-        #    t[0][1] = 6
-        #    t[0][2] = 4
-        #    print self.param_bin
-        ##    print self.max_penalty, numpy.log(self.max_penalty)
-        #    print tref[i], rate[i], numpy.log(rate)[i], nbinned[i], pdif[i], tdif[i], sdif[i], pref[i], p[i]
-        #    exit()
+            # convert binned to same dtype as stored in hist
+            nbinned = numpy.zeros(len(pbin), dtype=self.pdtype)
+            for i in range(len(binned)):
+                nbinned['c%s' % i] = binned[i]
             
-        # Scale by signal population SNR
-        rate *= (sref / self.ref_snr) ** -4.0
+            # Read signal weight from precalculated histogram
+            l = numpy.searchsorted(self.param_bin[ref_ifo], nbinned)
+            l[l == len(self.weights)] = 0
+            rate[rtype] = self.weights[ref_ifo][l]
+            
+            # These weren't in our histogram so give them max penalty instead
+            # of random value
+            missed = numpy.where(self.param_bin[ref_ifo][l] != nbinned)[0]       
+            rate[rtype][missed] = self.max_penalty
+                
+            # Scale by signal population SNR
+            rate[rtype] *= (sref / self.ref_snr) ** -4.0
 
         return numpy.log(rate) 
 
