@@ -327,7 +327,7 @@ class PhaseTDNewStatistic(NewSNRStatistic):
         for ifo in self.hist_ifos:
             self.weights[ifo] = histfile[ifo]['weights'][:]
  
-            param = histfile['param_bin'][:]
+            param = histfile[ifo]['param_bin'][:]
             ncol = param.shape[1]
             self.pdtype = [('c%s' % i, int) for i in range(ncol)]
             self.param_bin[ifo] = numpy.zeros(len(self.weights[ifo]), dtype=self.pdtype)
@@ -336,7 +336,7 @@ class PhaseTDNewStatistic(NewSNRStatistic):
             
             l = self.param_bin[ifo].argsort()
             self.param_bin[ifo] = self.param_bin[ifo][l]
-            self.weights[ifo] = self.weights[l]
+            self.weights[ifo] = self.weights[ifo][l]
             
             self.max_penalty = self.weights[ifo].min()
         
@@ -401,33 +401,37 @@ class PhaseTDNewStatistic(NewSNRStatistic):
             
         # Figure out which weights each trigger will use
         snrs = numpy.array([numpy.array(stats[ifo]['snr'], ndmin=1) for ifo in self.ifos])
-        smin = numpy.argmin(snrs, axis=1)
+        smin = numpy.argmin(snrs, axis=0)
         rtypes = {ifo:numpy.where(smin == j)[0] for j, ifo in enumerate(self.ifos)}
+        print smin, rtypes        
         
         # Get reference ifo information 
         rate = numpy.zeros(len(shift), dtype=numpy.float32)
         for ref_ifo in self.ifos:
             rtype = rtypes[ref_ifo]
             ref = stats[ref_ifo]
-            pref = numpy.array(ref['coa_phase'], ndmin=1)
-            tref = numpy.array(ref['end_time'], ndmin=1)
-            sref = numpy.array(ref['snr'], ndmin=1)
+            pref = numpy.array(ref['coa_phase'], ndmin=1)[rtype]
+            tref = numpy.array(ref['end_time'], ndmin=1)[rtype]
+            sref = numpy.array(ref['snr'], ndmin=1)[rtype]
             sigref = numpy.array(ref['sigmasq'], ndmin=1) ** 0.5
+            sigref = sigref[rtype]
             senseref = self.relsense[self.hist_ifos[0]]
             
             binned = []
-            for ifo in self.hist_ifos[1:]:
-                sc = stats[ifo]
-                p = numpy.array(sc['coa_phase'], ndmin=1)
-                t = numpy.array(sc['end_time'], ndmin=1)
-                s = numpy.array(sc['snr'], ndmin=1)
+            other_ifos = [ifo for ifo in self.ifos if ifo != ref_ifo]
+            for ifo in other_ifos:
+                sc = stats[ifo] 
+                p = numpy.array(sc['coa_phase'], ndmin=1)[rtype]
+                t = numpy.array(sc['end_time'], ndmin=1)[rtype]
+                s = numpy.array(sc['snr'], ndmin=1)[rtype]
                 
                 sense = self.relsense[ifo]
                 sig = numpy.array(sc['sigmasq'], ndmin=1) ** 0.5
-                
+                sig = sig[rtype]                
+
                 # Calculate differences
                 pdif = (pref - p) % (numpy.pi * 2.0)
-                tdif = shift * to_shift[ref_ifo] + tref - shift * to_shift[ifo] - t
+                tdif = shift[rtype] * to_shift[ref_ifo] + tref - shift[rtype] * to_shift[ifo] - t
                 sdif = s / sref * sense / senseref * sigref / sig
                     
                 # Put into bins
@@ -443,7 +447,8 @@ class PhaseTDNewStatistic(NewSNRStatistic):
             
             # Read signal weight from precalculated histogram
             l = numpy.searchsorted(self.param_bin[ref_ifo], nbinned)
-            l[l == len(self.weights)] = 0
+            l[l == len(self.weights[ref_ifo])] = 0
+            print len(l), len(rtype)
             rate[rtype] = self.weights[ref_ifo][l]
             
             # These weren't in our histogram so give them max penalty instead
@@ -1182,8 +1187,9 @@ class TwoGCBBHStatistic(ExpFitSGFgBgRateNewStatistic):
     
     def logsignalrate_multiifo(self, stats, shift, to_shift):
         logr_s = ExpFitSGFgBgRateNewStatistic.logsignalrate_multiifo(self, stats, shift, to_shift)
-        mchirp = self.mchirp if self.mchirp < 40 else 40.0
-        logr_s += numpy.log((mchirp / 20.0) ** (11./3.0))
+        logr_s += numpy.log((self.mchirp / 20.0) ** (11./3.0))
+        if self.mchirp > 60.0:
+            logr_s[:] = -20
         return logr_s
 
 statistic_dict = {
