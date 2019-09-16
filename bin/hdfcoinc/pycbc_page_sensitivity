@@ -227,21 +227,24 @@ if args.hdf_out:
 color = iter(cm.rainbow(numpy.linspace(0, 1, len(args.bins)-1)))
 if not args.exclusive_sig:
     fvalues = [found['sig'], found['sig_exc']]
-    do_labels = [True, False]
+    do_labels = [False, True]
     alphas = [.8, .3]
 else:
     fvalues = [found['sig_exc']]
     do_labels = [True]
     alphas = [.6]
 
+
+print fvalues
 fig = pylab.figure()
 # Cycle over parameter bins plotting each in turn
 for j in range(len(args.bins)-1):
     c = next(color)
-
+    
     # cycle over inclusive / exclusive significance if available
     for sig_val, do_label, alpha in zip(fvalues, do_labels, alphas):
-        if sig_val[0] is None:
+        print sig_val, do_label
+        if len(sig_val) == 0 or sig_val[0] is None:
             logging.info('Skipping exclusive significance')
             continue
 
@@ -321,6 +324,7 @@ for j in range(len(args.bins)-1):
             reach, ehigh, elow = vols * t, vol_errors * t, vol_errors * t
 
         label = labels[args.bin_type] % (left, right) if do_label else None
+        print label
         pylab.plot(x_values, reach, label=label, c=c)
         pylab.plot(x_values, reach, alpha=alpha, c='black')
         pylab.fill_between(x_values, reach - elow, reach + ehigh,
