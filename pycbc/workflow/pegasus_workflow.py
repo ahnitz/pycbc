@@ -130,6 +130,7 @@ class Node(ProfileShortcuts):
         # so ['--option','value'] --> "--optionvalue"
         # and ['--option',' ','value'] --> "--option value"
         self._raw_options = []
+        self.as_job = self._dax_node
 
     def add_arg(self, arg):
         """ Add an argument
@@ -226,6 +227,11 @@ class Node(ProfileShortcuts):
         self.add_arg(out._dax_repr())
         self._add_output(out)
 
+    def new_output_file_arg(self, name):
+        fil = File(name)
+        self.add_output_arg(fil)
+        return fil
+
     def new_output_file_opt(self, opt, name):
         """ Add an option and return a new file handle
         """
@@ -283,6 +289,7 @@ class Workflow(object):
             if step in input_root:
                 common = step
                 break
+
         dep = dax.Dependency(
             parent=input_root[input_root.index(common)-1].as_job,
             child=workflow_root[workflow_root.index(common)-1].as_job)
@@ -333,6 +340,7 @@ class Workflow(object):
         # this node requires.
         added_nodes = []
         for inp in node._inputs:
+            # input made by another job in this workflow
             if inp.node is not None and inp.node.in_workflow == self:
                 if inp.node not in added_nodes:
                     parent = inp.node._dax_node
@@ -341,17 +349,27 @@ class Workflow(object):
                     self._adag.addDependency(dep)
                     added_nodes.append(inp.node)
 
+            # input hasn't been added to a workflow, but should have been!!!
             elif inp.node is not None and not inp.node.in_workflow:
                 raise ValueError('Parents of this node must be added to the '
                                  'workflow first.')
 
+            # The input is a fixed external file, not made within a workflow
             elif inp.node is None and not inp.workflow_input:
                 self._inputs += [inp]
                 inp.workflow_input = True
 
+            # a subworkflow of self made this input
+            elif inp.node is not None and ischild(inp.node.in_workflow, self):
+                # find root workflow below self
+                # make parent of just added jobs, if not already done so.
+
+            # some other workflow made this input, not a subworkflow of self
             elif inp.node is not None and inp.node.in_workflow != self and inp not in self._inputs:
                 self._inputs += [inp]
                 self._external_workflow_inputs += [inp]
+                # copy and then add PFN to this file with the storage location
+                # remove storage location
 
         # Record the outputs that this node generates
         self._outputs += node._outputs
@@ -490,7 +508,7 @@ class File(DataStorage, dax.File):
         if (urlparts.scheme == '' or urlparts.scheme == 'file'):
             if os.path.isfile(urlparts.path):
                 path = os.path.abspath(urlparts.path)
-                path = urljoin('file:', pathname2url(path)) 
+                path = urljoin('file:', pathname2url(path))
                 site = 'local'
 
         fil = File(os.path.basename(path))

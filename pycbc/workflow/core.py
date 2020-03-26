@@ -624,15 +624,22 @@ class Workflow(pegasus_workflow.Workflow):
         # Parse ini file
         self.cp = WorkflowConfigParser.from_cli(args)
 
-        # Set global values
-        start_time = int(self.cp.get("workflow", "start-time"))
-        end_time = int(self.cp.get("workflow", "end-time"))
-        self.analysis_time = segments.segment([start_time, end_time])
+        # Set global values FIXME, better place for this?
+        try:
+            start_time = int(self.cp.get("workflow", "start-time"))
+            end_time = int(self.cp.get("workflow", "end-time"))
+            self.analysis_time = segments.segment([start_time, end_time])
+        except:
+            self.analysis_time = segments.segment([0, 0])
 
         # Set the ifos to analyse
         ifos = []
-        for ifo in self.cp.options('workflow-ifos'):
-            ifos.append(ifo.upper())
+        try:
+            for ifo in self.cp.options('workflow-ifos'):
+                ifos.append(ifo.upper())
+        except:
+            pass
+
         self.ifos = ifos
         self.ifos.sort(key=str.lower)
         self.ifo_string = ''.join(self.ifos)
