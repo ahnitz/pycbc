@@ -363,12 +363,15 @@ class Workflow(object):
             elif inp.node is not None and ischild(inp.node.in_workflow, self):
                 # find root workflow below self
                 # make parent of just added jobs, if not already done so.
+                raise ValueError("A job cannot currently use input from a cousin sub-workflow")
 
             # some other workflow made this input, not a subworkflow of self
             elif inp.node is not None and inp.node.in_workflow != self and inp not in self._inputs:
+                
+                inp = File.from_path(inp.storage_path)
                 self._inputs += [inp]
                 self._external_workflow_inputs += [inp]
-                # copy and then add PFN to this file with the storage location
+                
                 # remove storage location
 
         # Record the outputs that this node generates
