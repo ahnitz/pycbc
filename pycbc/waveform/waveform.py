@@ -823,6 +823,9 @@ _filter_time_lengths[apx_name] = _filter_time_lengths["SpinTaylorF2"]
 from . nltides import nonlinear_tidal_spa
 cpu_fd["TaylorF2NL"] = nonlinear_tidal_spa
 
+from pycbc.waveform.hmr import getfeob
+cpu_fd["HMR"] = getfeob
+
 # Load external waveforms #####################################################
 if 'PYCBC_WAVEFORM' in os.environ:
     mods = os.environ['PYCBC_WAVEFORM'].split(':')
