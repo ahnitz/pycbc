@@ -7,8 +7,8 @@ from scipy.interpolate import interp1d
 import os
 
 
-eobfile = os.environ('HMR_FILE')
-f = h5py.File(eobfile)
+eobfile = os.environ['HMR_FILE']
+f = h5py.File(eobfile, 'r')
 
 m1s = numpy.array([f[k].attrs['m1'] for k in f])
 m2s = numpy.array([f[k].attrs['m2'] for k in f])
@@ -18,9 +18,10 @@ keys = [k for k in f]
 
 def getfeob(**kwds):
     
-    return feob(kwds['mass1'], kwds['mass2'],
+    hp = feob(kwds['mass1'], kwds['mass2'],
                 kwds['delta_f'],
-                duration=90)
+                duration=90).astype(numpy.complex128)
+    return hp, hp*1.0j
                 
 def ieob(m1, m2, delta_t, duration=90.0):
     # get closest mass ratio in set
@@ -59,4 +60,4 @@ def feob(m1, m2, delta_f, duration=90.0):
     fs = ts.to_frequencyseries().cyclic_time_shift(ts.start_time)
     fs._epoch = 0
     fs._delta_f = delta_f
-    return fs * pycbc.DYN_RANGE_FAC
+    return fs
