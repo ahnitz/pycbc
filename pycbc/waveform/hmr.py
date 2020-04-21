@@ -41,7 +41,7 @@ def ieob(m1, m2, delta_t, duration=90.0):
     y = inter(x)
     return TimeSeries(y, epoch=x[0], delta_t=delta_t)
 
-def feob(m1, m2, delta_f, duration=90.0):
+def feob(m1, m2, delta_f, duration=100.0):
     # get closest mass ratio in set
     q = float(m1) / float(m2)
     j = abs(qs - q).argmin()
