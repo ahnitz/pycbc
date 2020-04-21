@@ -20,10 +20,10 @@ def getfeob(**kwds):
 
     hp = feob(kwds['mass1'], kwds['mass2'],
                 kwds['delta_f'],
-                duration=90).astype(numpy.complex128)
+                duration=100).astype(numpy.complex128)
     return hp, hp*1.0j
 
-def ieob(m1, m2, delta_t, duration=90.0):
+def ieob(m1, m2, delta_t, duration=100.0):
     # get closest mass ratio in set
     q = m1 / m2
     j = abs(qs - q).argmin()
