@@ -43,7 +43,7 @@ def ieob(m1, m2, delta_t, duration=100.0):
 
 def feob(m1, m2, delta_f, duration=100.0):
     # get closest mass ratio in set
-    q = float(m1) / float(m2)
+    q = max(float(m1) / float(m2), float(m2) / float(m1))
     j = abs(qs - q).argmin()
     ts = load_timeseries(eobfile, group=keys[j])
     M_ref = mchirp_from_mass1_mass2(m1s[j], m2s[j])
