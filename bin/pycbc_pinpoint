@@ -1,0 +1,96 @@
+#!/usr/bin/env python
+# Copyright (C) 2020 Alex Nitz
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+import logging, argparse, numpy, argparse, pycbc
+from pycbc import vetoes, psd, waveform, events, strain, detector, DYN_RANGE_FAC
+from pycbc.types import TimeSeries, zeros, float32, complex64
+
+parser = argparse.ArgumentParser(usage='',
+    description="Targetted Coherent Analysis for a Precisely Known Sky Location")
+parser.add_argument("-V", "--verbose", action="store_true",
+                  help="print extra debugging information", default=False)
+parser.add_argument("--output", type=str)
+parser.add_argument("--bank-file", type=str)
+parser.add_argument("--instruments", nargs='*', type=str)
+parser.add_argument("--low-frequency-cutoff", type=float,
+                  help="The low frequency cutoff to use for filtering (Hz)")
+parser.add_argument("--cluster-window", type=float, default=1.0,
+                  help="Length of clustering window in seconds.")
+parser.add_argument("--chisq-bins", default=0)
+parser.add_argument("--chisq-threshold", type=float, default=0)
+parser.add_argument("--right-ascension", type=float)
+parser.add_argument("--declination", type=float)
+parser.add_argument("--network-snr-threshold", type=float, default=0.0, help="""
+                    Triggers with network snr below this value will
+                    be discarded.""")
+
+# Add options groups
+strain.insert_strain_option_group_multi_ifo(parser)
+strain.StrainSegments.insert_segment_option_group_multi_ifo(parser)
+psd.insert_psd_option_group_multi_ifo(parser)
+args = parser.parse_args()
+
+ifos = args.instruments
+flow = args.low_frequency_cutoff
+
+# Option verifications
+strain.verify_strain_options_multi_ifo(args, parser, ifos)
+strain.StrainSegments.verify_segment_options_multi_ifo(args, parser,
+                                                       ifos)
+psd.verify_psd_options_multi_ifo(args, parser, ifos)
+pycbc.init_logging(args.verbose)
+
+
+strain_dict = strain.from_cli_multi_ifos(args, ifos,
+                                         dyn_range_fac=DYN_RANGE_FAC
+                                        )
+strain_segments_dict = strain.StrainSegments.from_cli_multi_ifos(
+                                             args, strain_dict, ifos)
+
+logging.info("Making frequency-domain data segments")
+segments = {ifo : strain_segments_dict[ifo].fourier_segments()
+           for ifo in ifos}
+del strain_segments_dict
+
+flen = len(segments[ifos[0]][0])
+tlen = (flen - 1) * 2
+delta_f = segments[ifos[0]][0].delta_f
+
+psd.associate_psds_to_multi_ifo_segments(args, segments, strain_dict, flen,
+        delta_f, flow, ifos, dyn_range_factor=DYN_RANGE_FAC,
+        precision='single')
+
+#logging.info("Initializing signal-based vetoes.")
+#power_chisq = vetoes.SingleDetPowerChisq(args.chisq_bins)
+
+logging.info("Overwhitening frequency-domain data segments")
+for ifo in ifos:
+    for seg in segments[ifo]:
+        seg /= seg.psd
+
+logging.info("Read in template bank")
+template_mem = zeros(tlen, dtype=complex64)
+bank = waveform.FilterBank(args.bank_file, flen, delta_f, complex64,
+                           low_frequency_cutoff=flow,
+                           out=template_mem)
+
+for t_num, template in enumerate(bank):
+    for s_num, stilde in enumerate(segments[ifos[0]]):
+        stilde = {ifo : segments[ifo][s_num] for ifo in opt.ifos}
+        logging.info('Template {}, Segment {}'.format(t_num, s_num))
+        
+logging.info('Done')
