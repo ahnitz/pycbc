@@ -16,7 +16,11 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 import logging, argparse, numpy, argparse, pycbc
-from pycbc import vetoes, psd, waveform, events, strain, detector, DYN_RANGE_FAC
+
+import scipy.special
+import numpy.random
+
+from pycbc import vetoes, psd, waveform, events, strain, detector, filter, DYN_RANGE_FAC
 from pycbc.types import TimeSeries, zeros, float32, complex64
 
 parser = argparse.ArgumentParser(usage='',
@@ -37,6 +41,10 @@ parser.add_argument("--declination", type=float)
 parser.add_argument("--network-snr-threshold", type=float, default=0.0, help="""
                     Triggers with network snr below this value will
                     be discarded.""")
+parser.add_argument("--marg-seed", type=int, default=0,
+                  help="Seed to choose points to sample likelihood")
+parser.add_argument("--marg-size", type=int, default=100000,
+                  help="Number of samples to take from likelihood")
 
 # Add options groups
 strain.insert_strain_option_group_multi_ifo(parser)
@@ -69,7 +77,6 @@ del strain_segments_dict
 flen = len(segments[ifos[0]][0])
 tlen = (flen - 1) * 2
 delta_f = segments[ifos[0]][0].delta_f
-
 psd.associate_psds_to_multi_ifo_segments(args, segments, strain_dict, flen,
         delta_f, flow, ifos, dyn_range_factor=DYN_RANGE_FAC,
         precision='single')
@@ -81,16 +88,87 @@ logging.info("Overwhitening frequency-domain data segments")
 for ifo in ifos:
     for seg in segments[ifo]:
         seg /= seg.psd
+        
+logging.info("Shifting data to geocentric coordinates")
+for ifo in ifos:
+    for j, seg in enumerate(segments[ifo]):
+        det = detector.Detector(ifo)
+        start = seg.start_time
+        end =(seg.end_time)
+        tcenter = (float(start) + float(end)) / 2.0
+        dt = det.time_delay_from_earth_center(args.right_ascension, 
+                                              args.declination, tcenter)
+        seg[:] = seg.cyclic_time_shift(-dt)
+        segments[ifo][j] = seg
 
 logging.info("Read in template bank")
 template_mem = zeros(tlen, dtype=complex64)
 bank = waveform.FilterBank(args.bank_file, flen, delta_f, complex64,
                            low_frequency_cutoff=flow,
                            out=template_mem)
+               
+logging.info("Setting up marginalization points")
+numpy.random.seed(args.marg_seed)
+
+# points should be drawn according to prior (we'll integrate over these later)
+polm = numpy.random.uniform(0, numpy.pi*2.0, size=args.marg_size)
+incm = numpy.arccos(numpy.random.uniform(-1, 1, size=args.marg_size))
+distm = numpy.random.uniform(350, 2000, size=args.marg_size)
+
+htf = {}
+for ifo in ifos:
+    det = detector.Detector(ifo)
+    fp, fc = det.antenna_pattern(args.right_ascension, 
+                                  args.declination,
+                                  polm,
+                                  args.gps_start_time[ifos[0]])  # Reference time, might want to recalculate this....    
+    ip = numpy.cos(incm)
+    ic = 0.5 * (1.0 + ip * ip)
+    htf[ifo] = (fp * ip + 1.0j * fc * ic) / distm
+                 
+def marginal_likelihood(sh, hh):
+    """ Approximate marginal likelihood over pol/inc/dist. Maximized over phase.
+    """
+    shloglr = numpy.zeros(args.marg_size)
+    hhloglr = numpy.zeros(args.marg_size)
+    
+    for ifo in sh:
+        shloglr += sh[ifo] * htf[ifo]
+        hhloglr += hh[ifo] * abs(htf[ifo]) ** 2.0
+
+    vloglr = abs(shloglr) + hhloglr
+    return logexpsum(vloglr) - numpy.log(args.marg_size)
+
+def threshold(vec, value, window):
+    window_idx = int(window * vec.sample_rate)
+    
+    
 
 for t_num, template in enumerate(bank):
     for s_num, stilde in enumerate(segments[ifos[0]]):
-        stilde = {ifo : segments[ifo][s_num] for ifo in opt.ifos}
+        stilde = {ifo : segments[ifo][s_num] for ifo in ifos}
         logging.info('Template {}, Segment {}'.format(t_num, s_num))
+        
+        # calculate SNR fo reach detector
+        snrs = {}
+        for ifo in ifos:
+            snr, corr, norm = filter.matched_filter_core(template, stilde[ifo],
+                                               h_norm=template.sigmasq(stilde[ifo].psd))
+            snr *= norm
+            snr = snr[stilde[ifo].analyze]
+            snrs[ifo] = snr.copy()
+            print(ifo, abs(snr).abs_max_loc())
+            
+        # Cluster and threshold triggers based on the network SNR
+        net_snr = 0
+        for ifo in snrs:
+            net_snr += abs(snrs[ifo]) ** 2.0
+        net_snr = net_snr ** 0.5
+        print(net_snr.max())
+        
+        # Calculate signal-consistency tests and toss out triggers 
+       
+        # Calculate the marginal likelihood approximation for each trigger
+        
         
 logging.info('Done')
