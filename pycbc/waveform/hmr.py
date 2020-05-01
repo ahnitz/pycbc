@@ -17,10 +17,13 @@ fl = numpy.array([f[k].attrs['flow'] for k in f])
 keys = [k for k in f]
 
 def getfeob(**kwds):
-
+    if 'duration' in kwds:
+        duration = kwds['duration']
+    else:
+        duration = 100.0
     hp = feob(kwds['mass1'], kwds['mass2'],
                 kwds['delta_f'],
-                duration=100).astype(numpy.complex128)
+                duration=duration).astype(numpy.complex128)
     return hp, hp*1.0j
 
 def ieob(m1, m2, delta_t, duration=100.0):
