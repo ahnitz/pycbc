@@ -24,6 +24,9 @@ def getfeob(**kwds):
     hp = feob(kwds['mass1'], kwds['mass2'],
                 kwds['delta_f'],
                 duration=duration).astype(numpy.complex128)
+    kmin = int(kwds['f_lower'] / float(kwds['delta_f']))
+    hp[:kmin].clear()
+    hp /= kwds['distance']
     return hp, hp*1.0j
 
 def ieob(m1, m2, delta_t, duration=100.0):
@@ -65,6 +68,9 @@ def feob(m1, m2, delta_f, duration=100.0):
         ts = ts[len(ts) - tlen:]
     else:
         ts.resize(sr * bf)
+
+    from pycbc.waveform.utils import taper_timeseries
+    ts = taper_timeseries(ts, tapermethod='start')
 
     fs = ts.to_frequencyseries().cyclic_time_shift(ts.start_time) * Mr**2.0
     fs._epoch = 0
