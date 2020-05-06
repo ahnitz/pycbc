@@ -879,7 +879,10 @@ def get_waveform_filter(out, template=None, **kwargs):
     if input_params['approximant'] in fd_approximants(_scheme.mgr.state):
         wav_gen = fd_wav[type(_scheme.mgr.state)]
 
-        duration = get_waveform_filter_length_in_time(**input_params)
+        if 'duration' in input_params:
+            duration = input_params['duration']
+        else:
+            duration = get_waveform_filter_length_in_time(**input_params)
         hp, _ = wav_gen[input_params['approximant']](
                                                return_hc=False, **input_params)
 

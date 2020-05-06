@@ -955,7 +955,7 @@ def load_timeseries(path, group=None):
         data = _numpy.loadtxt(path)
     elif ext == '.hdf':
         key = 'data' if group is None else group
-        f = h5py.File(path)
+        f = h5py.File(path, 'r')
         data = f[key][:]
         series = TimeSeries(data, delta_t=f[key].attrs['delta_t'],
                                   epoch=f[key].attrs['start_time'])

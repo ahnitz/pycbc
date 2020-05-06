@@ -9,12 +9,12 @@ import os
 
 eobfile = os.environ['HMR_FILE']
 f = h5py.File(eobfile, 'r')
-
 m1s = numpy.array([f[k].attrs['m1'] for k in f])
 m2s = numpy.array([f[k].attrs['m2'] for k in f])
 qs = m1s / m2s
 fl = numpy.array([f[k].attrs['flow'] for k in f])
 keys = [k for k in f]
+f.close()
 
 def getfeob(**kwds):
     if 'duration' in kwds:
