@@ -10,7 +10,7 @@ import os
 eobfile = os.environ['HMR_FILE']
 if 'HMR_FILE_SHARED' in os.environ:
     eobfile_src = eobfile
-    eob_file = '/dev/shm/HMR_FILE.hdf'
+    eobfile = '/dev/shm/HMR_FILE.hdf'
 
     from filelock import FileLock
     import os.path
@@ -25,7 +25,7 @@ if 'HMR_FILE_SHARED' in os.environ:
                 recopy = True
 
         if not os.path.exists(eob_file) or recopy:
-            shutil.copy(eobfile_src, eob_file)
+            shutil.copy(eobfile_src, eobfile)
 
 f = h5py.File(eobfile, 'r')
 m1s = numpy.array([f[k].attrs['m1'] for k in f])
