@@ -185,7 +185,7 @@ if len(indices) > 0:
         track_t, track_f = pycbc.pnutils.get_inspiral_tf(
                     tc - center_time, tmplts.mass1[tid], tmplts.mass2[tid],
                     tmplts.spin1z[tid], tmplts.spin2z[tid],
-                    opts.f_low, approximant=bank.approximant(tid))
+                    opts.f_low)
         if max_rank and rho == max_rank:
             ax.plot(track_t, track_f, '-', color='#0080ff', zorder=3, lw=2)
         else:

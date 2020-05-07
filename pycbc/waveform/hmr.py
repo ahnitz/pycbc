@@ -15,16 +15,16 @@ if 'HMR_FILE_SHARED' in os.environ:
     from filelock import FileLock
     import os.path
     import shutil
-    with FileLock(eob_file + '.lock'):
+    with FileLock(eobfile + '.lock'):
         recopy = False
-        if os.path.exists(eob_file):
+        if os.path.exists(eobfile):
             try:
                 f = h5py.File(eobfile, 'r')
                 test = f['0']
             except:
                 recopy = True
 
-        if not os.path.exists(eob_file) or recopy:
+        if not os.path.exists(eobfile) or recopy:
             shutil.copy(eobfile_src, eobfile)
 
 f = h5py.File(eobfile, 'r')
