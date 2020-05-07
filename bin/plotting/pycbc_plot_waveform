@@ -122,8 +122,8 @@ hp, hc = waveform.get_two_pol_waveform_filter(zeros(flen, dtype=complex64),
                                     delta_f=delta_f, delta_t=delta_t)
 
 # 0.1s (post-merger) added for safety
-tmplt_length = hp.length_in_time + 0.1
-pre_merger_length = hp.chirp_length
+tmplt_length =  61.0
+pre_merger_length = 60.5
 post_merger_length = tmplt_length - pre_merger_length
 
 # Find last non-zero frequency point

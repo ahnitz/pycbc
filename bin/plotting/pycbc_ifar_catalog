@@ -26,8 +26,8 @@ import pycbc.version
 from pycbc import conversions
 from scipy.stats import norm, poisson
 
-pylab.rc('text', usetex=True)
-pylab.rc('font', **{'family': 'serif', 'serif': ['Computer Modern']})
+#pylab.rc('text', usetex=True)
+#pylab.rc('font', **{'family': 'serif', 'serif': ['Computer Modern']})
 
 parser = argparse.ArgumentParser(usage='pycbc_ifar_catalog [--options]',
                     description='Plots cumulative IFAR vs count for'

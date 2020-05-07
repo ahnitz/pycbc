@@ -867,6 +867,7 @@ def get_waveform_filter(out, template=None, **kwargs):
     n = len(out)
 
     input_params = props(template, **kwargs)
+    print input_params
 
     if input_params['approximant'] in filter_approximants(_scheme.mgr.state):
         wav_gen = filter_wav[type(_scheme.mgr.state)]
@@ -878,7 +879,6 @@ def get_waveform_filter(out, template=None, **kwargs):
 
     if input_params['approximant'] in fd_approximants(_scheme.mgr.state):
         wav_gen = fd_wav[type(_scheme.mgr.state)]
-
         if 'duration' in input_params:
             duration = input_params['duration']
         else:
@@ -988,7 +988,14 @@ def get_two_pol_waveform_filter(outplus, outcross, template, **kwargs):
         hp = FrequencySeries(outplus, delta_f=hp.delta_f, copy=False)
         outcross[0:len(hc)] = hc[:]
         hc = FrequencySeries(outcross, delta_f=hc.delta_f, copy=False)
-        hp.chirp_length = get_waveform_filter_length_in_time(**input_params)
+        print input_params
+        if 'duration' in input_params:
+            duration = input_params['duration']
+        else:
+            duration = get_waveform_filter_length_in_time(**input_params)
+
+        hp.chirp_length = duration
+
         hp.length_in_time = hp.chirp_length
         hc.chirp_length = hp.chirp_length
         hc.length_in_time = hp.length_in_time
