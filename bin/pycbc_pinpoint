@@ -15,7 +15,7 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-import logging, argparse, numpy, argparse, pycbc
+import logging, argparse, numpy, argparse, pycbc, h5py
 
 import scipy.special
 import numpy.random
@@ -113,7 +113,7 @@ numpy.random.seed(args.marg_seed)
 # points should be drawn according to prior (we'll integrate over these later)
 polm = numpy.random.uniform(0, numpy.pi*2.0, size=args.marg_size)
 incm = numpy.arccos(numpy.random.uniform(-1, 1, size=args.marg_size))
-distm = numpy.random.uniform(350, 2000, size=args.marg_size)
+distm = numpy.random.uniform(1, 3000, size=args.marg_size)
 
 htf = {}
 for ifo in ifos:
@@ -124,8 +124,8 @@ for ifo in ifos:
                                   args.gps_start_time[ifos[0]])  # Reference time, might want to recalculate this....    
     ip = numpy.cos(incm)
     ic = 0.5 * (1.0 + ip * ip)
-    htf[ifo] = (fp * ip + 1.0j * fc * ic) / distm
-                 
+    htf[ifo] = (fp * ip + 1.0j * fc * ic) / (distm)
+            
 def marginal_likelihood(sh, hh):
     """ Approximate marginal likelihood over pol/inc/dist. Maximized over phase.
     """
@@ -135,8 +135,12 @@ def marginal_likelihood(sh, hh):
     for ifo in sh:
         shloglr += sh[ifo] * htf[ifo]
         hhloglr += hh[ifo] * abs(htf[ifo]) ** 2.0
-
+        
     vloglr = abs(shloglr) + hhloglr
+    
+    j = vloglr.argmax()
+    logging.info('ML point: pol=%s, inc=%s, dist=%s', polm[j], incm[j], distm[j])
+    
     return scipy.special.logsumexp(vloglr) - numpy.log(args.marg_size)
 
 def threshold(vec, value, window):
@@ -195,11 +199,12 @@ for t_num, template in enumerate(bank):
         # marginized over pol, inc, dist
         hh = {ifo: template.sigmasq(stilde[ifo].psd) * -0.5 for ifo in ifos}
         for p, cval in zip(peaks, chisq):
-            sh = {ifo: snr[p] / norm[ifo] * 4 * delta_f for ifo in ifos}
+            sh = {ifo: snrs[ifo][p] / norm[ifo] * 4.0 * delta_f for ifo in ifos}
             ml = marginal_likelihood(sh, hh)
             logging.info('Marginal Lik: %s %s', p, ml)
 
             events['marg'].append(ml)
+            events['template_id'].append(t_num)
             for ifo in ifos:
                 snrp = snrs[ifo][p]
                 events[ifo + '_' + 'snr'].append(snrp)
@@ -207,6 +212,6 @@ for t_num, template in enumerate(bank):
 
 f = h5py.File(args.output_file, 'w')
 for k in events:
-    f[k] = numpy.concatenate(events[k])            
+    f[k] = numpy.array(events[k])           
             
 logging.info('Done')
