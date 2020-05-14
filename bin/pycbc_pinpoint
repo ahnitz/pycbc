@@ -22,6 +22,9 @@ import numpy.random
 
 from pycbc import vetoes, psd, waveform, events, strain, detector, filter, DYN_RANGE_FAC
 from pycbc.types import TimeSeries, zeros, float32, complex64
+from pycbc.distributions import read_distributions_from_config
+from pycbc.workflow import WorkflowConfigParser
+from pycbc.fft.fftw import set_measure_level
 
 parser = argparse.ArgumentParser(usage='',
     description="Targetted Coherent Analysis for a Precisely Known Sky Location")
@@ -45,6 +48,7 @@ parser.add_argument("--marg-seed", type=int, default=0,
                   help="Seed to choose points to sample likelihood")
 parser.add_argument("--marg-size", type=int, default=100000,
                   help="Number of samples to take from likelihood")
+parser.add_argument("--extrinsic-priors", help="Prior config file")
 
 # Add options groups
 strain.insert_strain_option_group_multi_ifo(parser)
@@ -111,17 +115,22 @@ logging.info("Setting up marginalization points")
 numpy.random.seed(args.marg_seed)
 
 # points should be drawn according to prior (we'll integrate over these later)
-polm = numpy.random.uniform(0, numpy.pi*2.0, size=args.marg_size)
-incm = numpy.arccos(numpy.random.uniform(-1, 1, size=args.marg_size))
-distm = numpy.random.uniform(1, 3000, size=args.marg_size)
+cp = WorkflowConfigParser([args.extrinsic_priors])
+dtr = read_distributions_from_config(cp)
+margvals = {}
+for d in dtr:
+    res = d.rvs(size=args.marg_size)
+    name = res.dtype.names[0]
+    margvals[name] = res[name].flatten()
+polm = margvals['polarization']
+incm = margvals['inclination']
+distm = margvals['distance']
 
 htf = {}
 for ifo in ifos:
     det = detector.Detector(ifo)
-    fp, fc = det.antenna_pattern(args.right_ascension, 
-                                  args.declination,
-                                  polm,
-                                  args.gps_start_time[ifos[0]])  # Reference time, might want to recalculate this....    
+    fp, fc = det.antenna_pattern(args.right_ascension, args.declination,
+                                 polm, args.gps_start_time[ifos[0]])  # Reference time, might want to recalculate this....    
     ip = numpy.cos(incm)
     ic = 0.5 * (1.0 + ip * ip)
     htf[ifo] = (fp * ip + 1.0j * fc * ic) / (distm)
@@ -135,7 +144,9 @@ def marginal_likelihood(sh, hh):
     for ifo in sh:
         shloglr += sh[ifo] * htf[ifo]
         hhloglr += hh[ifo] * abs(htf[ifo]) ** 2.0
-        
+   
+    # The abs here implements the maximization over phase in lieu of 
+    # a marginalization     
     vloglr = abs(shloglr) + hhloglr
     
     j = vloglr.argmax()
@@ -169,20 +180,20 @@ for t_num, template in enumerate(bank):
         # calculate SNR fo reach detector
         snrs, corr, norm = {}, {}, {}
         for ifo in ifos:
+            set_measure_level(1)
             snr, corr[ifo], norm[ifo] = filter.matched_filter_core(template, stilde[ifo],
                                                h_norm=template.sigmasq(stilde[ifo].psd))
             snr *= norm[ifo]
             snr = snr[stilde[ifo].analyze]
             snrs[ifo] = snr.copy()
-            logging.info('Found max peak: %s: %s', ifo, abs(snr).abs_max_loc())
+            logging.info('Found max peak: %s: %s', ifo, snr.abs_max_loc())
             
         # Cluster and threshold triggers based on the network SNR
         net_snr = 0
         for ifo in snrs:
-            net_snr += abs(snrs[ifo]) ** 2.0
-        net_snr = net_snr ** 0.5
-        peaks = threshold(net_snr, args.network_snr_threshold, args.cluster_window)
-        logging.info('Clustered peak network SNRS: %s', net_snr[peaks])
+            net_snr += snrs[ifo].squared_norm()
+        peaks = threshold(net_snr, args.network_snr_threshold ** 2.0, args.cluster_window)
+        logging.info('Clustered peak network SNRS: %s', net_snr[peaks] ** 0.5)
 
         # Calculate signal-consistency tests and toss out triggers 
         chisq = []
