@@ -49,6 +49,8 @@ parser.add_argument("--marg-seed", type=int, default=0,
 parser.add_argument("--marg-size", type=int, default=100000,
                   help="Number of samples to take from likelihood")
 parser.add_argument("--extrinsic-priors", help="Prior config file")
+parser.add_argument("--timeslide-interval", default=0.1, type=float)
+parser.add_argument("--num-timeslides", default=100, type=int)
 
 # Add options groups
 strain.insert_strain_option_group_multi_ifo(parser)
@@ -89,9 +91,13 @@ logging.info("Initializing signal-based vetoes.")
 power_chisq = vetoes.SingleDetPowerChisq(args.chisq_bins)
 
 logging.info("Overwhitening frequency-domain data segments")
+min_snr_dur = None
 for ifo in ifos:
     for seg in segments[ifo]:
         seg /= seg.psd
+        snr_dur = (seg.analyze.stop - seg.analyze.start) / seg.sample_rate
+        if min_snr_dur is None or snr_dur < min_snr_dur:
+            min_snr_dur = snr_dur
         
 logging.info("Shifting data to geocentric coordinates")
 for ifo in ifos:
@@ -154,21 +160,72 @@ def marginal_likelihood(sh, hh):
     
     return scipy.special.logsumexp(vloglr) - numpy.log(args.marg_size)
 
-def threshold(vec, value, window):
+def shuffled(num, size):
+    shifts = [numpy.arange(0, size)]
+    j = 0
+    for i in range(num-1):
+        notunique = True
+        while notunique:
+            shifts2 = shifts[0].copy()
+            numpy.random.shuffle(shifts2)
+            j += 1
+            for s in shifts:
+                if abs(shifts2 - shifts).min() == 0:
+                    notunique=True
+                    break
+            else:
+                shifts.append(shifts2)
+                notunique=False
+    return shifts
+
+nslides = int(min_snr_dur / args.timeslide_interval) - 1
+if args.num_timeslides > nslides:
+    raise ValueError("Too many time slides! Max is %s", nslides)
+    
+shifts = shuffled(len(ifos), args.num_timeslides)
+offsets = {}
+for s, ifo in zip(shifts, ifos):
+    offsets[ifo] =  (s * args.timeslide_interval*seg.sample_rate).astype(numpy.int)
+    offsets[ifo] = numpy.append(offsets[ifo], 0) # add in zerolag offset
+    noffsets = len(offsets[ifo])
+
+def threshold(snrs, value, window):
     """ Pick peaks within window above threshold """
-    window_idx = int(window * vec.sample_rate)
-    vec1 = vec.numpy()
-    nblocks = int(numpy.ceil(len(vec) / window_idx))
-    nidx = nblocks * window_idx
-    vec1.resize(nidx) # should add zeros to end
-    vec2 = vec1.reshape(nblocks, window_idx)
-    maxs = vec2.argmax(axis=1) + numpy.arange(0, nblocks) * window_idx
-    return maxs[vec1[maxs] > value]
+    window_idx = int(window * seg.sample_rate)
+    
+    # Extend SNRs so we can do continuous slices
+    snrsq = {}
+    for ifo in snrs:
+        slen = len(snrs[ifo])
+        snrsq[ifo] = numpy.resize(snrs[ifo].squared_norm(), slen*2)
+
+    peaks = {ifo: [] for ifo in ifos}
+    for i in range(noffsets):     
+        vs = [snrsq[ifo][offsets[ifo][i]:offsets[ifo][i] + slen] for ifo in ifos]
+        vec = numpy.sum(vs, axis=0)
+        
+        nblocks = int(len(vec) / window_idx)
+        nidx = nblocks * window_idx
+        assert nidx == slen
+        
+        vec2 = vec.reshape(nblocks, window_idx)
+        maxs = vec2.argmax(axis=1) + numpy.arange(0, nblocks) * window_idx
+        maxs = maxs[vec[maxs] > value]
+        
+        if len(maxs) > 0:
+            for ifo in ifos:
+                poffset = maxs + offsets[ifo][i]
+                poffset[poffset > slen] -= slen
+                peaks[ifo].append(poffset)
+    
+    if len(peaks[ifo]) > 0:
+        peaks = {ifo:numpy.concatenate(peaks[ifo]) for ifo in ifos}
+    return peaks
 
 events = {}
 for k in ['marg', 'template_id']:
     events[k] = []
-for k in ['snr', 'chisq']:
+for k in ['snr', 'chisq', 'time']:
     for ifo in ifos:
         events[ifo + '_' + k] = []
 
@@ -189,39 +246,40 @@ for t_num, template in enumerate(bank):
             logging.info('Found max peak: %s: %s', ifo, snr.abs_max_loc())
             
         # Cluster and threshold triggers based on the network SNR
-        net_snr = 0
-        for ifo in snrs:
-            net_snr += snrs[ifo].squared_norm()
-        peaks = threshold(net_snr, args.network_snr_threshold ** 2.0, args.cluster_window)
-        logging.info('Clustered peak network SNRS: %s', net_snr[peaks] ** 0.5)
+        peaks = threshold(snrs, args.network_snr_threshold ** 2.0, args.cluster_window)
 
         # Calculate signal-consistency tests and toss out triggers 
         chisq = []
-        if len(peaks) > 0:
+        if len(peaks[ifo]) > 0:
             for ifo in ifos:
                 chisq, dof = power_chisq.values(corr[ifo],
-                            snrs[ifo].numpy()[peaks] / norm[ifo],
+                            snrs[ifo].numpy()[peaks[ifo]] / norm[ifo],
                             norm[ifo], stilde[ifo].psd,
-                            peaks + stilde[ifo].analyze.start, template)
+                            (peaks[ifo]) + stilde[ifo].analyze.start,
+                            template)
                 chisq /= dof
                 logging.info('Chisq test: %s: %s', ifo, chisq)
         
         # Calculate the marginal likelihood approximation for each trigger
         # marginized over pol, inc, dist
         hh = {ifo: template.sigmasq(stilde[ifo].psd) * -0.5 for ifo in ifos}
-        for p, cval in zip(peaks, chisq):
-            sh = {ifo: snrs[ifo][p] / norm[ifo] * 4.0 * delta_f for ifo in ifos}
+        for j, cval in enumerate(chisq):
+            sh = {ifo: snrs[ifo][peaks[ifo][j]] / norm[ifo] * 4.0 * delta_f
+                       for ifo in ifos}
             ml = marginal_likelihood(sh, hh)
-            logging.info('Marginal Lik: %s %s', p, ml)
+            logging.info('Marginal Lik: %s %s', peaks[ifo][j], ml)
 
             events['marg'].append(ml)
             events['template_id'].append(t_num)
             for ifo in ifos:
-                snrp = snrs[ifo][p]
+                snrp = snrs[ifo][peaks[ifo][j]]
                 events[ifo + '_' + 'snr'].append(snrp)
                 events[ifo + '_' + 'chisq'].append(cval)
+                times = peaks[ifo][j] * snrs[ifo].delta_t + float(snrs[ifo].start_time)
+                events[ifo + '_' + 'time'].append(times)
 
 f = h5py.File(args.output_file, 'w')
+f.attrs['nslides'] = noffsets
 for k in events:
     f[k] = numpy.array(events[k])           
             
