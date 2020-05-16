@@ -280,6 +280,12 @@ for t_num, template in enumerate(bank):
 
 f = h5py.File(args.output_file, 'w')
 f.attrs['nslides'] = noffsets
+start = float(segments[ifos[0]][0].start_time)
+start += segments[ifos[0]][0].analyze.start * snr.delta_t
+end = float(segments[ifos[0]][-1].start_time)
+end += segments[ifos[0]][-1].analyze.stop * snr.delta_t
+f.attrs['start_time'] = start
+f.attrs['end_time'] = end
 for k in events:
     f[k] = numpy.array(events[k])           
             
