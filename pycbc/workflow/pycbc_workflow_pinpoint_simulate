@@ -1,0 +1,90 @@
+#!/usr/bin/env python
+import h5py
+import sys, os, logging, argparse
+import Pegasus.DAX3 as dax
+import pycbc.workflow as wf
+import pycbc
+import pycbc.workflow.pegasus_workflow as wdax
+from pycbc.workflow import WorkflowConfigParser
+
+def to_file(path, ifo=None):
+    """ Takes a str and returns a pycbc.workflow.pegasus_workflow.File
+    instance.
+    """
+    fil = wdax.File(os.path.basename(path))
+    fil.ifo = ifo
+    path = os.path.abspath(path)
+    fil.PFN(path, "local")
+    return fil
+
+# command line parser
+parser = argparse.ArgumentParser()
+parser.add_argument("--num-sky-points", type=int)
+parser.add_argument("--bank-file")
+parser.add_argument("--num-banks")s
+parser.add_argument("--output-dir", default=None,
+                    help="Path to output directory.")
+
+pycbc.init_logging(True)
+
+wf.add_workflow_command_line_group(parser)
+opts = parser.parse_args()
+
+# create workflow and sub-workflows
+workflow = wf.Workflow(opts, "gw")
+
+# make data output and results directories
+wf.makedir(opts.output_dir)
+
+pinpoint_exe = wf.Executable(workflow.cp, "pinpoint", ifos=workflow.ifos,
+                              out_dir=opts.output_dir)
+
+infhand = to_file(opts.inference_config)
+
+# loop over number of loudest events to be analyzed
+for num_event in range(len(cat)):
+
+    trig = cat[num_event]
+    time = (trig['H1_end_time'] + trig['L1_end_time'])/2.0
+    m1 = trig['mass1']
+    m2 = trig['mass2']
+    s1 = trig['spin1z']
+    s2 = trig['spin2z']
+
+    # make individual trig ini files
+    path = opts.output_dir + '/trig_%s.ini' % num_event
+    f = open(path, 'w')
+    f.write("""
+[trigger]
+stat=%s
+mass1=%s
+mass2=%s
+spin1z=%s
+spin2z=%s
+start=%s
+end=%s
+""" % (trig['stat'], m1, m2, s1, s2, time-0.1, time+0.1))
+
+    fhand = to_file(path)
+
+    # make node for running sampler
+    node = inference_exe.create_node()
+    node.add_input_list_opt("--config-file", [infhand, fhand])
+    node.add_opt("--gps-start-time", int(time) - 224)
+    node.add_opt("--gps-end-time", int(time) + 32)
+    node.set_memory(4000)
+    inference_file = node.new_output_file_opt(workflow.analysis_time, ".hdf",
+                                              "--output-file",
+                                              tags=[str(num_event)])
+    workflow += node
+
+    # condense the inference output
+    node = plot_exe.create_node()
+    node.add_input_opt("--input-file", inference_file)
+    plot_file = node.new_output_file_opt(workflow.analysis_time, ".png",
+                                              "--output-file",
+                                              tags=[str(num_event)])
+    workflow += node
+
+# write dax
+workflow.save('gw.dax')
