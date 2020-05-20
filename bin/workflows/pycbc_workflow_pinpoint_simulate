@@ -1,0 +1,104 @@
+#!/usr/bin/env python
+import h5py, numpy, numpy.random
+import sys, os, logging, argparse
+import Pegasus.DAX3 as dax
+import pycbc.workflow as wf
+import pycbc
+import pycbc.workflow.pegasus_workflow as wdax
+
+from pycbc.workflow import WorkflowConfigParser
+from pycbc.distributions import UniformSky
+
+def to_file(path, ifo=None):
+    """ Takes a str and returns a pycbc.workflow.pegasus_workflow.File
+    instance.
+    """
+    fil = wdax.File(os.path.basename(path))
+    fil.ifo = ifo
+    path = os.path.abspath(path)
+    fil.PFN(path, "local")
+    return fil
+
+# command line parser
+parser = argparse.ArgumentParser()
+parser.add_argument("--num-sky-points", type=int)
+parser.add_argument("--bank-file")
+parser.add_argument("--injection-file")
+
+
+pycbc.init_logging(True)
+
+wf.add_workflow_command_line_group(parser)
+opts = parser.parse_args()
+
+# create workflow and sub-workflows
+workflow = wf.Workflow(opts, "gw")
+
+# Draw sky locations we'll simulate
+numpy.random.seed(1)
+radec = UniformSky().rvs(size=opts.num_sky_points)
+
+# determine the sub-banks
+bank = to_file(opts.bank_file)
+bank.tags = []
+bank.description ='bank'
+bank.ifo_list = workflow.ifos
+bank.segment = workflow.analysis_time
+subbanks = wf.setup_splittable_dax_generated(workflow, [bank], 'banks', tags=[])
+
+wf.makedir('results')
+pinpoint_exe = wf.Executable(workflow.cp, "pinpoint", ifos=workflow.ifos,
+                              out_dir='results')
+wf.makedir('injections')
+inj_exe = wf.Executable(workflow.cp, "create_injection", ifos=workflow.ifos,
+                              out_dir='injections')
+
+base_inj = to_file(opts.injection_file)
+
+# Loop over sky points
+for i, rd in enumerate(radec):
+    ra = rd['ra']
+    dec = rd['dec']
+    
+    # Create auxiliary injection file for this sky point
+    with open('injections/sky-{}.ini'.format(i), 'w') as f:
+        f.write("""
+            [static_params]
+            ra = {}
+            dec = {}
+        """.format(ra, dec))
+    aux_inj = to_file('injections/sky-{}.ini'.format(i))
+        
+    node = inj_exe.create_node()
+    node.add_input_list_opt('--config-file', [base_inj, aux_inj])
+    pin_inj = node.new_output_file_opt(workflow.analysis_time, '.hdf', '--output-file',
+                                            tags=[str(i)])
+    workflow += node
+       
+    # loop over sub banks
+    for j, subbank in enumerate(subbanks):
+        # Loop over time duration
+        start = int(workflow.cp.get_opt_tags('workflow', 'start-time', [])) 
+        stop = int(workflow.cp.get_opt_tags('workflow', 'end-time', []))
+        chunk = int(workflow.cp.get_opt_tags('workflow', 'chunk-size', []))
+        end = start + chunk
+        while end < stop + chunk: 
+            start_pad = int(workflow.cp.get_opt_tags('pinpoint','segment-start-pad', []))
+            end_pad = int(workflow.cp.get_opt_tags('pinpoint', 'segment-end-pad', []))
+            
+            node = pinpoint_exe.create_node()
+            node.add_opt('--gps-start-time', start)
+            node.add_opt('--gps-end-time', end)
+            
+            node.add_input_opt('--injection-file', pin_inj)
+            node.add_input_opt('--bank-file', subbank)
+            
+            from ligo.segments import segment
+            out = node.new_output_file_opt(segment(start, end), '.hdf',
+                                        '--output-file', tags=['{}-{}'.format(i, j)])
+            start += chunk - start_pad - end_pad
+            end = start + chunk
+            workflow += node
+         
+# write dax
+workflow.save('gw.dax')
