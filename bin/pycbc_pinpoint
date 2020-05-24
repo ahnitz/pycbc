@@ -20,11 +20,10 @@ import logging, argparse, numpy, argparse, pycbc, h5py
 import scipy.special
 import numpy.random
 
-from pycbc import vetoes, psd, waveform, events, strain, detector, filter, DYN_RANGE_FAC
+from pycbc import vetoes, psd, waveform, events, strain, detector, scheme, fft, filter, DYN_RANGE_FAC
 from pycbc.types import TimeSeries, zeros, float32, complex64
 from pycbc.distributions import read_distributions_from_config
 from pycbc.workflow import WorkflowConfigParser
-from pycbc.fft.fftw import set_measure_level
 
 parser = argparse.ArgumentParser(usage='',
     description="Targetted Coherent Analysis for a Precisely Known Sky Location")
@@ -39,9 +38,10 @@ parser.add_argument("--chisq-bins", default=0)
 parser.add_argument("--chisq-threshold", type=float, default=0)
 parser.add_argument("--right-ascension", type=float)
 parser.add_argument("--declination", type=float)
-parser.add_argument("--network-snr-threshold", type=float, default=5.0, help="""
+parser.add_argument("--network-snr-threshold", type=float, default=6.5, help="""
                     Triggers with network snr below this value will
                     be discarded.""")
+parser.add_argument("--min-single-snr", type=float, default=4.0)
 parser.add_argument("--cluster-window", type=float, default=1.0,
                   help="Length of clustering window in seconds.")
 parser.add_argument("--marg-seed", type=int, default=0,
@@ -56,239 +56,247 @@ parser.add_argument("--num-timeslides", default=100, type=int)
 strain.insert_strain_option_group_multi_ifo(parser)
 strain.StrainSegments.insert_segment_option_group_multi_ifo(parser)
 psd.insert_psd_option_group_multi_ifo(parser)
+scheme.insert_processing_option_group(parser)
+fft.insert_fft_option_group(parser)
 args = parser.parse_args()
 
 ifos = args.instruments
 flow = args.low_frequency_cutoff
 
 # Option verifications
+scheme.verify_processing_options(args, parser)
 strain.verify_strain_options_multi_ifo(args, parser, ifos)
-strain.StrainSegments.verify_segment_options_multi_ifo(args, parser,
-                                                       ifos)
+strain.StrainSegments.verify_segment_options_multi_ifo(args, parser, ifos)
 psd.verify_psd_options_multi_ifo(args, parser, ifos)
 pycbc.init_logging(args.verbose)
 
+ctx = scheme.from_cli(args)
 
 strain_dict = strain.from_cli_multi_ifos(args, ifos,
                                          dyn_range_fac=DYN_RANGE_FAC
                                         )
-strain_segments_dict = strain.StrainSegments.from_cli_multi_ifos(
-                                             args, strain_dict, ifos)
+with ctx:
+    strain_segments_dict = strain.StrainSegments.from_cli_multi_ifos(
+                                                 args, strain_dict, ifos)
 
-logging.info("Making frequency-domain data segments")
-segments = {ifo : strain_segments_dict[ifo].fourier_segments()
-           for ifo in ifos}
-del strain_segments_dict
+    logging.info("Making frequency-domain data segments")
+    segments = {ifo : strain_segments_dict[ifo].fourier_segments()
+               for ifo in ifos}
+    del strain_segments_dict
 
-flen = len(segments[ifos[0]][0])
-tlen = (flen - 1) * 2
-delta_f = segments[ifos[0]][0].delta_f
-psd.associate_psds_to_multi_ifo_segments(args, segments, strain_dict, flen,
-        delta_f, flow, ifos, dyn_range_factor=DYN_RANGE_FAC,
-        precision='single')
+    flen = len(segments[ifos[0]][0])
+    tlen = (flen - 1) * 2
+    delta_f = segments[ifos[0]][0].delta_f
+    psd.associate_psds_to_multi_ifo_segments(args, segments, strain_dict, flen,
+            delta_f, flow, ifos, dyn_range_factor=DYN_RANGE_FAC,
+            precision='single')
 
-logging.info("Initializing signal-based vetoes.")
-power_chisq = vetoes.SingleDetPowerChisq(args.chisq_bins)
+    logging.info("Initializing signal-based vetoes.")
+    power_chisq = vetoes.SingleDetPowerChisq(args.chisq_bins)
 
-logging.info("Overwhitening frequency-domain data segments")
-min_snr_dur = None
-for ifo in ifos:
-    for seg in segments[ifo]:
-        seg /= seg.psd
-        snr_dur = (seg.analyze.stop - seg.analyze.start) / seg.sample_rate
-        if min_snr_dur is None or snr_dur < min_snr_dur:
-            min_snr_dur = snr_dur
-        
-logging.info("Shifting data to geocentric coordinates")
-for ifo in ifos:
-    for j, seg in enumerate(segments[ifo]):
-        det = detector.Detector(ifo)
-        start = seg.start_time
-        end =(seg.end_time)
-        tcenter = (float(start) + float(end)) / 2.0
-        dt = det.time_delay_from_earth_center(args.right_ascension, 
-                                              args.declination, tcenter)
-        seg[:] = seg.cyclic_time_shift(-dt)
-        segments[ifo][j] = seg
-
-logging.info("Read in template bank")
-template_mem = zeros(tlen, dtype=complex64)
-bank = waveform.FilterBank(args.bank_file, flen, delta_f, complex64,
-                           low_frequency_cutoff=flow,
-                           out=template_mem)
-               
-logging.info("Setting up marginalization points")
-numpy.random.seed(args.marg_seed)
-
-# points should be drawn according to prior (we'll integrate over these later)
-cp = WorkflowConfigParser([args.extrinsic_priors])
-dtr = read_distributions_from_config(cp)
-margvals = {}
-for d in dtr:
-    res = d.rvs(size=args.marg_size)
-    name = res.dtype.names[0]
-    margvals[name] = res[name].flatten()
-polm = margvals['polarization']
-incm = margvals['inclination']
-distm = margvals['distance']
-
-htf = {}
-for ifo in ifos:
-    det = detector.Detector(ifo)
-    fp, fc = det.antenna_pattern(args.right_ascension, args.declination,
-                                 polm, args.gps_start_time[ifos[0]])  # Reference time, might want to recalculate this....    
-    ip = numpy.cos(incm)
-    ic = 0.5 * (1.0 + ip * ip)
-    htf[ifo] = (fp * ip + 1.0j * fc * ic) / (distm)
-            
-def marginal_likelihood(sh, hh):
-    """ Approximate marginal likelihood over pol/inc/dist. Maximized over phase.
-    """
-    shloglr = numpy.zeros(args.marg_size, dtype=numpy.complex128)
-    hhloglr = numpy.zeros(args.marg_size, dtype=numpy.float64)
-    
-    for ifo in sh:
-        shloglr += sh[ifo] * htf[ifo]
-        hhloglr += hh[ifo] * abs(htf[ifo]) ** 2.0
-   
-    # The abs here implements the maximization over phase in lieu of 
-    # a marginalization     
-    vloglr = abs(shloglr) + hhloglr
-    
-    j = vloglr.argmax()
-    logging.info('ML point: pol=%s, inc=%s, dist=%s', polm[j], incm[j], distm[j])
-    
-    return scipy.special.logsumexp(vloglr) - numpy.log(args.marg_size)
-
-def shuffled(num, size):
-    shifts = [numpy.arange(0, size)]
-    j = 0
-    for i in range(num-1):
-        notunique = True
-        while notunique:
-            shifts2 = shifts[0].copy()
-            numpy.random.shuffle(shifts2)
-            j += 1
-            for s in shifts:
-                if abs(shifts2 - shifts).min() == 0:
-                    notunique=True
-                    break
-            else:
-                shifts.append(shifts2)
-                notunique=False
-    return shifts
-
-nslides = int(min_snr_dur / args.timeslide_interval) - 1
-if args.num_timeslides > nslides:
-    raise ValueError("Too many time slides! Max is %s", nslides)
-    
-shifts = shuffled(len(ifos), args.num_timeslides)
-offsets = {}
-for s, ifo in zip(shifts, ifos):
-    offsets[ifo] =  (s * args.timeslide_interval*seg.sample_rate).astype(numpy.int)
-    offsets[ifo] = numpy.append(offsets[ifo], 0) # add in zerolag offset
-    noffsets = len(offsets[ifo])
-
-def threshold(snrs, value, window):
-    """ Pick peaks within window above threshold """
-    window_idx = int(window * seg.sample_rate)
-    
-    # Extend SNRs so we can do continuous slices
-    snrsq = {}
-    for ifo in snrs:
-        slen = len(snrs[ifo])
-        snrsq[ifo] = numpy.resize(snrs[ifo].squared_norm(), slen*2)
-
-    peaks = {ifo: [] for ifo in ifos}
-    for i in range(noffsets):     
-        vs = [snrsq[ifo][offsets[ifo][i]:offsets[ifo][i] + slen] for ifo in ifos]
-        vec = numpy.sum(vs, axis=0)
-        
-        nblocks = int(len(vec) / window_idx)
-        nidx = nblocks * window_idx
-        assert nidx == slen
-        
-        vec2 = vec.reshape(nblocks, window_idx)
-        maxs = vec2.argmax(axis=1) + numpy.arange(0, nblocks) * window_idx
-        maxs = maxs[vec[maxs] > value]
-        
-        if len(maxs) > 0:
-            for ifo in ifos:
-                poffset = maxs + offsets[ifo][i]
-                poffset[poffset > slen] -= slen
-                peaks[ifo].append(poffset)
-    
-    if len(peaks[ifo]) > 0:
-        peaks = {ifo:numpy.concatenate(peaks[ifo]) for ifo in ifos}
-    return peaks
-
-events = {}
-for k in ['marg', 'template_id']:
-    events[k] = []
-for k in ['snr', 'chisq', 'time']:
+    logging.info("Overwhitening frequency-domain data segments")
+    min_snr_dur = None
     for ifo in ifos:
-        events[ifo + '_' + k] = []
-
-for t_num, template in enumerate(bank):
-    for s_num, stilde in enumerate(segments[ifos[0]]):
-        stilde = {ifo : segments[ifo][s_num] for ifo in ifos}
-        logging.info('Template {}, Segment {}'.format(t_num, s_num))
-        
-        # calculate SNR fo reach detector
-        snrs, corr, norm = {}, {}, {}
-        for ifo in ifos:
-            set_measure_level(1)
-            snr, corr[ifo], norm[ifo] = filter.matched_filter_core(template, stilde[ifo],
-                                               h_norm=template.sigmasq(stilde[ifo].psd))
-            snr *= norm[ifo]
-            snr = snr[stilde[ifo].analyze]
-            snrs[ifo] = snr.copy()
-            logging.info('Found max peak: %s: %s', ifo, snr.abs_max_loc())
+        for seg in segments[ifo]:
+            seg /= seg.psd
+            snr_dur = (seg.analyze.stop - seg.analyze.start) / seg.sample_rate
+            if min_snr_dur is None or snr_dur < min_snr_dur:
+                min_snr_dur = snr_dur
             
-        # Cluster and threshold triggers based on the network SNR
-        peaks = threshold(snrs, args.network_snr_threshold ** 2.0, args.cluster_window)
+    logging.info("Shifting data to geocentric coordinates")
+    for ifo in ifos:
+        for j, seg in enumerate(segments[ifo]):
+            det = detector.Detector(ifo)
+            start = seg.start_time
+            end =(seg.end_time)
+            tcenter = (float(start) + float(end)) / 2.0
+            dt = det.time_delay_from_earth_center(args.right_ascension, 
+                                                  args.declination, tcenter)
+            seg[:] = seg.cyclic_time_shift(-dt)
+            segments[ifo][j] = seg
 
-        # Calculate signal-consistency tests and toss out triggers 
-        chisq = []
+    logging.info("Read in template bank")
+    template_mem = zeros(tlen, dtype=complex64)
+    bank = waveform.FilterBank(args.bank_file, flen, delta_f, complex64,
+                               low_frequency_cutoff=flow,
+                               out=template_mem)
+                   
+    logging.info("Setting up marginalization points")
+    numpy.random.seed(args.marg_seed)
+
+    # points should be drawn according to prior (we'll integrate over these later)
+    cp = WorkflowConfigParser([args.extrinsic_priors])
+    dtr = read_distributions_from_config(cp)
+    margvals = {}
+    for d in dtr:
+        res = d.rvs(size=args.marg_size)
+        name = res.dtype.names[0]
+        margvals[name] = res[name].flatten()
+    polm = margvals['polarization']
+    incm = margvals['inclination']
+    distm = margvals['distance']
+
+    htf = {}
+    for ifo in ifos:
+        det = detector.Detector(ifo)
+        fp, fc = det.antenna_pattern(args.right_ascension, args.declination,
+                                     polm, args.gps_start_time[ifos[0]])  # Reference time, might want to recalculate this....    
+        ip = numpy.cos(incm)
+        ic = 0.5 * (1.0 + ip * ip)
+        htf[ifo] = (fp * ip + 1.0j * fc * ic) / (distm)
+                
+    def marginal_likelihood(sh, hh):
+        """ Approximate marginal likelihood over pol/inc/dist. Maximized over phase.
+        """
+        shloglr = numpy.zeros(args.marg_size, dtype=numpy.complex128)
+        hhloglr = numpy.zeros(args.marg_size, dtype=numpy.float64)
+        
+        for ifo in sh:
+            shloglr += sh[ifo] * htf[ifo]
+            hhloglr += hh[ifo] * abs(htf[ifo]) ** 2.0
+       
+        # The abs here implements the maximization over phase in lieu of 
+        # a marginalization     
+        vloglr = abs(shloglr) + hhloglr
+        
+        j = vloglr.argmax()
+        logging.info('ML point: pol=%s, inc=%s, dist=%s', polm[j], incm[j], distm[j])
+        
+        return scipy.special.logsumexp(vloglr) - numpy.log(args.marg_size)
+
+    def shuffled(num, size):
+        shifts = [numpy.arange(0, size)]
+        j = 0
+        for i in range(num-1):
+            notunique = True
+            while notunique:
+                shifts2 = shifts[0].copy()
+                numpy.random.shuffle(shifts2)
+                j += 1
+                for s in shifts:
+                    if abs(shifts2 - shifts).min() == 0:
+                        notunique=True
+                        break
+                else:
+                    shifts.append(shifts2)
+                    notunique=False
+        return shifts
+
+    nslides = int(min_snr_dur / args.timeslide_interval) - 1
+    if args.num_timeslides > nslides:
+        raise ValueError("Too many time slides! Max is %s", nslides)
+        
+    shifts = shuffled(len(ifos), args.num_timeslides)
+    offsets = {}
+    for s, ifo in zip(shifts, ifos):
+        offsets[ifo] =  (s * args.timeslide_interval*seg.sample_rate).astype(numpy.int)
+        offsets[ifo] = numpy.append(offsets[ifo], 0) # add in zerolag offset
+        noffsets = len(offsets[ifo])
+
+    def threshold(snrs, value, window, minsnr):
+        """ Pick peaks within window above threshold """
+        from pycbc.events import findchirp_cluster_over_window
+        window_idx = int(window * seg.sample_rate)
+        
+        # Extend SNRs so we can do continuous slices
+        snrsq = {}
+        for ifo in snrs:
+            slen = len(snrs[ifo])
+            snrsq[ifo] = snrs[ifo].squared_norm()
+
+        above = {}
+        for ifo in snrs:    
+            above[ifo] = numpy.where(snrsq[ifo] > minsnr**2.0)[0]
+        
+        peaks = {ifo: [] for ifo in ifos}
+        for i in range(noffsets):     
+            for ifo1 in above:
+                nsnr = numpy.zeros(len(above[ifo1]))
+                idx = {}
+                for ifo2 in ifos:
+                    idx[ifo2] = (above[ifo1] + offsets[ifo2][i] - offsets[ifo1][i]) % slen
+                    nsnr += snrsq[ifo2][idx[ifo2]]
+                    
+                k = numpy.where(nsnr > value**2.0)[0]            
+                if len(k > 0):
+                    k2 = findchirp_cluster_over_window(idx[ifo1][k], nsnr[k], window_idx)
+                    k = k[k2]                
+                
+                for ifo in ifos:
+                    peaks[ifo].append(idx[ifo][k])
+
         if len(peaks[ifo]) > 0:
-            for ifo in ifos:
-                chisq, dof = power_chisq.values(corr[ifo],
-                            snrs[ifo].numpy()[peaks[ifo]] / norm[ifo],
-                            norm[ifo], stilde[ifo].psd,
-                            (peaks[ifo]) + stilde[ifo].analyze.start,
-                            template)
-                chisq /= dof
-                logging.info('Chisq test: %s: %s', ifo, chisq)
-        
-        # Calculate the marginal likelihood approximation for each trigger
-        # marginized over pol, inc, dist
-        hh = {ifo: template.sigmasq(stilde[ifo].psd) * -0.5 for ifo in ifos}
-        for j, cval in enumerate(chisq):
-            sh = {ifo: snrs[ifo][peaks[ifo][j]] / norm[ifo] * 4.0 * delta_f
-                       for ifo in ifos}
-            ml = marginal_likelihood(sh, hh)
-            logging.info('Marginal Lik: %s %s', peaks[ifo][j], ml)
+            peaks = {ifo:numpy.concatenate(peaks[ifo]) for ifo in ifos}
+        return peaks  
 
-            events['marg'].append(ml)
-            events['template_id'].append(t_num)
-            for ifo in ifos:
-                snrp = snrs[ifo][peaks[ifo][j]]
-                events[ifo + '_' + 'snr'].append(snrp)
-                events[ifo + '_' + 'chisq'].append(cval)
-                times = peaks[ifo][j] * snrs[ifo].delta_t + float(snrs[ifo].start_time)
-                events[ifo + '_' + 'time'].append(times)
+    events = {}
+    for k in ['marg', 'template_id']:
+        events[k] = []
+    for k in ['snr', 'chisq', 'time']:
+        for ifo in ifos:
+            events[ifo + '_' + k] = []
 
-f = h5py.File(args.output_file, 'w')
-f.attrs['nslides'] = noffsets
-
-start = float(segments[ifos[0]][0].start_time)
-start += segments[ifos[0]][0].analyze.start * snr.delta_t
-end = float(segments[ifos[0]][-1].start_time)
-end += segments[ifos[0]][-1].analyze.stop * snr.delta_t
-f.attrs['start_time'] = start
-f.attrs['end_time'] = end
-
-for k in events:
-    f[k] = numpy.array(events[k])           
+    for t_num, template in enumerate(bank):
+        for s_num, stilde in enumerate(segments[ifos[0]]):
+            stilde = {ifo : segments[ifo][s_num] for ifo in ifos}
+            logging.info('Template {}, Segment {}'.format(t_num, s_num))
             
-logging.info('Done')
+            # calculate SNR fo reach detector
+            snrs, corr, norm = {}, {}, {}
+            for ifo in ifos:
+                snr, corr[ifo], norm[ifo] = filter.matched_filter_core(template, stilde[ifo],
+                                                   h_norm=template.sigmasq(stilde[ifo].psd))
+                snr *= norm[ifo]
+                snr = snr[stilde[ifo].analyze]
+                snrs[ifo] = snr.copy()
+                logging.info('Found max peak: %s: %s', ifo, snr.abs_max_loc())
+                
+            # Cluster and threshold triggers based on the network SNR
+            peaks = threshold(snrs, args.network_snr_threshold,
+                                    args.cluster_window,
+                                    args.min_single_snr)
+
+            # Calculate signal-consistency tests and toss out triggers 
+            chisq = []
+            if len(peaks[ifo]) > 0:
+                for ifo in ifos:
+                    chisq, dof = power_chisq.values(corr[ifo],
+                                snrs[ifo].numpy()[peaks[ifo]] / norm[ifo],
+                                norm[ifo], stilde[ifo].psd,
+                                (peaks[ifo]) + stilde[ifo].analyze.start,
+                                template)
+                    chisq /= dof
+                    logging.info('Chisq test: %s: %s', ifo, chisq)
+            
+            # Calculate the marginal likelihood approximation for each trigger
+            # marginized over pol, inc, dist
+            hh = {ifo: template.sigmasq(stilde[ifo].psd) * -0.5 for ifo in ifos}
+            for j, cval in enumerate(chisq):
+                sh = {ifo: snrs[ifo][peaks[ifo][j]] / norm[ifo] * 4.0 * delta_f
+                           for ifo in ifos}
+                ml = marginal_likelihood(sh, hh)
+                logging.info('Marginal Lik: %s %s', peaks[ifo][j], ml)
+
+                events['marg'].append(ml)
+                events['template_id'].append(t_num)
+                for ifo in ifos:
+                    snrp = snrs[ifo][peaks[ifo][j]]
+                    events[ifo + '_' + 'snr'].append(snrp)
+                    events[ifo + '_' + 'chisq'].append(cval)
+                    times = peaks[ifo][j] * snrs[ifo].delta_t + float(snrs[ifo].start_time)
+                    events[ifo + '_' + 'time'].append(times)
+
+    f = h5py.File(args.output_file, 'w')
+    f.attrs['nslides'] = noffsets
+
+    start = float(segments[ifos[0]][0].start_time)
+    start += segments[ifos[0]][0].analyze.start * snr.delta_t
+    end = float(segments[ifos[0]][-1].start_time)
+    end += segments[ifos[0]][-1].analyze.stop * snr.delta_t
+    f.attrs['start_time'] = start
+    f.attrs['end_time'] = end
+
+    for k in events:
+        f[k] = numpy.array(events[k])           
+                
+    logging.info('Done')
