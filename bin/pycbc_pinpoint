@@ -21,9 +21,29 @@ import scipy.special
 import numpy.random
 
 from pycbc import vetoes, psd, waveform, events, strain, detector, scheme, fft, filter, DYN_RANGE_FAC
-from pycbc.types import TimeSeries, zeros, float32, complex64
+from pycbc.types import TimeSeries, FrequencySeries, zeros, float32, complex64
 from pycbc.distributions import read_distributions_from_config
 from pycbc.workflow import WorkflowConfigParser
+
+class mfilter(object):
+    def __init__(self, tlen):
+        from pycbc.fft import IFFT
+        self.tlen = tlen
+        self.qtilde = zeros(tlen, dtype=numpy.complex64)
+        self.q = zeros(tlen, dtype=numpy.complex64)
+        self.ifft = IFFT(self.qtilde, self.q)
+        
+    def execute(self, htilde, stilde):
+        from pycbc.filter import correlate
+        kmin, kmax = 1, int(self.tlen / 2)
+        correlate(htilde[kmin:kmax], stilde[kmin:kmax], self.qtilde[kmin:kmax])
+        self.ifft.execute()
+        norm = (4.0 * stilde.delta_f) / template.sigmasq(stilde.psd) ** 0.5
+        snr = TimeSeries(self.q, epoch=stilde._epoch,
+                              delta_t=stilde.delta_t, copy=False)
+        corr = FrequencySeries(self.qtilde, epoch=stilde._epoch,
+                              delta_f=stilde.delta_f, copy=False)
+        return (snr, corr, norm)
 
 parser = argparse.ArgumentParser(usage='',
     description="Targetted Coherent Analysis for a Precisely Known Sky Location")
@@ -75,173 +95,180 @@ ctx = scheme.from_cli(args)
 strain_dict = strain.from_cli_multi_ifos(args, ifos,
                                          dyn_range_fac=DYN_RANGE_FAC
                                         )
-with ctx:
-    strain_segments_dict = strain.StrainSegments.from_cli_multi_ifos(
-                                                 args, strain_dict, ifos)
 
-    logging.info("Making frequency-domain data segments")
-    segments = {ifo : strain_segments_dict[ifo].fourier_segments()
-               for ifo in ifos}
-    del strain_segments_dict
+strain_segments_dict = strain.StrainSegments.from_cli_multi_ifos(
+                                             args, strain_dict, ifos)
 
-    flen = len(segments[ifos[0]][0])
-    tlen = (flen - 1) * 2
-    delta_f = segments[ifos[0]][0].delta_f
-    psd.associate_psds_to_multi_ifo_segments(args, segments, strain_dict, flen,
-            delta_f, flow, ifos, dyn_range_factor=DYN_RANGE_FAC,
-            precision='single')
+logging.info("Making frequency-domain data segments")
+segments = {ifo : strain_segments_dict[ifo].fourier_segments()
+           for ifo in ifos}
+del strain_segments_dict
 
-    logging.info("Initializing signal-based vetoes.")
-    power_chisq = vetoes.SingleDetPowerChisq(args.chisq_bins)
+flen = len(segments[ifos[0]][0])
+tlen = (flen - 1) * 2
+delta_f = segments[ifos[0]][0].delta_f
+psd.associate_psds_to_multi_ifo_segments(args, segments, strain_dict, flen,
+        delta_f, flow, ifos, dyn_range_factor=DYN_RANGE_FAC,
+        precision='single')
 
-    logging.info("Overwhitening frequency-domain data segments")
-    min_snr_dur = None
-    for ifo in ifos:
-        for seg in segments[ifo]:
-            seg /= seg.psd
-            snr_dur = (seg.analyze.stop - seg.analyze.start) / seg.sample_rate
-            if min_snr_dur is None or snr_dur < min_snr_dur:
-                min_snr_dur = snr_dur
-            
-    logging.info("Shifting data to geocentric coordinates")
-    for ifo in ifos:
-        for j, seg in enumerate(segments[ifo]):
-            det = detector.Detector(ifo)
-            start = seg.start_time
-            end =(seg.end_time)
-            tcenter = (float(start) + float(end)) / 2.0
-            dt = det.time_delay_from_earth_center(args.right_ascension, 
-                                                  args.declination, tcenter)
-            seg[:] = seg.cyclic_time_shift(-dt)
-            segments[ifo][j] = seg
+logging.info("Initializing signal-based vetoes.")
+power_chisq = vetoes.SingleDetPowerChisq(args.chisq_bins)
 
-    logging.info("Read in template bank")
-    template_mem = zeros(tlen, dtype=complex64)
-    bank = waveform.FilterBank(args.bank_file, flen, delta_f, complex64,
-                               low_frequency_cutoff=flow,
-                               out=template_mem)
-                   
-    logging.info("Setting up marginalization points")
-    numpy.random.seed(args.marg_seed)
-
-    # points should be drawn according to prior (we'll integrate over these later)
-    cp = WorkflowConfigParser([args.extrinsic_priors])
-    dtr = read_distributions_from_config(cp)
-    margvals = {}
-    for d in dtr:
-        res = d.rvs(size=args.marg_size)
-        name = res.dtype.names[0]
-        margvals[name] = res[name].flatten()
-    polm = margvals['polarization']
-    incm = margvals['inclination']
-    distm = margvals['distance']
-
-    htf = {}
-    for ifo in ifos:
+logging.info("Overwhitening frequency-domain data segments")
+min_snr_dur = None
+for ifo in ifos:
+    for seg in segments[ifo]:
+        seg /= seg.psd
+        snr_dur = (seg.analyze.stop - seg.analyze.start) / seg.sample_rate
+        if min_snr_dur is None or snr_dur < min_snr_dur:
+            min_snr_dur = snr_dur
+        
+logging.info("Shifting data to geocentric coordinates")
+for ifo in ifos:
+    for j, seg in enumerate(segments[ifo]):
         det = detector.Detector(ifo)
-        fp, fc = det.antenna_pattern(args.right_ascension, args.declination,
-                                     polm, args.gps_start_time[ifos[0]])  # Reference time, might want to recalculate this....    
-        ip = numpy.cos(incm)
-        ic = 0.5 * (1.0 + ip * ip)
-        htf[ifo] = (fp * ip + 1.0j * fc * ic) / (distm)
-                
-    def marginal_likelihood(sh, hh):
-        """ Approximate marginal likelihood over pol/inc/dist. Maximized over phase.
-        """
-        shloglr = numpy.zeros(args.marg_size, dtype=numpy.complex128)
-        hhloglr = numpy.zeros(args.marg_size, dtype=numpy.float64)
-        
-        for ifo in sh:
-            shloglr += sh[ifo] * htf[ifo]
-            hhloglr += hh[ifo] * abs(htf[ifo]) ** 2.0
-       
-        # The abs here implements the maximization over phase in lieu of 
-        # a marginalization     
-        vloglr = abs(shloglr) + hhloglr
-        
-        j = vloglr.argmax()
-        logging.info('ML point: pol=%s, inc=%s, dist=%s', polm[j], incm[j], distm[j])
-        
-        return scipy.special.logsumexp(vloglr) - numpy.log(args.marg_size)
+        start = seg.start_time
+        end =(seg.end_time)
+        tcenter = (float(start) + float(end)) / 2.0
+        dt = det.time_delay_from_earth_center(args.right_ascension, 
+                                              args.declination, tcenter)
+        seg[:] = seg.cyclic_time_shift(-dt)
+        segments[ifo][j] = seg
 
-    def shuffled(num, size):
-        shifts = [numpy.arange(0, size)]
-        j = 0
-        for i in range(num-1):
-            notunique = True
-            while notunique:
-                shifts2 = shifts[0].copy()
-                numpy.random.shuffle(shifts2)
-                j += 1
-                for s in shifts:
-                    if abs(shifts2 - shifts).min() == 0:
-                        notunique=True
-                        break
-                else:
-                    shifts.append(shifts2)
-                    notunique=False
-        return shifts
+logging.info("Read in template bank")
+template_mem = zeros(tlen, dtype=complex64)
+bank = waveform.FilterBank(args.bank_file, flen, delta_f, complex64,
+                           low_frequency_cutoff=flow,
+                           out=template_mem)
+               
+logging.info("Setting up marginalization points")
+numpy.random.seed(args.marg_seed)
 
-    nslides = int(min_snr_dur / args.timeslide_interval) - 1
-    if args.num_timeslides > nslides:
-        raise ValueError("Too many time slides! Max is %s", nslides)
-        
-    shifts = shuffled(len(ifos), args.num_timeslides)
-    offsets = {}
-    for s, ifo in zip(shifts, ifos):
-        offsets[ifo] =  (s * args.timeslide_interval*seg.sample_rate).astype(numpy.int)
-        offsets[ifo] = numpy.append(offsets[ifo], 0) # add in zerolag offset
-        noffsets = len(offsets[ifo])
+# points should be drawn according to prior (we'll integrate over these later)
+cp = WorkflowConfigParser([args.extrinsic_priors])
+dtr = read_distributions_from_config(cp)
+margvals = {}
+for d in dtr:
+    res = d.rvs(size=args.marg_size)
+    name = res.dtype.names[0]
+    margvals[name] = res[name].flatten()
+polm = margvals['polarization']
+incm = margvals['inclination']
+distm = margvals['distance']
 
-    def threshold(snrs, value, window, minsnr):
-        """ Pick peaks within window above threshold """
-        from pycbc.events import findchirp_cluster_over_window
-        window_idx = int(window * seg.sample_rate)
-        
-        # calculate the squares
-        snrsq = {}
-        for ifo in snrs:
-            slen = len(snrs[ifo])
-            snrsq[ifo] = snrs[ifo].squared_norm()
-
-        above = {}
-        for ifo in snrs:
-            above[ifo] = numpy.where(snrsq[ifo] > minsnr**2.0)[0]
-
-        peaks = {ifo: [] for ifo in ifos}
-
-        # Determine all the indices where wee need to check the SNR^2
-        idx_base = {ifo: numpy.add.outer(above[ifo], -offsets[ifo]) for ifo in ifos}
-        idxp = {}
-        for ifo2 in ifos:
-            idxp[ifo2] = {ifo1: ((idx_base[ifo1] + offsets[ifo2]) % slen).T for ifo1 in ifos}
-
-        # calculate network snrsq for all the points
-        nsnr = {}
-        for ifo1 in ifos:
-            nsnr[ifo1] = sum([snrsq[ifo][idxp[ifo][ifo1]] for ifo in ifos])
+htf = {}
+for ifo in ifos:
+    det = detector.Detector(ifo)
+    fp, fc = det.antenna_pattern(args.right_ascension, args.declination,
+                                 polm, args.gps_start_time[ifos[0]])  # Reference time, might want to recalculate this....    
+    ip = numpy.cos(incm)
+    ic = 0.5 * (1.0 + ip * ip)
+    htf[ifo] = (fp * ip + 1.0j * fc * ic) / (distm)
             
-        for i in range(noffsets):     
-            for ifo1 in above: 
-                ns = nsnr[ifo1][i]
-                k = numpy.where(ns > value**2.0)[0]
-                if len(k > 0):
-                    k2 = findchirp_cluster_over_window(idxp[ifo1][ifo1][i, k], ns[k], window_idx)
-                    k = k[k2]                
-                
-                for ifo in ifos:
-                    peaks[ifo].append(idxp[ifo][ifo1][i, k])
+def marginal_likelihood(sh, hh):
+    """ Approximate marginal likelihood over pol/inc/dist. Maximized over phase.
+    """
+    shloglr = numpy.zeros(args.marg_size, dtype=numpy.complex128)
+    hhloglr = numpy.zeros(args.marg_size, dtype=numpy.float64)
+    
+    for ifo in sh:
+        shloglr += sh[ifo] * htf[ifo]
+        hhloglr += hh[ifo] * abs(htf[ifo]) ** 2.0
+   
+    # The abs here implements the maximization over phase in lieu of 
+    # a marginalization     
+    vloglr = abs(shloglr) + hhloglr
+    
+    j = vloglr.argmax()
+    logging.info('ML point: pol=%s, inc=%s, dist=%s', polm[j], incm[j], distm[j])
+    
+    return scipy.special.logsumexp(vloglr) - numpy.log(args.marg_size)
 
-        if len(peaks[ifo]) > 0:
-            peaks = {ifo:numpy.concatenate(peaks[ifo]) for ifo in ifos}
-        return peaks  
+def shuffled(num, size):
+    shifts = [numpy.arange(0, size)]
+    j = 0
+    for i in range(num-1):
+        notunique = True
+        while notunique:
+            shifts2 = shifts[0].copy()
+            numpy.random.shuffle(shifts2)
+            j += 1
+            for s in shifts:
+                if abs(shifts2 - shifts).min() == 0:
+                    notunique=True
+                    break
+            else:
+                shifts.append(shifts2)
+                notunique=False
+    return shifts
 
-    events = {}
-    for k in ['marg', 'template_id']:
-        events[k] = []
-    for k in ['snr', 'chisq', 'time']:
-        for ifo in ifos:
-            events[ifo + '_' + k] = []
+nslides = int(min_snr_dur / args.timeslide_interval) - 1
+if args.num_timeslides > nslides:
+    raise ValueError("Too many time slides! Max is %s", nslides)
+    
+shifts = shuffled(len(ifos), args.num_timeslides)
+offsets = {}
+for s, ifo in zip(shifts, ifos):
+    offsets[ifo] =  (s * args.timeslide_interval*seg.sample_rate).astype(numpy.int)
+    offsets[ifo] = numpy.append(offsets[ifo], 0) # add in zerolag offset
+    noffsets = len(offsets[ifo])
+
+def threshold(snrs, value, window, minsnr):
+    """ Pick peaks within window above threshold """
+    from pycbc.events import findchirp_cluster_over_window
+    window_idx = int(window * seg.sample_rate)
+    
+    # calculate the squares
+    snrsq = {}
+    for ifo in snrs:
+        slen = len(snrs[ifo])
+        snrsq[ifo] = snrs[ifo].squared_norm()
+
+    above = {}
+    for ifo in snrs:
+        above[ifo] = numpy.where(snrsq[ifo] > minsnr**2.0)[0]
+
+    peaks = {ifo: [] for ifo in ifos}
+
+    # Determine all the indices where wee need to check the SNR^2
+    idx_base = {ifo: numpy.add.outer(above[ifo], -offsets[ifo]) for ifo in ifos}
+    idxp = {}
+    for ifo2 in ifos:
+        idxp[ifo2] = {ifo1: ((idx_base[ifo1] + offsets[ifo2]) % slen).T for ifo1 in ifos}
+
+    # calculate network snrsq for all the points
+    nsnr = {}
+    for ifo1 in ifos:
+        nsnr[ifo1] = sum([snrsq[ifo][idxp[ifo][ifo1]] for ifo in ifos])
+        
+    for i in range(noffsets):     
+        for ifo1 in above: 
+            ns = nsnr[ifo1][i]
+            k = numpy.where(ns > value**2.0)[0]
+            if len(k > 0):
+                k2 = findchirp_cluster_over_window(idxp[ifo1][ifo1][i, k],
+                                                   ns[k], window_idx)
+                k = k[k2]                
+            
+            for ifo in ifos:
+                peaks[ifo].append(idxp[ifo][ifo1][i, k])
+
+    if len(peaks[ifo]) > 0:
+        peaks = {ifo:numpy.concatenate(peaks[ifo]) for ifo in ifos}
+    return peaks  
+
+events = {}
+for k in ['marg', 'template_id']:
+    events[k] = []
+for k in ['snr', 'chisq', 'time']:
+    for ifo in ifos:
+        events[ifo + '_' + k] = []
+
+with ctx:
+    mfilters = {}
+    for ifo in ifos:
+        mfilters[ifo] = mfilter(tlen)
+
 
     for t_num, template in enumerate(bank):
         for s_num, stilde in enumerate(segments[ifos[0]]):
@@ -251,8 +278,7 @@ with ctx:
             # calculate SNR fo reach detector
             snrs, corr, norm = {}, {}, {}
             for ifo in ifos:
-                snr, corr[ifo], norm[ifo] = filter.matched_filter_core(template, stilde[ifo],
-                                                   h_norm=template.sigmasq(stilde[ifo].psd))
+                snr, corr[ifo], norm[ifo] = mfilters[ifo].execute(template, stilde[ifo])
                 snrs[ifo] = snr[stilde[ifo].analyze] * norm[ifo]
                 #logging.info('Found max peak: %s: %s', ifo, snr.abs_max_loc())
                 
