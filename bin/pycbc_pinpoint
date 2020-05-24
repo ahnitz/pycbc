@@ -209,13 +209,16 @@ with ctx:
             above[ifo] = numpy.where(snrsq[ifo] > minsnr**2.0)[0]
         
         peaks = {ifo: [] for ifo in ifos}
+        nsnrs = {ifo: numpy.zeros(len(above[ifo])) for ifo in ifos}
         for i in range(noffsets):     
             for ifo1 in above:
-                nsnr = numpy.zeros(len(above[ifo1]))
+                nsnr = nsnrs[ifo1]
+                nsnr[:] = 0
                 idx = {}
+                idx_base = above[ifo1] - offsets[ifo1][i]
                 for ifo2 in ifos:
-                    idx[ifo2] = (above[ifo1] + offsets[ifo2][i] - offsets[ifo1][i]) % slen
-                    nsnr += snrsq[ifo2][idx[ifo2]]
+                    idx[ifo2] = (idx_base + offsets[ifo2][i]) % slen
+                    nsnr += snrsq[ifo2][idx[ifo2]] 
                     
                 k = numpy.where(nsnr > value**2.0)[0]            
                 if len(k > 0):
@@ -246,10 +249,8 @@ with ctx:
             for ifo in ifos:
                 snr, corr[ifo], norm[ifo] = filter.matched_filter_core(template, stilde[ifo],
                                                    h_norm=template.sigmasq(stilde[ifo].psd))
-                snr *= norm[ifo]
-                snr = snr[stilde[ifo].analyze]
-                snrs[ifo] = snr.copy()
-                logging.info('Found max peak: %s: %s', ifo, snr.abs_max_loc())
+                snrs[ifo] = snr[stilde[ifo].analyze] * norm[ifo]
+                #logging.info('Found max peak: %s: %s', ifo, snr.abs_max_loc())
                 
             # Cluster and threshold triggers based on the network SNR
             peaks = threshold(snrs, args.network_snr_threshold,
