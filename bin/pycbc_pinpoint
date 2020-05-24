@@ -198,35 +198,39 @@ with ctx:
         from pycbc.events import findchirp_cluster_over_window
         window_idx = int(window * seg.sample_rate)
         
-        # Extend SNRs so we can do continuous slices
+        # calculate the squares
         snrsq = {}
         for ifo in snrs:
             slen = len(snrs[ifo])
             snrsq[ifo] = snrs[ifo].squared_norm()
 
         above = {}
-        for ifo in snrs:    
+        for ifo in snrs:
             above[ifo] = numpy.where(snrsq[ifo] > minsnr**2.0)[0]
-        
+
         peaks = {ifo: [] for ifo in ifos}
-        nsnrs = {ifo: numpy.zeros(len(above[ifo])) for ifo in ifos}
+
+        # Determine all the indices where wee need to check the SNR^2
+        idx_base = {ifo: numpy.add.outer(above[ifo], -offsets[ifo]) for ifo in ifos}
+        idxp = {}
+        for ifo2 in ifos:
+            idxp[ifo2] = {ifo1: ((idx_base[ifo1] + offsets[ifo2]) % slen).T for ifo1 in ifos}
+
+        # calculate network snrsq for all the points
+        nsnr = {}
+        for ifo1 in ifos:
+            nsnr[ifo1] = sum([snrsq[ifo][idxp[ifo][ifo1]] for ifo in ifos])
+            
         for i in range(noffsets):     
-            for ifo1 in above:
-                nsnr = nsnrs[ifo1]
-                nsnr[:] = 0
-                idx = {}
-                idx_base = above[ifo1] - offsets[ifo1][i]
-                for ifo2 in ifos:
-                    idx[ifo2] = (idx_base + offsets[ifo2][i]) % slen
-                    nsnr += snrsq[ifo2][idx[ifo2]] 
-                    
-                k = numpy.where(nsnr > value**2.0)[0]            
+            for ifo1 in above: 
+                ns = nsnr[ifo1][i]
+                k = numpy.where(ns > value**2.0)[0]
                 if len(k > 0):
-                    k2 = findchirp_cluster_over_window(idx[ifo1][k], nsnr[k], window_idx)
+                    k2 = findchirp_cluster_over_window(idxp[ifo1][ifo1][i, k], ns[k], window_idx)
                     k = k[k2]                
                 
                 for ifo in ifos:
-                    peaks[ifo].append(idx[ifo][k])
+                    peaks[ifo].append(idxp[ifo][ifo1][i, k])
 
         if len(peaks[ifo]) > 0:
             peaks = {ifo:numpy.concatenate(peaks[ifo]) for ifo in ifos}
