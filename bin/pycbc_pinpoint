@@ -157,6 +157,7 @@ incm = margvals['inclination']
 distm = margvals['distance']
 
 htf = {}
+ahtf = {}
 for ifo in ifos:
     det = detector.Detector(ifo)
     fp, fc = det.antenna_pattern(args.right_ascension, args.declination,
@@ -164,16 +165,28 @@ for ifo in ifos:
     ip = numpy.cos(incm)
     ic = 0.5 * (1.0 + ip * ip)
     htf[ifo] = (fp * ip + 1.0j * fc * ic) / (distm)
-            
+    ahtf[ifo] = abs(htf[ifo]) ** 2.0
+
+_save = None 
+_hhloglr = None      
 def marginal_likelihood(sh, hh):
     """ Approximate marginal likelihood over pol/inc/dist. Maximized over phase.
     """
     shloglr = numpy.zeros(args.marg_size, dtype=numpy.complex128)
-    hhloglr = numpy.zeros(args.marg_size, dtype=numpy.float64)
+    
+    global _hhloglr
+    global _save
+    if _save is hh:
+        hhloglr = _hhloglr
+    else:
+        hhloglr = numpy.zeros(args.marg_size, dtype=numpy.float64)
+        for ifo in hh:
+            hhloglr += hh[ifo] * ahtf[ifo]
+        _save = hh
+        _hhloglr = hhloglr
     
     for ifo in sh:
         shloglr += sh[ifo] * htf[ifo]
-        hhloglr += hh[ifo] * abs(htf[ifo]) ** 2.0
    
     # The abs here implements the maximization over phase in lieu of 
     # a marginalization     
@@ -222,7 +235,7 @@ def threshold(snrs, value, window, minsnr):
     snrsq = {}
     for ifo in snrs:
         slen = len(snrs[ifo])
-        snrsq[ifo] = snrs[ifo].squared_norm()
+        snrsq[ifo] = snrs[ifo].squared_norm().numpy()
 
     above = {}
     for ifo in snrs:
@@ -232,23 +245,25 @@ def threshold(snrs, value, window, minsnr):
 
     # Determine all the indices where wee need to check the SNR^2
     idx_base = {ifo: numpy.add.outer(above[ifo], -offsets[ifo]) for ifo in ifos}
+
     idxp = {}
     for ifo2 in ifos:
         idxp[ifo2] = {ifo1: ((idx_base[ifo1] + offsets[ifo2]) % slen).T for ifo1 in ifos}
-
+        
     # calculate network snrsq for all the points
     nsnr = {}
+    wnsnr = {}
     for ifo1 in ifos:
         nsnr[ifo1] = sum([snrsq[ifo][idxp[ifo][ifo1]] for ifo in ifos])
-        
+        wnsnr[ifo1] = nsnr[ifo1] > value ** 2.0
+
     for i in range(noffsets):     
         for ifo1 in above: 
             ns = nsnr[ifo1][i]
-            k = numpy.where(ns > value**2.0)[0]
-            if len(k > 0):
-                k2 = findchirp_cluster_over_window(idxp[ifo1][ifo1][i, k],
-                                                   ns[k], window_idx)
-                k = k[k2]                
+            k = numpy.where(wnsnr[ifo1][i])[0]
+            if len(k > 1):
+                k2 = findchirp_cluster_over_window(idxp[ifo1][ifo1][i, k], ns[k], window_idx)
+                k = k[k2]             
             
             for ifo in ifos:
                 peaks[ifo].append(idxp[ifo][ifo1][i, k])
