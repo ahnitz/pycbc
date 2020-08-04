@@ -234,9 +234,15 @@ class _XMLInjectionSet(object):
         name, phase_order = legacy_approximant_name(inj.waveform)
 
         # compute the waveform time series
+        # We are only doing nonspin injections so we'll hijack this for ecc
+        # 
+        ecc = inj.spin1z
+        inj.spin1z = 0
+        inj.spin2z = 0
+
         hp, hc = get_td_waveform(
             inj, approximant=name, delta_t=delta_t,
-            phase_order=phase_order,
+            phase_order=phase_order, eccentricity=ecc, long_asc_nodes=(inj.polarization + inj.coa_phase) % 6.28,
             f_lower=f_l, distance=inj.distance,
             **self.extra_args)
 
