@@ -249,13 +249,6 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
             l = opt.normalize_strain
             strain = strain / l
 
-        if injector is not None:
-            logging.info("Applying injections")
-            injections = \
-                injector.apply(strain, opt.channel_name[0:2],
-                               distance_scale=opt.injection_scale_factor,
-                               inj_filter_rejector=inj_filter_rejector)
-
         if opt.sgburst_injection_file:
             logging.info("Applying sine-Gaussian burst injections")
             injector = SGBurstInjectionSet(opt.sgburst_injection_file)
@@ -266,6 +259,19 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
             logging.info("Highpass Filtering")
             strain = highpass(strain, frequency=opt.strain_high_pass)
 
+        if opt.sample_rate:
+            logging.info("Resampling data")
+            strain = resample_to_delta_t(strain,
+                                         1. / opt.sample_rate,
+                                         method='ldas')
+
+        if injector is not None:
+            logging.info("Applying injections")
+            injections = \
+                injector.apply(strain, opt.channel_name[0:2],
+                               distance_scale=opt.injection_scale_factor,
+                               inj_filter_rejector=inj_filter_rejector)
+
         if precision == 'single':
             logging.info("Converting to float32")
             strain = (strain * dyn_range_fac).astype(pycbc.types.float32)
@@ -274,12 +280,6 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
             strain = (strain * dyn_range_fac).astype(pycbc.types.float64)
         else:
             raise ValueError("Unrecognized precision {}".format(precision))
-
-        if opt.sample_rate:
-            logging.info("Resampling data")
-            strain = resample_to_delta_t(strain,
-                                         1. / opt.sample_rate,
-                                         method='ldas')
 
         if opt.gating_file is not None:
             logging.info("Gating times contained in gating file")
