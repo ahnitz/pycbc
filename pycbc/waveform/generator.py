@@ -962,7 +962,7 @@ class FDomainDetFrameModesGenerator(BaseFDomainDetFrameGenerator):
         rfparams = {param: self.current_params[param]
             for param in kwargs if param not in self.location_args}
         hlms = self.rframe_generator.generate(**rfparams)
-        h = {}
+        h = {det: {} for det in self.detectors}
         for mode in hlms:
             ulm, vlm = hlms[mode]
             if isinstance(ulm, TimeSeries):
@@ -977,7 +977,6 @@ class FDomainDetFrameModesGenerator(BaseFDomainDetFrameGenerator):
             else:
                 tshift = 0.
             ulm._epoch = vlm._epoch = self._epoch
-            h[mode] = {}
             if self.detector_names != ['RF']:
                 for detname, det in self.detectors.items():
                     # apply the time shift
@@ -994,7 +993,7 @@ class FDomainDetFrameModesGenerator(BaseFDomainDetFrameGenerator):
                             detulm, **self.current_params)
                         detvlm = self.recalib[detname].map_to_adjust(
                             detvlm, **self.current_params)
-                    h[mode][detname] = (detulm, detvlm)
+                    h[detname][mode] = (detulm, detvlm)
             else:
                 # no detector response, just apply time shift
                 if 'tc' in self.current_params:
@@ -1004,21 +1003,21 @@ class FDomainDetFrameModesGenerator(BaseFDomainDetFrameGenerator):
                     vlm = apply_fd_time_shift(vlm,
                                              self.current_params['tc']+tshift,
                                              copy=False)
-                h[mode]['RF'] = (ulm, vlm)
+                h['RF'][mode] = (ulm, vlm)
             if self.gates is not None:
                 # resize all to nearest power of 2
                 ulms = {}
                 vlms = {}
                 for det in h:
-                    ulm = h[det]
-                    vlm = h[det]
+                    ulm, vlm = h[det][mode]
                     ulm.resize(ceilpow2(len(ulm)-1) + 1)
                     vlm.resize(ceilpow2(len(vlm)-1) + 1)
                     ulms[det] = ulm
                     vlms[det] = vlm
                 ulms = strain.apply_gates_to_fd(ulms, self.gates)
                 vlms = strain.apply_gates_to_fd(ulms, self.gates)
-                h[mode] = {det: (ulms[det], vlms[det]) for det in h}
+                for det in ulms:
+                    h[det][mode] = (ulms[det], vlms[det])
         return h
 
     @staticmethod
