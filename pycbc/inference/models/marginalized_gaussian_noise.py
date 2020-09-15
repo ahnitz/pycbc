@@ -365,7 +365,7 @@ class MarginalizedPolarizationDistance(BaseGaussianNoise):
         print(min_distance, max_distance, distance_samples)
         min_distance = float(min_distance)
         max_distance = float(max_distance)
-        distance_samples = int(distance_sampes)
+        distance_samples = int(distance_samples)
         dist = numpy.linspace(min_distance, max_distance, distance_samples)
 
         if prior_type == 'luminosity_volume':
