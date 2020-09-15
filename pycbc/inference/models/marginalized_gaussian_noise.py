@@ -326,7 +326,7 @@ class MarginalizedPolarization(BaseGaussianNoise):
 
         return float(lr_total)
 
-class MarginalizedPolarizaztionDistance(BaseGaussianNoise):
+class MarginalizedPolarizationDistance(BaseGaussianNoise):
     r""" This likelihood numerically marginalizes over polarization angle
     and the distance.
 
