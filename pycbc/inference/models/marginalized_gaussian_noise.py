@@ -482,11 +482,11 @@ class MarginalizedPolarizationDistance(BaseGaussianNoise):
 
             hh = fp * fp * hphp + fc * fc * hchc + fp * fc * (hphc + hchp)
 
-            # store
-            setattr(self._current_stats, '{}_optimal_snrsq'.format(det), hh)
-
             cplx_hd = numpy.resize(cplx_hd, self.nsample) / self.dist
             hh = numpy.resize(hh, self.nsample) / self.dist**2.0
+
+            # store
+            setattr(self._current_stats, '{}_optimal_snrsq'.format(det), hh)
 
             lr += cplx_hd.real - 0.5 * hh
 
