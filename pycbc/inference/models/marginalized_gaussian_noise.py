@@ -369,7 +369,7 @@ class MarginalizedPolarizationDistance(BaseGaussianNoise):
         dist = numpy.linspace(min_distance, max_distance, distance_samples)
 
         if prior_type == 'luminosity_volume':
-            dist_weights = self.dist ** 2.0
+            dist_weights = dist ** 2.0
 
         elif prior_type == 'comoving_volume':
             from pycbc.cosmology import redshift, cosmological_quantity_from_redshift
