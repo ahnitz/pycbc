@@ -26,6 +26,7 @@ from .gaussian_noise import GaussianNoise
 from .marginalized_gaussian_noise import MarginalizedPhaseGaussianNoise
 from .marginalized_gaussian_noise import MarginalizedPolarization
 from .marginalized_gaussian_noise import MarginalizedHMPolPhase
+from .marginalized_gaussian_noise import MarginalizedPolarizationDistance
 from .single_template import SingleTemplate
 from .relbin import Relative
 
