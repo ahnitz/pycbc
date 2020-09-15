@@ -348,7 +348,7 @@ class MarginalizedPolarizationDistance(BaseGaussianNoise):
                  prior_type='comoving_volume',
                  static_params=None, **kwargs):
         # set up the boiler-plate attributes
-        super(MarginalizedPolarization, self).__init__(
+        super(MarginalizedPolarizationDistance, self).__init__(
             variable_params, data, low_frequency_cutoff, psds=psds,
             high_frequency_cutoff=high_frequency_cutoff, normalize=normalize,
             static_params=static_params, **kwargs)
