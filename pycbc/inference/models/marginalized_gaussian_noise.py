@@ -384,8 +384,14 @@ class MarginalizedPolarizationDistance(BaseGaussianNoise):
 
         # remap to pol x dist grid
         self.nsample = distance_samples * polarization_samples
-        self.dist = numpy.resize(dist, self.nsample).reshape(distance_samples, polarization_samples).T.flatten()
-        self.logw = numpy.resize(dist_weights, self.nsample).reshape(distance_samples, polarization_samples).T.flatten()
+        dist = numpy.resize(dist, self.nsample)
+        self.dist = dist.reshape(distance_samples,
+                                 polarization_samples).T.flatten()
+
+        w = numpy.resize(dist_weights, self.nsample)
+        w = w.reshape(distance_samples, polarization_samples).T.flatten()
+        self.logw = numpy.log(w)
+
         self.polm = numpy.resize(self.pol, self.nsamples)
 
         self.ref_dist = 1 # Mpc
