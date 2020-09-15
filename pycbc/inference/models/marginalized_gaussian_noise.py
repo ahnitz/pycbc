@@ -362,7 +362,7 @@ class MarginalizedPolarizationDistance(BaseGaussianNoise):
 
         self.polarization_samples = polarization_samples
         self.pol = numpy.linspace(0, 2*numpy.pi, self.polarization_samples)
-        print(min_distance, max_distance, distance_samples)
+
         min_distance = float(min_distance)
         max_distance = float(max_distance)
         distance_samples = int(distance_samples)
@@ -386,6 +386,7 @@ class MarginalizedPolarizationDistance(BaseGaussianNoise):
         self.nsample = distance_samples * polarization_samples
         self.dist = numpy.resize(dist, self.nsample).reshape(distance_samples, polarization_samples).T.flatten()
         self.logw = numpy.resize(dist_weights, self.nsample).reshape(distance_samples, polarization_samples).T.flatten()
+        self.polm = numpy.resize(self.pol, self.nsamples)
 
         self.ref_dist = 1 # Mpc
         self.dets = {}
@@ -395,9 +396,8 @@ class MarginalizedPolarizationDistance(BaseGaussianNoise):
         """Adds ``loglr``, ``maxl_polarization``, and the ``optimal_snrsq`` in
         each detector.
         """
-        return []
-        #return ['loglr', 'maxl_polarization'] + \
-        #       ['{}_optimal_snrsq'.format(det) for det in self._data]
+        return ['loglr', 'maxl_polarization'] + \
+               ['{}_optimal_snrsq'.format(det) for det in self._data]
 
     def _nowaveform_loglr(self):
         """Convenience function to set loglr values if no waveform generated.
@@ -487,11 +487,11 @@ class MarginalizedPolarizationDistance(BaseGaussianNoise):
         lr_total = special.logsumexp(lr) + self.logw - numpy.log(len(self.pol))
 
         # store the maxl polarization
-        #idx = lr.argmax()
-        #setattr(self._current_stats, 'maxl_polarization', self.pol[idx])
+        idx = lr.argmax()
+        setattr(self._current_stats, 'maxl_polarization', self.polm[idx])
 
         # store the maxl distance
-        #setattr(self._current_stats, 'maxl_distance', self.pol[idx])
+        setattr(self._current_stats, 'maxl_distance', self.dist[idx])
 
         # just store the maxl optimal snrsq
         for det in wfs:
