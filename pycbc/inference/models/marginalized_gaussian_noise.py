@@ -490,7 +490,7 @@ class MarginalizedPolarizationDistance(BaseGaussianNoise):
 
             lr += cplx_hd.real - 0.5 * hh
 
-        lr_total = special.logsumexp(lr) + self.logw - numpy.log(len(self.pol))
+        lr_total = special.logsumexp(lr + self.logw) - numpy.log(len(self.pol))
 
         # store the maxl polarization
         idx = lr.argmax()
