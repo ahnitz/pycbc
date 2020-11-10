@@ -72,14 +72,21 @@ class BruteParallelGaussianMarginalize(BaseGaussianNoise):
                 params.append(pref)
             vals = list(self.pool.map(self.call, params))
             loglr = numpy.array([v[0] for v in vals])
+            
             # get the maxl values
             maxidx = loglr.argmax()
             maxstats = vals[maxidx][1]
             maxphase = self.phase[maxidx]
+            
             # set the stats
             for stat in maxstats:
                 setattr(self._current_stats, stat, maxstats[stat])
             self._current_stats.maxl_phase = maxphase
-            self._current_stats.maxl_loglr = loglr[maxidx]
+            
+            if 'maxl_loglr' not in maxstats:
+                self._current_stats.maxl_loglr = loglr[maxidx]
+            else:
+                self._current_stats.maxl_loglr = maxstats['maxl_loglr']
+            
             # calculate the marginal loglr and return
             return logsumexp(loglr) - numpy.log(len(self.phase))

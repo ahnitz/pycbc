@@ -160,7 +160,7 @@ class BaseGenerator(object):
             try:
                 new_waveform = self.generator(**self.current_params)
                 self._cache.clear()
-                self._cache[values_hash] = new_waveform
+                #self._cache[values_hash] = new_waveform
                 return new_waveform
             except RuntimeError as e:
                 if self.record_failures:
