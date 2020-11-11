@@ -101,7 +101,7 @@ def parse_veto_definer(veto_def_filename, ifos):
     return data
 
 
-GWOSC_URL = 'https://www.gw-openscience.org/timeline/segments/json/{}/{}_{}/{}/{}/'
+GWOSC_URL = 'https://losc-web.gw-openscience.org/timeline/segments/json/{}/{}_{}/{}/{}/'
 
 
 def query_flag(ifo, segment_name, start_time, end_time,
