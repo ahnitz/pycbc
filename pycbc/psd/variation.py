@@ -1,13 +1,12 @@
 """ PSD Variation """
 
 import numpy
-from numpy.fft import rfft, irfft
+import logging
 import scipy.signal as sig
-
-
 import pycbc.psd
-from pycbc.types import TimeSeries
-from pycbc.filter import resample_to_delta_t
+from numpy.fft import rfft, irfft
+from pycbc.types import TimeSeries, complex_same_precision_as
+from pycbc.filter import resample_to_delta_t, sigma
 
 
 def mean_square(data, delta_t, srate, short_stride, stride):
@@ -216,4 +215,145 @@ def find_trigger_value(psd_var, idx, start, sample_rate):
                                  fill_value=1.0, bounds_error=False)
     vals = psd_var.cached_psd_var_interpolant(time)
 
-    return vals
+
+
+def sigma_var(strain, start, end, step=2.0, duration=16, subsegment=1, fmin=20,
+            fmax=480, mass=10.0, time_offset=1.0):
+    """ Calculate how much the noise weighted reference signal amplitude
+    varies compared to the average.
+
+    Parameters
+    ----------
+    strain: pycbc.type.TimeSeries
+        Data containing the requrested start / end times to calculate the
+        sigma variation for.
+    start: float
+        Earliest time allowed to be used.
+    end: float
+        Latest time allowed to be used
+    step: {float, 2.0}
+        The duration in seconds between samples of the sigma value.
+    duration: {float, 16.0}
+        The time in seconds used to calculate a local PSD estimate
+    subsegment: {float, 1}
+        The length of a psd sample when calculating the local PSD estimate
+    fmin: {float, 20}
+        The minimum frequency to use in the sigma calculation
+    fmax: {float, 480}
+        The maximum frequency to us in the sigma calculation
+    mass: {float, 10.0}
+        The component mass to use (assumed equal mass) for the reference
+        signal.
+    time_offset: {float, 1.0}
+        Time offset in seconds to add to the assigned times for each sigma
+        value. If zero, the time chosen is the central time used for the local
+        psd estimate.
+
+    Returns
+    --------
+    scale: scipy.interpolate.interp1d
+        Interpolator that returns the sigma scaling for a given time. Assumed
+        to be 1.0 outside the possible interval.
+    """
+    from pycbc.waveform import get_fd_waveform
+    from scipy.interpolate import interp1d
+
+    # segment data and calculate psd in each short period
+    tstarts  = numpy.arange(start, end - duration, step)
+    tends = tstarts + duration
+    pshorts = [strain.time_slice(s, e).psd(subsegment)
+               for s, e in zip(tstarts, tends)]
+
+    # Calculate the scale factors
+    m1 = m2 = mass
+    href, _ = get_fd_waveform(approximant="IMRPhenomD", mass1=m1, mass2=m2,
+                              f_lower=fmin, delta_f=pshorts[0].delta_f)
+    href = href.astype(complex_same_precision_as(pshorts[0]))
+    sigmas = [sigma(href, psd=p, low_frequency_cutoff=fmin,
+                    high_frequency_cutoff=fmax) for p in pshorts]
+    sigmas = numpy.array(sigmas)
+    sigmas /= numpy.median(sigmas)
+
+    # choose central time of each short sigma estimate offset by preset value
+    sigtime = ((tends + tstarts) / 2.0 + time_offset).astype(numpy.float64)
+    scale = interp1d(sigtime, sigmas, fill_value=1.0, bounds_error=False)
+    return scale
+
+
+class SigmaVariation(object):
+    """Class that encapsulates handling of sigma variation calculation within
+    Inspiral-type executables.
+    """
+    def __init__(self, segments, durations, subsegments, time_offsets, step,
+                 fmin, fmax, mass): 
+        self.sample_rate = segments.strain.sample_rate
+                 
+        # Set the naming and return format of the saved stats
+        self._returns = {}
+        self.names = {}
+        for dur in durations:
+            name = 'sigvar_{}'.format(int(dur))
+            self.names[dur] = name
+            self._returns[name] = numpy.float32
+                 
+        # precalculate all the sigma variation interpolating functions
+        self.scales = []
+        for i, seg in enumerate(segments.segment_slices):
+            scale = {}
+            group = zip(durations, subsegments, time_offsets)
+            for dur, subs, toff in group:
+                logging.info('precalc sigma var for seg %s, dur %s', i, dur)
+                segd = segments.strain[seg].copy()
+                segd.start_time = 0 # avoids doing time accounting when applying
+                scale[dur] = sigma_var(segd, 0, segd.end_time,
+                                       fmin=fmin, fmax=fmax,
+                                       step=step,
+                                       duration=dur,
+                                       subsegment=subs,
+                                       time_offset=toff)                                  
+            self.scales.append(scale)
+            
+    @staticmethod
+    def insert_option_group(parser):
+        group = parser.add_argument_group("Sigma Variation")
+        group.add_argument("--sigvar-durations", nargs='+', type=float, 
+                          help="Durations of time used for local psd estimates")
+        group.add_argument("--sigvar-subsegments", nargs='+', type=float, 
+                          help=" The length of a psd sample when calculating"
+                               " the local PSD estimate")
+        group.add_argument("--sigvar-time-offsets", nargs='+', type=float, 
+                          help="Seconds to offset each estimates time")
+        group.add_argument("--sigvar-step", type=float, 
+                          help="Seconds between estimates")                        
+        group.add_argument("--sigvar-fmin", type=float, 
+                          help="low frequency cutoff")
+        group.add_argument("--sigvar-fmax", type=float, 
+                          help="high frequency cutoff")
+        group.add_argument("--sigvar-mass", type=float, 
+                          help="low frequency cutoff")
+                               
+    @classmethod
+    def from_cli(cls, args, segments):
+        if args.sigvar_durations is None:
+            return None
+        return cls(segments, 
+                   args.sigvar_durations,
+                   args.sigvar_subsegments,
+                   args.sigvar_time_offsets,
+                   args.sigvar_fmin,
+                   args.sigvar_step,
+                   args.sigvar_fmax,
+                   args.sigvar_mass)
+
+    @property
+    def returns(self):
+        return self._returns
+
+    def values(self, seg_num, idx):
+        out_vals = {}
+        for dur in self.scales[seg_num]:
+            name = self.names[dur]
+            times = idx / float(self.sample_rate)
+            out_vals[name] = self.scales[seg_num][dur](times)
+        return out_vals
+
