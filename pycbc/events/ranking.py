@@ -4,7 +4,6 @@ statistic values
 from six import raise_from
 import numpy
 
-
 def effsnr(snr, reduced_x2, fac=250.):
     """Calculate the effective SNR statistic. See (S5y1 paper) for definition.
     """
@@ -289,6 +288,42 @@ def get_newsnr_sgveto_psdvar_scaled_threshold(trigs):
     return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
 
 
+def cut_v1(trigs):
+    """
+    Calculate newsnr re-weighted by the sine-gaussian veto and scaled
+    psd variation statistic. A further threshold is applied to the
+    reduced chisq.
+
+    Parameters
+    ----------
+    trigs: dict of numpy.ndarrays
+        Dictionary holding single detector trigger information.
+    'chisq_dof', 'snr', 'chisq' and 'psd_var_val' are required keys
+
+    Returns
+    -------
+     numpy.ndarray
+        Array of newsnr values
+    """
+    dof = 2. * trigs['chisq_dof'][:] - 2.
+    nsnr_sg_psdt = \
+                 newsnr_sgveto_psdvar_scaled_threshold(
+                     trigs['snr'][:], trigs['chisq'][:] / dof,
+                     trigs['sg_chisq'][:],
+                     trigs['psd_var_val'][:])
+    
+    mm = 0.90
+    expc = 1 + (1-mm) **2.0 * trigs['snr'][:] ** 2.0 
+    
+    m1 = trigs['chisq'][:] / dof
+    m2 = trigs['sg_chisq'][:] / dof
+    
+    nsnr_sg_psdt[m1 < expc] = 3
+    nsnr_sg_psdt[m2 < expc * 1.5] = 3
+    
+    return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
+
+
 sngls_ranking_function_dict = {
     'snr': get_snr,
     'newsnr': get_newsnr,
@@ -298,6 +333,7 @@ sngls_ranking_function_dict = {
     'newsnr_sgveto_psdvar_threshold': get_newsnr_sgveto_psdvar_threshold,
     'newsnr_sgveto_psdvar_scaled': get_newsnr_sgveto_psdvar_scaled,
     'newsnr_sgveto_psdvar_scaled_threshold': get_newsnr_sgveto_psdvar_scaled_threshold,
+    'cut_v1': cut_v1,
 }
 
 
