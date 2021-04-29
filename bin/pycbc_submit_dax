@@ -314,7 +314,9 @@ elif [ -z $PEGASUS_FILE_DIRECTORY ] ; then
 fi
 
 # Create the site catalog
-export LOCAL_SITE_PATH=${PWD}
+export LOCAL_SITE_PATH=`mktemp -d --tmpdir -p /atlas/user/scratch/ahnitz`
+ln -s $LOCAL_SITE_PATH/local-site-scratch local-site-scratch
+
 LOCAL_SITE_STORAGE_PATH=${LOCAL_SITE_PATH}
 LOCAL_SITE_STORAGE_URL='file://'${LOCAL_SITE_PATH}
 if [[ "$LOCAL_STAGING_SERVER" == stash://* ]] ; then
