@@ -1546,7 +1546,8 @@ class ExpFitSGFgBgNormStatistic(PhaseTDStatistic,
         """
 
         # Safety against subclassing and not rethinking this
-        allowed_names = ['ExpFitSGFgBgNormStatistic']
+        allowed_names = ['ExpFitSGFgBgNormStatistic',
+                         'ExpFitSGPSDFgBgNormBBHStatistic']
         self._check_coinc_lim_subclass(allowed_names)
 
         if not self.has_hist:

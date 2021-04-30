@@ -316,6 +316,7 @@ fi
 # Create the site catalog
 export LOCAL_SITE_PATH=`mktemp -d --tmpdir -p /atlas/user/scratch/ahnitz`
 ln -s $LOCAL_SITE_PATH/local-site-scratch local-site-scratch
+ln -s $PWD $LOCAL_SITE_PATH/origin
 
 LOCAL_SITE_STORAGE_PATH=${LOCAL_SITE_PATH}
 LOCAL_SITE_STORAGE_URL='file://'${LOCAL_SITE_PATH}
