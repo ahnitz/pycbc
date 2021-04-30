@@ -263,7 +263,7 @@ def get_newsnr_sgveto_psdvar_scaled(trigs):
     return numpy.array(nsnr_sg_psdscale, ndmin=1, dtype=numpy.float32)
 
 
-def get_newsnr_sgveto_psdvar_scaled_threshold(trigs):
+def get_newsnr_sgveto_psdvar_scaled_threshold(trigs, threshold=2.0):
     """
     Calculate newsnr re-weighted by the sine-gaussian veto and scaled
     psd variation statistic. A further threshold is applied to the
@@ -285,7 +285,7 @@ def get_newsnr_sgveto_psdvar_scaled_threshold(trigs):
                  newsnr_sgveto_psdvar_scaled_threshold(
                      trigs['snr'][:], trigs['chisq'][:] / dof,
                      trigs['sg_chisq'][:],
-                     trigs['psd_var_val'][:])
+                     trigs['psd_var_val'][:], threshold=float(threshold))
     return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
 
 
