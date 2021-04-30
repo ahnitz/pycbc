@@ -1368,7 +1368,7 @@ class ExpFitSGFgBgNormStatistic(PhaseTDStatistic,
             Array of log noise rate density for each input trigger.
         """
         alphai, ratei, thresh = self.find_fits(trigs)
-        newsnr = self.get_single_ranking(trigs)
+        newsnr = self.get_sngl_ranking(trigs)
         # Above the threshold we use the usual fit coefficient (alpha)
         # below threshold use specified alphabelow
         bt = newsnr < thresh
