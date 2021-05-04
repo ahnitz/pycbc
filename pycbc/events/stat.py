@@ -1764,7 +1764,7 @@ def get_statistic(stat):
         raise RuntimeError('%s is not an available detection statistic' % stat)
 
 
-def insert_statistic_option_group(parser):
+def insert_statistic_option_group(parser, default_ranking_statistic=None):
     """
     Add ranking statistic options to the optparser object.
 
@@ -1774,6 +1774,9 @@ def insert_statistic_option_group(parser):
     -----------
     parser : object
         OptionParser instance.
+    default_ranking_statisic : str
+        Allows setting a default statistic for the '--ranking-statistic'
+        option. The option is no longer required if a default is provided.
 
     Returns
     --------
@@ -1788,8 +1791,9 @@ def insert_statistic_option_group(parser):
 
     statistic_opt_group.add_argument(
         "--ranking-statistic",
+        default=default_ranking_statistic,
         choices=statistic_dict.keys(),
-        required=True,
+        required=True if default_ranking_statistic is None else False,
         help="The coinc ranking statistic to calculate"
     )
 
