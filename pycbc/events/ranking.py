@@ -288,7 +288,7 @@ def get_newsnr_sgveto_psdvar_scaled_threshold(trigs, threshold=2.0):
                      trigs['psd_var_val'][:], threshold=float(threshold))
     return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
 
-def get_newnsr_exp(trigs, chisq_cut=2.0, sg_chisq_cut=4.0):
+def get_newsnr_exp(trigs, chisq_cut=2.0, sg_chisq_cut=4.0):
     """
     Calculate newsnr re-weighted by the sine-gaussian veto and scaled
     psd variation statistic. A further threshold is applied to the
@@ -309,12 +309,14 @@ def get_newnsr_exp(trigs, chisq_cut=2.0, sg_chisq_cut=4.0):
     rchisq = trigs['chisq'][:] / dof
     sg_chisq = trigs['sg_chisq'][:]
 
-    nsnr_sg_psdt = newsnr_sgveto_psdvar_scaled_threshold(
+    nsnr_sg_psdt = newsnr_sgveto_psdvar_scaled(
                      trigs['snr'][:], rchisq,
                      sg_chisq,
                      trigs['psd_var_val'][:])
-    nsnr_sg_psdt[rchisq < chisq_cut] = 1
-    nsnr_sg_psdt[sg_chisq < sg_chisq_cut] = 1
+    print(rchisq, sg_chisq, nsnr_sg_psdt.max(), (nsnr_sg_psdt > 5.9).sum(), chisq_cut, sg_chisq_cut)
+    nsnr_sg_psdt[rchisq >= float(chisq_cut)] = 1
+    nsnr_sg_psdt[sg_chisq >= float(sg_chisq_cut)] = 1
+    print(rchisq, sg_chisq, nsnr_sg_psdt.max(), (nsnr_sg_psdt > 5.9).sum(), chisq_cut, sg_chisq_cut)
     return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
 
 sngls_ranking_function_dict = {

@@ -21,7 +21,7 @@ import copy, numpy as np
 
 from pycbc import io, events
 from pycbc.events import triggers, trigger_fits as trstats
-from pycbc.events import stat
+from pycbc.events import stat as statsmod
 from pycbc.types.optparse import MultiDetOptionAction
 import pycbc.version
 
@@ -43,7 +43,7 @@ def get_stat(statname, trigs, threshold):
         # as the stat classes expect.
         chunk = {k: trigs[k][s:e] for k in trigs if len(trigs[k]) == size}
         
-        rank_method = stat.get_statistic_from_opts(args, [args.ifo])
+        rank_method = statsmod.get_statistic_from_opts(args, [args.ifo])
         chunk_stat = rank_method.get_sngl_ranking(chunk)
 
         above = chunk_stat >= threshold
@@ -121,8 +121,8 @@ parser.add_argument("--min-duration", default=0.,
 parser.add_argument("--approximant", default="SEOBNRv4",
                     help="Approximant for template duration. Default SEOBNRv4")
 
-stat.insert_statistic_option_group(parser,
-    default_ranking_statistic='sngl_ranking_only')
+statsmod.insert_statistic_option_group(parser,
+    default_ranking_statistic='single_ranking_only')
 args = parser.parse_args()
 
 args.veto_segment_name = sum(args.veto_segment_name, [])
@@ -368,7 +368,7 @@ outfile.create_dataset("median_sigma", data=median_sigma)
 # add some metadata
 outfile.attrs.create("ifo", data=args.ifo.encode())
 outfile.attrs.create("fit_function", data=args.fit_function.encode())
-outfile.attrs.create("sngl_stat", data=args.sngl_stat.encode())
+outfile.attrs.create("sngl_stat", data=args.sngl_ranking)
 if args.save_trig_param:
     outfile.attrs.create("save_trig_param", data=args.save_trig_param.encode())
 outfile.attrs.create("stat_threshold", data=args.stat_threshold)

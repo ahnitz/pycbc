@@ -25,7 +25,7 @@ import numpy as np
 from pycbc import events, bin_utils, results
 from pycbc.events import triggers as trigs
 from pycbc.events import trigger_fits as trstats
-from pycbc.events import stat
+from pycbc.events import stat as pystat
 from pycbc.types.optparse import MultiDetOptionAction
 import pycbc.version
 
@@ -93,8 +93,8 @@ parser.add_argument("--prune-window", type=float, default=0.1,
                     help="Time (s) to remove all triggers around a trigger "
                          "which is loudest in each split, default 0.1s")
 
-stat.insert_statistic_option_group(parser,
-    default_ranking_statistic='sngl_ranking_only')
+pystat.insert_statistic_option_group(parser,
+    default_ranking_statistic='single_ranking_only')
 args = parser.parse_args()
 
 pycbc.init_logging(args.verbose)
@@ -212,7 +212,7 @@ for idx, idx_start in enumerate(boundaries):
             np.argmax(sorted_boundary_list == idx_start) + 1]
 
 logging.info('calculating single stat values from trigger file')
-rank_method = stat.get_statistic_from_opts(args, [args.ifo])
+rank_method = pystat.get_statistic_from_opts(args, [args.ifo])
 stat = rank_method.get_sngl_ranking(trigf[args.ifo])
 
 if args.veto_file:
