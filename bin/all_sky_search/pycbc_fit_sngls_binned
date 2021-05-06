@@ -135,8 +135,8 @@ else:
     log_level = logging.WARN
 logging.basicConfig(format='%(asctime)s : %(message)s', level=log_level)
 
-statname = "reweighted SNR" if args.sngl_stat == "new_snr" else \
-           args.sngl_stat.replace("_", " ").replace("snr", "SNR")
+statname = "reweighted SNR" if args.sngl_ranking == "new_snr" else \
+           args.sngl_ranking.replace("_", " ").replace("snr", "SNR")
 paramname = args.bin_param.replace("_", " ")
 paramtag = args.bin_param.replace("_", "")
 if args.plot_dir:
