@@ -313,10 +313,10 @@ def get_newsnr_exp(trigs, chisq_cut=2.0, sg_chisq_cut=4.0):
                      trigs['snr'][:], rchisq,
                      sg_chisq,
                      trigs['psd_var_val'][:])
-    print(rchisq, sg_chisq, nsnr_sg_psdt.max(), (nsnr_sg_psdt > 5.9).sum(), chisq_cut, sg_chisq_cut)
+
     nsnr_sg_psdt[rchisq >= float(chisq_cut)] = 1
     nsnr_sg_psdt[sg_chisq >= float(sg_chisq_cut)] = 1
-    print(rchisq, sg_chisq, nsnr_sg_psdt.max(), (nsnr_sg_psdt > 5.9).sum(), chisq_cut, sg_chisq_cut)
+
     return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
 
 sngls_ranking_function_dict = {
