@@ -63,8 +63,9 @@ args = parser.parse_args()
 injection_style = args.background_files != None
 
 if args.max_hierarchical_removal and injection_style:
-    raise NotImplementedError("Hierarchical background removal doesn't make "
-                              "sense for injections.")
+    #raise NotImplementedError("Hierarchical background removal doesn't make "
+    #                          "sense for injections.")
+    args.max_hierarchical_removal = 0
 
 pycbc.init_logging(args.verbose)
 
