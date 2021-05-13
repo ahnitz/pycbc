@@ -1020,8 +1020,13 @@ class ReadByTemplate(object):
             veto_files = []
         for vfile, name in zip(veto_files, segment_name):
             veto_segs = veto.select_segments_by_definer(vfile, ifo=self.ifo,
-                                                        segment_name=name)
+                                                        segment_name=name).coalesce()
+            #print(vfile, name, veto_segs, self.ifo)
             self.segs = (self.segs - veto_segs).coalesce()
+
+            #self.valid = veto.segments_to_start_end(self.segs)
+            #print("SANITY", veto.indices_within_times(np.array([1185718664.984]), self.valid[0], self.valid[1]))
+
         if self.ifo in gating_veto_windows:
             gating_veto = gating_veto_windows[self.ifo].split(',')
             gveto_before = float(gating_veto[0])
@@ -1035,7 +1040,9 @@ class ReadByTemplate(object):
                 gating_veto_segs = veto.start_end_to_segments(gate_times + gveto_before,
                                                               gate_times + gveto_after).coalesce()
                 self.segs = (self.segs - gating_veto_segs).coalesce()
+
         self.valid = veto.segments_to_start_end(self.segs)
+        #print(veto.indices_within_times(np.array([1185718664.984]), self.valid[0], self.valid[1]))
 
     def get_data(self, col, num):
         """ Get a column of data for template with id 'num'
@@ -1075,7 +1082,7 @@ class ReadByTemplate(object):
         if self.valid:
             self.keep = veto.indices_within_times(times, self.valid[0],
                                                   self.valid[1])
-#            logging.info('applying vetoes')
+            logging.info('applying vetoes %s', len(self.keep))
         else:
             self.keep = np.arange(0, len(times))
 
