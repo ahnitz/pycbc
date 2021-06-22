@@ -52,8 +52,7 @@ for key in xinj.table[0].__slots__:
 for k in ['simulation_id', 'process_id']:
     a = data.pop(k)
 
-data['approximant'], data['phase_order'] = \
-        numpy.array([legacy_approximant_name(wf) for wf in data['waveform']]).T
+data['approximant'] = data['waveform'].astype('S32')
 data['tc'] = data['geocent_end_time'] + 1e-9 * data['geocent_end_time_ns']
 data['dec'] = data['latitude']
 data['ra'] = data['longitude']
