@@ -939,6 +939,9 @@ cpu_fd['PreTaylorF2'] = premerger_taylorf2
 from .multiband import multiband_fd_waveform
 cpu_fd['multiband'] = multiband_fd_waveform
 
+from pycbc.waveform.hmr import getfeob
+cpu_fd["HMR"] = getfeob
+
 # Load external waveforms #####################################################
 if 'PYCBC_WAVEFORM' in os.environ:
     mods = os.environ['PYCBC_WAVEFORM'].split(':')
