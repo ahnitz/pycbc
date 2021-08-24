@@ -76,6 +76,7 @@ def feob(m1, m2, delta_f, duration=100.0):
     Mr = (M_targ / M_ref)
     st = ts.sample_times
 
+    #print(ts.duration, duration, Mr)
     if ts.duration > duration / Mr:
         ts = ts.time_slice(st[-1] - duration/Mr, st[-1])
 
