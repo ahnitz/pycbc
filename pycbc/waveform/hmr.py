@@ -5,37 +5,44 @@ from pycbc.conversions import mchirp_from_mass1_mass2, mass1_from_mchirp_q, mass
 import numpy
 from scipy.interpolate import interp1d
 import os
+from filelock import FileLock
+import os.path
+import shutil
 
 
 eobfile = os.environ['HMR_FILE']
 if 'HMR_FILE_SHARED' in os.environ:
     eobfile_src = eobfile
     eobfile = '/dev/shm/HMR_FILE.hdf'
+m1s = m2s = qs = fl = keys = None
 
-    from filelock import FileLock
-    import os.path
-    import shutil
-    with FileLock(eobfile + '.lock'):
-        recopy = False
-        if os.path.exists(eobfile):
-            try:
-                f = h5py.File(eobfile, 'r')
-                test = f['0']
-            except:
-                recopy = True
+def set_stuff():
+    if 'HMR_FILE_SHARED' in os.environ:
+        with FileLock(eobfile + '.lock'):
+            recopy = False
+            if os.path.exists(eobfile):
+                try:
+                    f = h5py.File(eobfile, 'r')
+                    test = f['0']
+                except:
+                    recopy = True
 
-        if not os.path.exists(eobfile) or recopy:
-            shutil.copy(eobfile_src, eobfile)
+            if not os.path.exists(eobfile) or recopy:
+                shutil.copy(eobfile_src, eobfile)
 
-f = h5py.File(eobfile, 'r')
-m1s = numpy.array([f[k].attrs['m1'] for k in f])
-m2s = numpy.array([f[k].attrs['m2'] for k in f])
-qs = m1s / m2s
-fl = numpy.array([f[k].attrs['flow'] for k in f])
-keys = [k for k in f]
-f.close()
+    f = h5py.File(eobfile, 'r')
+    global m1s, m2s, qs, fl, keys
+    m1s = numpy.array([f[k].attrs['m1'] for k in f])
+    m2s = numpy.array([f[k].attrs['m2'] for k in f])
+    qs = m1s / m2s
+    fl = numpy.array([f[k].attrs['flow'] for k in f])
+    keys = [k for k in f]
+    f.close()
 
 def getfeob(**kwds):
+    if keys is None:
+        set_stuff()
+
     if 'duration' in kwds:
         duration = kwds['duration']
     else:
@@ -49,6 +56,8 @@ def getfeob(**kwds):
     return hp, hp*1.0j
 
 def ieob(m1, m2, delta_t, duration=100.0):
+    if keys is None:
+        set_stuff()
     # get closest mass ratio in set
     q = m1 / m2
     j = abs(qs - q).argmin()
@@ -67,6 +76,8 @@ def ieob(m1, m2, delta_t, duration=100.0):
     return TimeSeries(y, epoch=x[0], delta_t=delta_t)
 
 def feob(m1, m2, delta_f, duration=100.0):
+    if keys is None:
+        set_stuff()
     # get closest mass ratio in set
     q = max(float(m1) / float(m2), float(m2) / float(m1))
     j = abs(qs - q).argmin()
