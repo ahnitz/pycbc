@@ -263,7 +263,7 @@ def get_newsnr_sgveto_psdvar_scaled(trigs):
     return numpy.array(nsnr_sg_psdscale, ndmin=1, dtype=numpy.float32)
 
 
-def get_newsnr_sgveto_psdvar_scaled_threshold(trigs):
+def get_newsnr_sgveto_psdvar_scaled_threshold(trigs, threshold=2.0):
     """
     Calculate newsnr re-weighted by the sine-gaussian veto and scaled
     psd variation statistic. A further threshold is applied to the
@@ -285,9 +285,39 @@ def get_newsnr_sgveto_psdvar_scaled_threshold(trigs):
                  newsnr_sgveto_psdvar_scaled_threshold(
                      trigs['snr'][:], trigs['chisq'][:] / dof,
                      trigs['sg_chisq'][:],
-                     trigs['psd_var_val'][:])
+                     trigs['psd_var_val'][:], threshold=float(threshold))
     return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
 
+def get_newsnr_exp(trigs, chisq_cut=2.0, sg_chisq_cut=4.0):
+    """
+    Calculate newsnr re-weighted by the sine-gaussian veto and scaled
+    psd variation statistic. A further threshold is applied to the
+    reduced chisq.
+
+    Parameters
+    ----------
+    trigs: dict of numpy.ndarrays
+        Dictionary holding single detector trigger information.
+    'chisq_dof', 'snr', 'chisq' and 'psd_var_val' are required keys
+
+    Returns
+    -------
+     numpy.ndarray
+        Array of newsnr values
+    """
+    dof = 2. * trigs['chisq_dof'][:] - 2.
+    rchisq = trigs['chisq'][:] / dof
+    sg_chisq = trigs['sg_chisq'][:]
+
+    nsnr_sg_psdt = newsnr_sgveto_psdvar_scaled(
+                     trigs['snr'][:], rchisq,
+                     sg_chisq,
+                     trigs['psd_var_val'][:])
+
+    nsnr_sg_psdt[rchisq >= float(chisq_cut)] = 1
+    nsnr_sg_psdt[sg_chisq >= float(sg_chisq_cut)] = 1
+
+    return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
 
 sngls_ranking_function_dict = {
     'snr': get_snr,
@@ -298,6 +328,7 @@ sngls_ranking_function_dict = {
     'newsnr_sgveto_psdvar_threshold': get_newsnr_sgveto_psdvar_threshold,
     'newsnr_sgveto_psdvar_scaled': get_newsnr_sgveto_psdvar_scaled,
     'newsnr_sgveto_psdvar_scaled_threshold': get_newsnr_sgveto_psdvar_scaled_threshold,
+    'newsnr_exp': get_newsnr_exp,
 }
 
 
