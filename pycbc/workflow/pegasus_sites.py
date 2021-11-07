@@ -228,6 +228,11 @@ def add_site(sitecat, sitename, cp, out_dir=None):
     opt = 'pycbc|site-scratch'
     if cp.has_option(sec, opt):
         out_dir = os.path.abspath(cp.get(sec, opt))
+        if cp.has_option(sec, 'pycbc|unique-scratch'):
+            scratchdir = tempfile.mkdtemp(prefix='pycbc-tmp_', dir=out_dir)
+            os.chmod(scratchdir, 0o755)
+            os.symlink(submitdir, 'cpool-scratch-dir')
+            out_dir = scratchdir
     elif out_dir is None:
         out_dir = os.getcwd()
     local_url = urljoin('file://', pathname2url(out_dir))
