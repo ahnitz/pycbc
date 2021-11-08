@@ -507,7 +507,6 @@ class PyCBCInspiralExecutable(Executable):
             set_submit_subdir=False
         )
         self.cp = cp
-        self.set_memory(2000)
         self.injection_file = injection_file
         self.ext = '.hdf'
 
@@ -812,7 +811,6 @@ class PyCBCTmpltbankExecutable(Executable):
             tags = []
         super(PyCBCTmpltbankExecutable, self).__init__(cp, exe_name, 'vanilla', ifo, out_dir, tags=tags)
         self.cp = cp
-        self.set_memory(2000)
         self.write_psd = write_psd
         self.psd_files = psd_files
 
@@ -906,7 +904,6 @@ class LigolwAddExecutable(Executable):
     current_retention_level = Executable.INTERMEDIATE_PRODUCT
     def __init__(self, *args, **kwargs):
         super(LigolwAddExecutable, self).__init__(*args, **kwargs)
-        self.set_memory(2000)
 
     def create_node(self, jobSegment, input_files, output=None,
                     use_tmp_subdirs=True, tags=None):
