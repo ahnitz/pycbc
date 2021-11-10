@@ -233,9 +233,10 @@ def add_site(sitecat, sitename, cp, out_dir=None):
             scratchdir = tempfile.mkdtemp(prefix='pycbc-tmp_', dir=out_dir)
             os.chmod(scratchdir, 0o755)
             try:
-                os.symlink(scratchdir, 'cpool-scratch-dir')
+                os.symlink(scratchdir, '{}-scratch-dir'.format(sitename))
             except:
-                out_dir = scratchdir
+                pass
+            out_dir = scratchdir
     elif out_dir is None:
         out_dir = os.getcwd()
     local_url = urljoin('file://', pathname2url(out_dir))
