@@ -26,6 +26,8 @@ import numpy, lal, lalsimulation, pycbc.pnutils
 from pycbc.scheme import schemed
 from pycbc.types import FrequencySeries, Array, complex64, float32, zeros
 from pycbc.waveform.utils import ceilpow2
+from pycbc import MT_sun, MR_sun
+from astropy.constants import pc
 
 def findchirp_chirptime(m1, m2, fLower, porder):
     # variables used to compute chirp time
@@ -40,27 +42,27 @@ def findchirp_chirptime(m1, m2, fLower, porder):
         porder = 7
 
     if porder >= 7:
-        c7T = lal.PI * (14809.0 * eta * eta / 378.0 - 75703.0 * eta / 756.0 - 15419335.0 / 127008.0)
+        c7T = numpy.pi * (14809.0 * eta * eta / 378.0 - 75703.0 * eta / 756.0 - 15419335.0 / 127008.0)
 
     if porder >= 6:
-        c6T = lal.GAMMA * 6848.0 / 105.0 - 10052469856691.0 / 23471078400.0 +\
-            lal.PI * lal.PI * 128.0 / 3.0 + \
-            eta * (3147553127.0 / 3048192.0 - lal.PI * lal.PI * 451.0 / 12.0) -\
+        c6T = numpy.euler_gamma * 6848.0 / 105.0 - 10052469856691.0 / 23471078400.0 +\
+            numpy.pi * numpy.pi * 128.0 / 3.0 + \
+            eta * (3147553127.0 / 3048192.0 - numpy.pi * numpy.pi * 451.0 / 12.0) -\
             eta * eta * 15211.0 / 1728.0 + eta * eta * eta * 25565.0 / 1296.0 +\
             eta * eta * eta * 25565.0 / 1296.0 + numpy.log(4.0) * 6848.0 / 105.0
         c6LogT = 6848.0 / 105.0
 
     if porder >= 5:
-        c5T = 13.0 * lal.PI * eta / 3.0 - 7729.0 * lal.PI / 252.0
+        c5T = 13.0 * numpy.pi * eta / 3.0 - 7729.0 * numpy.pi / 252.0
 
     if porder >= 4:
         c4T = 3058673.0 / 508032.0 + eta * (5429.0 / 504.0 + eta * 617.0 / 72.0)
-        c3T = -32.0 * lal.PI / 5.0
+        c3T = -32.0 * numpy.pi / 5.0
         c2T = 743.0 / 252.0 + eta * 11.0 / 3.0
-        c0T = 5.0 * m * lal.MTSUN_SI / (256.0 * eta)
+        c0T = 5.0 * m * MT_sun.value / (256.0 * eta)
 
     # This is the PN parameter v evaluated at the lower freq. cutoff
-    xT = pow (lal.PI * m * lal.MTSUN_SI * fLower, 1.0 / 3.0)
+    xT = pow (numpy.pi * m * MT_sun.value * fLower, 1.0 / 3.0)
     x2T = xT * xT
     x3T = xT * x2T
     x4T = x2T * x2T
@@ -104,10 +106,10 @@ def spa_amplitude_factor(**kwds):
 
     M = m1 + m2
 
-    m_sec = M * lal.MTSUN_SI
-    piM = lal.PI * m_sec
+    m_sec = M * MT_sun.value
+    piM = numpy.pi * m_sec
 
-    amp0 = 4. * m1 * m2 / (1e6 * lal.PC_SI ) * lal.MRSUN_SI * lal.MTSUN_SI * sqrt(lal.PI/12.0)
+    amp0 = 4. * m1 * m2 / (1e6 * pc.value ) * MR_sun.value * MT_sun.value * sqrt(numpy.pi/12.0)
 
     fac = numpy.sqrt( -dETaN / FTaN) * amp0 * (piM ** (-7.0/6.0))
     return -fac
@@ -203,7 +205,7 @@ def spa_tmplt(**kwds):
     pfl5 = phasing.vlogv[5] / pfaN
     pfl6 = phasing.vlogv[6] / pfaN
 
-    piM = lal.PI * (mass1 + mass2) * lal.MTSUN_SI
+    piM = numpy.pi * (mass1 + mass2) * MT_sun.value
 
     if 'sample_points' not in kwds:
         f_lower = kwds['f_lower']
