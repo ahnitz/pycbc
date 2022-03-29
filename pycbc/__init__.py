@@ -34,6 +34,8 @@ import logging
 import random
 import string
 
+import astropy.constants as const
+
 try:
     # This will fail when pycbc is imported during the build process,
     # before version.py has been generated.
@@ -163,3 +165,7 @@ def gps_now():
     from astropy.time import Time
 
     return float(Time.now().gps)
+
+# Some common GW constant variations
+MT_sun = const.M_sun / const.c ** 3.0 * const.G
+MR_sun = const.M_sun / const.c ** 2.0 * const.G
