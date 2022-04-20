@@ -109,8 +109,8 @@ def _convert_liststring_to_list(lstring):
 
 
 def read_params_from_config(cp, prior_section='prior',
-                            vargs_section='variable_args',
-                            sargs_section='static_args'):
+                            vargs_section='variable_params',
+                            sargs_section='static_params'):
     """Loads static and variable parameters from a configuration file.
 
     Parameters
@@ -121,16 +121,16 @@ def read_params_from_config(cp, prior_section='prior',
         Check that priors exist in the given section. Default is 'prior.'
     vargs_section : str, optional
         The section to get the parameters that will be varied/need priors
-        defined for them. Default is 'variable_args'.
+        defined for them. Default is 'variable_params'.
     sargs_section : str, optional
         The section to get the parameters that will remain fixed. Default is
         'static_args'.
 
     Returns
     -------
-    variable_args : list
+    variable_params : list
         The names of the parameters to vary in the PE run.
-    static_args : dict
+    static_params : dict
         Dictionary of names -> values giving the parameters to keep fixed.
     """
     # sanity check that each parameter in [variable_args] has a priors section
