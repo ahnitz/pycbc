@@ -127,7 +127,7 @@ class Relative(BaseGaussianNoise, DistMarg):
         A dictionary of starting frequencies, in which the keys are the
         detector names and the values are the starting frequencies for the
         respective detectors to be used for computing inner products.
-    figucial_params : dict
+    fiducial_params : dict
         A dictionary of waveform parameters to be used for generating the
         fiducial waveform. Keys must be parameter names in the form
         'PARAM_ref' where PARAM is a recognized extrinsic parameter or
@@ -193,11 +193,12 @@ class Relative(BaseGaussianNoise, DistMarg):
         # make sure fid_param has ['mode_array'] which means one
         # needs to declare this in the model section
         if 'is_hom' in self.static_params:
-            logging.info("Extracting mode information")
             is_hom = self.static_params['is_hom']
             self._mode_ = int(self.fid_params['mode_array'])
             self._mode_m = self._mode_ % 10
             self._mode_l = int((self._mode_ % 100) / 10)
+            logging.info("Current submodel mode l=%s m=%s",
+                          self._mode_l, self._mode_m)
 
         for ifo in data:
             # store data and frequencies
@@ -209,13 +210,7 @@ class Relative(BaseGaussianNoise, DistMarg):
 
             # generate fiducial waveform
             f_lo = self.kmin[ifo] * self.df[ifo]
-
-            if is_hom:
-            # make sure the frequency of higher order mode follows
-            # f_{l,m} = self._mode_m * f_{2,2}
-                self.kmax[ifo] = int(self.kmax[ifo] * 2 / self._mode_m)
             f_hi = self.kmax[ifo] * self.df[ifo]
-
             logging.info(
                 "%s: Generating fiducial waveform from %s to %s Hz",
                 ifo, f_lo, f_hi,
@@ -226,7 +221,6 @@ class Relative(BaseGaussianNoise, DistMarg):
             fpoints = fpoints[self.kmin[ifo]:self.kmax[ifo]+1]
             fid_hp, fid_hc = get_fd_waveform_sequence(sample_points=fpoints,
                                                       **self.fid_params)
-
             # check for zeros at high frequencies
             # make sure only nonzero samples are included in bins
             numzeros = list(fid_hp[::-1] != 0j).index(True)
@@ -321,6 +315,10 @@ class Relative(BaseGaussianNoise, DistMarg):
         if earth_rotation is not False:
             logging.info("Enabling frequency-dependent earth rotation")
             from pycbc.waveform.spa_tmplt import spa_length_in_time
+
+            if is_hom:
+                # change if comparison is not wrt l = |m| = 2
+                fedges = fedges / self._mode_m * 2
 
             times = spa_length_in_time(
                 phase_order=-1,
