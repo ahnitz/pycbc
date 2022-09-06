@@ -1,0 +1,17 @@
+OMP_NUM_THREADS=1 pycbc_brute_bank \
+--verbose \
+--output-file lisa_a.hdf \
+--minimal-match 0.5 \
+--tolerance .05 \
+--buffer-length 1000000 \
+--sample-rate .1 \
+--approximant BBHX_PhenomD \
+--enable-sigma-bound \
+--tau0-threshold 100 \
+--tau0-crawl 200 \
+--tau0-start 0 \
+--tau0-end  200 \
+--psd-file  A_psd.txt \
+--input-config lisa_a_bank.ini \
+--seed 1 \
+--low-frequency-cutoff .00001
