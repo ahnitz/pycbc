@@ -14,7 +14,6 @@ OMP_NUM_THREADS=1 python -m cProfile -o log2 `which pycbc_inference_model_stats`
 --input-file reltime.hdf \
 --output-file reltime2.hdf \
 --nprocesses 2 \
---config-overrides model:marginalize_vector_samples:500 \
 --reconstruct-parameters \
 --force \
 --verbose
