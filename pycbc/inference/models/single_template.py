@@ -117,6 +117,8 @@ class SingleTemplate(DistMarg, BaseGaussianNoise):
         self.htfs = {}  # Waveform phase / distance transformation factors
         self.dts = {}
 
+        self.snr = {ifo: self.snr[ifo] for ifo in self.draw_ifos(self.snr)}
+
     @property
     def multi_signal_support(self):
         """ The list of classes that this model supports in a multi-signal

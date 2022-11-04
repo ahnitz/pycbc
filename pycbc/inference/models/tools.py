@@ -296,6 +296,25 @@ class DistMarg():
             # marginalizations.
             pass
 
+    def draw_ifos(self, snrs):
+        """ Helper utility to determine which ifos we should use based on the
+        reference SNR time series.
+        """
+        tcmin, tcmax = self.marginalized_vector_priors['tc'].bounds['tc']
+        ifos = list(snrs.keys())
+        keep_ifos = []
+        for ifo in ifos:
+            snr = snrs[ifo]
+            start = max(tcmin - EARTH_RADIUS, snr.start_time)
+            end = min(tcmax + EARTH_RADIUS, snr.end_time)
+            snr = snr.time_slice(start, end, mode='nearest')
+
+            if abs(snr).max() > 4.0:
+                keep_ifos.append(ifo)
+
+        logging.info("Ifos used for SNR based draws: %s", keep_ifos)
+        return keep_ifos
+
     def draw_times(self, snrs):
         """ Draw times consistent with the incoherent network SNR
 
@@ -377,7 +396,7 @@ class DistMarg():
         # precalculate dense sky grid and make dict and or array of the results
         if not hasattr(self, 'tinfo'):
             logging.info('pregenerating sky pointings')
-            size = int(1e7)
+            size = int(1e6)
             logging.info('drawing samples')
             ra = self.marginalized_vector_priors['ra'].rvs(size=size)['ra']
             dec = self.marginalized_vector_priors['dec'].rvs(size=size)['dec']
@@ -404,6 +423,9 @@ class DistMarg():
                     dmap[t] = []
                 dmap[t].append(v)
 
+            if len(ifos) == 1:
+                dmap[()] = list(zip(ra, dec, dtc))
+
             self.tinfo = ifos, dmap, d, tcmin, tcmax
 
         ifos, dmap, d, tcmin, tcmax = self.tinfo
@@ -423,7 +445,7 @@ class DistMarg():
 
             w = snr.squared_norm().numpy() / 2.0
             i = draw_sample(w, size=self.vsamples)
-
+            #print(ifo, w.max(), i)
             if sref is not None:
                 mcweight -= w[i]
                 delt = float(snr.start_time - sref.start_time)
