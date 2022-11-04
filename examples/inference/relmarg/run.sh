@@ -1,6 +1,6 @@
 OMP_NUM_THREADS=1 python -m cProfile -o log `which pycbc_inference` \
 --config-file `dirname "$0"`/reltime.ini \
---nprocesses=2 \
+--nprocesses=1 \
 --output-file reltime.hdf \
 --seed 0 \
 --force \
@@ -13,7 +13,7 @@ bash p.sh
 OMP_NUM_THREADS=1 python -m cProfile -o log2 `which pycbc_inference_model_stats` \
 --input-file reltime.hdf \
 --output-file reltime2.hdf \
---nprocesses 2 \
+--nprocesses 8 \
 --reconstruct-parameters \
 --force \
 --verbose
@@ -21,5 +21,7 @@ OMP_NUM_THREADS=1 python -m cProfile -o log2 `which pycbc_inference_model_stats`
 pycbc_inference_plot_posterior \
 --input-file reltime2.hdf \
 --output-file reltime.png \
---parameters distance inclination polarization coa_phase tc ra dec mchirp eta spin \
+--parameters distance inclination polarization coa_phase tc ra dec mchirp eta \
 --z-arg snr
+
+#pycbc_inference_plot_posterior --input-file reltime.hdf --output-file reltime.png --parameters distance inclination polarization coa_phase tc ra dec --z-arg snr

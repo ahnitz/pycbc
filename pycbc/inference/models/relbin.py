@@ -40,7 +40,8 @@ from .gaussian_noise import BaseGaussianNoise
 from .relbin_cpu import (likelihood_parts, likelihood_parts_v,
                          likelihood_parts_multi, likelihood_parts_multi_v,
                          likelihood_parts_det, likelihood_parts_vector,
-                         likelihood_parts_vectorp, snr_predictor)
+                         likelihood_parts_vectorp, snr_predictor,
+                         snr_predictor_dom)
 from .tools import DistMarg, EARTH_RADIUS
 
 
@@ -607,7 +608,7 @@ class RelativeTime(Relative):
         tcmin, tcmax = self.marginalized_vector_priors['tc'].bounds['tc']
         tstart = tcmin - EARTH_RADIUS
         tmax = tcmax - tcmin + EARTH_RADIUS * 2.0
-        print(tstart, tmax)
+
         num_samples = int(tmax * self.sample_rate)
         self.tstart = {ifo: tstart for ifo in self.data}
         self.num_samples = {ifo: num_samples for ifo in self.data}
@@ -705,7 +706,6 @@ class RelativeTime(Relative):
         lik = self.likelihood_function
         norm = 0.0
         filt = 0j
-        self._current_wf_parts = {}
 
         self.snr_draw(self.snr(wfs))
         p = self.current_params
@@ -728,8 +728,93 @@ class RelativeTime(Relative):
                                         hp, hc, h00,
                                         sdat['a0'], sdat['a1'],
                                         sdat['b0'], sdat['b1'])
-            self._current_wf_parts[ifo] = (fp, fc, dtc, hp, hc, h00)
             filt += filter_i
             norm += norm_i
         loglr = self.marginalize_loglr(filt, norm)
+        return loglr
+
+class RelativeTimeDom(RelativeTime):
+    """ Heterodyne likelihood optimized for time marginalization
+    """
+    name = "relative_time_dom"
+
+    def snr(self, wfs, reference=False):
+        """ Return hp/hc maximized SNR time series
+        """
+        delta_t = 1.0 / self.sample_rate
+        snrs = {}
+        self.sh = {}
+        self.hh = {}
+        for ifo in wfs:
+            sdat = self.sdat[ifo]
+            dtc = self.tstart[ifo] - self.end_time[ifo]
+
+            if reference:
+                dtc -= self.ta[ifo]
+
+            sh, hh = snr_predictor_dom(self.fedges[ifo],
+                        dtc - delta_t * 2.0, delta_t,
+                        self.num_samples[ifo] + 4,
+                        wfs[ifo][0],
+                        self.h00_sparse[ifo],
+                        sdat['a0'], sdat['a1'],
+                        sdat['b0'], sdat['b1'])
+            snr = TimeSeries(abs(sh[2:-2]) / hh ** 0.5, delta_t=delta_t,
+                                   epoch=self.tstart[ifo])
+            self.sh[ifo] = TimeSeries(sh, delta_t=delta_t,
+                                   epoch=self.tstart[ifo] - delta_t * 2.0)
+            self.hh[ifo] = hh
+            snrs[ifo] = snr
+
+        return snrs
+
+    def _loglr(self):
+        r"""Computes the log likelihood ratio,
+
+        .. math::
+
+            \log \mathcal{L}(\Theta) = \sum_i
+                \left<h_i(\Theta)|d_i\right> -
+                \frac{1}{2}\left<h_i(\Theta)|h_i(\Theta)\right>,
+
+        at the current parameter values :math:`\Theta`.
+
+        Returns
+        -------
+        float
+            The value of the log likelihood ratio.
+        """
+        # calculate <d-h|d-h> = <h|h> - 2<h|d> + <d|d> up to a constant
+        p = self.current_params
+
+        p2 = p.copy()
+        p2.pop('inclination')
+        wfs = self.get_waveforms(p2)
+        snrs = self.snr(wfs)
+
+        sh_total = hh_total = 0
+
+        ic = numpy.cos(p['inclination'])
+        ip = 0.5 * (1.0 + ic * ic)
+        pol_phase = numpy.exp(-2.0j * p['polarization'])
+
+        self.snr_draw(snrs)
+
+        for ifo in self.sh:
+            dt = self.det[ifo].time_delay_from_earth_center(p['ra'], p['dec'],
+                                                            p['tc'])
+            dts = p['tc'] + dt
+
+            fp, fc = self.det[ifo].antenna_pattern(p['ra'], p['dec'],
+                                                   0, p['tc'])
+            f = (fp + 1.0j * fc) * pol_phase
+
+            # Note, this includes complex conjugation already
+            # as our stored inner products were hp* x data
+            htf = (f.real * ip + 1.0j * f.imag * ic)
+            sh = self.sh[ifo].at_time(dts, interpolate='quadratic')
+            sh_total += sh * htf
+            hh_total += self.hh[ifo] * abs(htf) ** 2.0
+
+        loglr = self.marginalize_loglr(sh_total, hh_total)
         return loglr
