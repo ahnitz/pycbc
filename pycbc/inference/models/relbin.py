@@ -630,7 +630,7 @@ class RelativeTime(Relative):
         if not hasattr(self, '_ref_snr'):
             wfs = {ifo: (self.h00_sparse[ifo],
                          self.h00_sparse[ifo]) for ifo in self.h00_sparse}
-            self._ref_snr = self.get_snr(wfs, reference=True)
+            self._ref_snr = self.get_snr(wfs)
         return self._ref_snr
 
     def get_snr(self, wfs):
@@ -676,7 +676,7 @@ class RelativeTime(Relative):
         norm = 0.0
         filt = 0j
 
-        self.snr_draw(self.get_snr(wfs))
+        self.snr_draw(wfs)
         p = self.current_params
 
         for ifo in self.data:
@@ -759,15 +759,13 @@ class RelativeTimeDom(RelativeTime):
         p2 = p.copy()
         p2.pop('inclination')
         wfs = self.get_waveforms(p2)
-        snrs = self.get_snr(wfs)
-
+        
         sh_total = hh_total = 0
-
         ic = numpy.cos(p['inclination'])
         ip = 0.5 * (1.0 + ic * ic)
         pol_phase = numpy.exp(-2.0j * p['polarization'])
 
-        self.snr_draw(snrs)
+        self.snr_draw(wfs)
 
         for ifo in self.sh:
             if self.precalc_antenna_factors:
