@@ -25,6 +25,19 @@ class RefineSampler(DummySampler):
     ----------
     model : Model
         An instance of a model from ``pycbc.inference.models``.
+    num_samples: int
+        The number of samples to draw from the kde at the conclusion
+    iterative_kde_samples: int
+        The number of samples to add to the kde during each iterations
+    min_refinement_steps: int
+        The minimum number of iterations to take.
+    max_refinement_steps: The maximum number of refinment steps to take.
+    entropy: float
+        The target entropy between iterative kdes
+    dlogz: float
+        The target evidence difference between iterative kde updates
+    kde: kde
+        The inital kde to use.
     """
     name = 'refine'
 
@@ -41,7 +54,7 @@ class RefineSampler(DummySampler):
 
         self.model = model
         self.kde = kde
-        self.vparams = model.variable_params
+        self.vparam = model.variable_params
         models._global_instance = model
         self.num_samples = int(num_samples)
         self.pool = choose_pool(mpi=use_mpi, processes=nprocesses)
@@ -50,26 +63,29 @@ class RefineSampler(DummySampler):
         self.num_samples = int(num_samples)
         self.iterative_kde_samples = int(iterative_kde_samples)
         self.min_refinement_steps = int(min_refinement_steps)
-        self.max_refinment_steps = int(max_refinement_steps)
+        self.max_refinement_steps = int(max_refinement_steps)
         self.entropy = float(entropy)
         self.dlogz_target = float(dlogz)
 
-    def draw_samples(self, kde, size):
+    def draw_samples(self, size):
         """Draw new samples within the model priors"""
-        ksamples = kde.resample(size=size)
+        ksamples = self.kde.resample(size=size)
         params = {k:ksamples[i,:] for i, k in enumerate(self.vparam)}
         keep = self.model.prior_distribution.contains(params)
         return ksamples[:, keep]
         
-    def compare_kde(self, kde1, kde2, size=int(1e4)):
+    @staticmethod
+    def compare_kde(kde1, kde2, size=int(1e4)):
         s = kde1.resample(size=size)
         return sentropy(kde1.pdf(s), kde2.pdf(s))
 
-    def converged(self, kde_new, factor):     
+    def converged(self, step, kde_new, factor):   
+        """ Check that kde is converged by comparing to previous iteration
+        """  
         if not hasattr(self, 'old_logz'):
             self.old_logz =  numpy.inf
         
-        entropy_diff = compare_kde(self.kde, kde_new)
+        entropy_diff = self.compare_kde(self.kde, kde_new)
         
         # Compare how the logz changes when adding new samples
         # this is guaranteed to decrease as old samples included
@@ -84,7 +100,9 @@ class RefineSampler(DummySampler):
         logz3 = logsumexp(choice3) - numpy.log(len(choice3))
         dlogz2 = logz3 - logz2
         
-        if (entropy_diff < self.entropy and r >= self.min_refinement_steps
+        logging.info('%s: Checking convergence: dlogz_iter=%.4f, dlogz_half=%.4f, entropy=%.4f',
+                     step,  dlogz, dlogz2, entropy_diff)
+        if (entropy_diff < self.entropy and step >= self.min_refinement_steps
             and max(abs(dlogz), abs(dlogz2)) < self.dlogz_target):
             return True
         else:
@@ -117,13 +135,15 @@ class RefineSampler(DummySampler):
         self.kde = gaussian_kde(ksamples)                
 
     def run(self):
+        """ Iterative sample from kde and update based on likelihood values
+        """
         total_samples = None
         total_logp = None
         total_logw = None
         total_logl = None
 
         for r in range(self.max_refinement_steps):
-            ksamples = draw_samples(kde, self.iterative_kde_samples)
+            ksamples = self.draw_samples(self.iterative_kde_samples)
 
             # Calculate likelihood for each samples
             logp = []
@@ -136,7 +156,7 @@ class RefineSampler(DummySampler):
 
             logp = numpy.array(logp)
             logl = numpy.array(logl)
-            logw = logp - kde.logpdf(ksamples)    
+            logw = logp - self.kde.logpdf(ksamples)    
             
             if total_samples is not None:
                 total_samples = numpy.concatenate([total_samples, ksamples], axis=1)
@@ -152,13 +172,11 @@ class RefineSampler(DummySampler):
             ntotal_logw = total_logw - logsumexp(total_logw)
             kde_new = gaussian_kde(total_samples, weights=numpy.exp(ntotal_logw))
             
-            if self.converged(kde_new, total_logl + total_logw):
+            if self.converged(r, kde_new, total_logl + total_logw):
                 break
             
-            kde = kde_new
+            self.kde = kde_new
             
-        ksamples = draw_samples(kde, self.num_samples)
-        self._samples = {k: ksamples[k] for k in self.self.vparam}
-        
-        
-        
+        ksamples = self.draw_samples(self.num_samples)
+        self._samples = {k: ksamples[k] for k in self.vparam}
+
