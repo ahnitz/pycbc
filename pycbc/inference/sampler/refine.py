@@ -178,5 +178,5 @@ class RefineSampler(DummySampler):
             self.kde = kde_new
             
         ksamples = self.draw_samples(self.num_samples)
-        self._samples = {k: ksamples[k] for k in self.vparam}
+        self._samples = {k: ksamples[j,:] for j, k in enumerate(self.vparam)}
 
