@@ -179,4 +179,3 @@ class RefineSampler(DummySampler):
             
         ksamples = self.draw_samples(self.num_samples)
         self._samples = {k: ksamples[j,:] for j, k in enumerate(self.vparam)}
-
