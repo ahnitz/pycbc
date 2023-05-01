@@ -168,7 +168,7 @@ class RefineSampler(DummySampler):
         self.kde = gaussian_kde(ksamples)
 
     def run_samples(self, ksamples):
-        # Calculate likelihood for each samples
+        # Calculate likelihood for each sample
         args = []
         for i in range(len(ksamples[0])):
             param = {k: ksamples[j][i] for j, k in enumerate(self.vparam)}

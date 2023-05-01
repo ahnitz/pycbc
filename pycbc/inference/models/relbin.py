@@ -836,7 +836,14 @@ class RelativeTimeDom(RelativeTime):
             # as our stored inner products were hp* x data
             htf = (f.real * ip + 1.0j * f.imag * ic)
 
-            sh = self.sh[ifo].at_time(dts, interpolate='quadratic')
+            try:
+                sh = self.sh[ifo].at_time(dts, interpolate='quadratic')
+            except:
+                if numpy.isscalar(dts):
+                    return -numpy.inf
+                else:
+                    return -numpy.inf * numpy.ones(len(dts))
+            
             sh_total += sh * htf
             hh_total += self.hh[ifo] * abs(htf) ** 2.0
 
