@@ -567,7 +567,7 @@ class Relative(DistMarg, BaseGaussianNoise):
                                            sdat['a0'], sdat['a1'],
                                            sdat['b0'], sdat['b1'])
                     self._current_wf_parts[ifo] = (fp, fc, dtc, hp, hc, h00)
-                
+
             filt += filter_i
             norm += norm_i
         loglr = self.marginalize_loglr(filt, norm)
@@ -836,14 +836,7 @@ class RelativeTimeDom(RelativeTime):
             # as our stored inner products were hp* x data
             htf = (f.real * ip + 1.0j * f.imag * ic)
 
-            try:
-                sh = self.sh[ifo].at_time(dts, interpolate='quadratic')
-            except:
-                if numpy.isscalar(dts):
-                    return -numpy.inf
-                else:
-                    return -numpy.inf * numpy.ones(len(dts))
-            
+            sh = self.sh[ifo].at_time(dts, interpolate='quadratic', extrapolate=0)
             sh_total += sh * htf
             hh_total += self.hh[ifo] * abs(htf) ** 2.0
 
