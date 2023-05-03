@@ -267,10 +267,13 @@ class TimeSeries(Array):
                 fill_value = extrapolate
                 facl = facr = 0
                 if interpolate == 'quadratic':
-                    facl = facr = 1
+                    facl = facr = 1.1
                 elif interpolate == 'linear':
-                    facl, facr = 0, 1
-                keep_idx = _numpy.where((vtime >= self.start_time + self.delta_t * facl) & (vtime <= self.end_time - self.delta_t * facr))[0]
+                    facl, facr = 0.1, 1.1
+
+                left = (vtime >= self.start_time + self.delta_t * facl)
+                right = (vtime < self.end_time - self.delta_t * facr)
+                keep_idx = _numpy.where(left & right)[0]
                 vtime = vtime[keep_idx]
             else:
                 raise ValueError("Unsuported extrapolate: %s", extrapolate)
@@ -299,7 +302,6 @@ class TimeSeries(Array):
             ans = _numpy.zeros(size) + fill_value
             ans[keep_idx] = old
             ans = _numpy.array(ans, ndmin=1)
-            print(len(vtime))
 
         if _numpy.isscalar(time):
             return  ans[0]
