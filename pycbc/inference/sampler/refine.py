@@ -75,7 +75,8 @@ class RefineSampler(DummySampler):
                  iterative_kde_samples=int(1e3),
                  min_refinement_steps=5,
                  max_refinement_steps=40,
-                 entropy=0.001,
+                 offbase_fraction=0.7,
+                 entropy=0.01,
                  dlogz=0.01,
                  kde=None,
                  **kwargs):
@@ -93,6 +94,7 @@ class RefineSampler(DummySampler):
         self.iterative_kde_samples = int(iterative_kde_samples)
         self.min_refinement_steps = int(min_refinement_steps)
         self.max_refinement_steps = int(max_refinement_steps)
+        self.offbase_fraction = float(offbase_fraction)
         self.entropy = float(entropy)
         self.dlogz_target = float(dlogz)
 
@@ -103,6 +105,7 @@ class RefineSampler(DummySampler):
         params = {k: ksamples[i, :] for i, k in enumerate(self.vparam)}
         logging.info('checking prior')
         keep = self.model.prior_distribution.contains(params)
+        logging.info('done checking')
         return ksamples[:, keep]
 
     @staticmethod
@@ -112,9 +115,10 @@ class RefineSampler(DummySampler):
         s = kde1.resample(size=size)
         return sentropy(kde1.pdf(s), kde2.pdf(s))
 
-    def converged(self, step, kde_new, factor):
+    def converged(self, step, kde_new, factor, logw):
         """ Check that kde is converged by comparing to previous iteration
         """
+        logging.info('checking convergence')
         if not hasattr(self, 'old_logz'):
             self.old_logz = numpy.inf
 
@@ -133,11 +137,16 @@ class RefineSampler(DummySampler):
         logz3 = logsumexp(choice3) - numpy.log(len(choice3))
         dlogz2 = logz3 - logz2
 
-        logging.info('%s: Checking convergence: dlogz_iter=%.4f,'
-                     'dlogz_half=%.4f, entropy=%.4f',
-                     step,  dlogz, dlogz2, entropy_diff)
+        # If kde matches posterior, the weights should be uniform
+        # check fraction that are significant deviation from peak
+        frac_offbase = (logw < logw.max() - 4.0).sum() / len(logw)
+
+        logging.info('%s: dlogz_iter=%.4f,'
+                     'dlogz_half=%.4f, entropy=%.4f offbase fraction=%.4f',
+                     step,  dlogz, dlogz2, entropy_diff, frac_offbase)
         if (entropy_diff < self.entropy and step >= self.min_refinement_steps
-            and max(abs(dlogz), abs(dlogz2)) < self.dlogz_target):
+            and max(abs(dlogz), abs(dlogz2)) < self.dlogz_target, 
+            and frac_offbase < self.offbase_fraction):
             return True
         else:
             return False
@@ -176,12 +185,15 @@ class RefineSampler(DummySampler):
         """ Calculate the likelihoods and weights for a set of samples
         """
         # Calculate likelihood for each sample
+        logging.info('calculating likelihoods...')
         args = []
         for i in range(len(ksamples[0])):
             param = {k: ksamples[j][i] for j, k in enumerate(self.vparam)}
             args.append(param)
 
         result = self.pool.map(call_model, args)
+        logging.info('..done with likelihood')
+
         logp = numpy.array([r[0] for r in result])
         logl = numpy.array([r[1] for r in result])
         logw = logp - numpy.log(self.kde.pdf(ksamples))
@@ -200,12 +212,9 @@ class RefineSampler(DummySampler):
         total_logl = None
 
         for r in range(self.max_refinement_steps):
-            logging.info('calculating likelihoods...')
             ksamples = self.draw_samples(self.iterative_kde_samples)
             ksamples, logp, logl, logw = self.run_samples(ksamples)
-
-            logging.info('..done')
-
+            
             if total_samples is not None:
                 total_samples = numpy.concatenate([total_samples,
                                                    ksamples], axis=1)
@@ -223,7 +232,7 @@ class RefineSampler(DummySampler):
             kde_new = gaussian_kde(total_samples,
                                    weights=numpy.exp(ntotal_logw))
             logging.info('done')
-            if self.converged(r, kde_new, total_logl + total_logw):
+            if self.converged(r, kde_new, total_logl + total_logw, logw):
                 break
 
             self.kde = kde_new
