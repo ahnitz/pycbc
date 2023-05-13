@@ -122,7 +122,9 @@ class RefineSampler(DummySampler):
         if not hasattr(self, 'old_logz'):
             self.old_logz = numpy.inf
 
-        entropy_diff = self.compare_kde(self.kde, kde_new)
+        entropy_diff = -1
+        if self.entropy < 1:
+            entropy_diff = self.compare_kde(self.kde, kde_new)
 
         # Compare how the logz changes when adding new samples
         # this is guaranteed to decrease as old samples included
@@ -145,7 +147,7 @@ class RefineSampler(DummySampler):
                      'dlogz_half=%.4f, entropy=%.4f offbase fraction=%.4f',
                      step,  dlogz, dlogz2, entropy_diff, frac_offbase)
         if (entropy_diff < self.entropy and step >= self.min_refinement_steps
-            and max(abs(dlogz), abs(dlogz2)) < self.dlogz_target, 
+            and max(abs(dlogz), abs(dlogz2)) < self.dlogz_target
             and frac_offbase < self.offbase_fraction):
             return True
         else:
@@ -231,7 +233,7 @@ class RefineSampler(DummySampler):
             ntotal_logw = total_logw - logsumexp(total_logw)
             kde_new = gaussian_kde(total_samples,
                                    weights=numpy.exp(ntotal_logw))
-            logging.info('done')
+                                   
             if self.converged(r, kde_new, total_logl + total_logw, logw):
                 break
 
