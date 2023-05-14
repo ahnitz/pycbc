@@ -223,6 +223,8 @@ def add_plot_posterior_option_group(parser):
                         default=False,
                         help="In the case of multiple injections, pick one"
                              " for plotting based on its proximity in time.")
+    pgroup.add_argument('--injection-group', default=None, type=str,
+                        help="HDF group find the injection data")
     add_injsamples_map_opt(pgroup)
     return pgroup
 

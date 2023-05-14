@@ -528,7 +528,8 @@ class MultiSignalModel(HierarchicalModel):
     name = 'multi_signal'
 
     def __init__(self, variable_params, submodels, **kwargs):
-        super().__init__(variable_params, submodels, **kwargs)
+        super().__init__(variable_params, submodels,
+                         **kwargs)
 
         # Check what models each model supports
         support = {}
