@@ -79,6 +79,7 @@ class RefineSampler(DummySampler):
                  entropy=0.01,
                  dlogz=0.01,
                  kde=None,
+                 update_groups=None,
                  **kwargs):
         super().__init__(model, *args)
 
@@ -98,15 +99,36 @@ class RefineSampler(DummySampler):
         self.entropy = float(entropy)
         self.dlogz_target = float(dlogz)
 
-    def draw_samples(self, size):
+        self.param_groups = []
+        if update_groups is None:
+            self.param_groups.append(self.vparam)
+        else:
+            for gname in update_groups.split():
+                gvalue = kwargs[gname]
+                if gvalue == 'all':
+                    self.param_groups.append(self.vparam)
+                else:
+                    self.param_groups.append(gvalue.split())
+
+    def draw_samples(self, size, update_params=None):
         """Draw new samples within the model priors"""
         logging.info('getting from kde')
+
+        params = {}
         ksamples = self.kde.resample(size=size)
-        params = {k: ksamples[i, :] for i, k in enumerate(self.vparam)}
+        j = 0
+        for i, k in enumerate(self.vparam):
+            if update_params is not None and k not in update_params:
+                params[k] = numpy.ones(size) * self.fixed_samples[i]
+            else:
+                params[k] = ksamples[j, :]
+                j += 1
+
         logging.info('checking prior')
         keep = self.model.prior_distribution.contains(params)
         logging.info('done checking')
-        return ksamples[:, keep]
+        r = numpy.array([params[k][keep] for k in self.vparam])
+        return r
 
     @staticmethod
     def compare_kde(kde1, kde2, size=int(1e4)):
@@ -183,7 +205,7 @@ class RefineSampler(DummySampler):
         ksamples = numpy.array([samples[v] for v in self.vparam])
         self.kde = gaussian_kde(ksamples)
 
-    def run_samples(self, ksamples):
+    def run_samples(self, ksamples, update_params=None):
         """ Calculate the likelihoods and weights for a set of samples
         """
         # Calculate likelihood for each sample
@@ -198,7 +220,14 @@ class RefineSampler(DummySampler):
 
         logp = numpy.array([r[0] for r in result])
         logl = numpy.array([r[1] for r in result])
-        logw = logp - numpy.log(self.kde.pdf(ksamples))
+
+
+        if update_params is not None:
+            ksamples = numpy.array([ksamples[i, :]
+                                    for i, k in enumerate(self.vparam)
+                                    if k in update_params])
+
+        logw = logp  - numpy.log(self.kde.pdf(ksamples))
 
         k = logp != - numpy.inf
         ksamples = ksamples[:, k]
@@ -208,36 +237,61 @@ class RefineSampler(DummySampler):
     def run(self):
         """ Iterative sample from kde and update based on likelihood values
         """
-        total_samples = None
-        total_logp = None
-        total_logw = None
-        total_logl = None
+        self.group_kde = self.kde
+        for param_group in self.param_groups:
+            total_samples = None
+            total_logp = None
+            total_logw = None
+            total_logl = None
 
-        for r in range(self.max_refinement_steps):
-            ksamples = self.draw_samples(self.iterative_kde_samples)
-            ksamples, logp, logl, logw = self.run_samples(ksamples)
-            
-            if total_samples is not None:
-                total_samples = numpy.concatenate([total_samples,
-                                                   ksamples], axis=1)
-                total_logp = numpy.concatenate([total_logp, logp])
-                total_logw = numpy.concatenate([total_logw, logw])
-                total_logl = numpy.concatenate([total_logl, logl])
-            else:
-                total_samples = ksamples
-                total_logp = logp
-                total_logw = logw
-                total_logl = logl
+            gsample = self.group_kde.resample(int(1e5))
+            gsample = [gsample[i, :] for i, k in enumerate(self.vparam) if k in param_group]
+            self.kde = gaussian_kde(numpy.array(gsample))
+            self.fixed_samples = self.group_kde.resample(1)
 
-            logging.info('setting up next kde iteration..')
-            ntotal_logw = total_logw - logsumexp(total_logw)
-            kde_new = gaussian_kde(total_samples,
-                                   weights=numpy.exp(ntotal_logw))
-                                   
-            if self.converged(r, kde_new, total_logl + total_logw, logw):
-                break
+            logging.info('updating: %s', param_group)
+            for r in range(self.max_refinement_steps):
+                ksamples = self.draw_samples(self.iterative_kde_samples,
+                                             update_params=param_group)
+                ksamples, logp, logl, logw = self.run_samples(ksamples,
+                                             update_params=param_group)
 
-            self.kde = kde_new
+                for i, nm in enumerate(param_group):
+                    print(nm, numpy.median(ksamples[i, :]), numpy.std(ksamples[i, :]))
+
+                if total_samples is not None:
+                    total_samples = numpy.concatenate([total_samples,
+                                                       ksamples], axis=1)
+                    total_logp = numpy.concatenate([total_logp, logp])
+                    total_logw = numpy.concatenate([total_logw, logw])
+                    total_logl = numpy.concatenate([total_logl, logl])
+                else:
+                    total_samples = ksamples
+                    total_logp = logp
+                    total_logw = logw
+                    total_logl = logl
+
+                logging.info('setting up next kde iteration..')
+                ntotal_logw = total_logw - logsumexp(total_logw)
+                kde_new = gaussian_kde(total_samples,
+                                       weights=numpy.exp(ntotal_logw))
+
+                if self.converged(r, kde_new, total_logl + total_logw, logw):
+                    break
+
+                self.kde = kde_new
+
+            full_samples = []
+            gsample = self.group_kde.resample(len(total_samples[0]))
+            i = 0
+            for j, k in enumerate(self.vparam):
+                if k in param_group:
+                    full_samples.append(total_samples[i])
+                    i += 1
+                else:
+                    full_samples.append(gsample[j])
+
+            self.group_kde = gaussian_kde(numpy.array(full_samples))
 
         logging.info('Drawing final samples')
         ksamples = self.draw_samples(self.num_samples)
