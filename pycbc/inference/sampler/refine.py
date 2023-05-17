@@ -30,6 +30,7 @@ def resample_equal(samples, logwt, seed=0):
     idx = numpy.zeros(N, dtype=int)
     cumulative_sum = numpy.cumsum(weights)
     cumulative_sum /= cumulative_sum[-1]
+    print('resample', N, positions[-1], cumulative_sum[-1])
     i, j = 0, 0
     while i < N:
         if positions[i] < cumulative_sum[j]:
@@ -80,6 +81,7 @@ class RefineSampler(DummySampler):
                  dlogz=0.01,
                  kde=None,
                  update_groups=None,
+                 max_kde_samples=int(5e4),
                  **kwargs):
         super().__init__(model, *args)
 
@@ -93,6 +95,7 @@ class RefineSampler(DummySampler):
 
         self.num_samples = int(num_samples)
         self.iterative_kde_samples = int(iterative_kde_samples)
+        self.max_kde_samples = int(max_kde_samples)
         self.min_refinement_steps = int(min_refinement_steps)
         self.max_refinement_steps = int(max_refinement_steps)
         self.offbase_fraction = float(offbase_fraction)
@@ -137,7 +140,7 @@ class RefineSampler(DummySampler):
         s = kde1.resample(size=size)
         return sentropy(kde1.pdf(s), kde2.pdf(s))
 
-    def converged(self, step, kde_new, factor, logw):
+    def converged(self, step, kde_new, factor, logp):
         """ Check that kde is converged by comparing to previous iteration
         """
         logging.info('checking convergence')
@@ -163,7 +166,7 @@ class RefineSampler(DummySampler):
 
         # If kde matches posterior, the weights should be uniform
         # check fraction that are significant deviation from peak
-        frac_offbase = (logw < logw.max() - 4.0).sum() / len(logw)
+        frac_offbase = (logp < logp.max() - 5.0).sum() / len(logp)
 
         logging.info('%s: dlogz_iter=%.4f,'
                      'dlogz_half=%.4f, entropy=%.4f offbase fraction=%.4f',
@@ -205,7 +208,7 @@ class RefineSampler(DummySampler):
         ksamples = numpy.array([samples[v] for v in self.vparam])
         self.kde = gaussian_kde(ksamples)
 
-    def run_samples(self, ksamples, update_params=None):
+    def run_samples(self, ksamples, update_params=None, iteration=False):
         """ Calculate the likelihoods and weights for a set of samples
         """
         # Calculate likelihood for each sample
@@ -227,7 +230,29 @@ class RefineSampler(DummySampler):
                                     for i, k in enumerate(self.vparam)
                                     if k in update_params])
 
-        logw = logp  - numpy.log(self.kde.pdf(ksamples))
+        # Weights for iteration
+        if iteration:
+            logw = logp  - numpy.log(self.kde.pdf(ksamples))
+            logw = logw - logsumexp(logw)
+            
+            # To avoid single samples dominating the weighting kde before
+            # we will put a cap on the minimum and maximum logw
+
+            sort = logw.argsort()
+            
+            cap = logw[sort[-len(sort)//5]]
+            low = logw[sort[len(sort)//5]]
+            print(low, cap, logw[sort[-1]])
+            logw[logw > cap] = cap
+            logw[logw < low] = low
+           
+        
+        else:
+            # Weights for monte-carlo selection
+            logw = logp  - numpy.log(self.kde.pdf(ksamples))
+            logw = logw - logsumexp(logw)
+            
+            print(logw.min(), logw.max())
 
         k = logp != - numpy.inf
         ksamples = ksamples[:, k]
@@ -254,7 +279,8 @@ class RefineSampler(DummySampler):
                 ksamples = self.draw_samples(self.iterative_kde_samples,
                                              update_params=param_group)
                 ksamples, logp, logl, logw = self.run_samples(ksamples,
-                                             update_params=param_group)
+                                             update_params=param_group,
+                                             iteration=True)
 
                 for i, nm in enumerate(param_group):
                     print(nm, numpy.median(ksamples[i, :]), numpy.std(ksamples[i, :]))
@@ -272,11 +298,25 @@ class RefineSampler(DummySampler):
                     total_logl = logl
 
                 logging.info('setting up next kde iteration..')
+                #print(len(total_logp), self.max_kde_samples)
+                #if len(total_logp) > self.max_kde_samples:
+                #    samp = {k: total_samples[j,:] for j, k in enumerate(self.vparam) if k in param_group}
+                #    samp['logp'] = total_logp
+                #    samp['logl'] = total_logl
+                #    samp['logw'] = total_logw
+                #    samp = resample_equal(samp, total_logw)
+                #    total_samples = [samp[k] for k in self.vparam if k in param_group]
+                #    total_samples = numpy.array(total_samples)[:,:self.max_kde_samples]
+                #    total_logp = samp['logp'][:self.max_kde_samples]
+                #    total_logw = samp['logw'][:self.max_kde_samples]
+                #    total_logl = samp['logl'][:self.max_kde_samples]
+                #    print(total_logp.min(), total_logp.max())
+
                 ntotal_logw = total_logw - logsumexp(total_logw)
                 kde_new = gaussian_kde(total_samples,
                                        weights=numpy.exp(ntotal_logw))
 
-                if self.converged(r, kde_new, total_logl + total_logw, logw):
+                if self.converged(r, kde_new, total_logl + total_logw, logp):
                     break
 
                 self.kde = kde_new
@@ -300,4 +340,7 @@ class RefineSampler(DummySampler):
         self._samples = {k: ksamples[j,:] for j, k in enumerate(self.vparam)}
         self._samples['loglikelihood'] = logl
         logging.info("Reweighting to equal samples")
+        
+        
+        
         self._samples = resample_equal(self._samples, logw)
