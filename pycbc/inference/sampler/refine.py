@@ -192,21 +192,30 @@ class RefineSampler(DummySampler):
     def set_start_from_config(self, cp):
         """Sets the initial state of the sampler from config file
         """
+        num_samples = self.iterative_kde_samples
         if cp.has_option('sampler', 'start-file'):
             start_file = cp.get('sampler', 'start-file')
             logging.info("Using file %s for initial positions", start_file)
-            samples = loadfile(start_file, 'r').read_samples(self.vparam)
+            f = loadfile(start_file, 'r')
+            fsamples = f.read_samples(f['samples'].keys())
+            num_samples = len(fsamples)
+            
+        init_prior = initial_dist_from_config(
+            cp, self.model.variable_params, self.model.static_params)
+        if init_prior is not None:
+            samples = init_prior.rvs(size=num_samples)
         else:
-            init_prior = initial_dist_from_config(
-                cp, self.model.variable_params, self.model.static_params)
-            if init_prior is not None:
-                samples = init_prior.rvs(size=self.iterative_kde_samples)
-            else:
-                p = self.model.prior_distribution
-                samples = p.rvs(size=self.iterative_kde_samples)
+            p = self.model.prior_distribution
+            samples = p.rvs(size=num_samples)
 
-        ksamples = numpy.array([samples[v] for v in self.vparam])
-        self.kde = gaussian_kde(ksamples)
+        ksamples = []
+        for v in self.vparam:
+            if v in fsamples:
+                ksamples.append(fsamples[v])
+            else:
+                ksamples.append(samples[v])
+       
+        self.kde = gaussian_kde(numpy.array(ksamples))
 
     def run_samples(self, ksamples, update_params=None, iteration=False):
         """ Calculate the likelihoods and weights for a set of samples
