@@ -27,6 +27,8 @@ from pycbc.vetoes.sgchisq import SingleDetSGChisq
 from pycbc.filter.matched_ratio import RatioMatchedFilterControl
 from pycbc.waveform.bank import RatioFilterBank
 
+tstart = time.time()
+
 def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
                         fine_indices, stilde, bank, chisq_estimator, args):
     chisq_window_samp = int(args.chisq_window * stilde.sample_rate)
@@ -100,7 +102,8 @@ def get_args():
 
     parser.add_argument('--snr-threshold', type=float, default=5.5,
                        help="SNR threshold for trigger generation.")
-    
+    parser.add_argument("--newsnr-threshold", type=float, metavar='THRESHOLD',
+                            help="Cut triggers with NewSNR less than THRESHOLD")    
     parser.add_argument("--low-frequency-cutoff", type=float,
                         help="The low frequency cutoff to use for filtering (Hz)")
 
@@ -113,10 +116,6 @@ def get_args():
     group.add_argument('--fir-length', type=int, default=4096,
                        help="")
 
-    # Newsnr option 
-    parser.add_argument("--newsnr-threshold", type=float, metavar='THRESHOLD',
-                    help="Cut triggers with NewSNR less than THRESHOLD")
-    
     # power chisq related
     parser.add_argument("--chisq-snr-threshold", type=float,
                         help="Minimum SNR to calculate the power chisq")
@@ -139,6 +138,17 @@ def get_args():
     
     parser.add_argument('--verbose', action='store_true')
 
+    parser.add_argument("--keep-loudest-log-chirp-window", type=float,
+                        help="Keep loudest triggers within ln chirp mass window")
+    parser.add_argument("--keep-loudest-interval", type=float,
+                        help="Window in seconds to maximize triggers over bank")
+    parser.add_argument("--keep-loudest-num", type=int,
+                        help="Number of triggers to keep from each maximization interval")
+    parser.add_argument("--keep-loudest-stat", default="newsnr",
+                        choices=pycbc.events.ranking.sngls_ranking_function_dict.keys(),
+                        help="Statistic used to determine loudest to keep")
+    
+
     return parser, parser.parse_args()
 
 def main():
@@ -148,10 +158,6 @@ def main():
     # --- 1. Fake/Default Arguments for EventManager Compatibility ---
     # EventManager expects these to exist in 'args', even if None/False
     defaults = {
-        'newsnr_threshold': None,
-        'keep_loudest_interval': None,
-        'keep_loudest_num': 0,
-        'keep_loudest_stat': None,
         'psdvar_segment': None, # Used in write_to_hdf
         'autochi_number_points': 0,
         'autochi_onesided':False,
@@ -191,6 +197,7 @@ def main():
             delta_f=delta_f,
             dtype=np.complex64,
         )
+        bank.template_thinning(inj_filter_rejector)
         
         logging.info("Initializing Ratio Filter Engine...")
         engine = RatioMatchedFilterControl(
@@ -203,7 +210,6 @@ def main():
         
         power_chisq = pycbc.vetoes.SingleDetPowerChisq(args.chisq_bins,
                                                        args.chisq_snr_threshold)
-
         
         # --- 5. Event Manager Setup ---
         out_types = {
@@ -216,7 +222,7 @@ def main():
             'bank_chisq_dof': int,
             'cont_chisq': float32,
             'sg_chisq' : float32,
-            'psd_var_val': float32
+            'psd_var_val': float32,
         }
         
         out_vals_ref = {key: None for key in out_types}
@@ -239,6 +245,14 @@ def main():
         pycbc.psd.associate_psds_to_segments(args, segments, gwstrain, flen, delta_f,
                   flow, dyn_range_factor=pycbc.DYN_RANGE_FAC, precision='single')
 
+        # FIXME: Maybe we should use the PSD corresponding to each trigger
+        if args.psdvar_segment is not None:
+            logging.info("Calculating PSD variation")
+            psd_var = pycbc.psd.calc_filt_psd_variation(gwstrain, args.psdvar_segment,
+                    args.psdvar_short_segment, args.psdvar_long_segment,
+                    args.psdvar_psd_duration, args.psdvar_psd_stride,
+                    args.psd_estimation, args.psdvar_low_freq, args.psdvar_high_freq)
+
         n_coarse = len(bank.coarse_indices)
         
         seg_ids_local = []
@@ -249,6 +263,8 @@ def main():
         seg_coarse_ids = []
         seg_chi = []
         seg_chi_dof = []
+
+        tsetup = time.time() - tstart
         
         for i, coarse_idx in enumerate(bank.coarse_indices):
             ref_template = bank.get_coarse_template(coarse_idx)
@@ -330,25 +346,33 @@ def main():
             out_vals['sigmasq'] = np.ones(len(time_list)) * norm * norm_rescale ** 2.0
             out_vals['chisq'] = chi
             out_vals['chisq_dof'] = chi_dof
+
+            if args.psdvar_short_segment is not None:
+                out_vals['psd_var_val'] = \
+                        pycbc.psd.find_trigger_value(psd_var,
+                                      out_vals['time_index'],
+                                      args.gps_start_time, args.sample_rate)
                         
             # Zero-fill, these are all just dummy values for now
             dummy =  zeros(len(time_list), dtype=float32)
             out_vals['bank_chisq'] = dummy
             out_vals['bank_chisq_dof'] = dummy
             out_vals['cont_chisq'] = dummy
-            out_vals['psd_var_val'] = dummy
-            out_vals['sg_chisq'] = dummy 
-
+            out_vals['sg_chisq'] = dummy
             
             event_mgr.new_template(tmplt=bank.table[global_id])
             event_mgr.add_template_events(names, [out_vals[n] for n in names])
             
-        if cluster_window > 0:
-            event_mgr.cluster_template_events("time_index", "snr", cluster_window)
-        
-        event_mgr.finalize_template_events()
+            if cluster_window > 0:
+                event_mgr.cluster_template_events("time_index", "snr", cluster_window)
+            
+            event_mgr.finalize_template_events()
 
     # --- 7. Finalize ---
+    tstop = time.time()
+    run_time = tstop - tstart
+    event_mgr.save_performance(1, len(segments), len(bank), run_time, tsetup)    
+    
     logging.info("Consolidating and writing events...")
     event_mgr.consolidate_events(args, gwstrain=strain_segments)
     event_mgr.finalize_events()
