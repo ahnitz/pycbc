@@ -393,8 +393,9 @@ class GenUniformWaveform(object):
         else:
             dt = 1.0 / args.sample_rate
             hp = pycbc.waveform.get_waveform_filter(
-                        pycbc.types.zeros(self.flen, dtype=numpy.complex64),
-                        delta_f=self.delta_f, delta_t=dt,
+                        pycbc.types.zeros(buff_len * args.sample_rate // 2 + 1,
+                        dtype=numpy.complex64),
+                        delta_f=1.0 / buff_len, delta_t=dt,
                         **kwds)
 
         if args.full_resolution_buffer_length is not None:
