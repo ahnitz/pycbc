@@ -591,6 +591,12 @@ class TimeSeries(Array):
             PyCBC time series.
         """
         import lalsimulation as sim
+        
+        if hasattr(location, 'decode'):
+            location = location.decode()
+            
+        if hasattr(tapermethod, 'decode'):
+            tapermethod = tapermethod.decode()
 
         taper_map = {
             'TAPER_NONE'    : None,
