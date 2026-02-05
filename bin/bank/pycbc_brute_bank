@@ -391,7 +391,9 @@ class GenUniformWaveform(object):
         else:
                 f = self.f_lower
 
-        kwds['f_lower'] = f
+        if 'f_lower' not in kwds:
+            kwds['f_lower'] = f
+
         if hasattr(kwds['approximant'], 'decode'):
             kwds['approximant'] = kwds['approximant'].decode()
 
