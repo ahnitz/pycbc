@@ -22,6 +22,7 @@
 import numpy
 import logging
 import signal
+import tqdm
 import sys, os
 import argparse
 import numpy.random
@@ -281,16 +282,16 @@ class TriangleBank(object):
 
     def check_params(self, gen, params, threshold,
                            force_add=False,
-                           parallel_check=False):
+                           parallel_check=False, progress=False):
         num_added = 0
         total_num = len(tuple(params.values())[0])
         waveform_cache = []
 
         pool = pycbc.pool.choose_pool(args.nprocesses)
-        for return_wf in pool.imap_unordered(
+        for return_wf in tqdm.tqdm(pool.imap_unordered(
                 wf_wrapper,
-                (({k: params[k][idx] for k in params}, parallel_check, threshold) for idx in range(total_num))
-            ):
+                (({k: params[k][idx] for k in params}, parallel_check, threshold) for idx in range(total_num))),
+                total=total_num, disable=not progress):
             waveform_cache += [return_wf]
 
         pool.close_pool()
@@ -522,7 +523,8 @@ if len(args.input_file) > 0:
             params = {k: f[k][:] for k in f.keys() if k not in ['max_matches', 'validation']}
             total_raw_templates += len(params[list(params.keys())[0]])
             bank, _ = bank.check_params(gen, params, args.minimal_match, 
-                                        force_add=args.keep_entire_input_file)
+                                        force_add=args.keep_entire_input_file,
+                                        progress=True)
     reduction = total_raw_templates - len(bank)
     logging.info("Combined Size: %i (Naive Total: %i, Removed: %i)", 
                  len(bank), total_raw_templates, reduction)
