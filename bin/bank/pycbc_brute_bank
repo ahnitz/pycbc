@@ -114,9 +114,6 @@ def get_stable_match(p_inj, p_tmplt):
     while (last_match == -1.0) or (current_buflen <= 64):
         # Create a transient generator for this specific resolution
         tmp_gen = GenUniformWaveform(current_buflen, args.sample_rate, args.low_frequency_cutoff)
-        print(p_inj)
-        print(p_tmplt)
-        print(current_buflen)
         h_inj = tmp_gen.generate(**p_inj)
         h_tmplt = tmp_gen.generate(**p_tmplt)
         current_match = tmp_gen.match(h_inj, h_tmplt)
