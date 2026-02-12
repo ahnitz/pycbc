@@ -657,29 +657,20 @@ while tau0s < args.tau0_end:
 logging.info("Starting Final Validation Pass (10x density)...")
 val_size = size * 10
 
-# This should *not* be the same seed as the code uses, so we choose
-# a random one
-samples = draw_samples_from_config(args.input_config, val_size, numpy.random.randint(0, 2**32-1))
+samples = draw_samples_from_config(args.input_config, val_size, args.seed + 1)
 val_params = {n: samples[n] for n in samples.fieldnames}
-
 if static_args is not None:
     for k in static_args.keys():
         val_params[k] = numpy.array([static_args[k]]*val_size)
 
 logging.info("Validating bank against %i injections using fork-shared waveforms", val_size)
-
 worker_inputs = [{k: val_params[k][i] for k in val_params}
                  for i in range(val_size)]
-
-pool = pycbc.pool.choose_pool(args.nprocesses)
-# Using imap_unordered to mirror the successful check_params pattern
-results = list(pool.imap_unordered(validation_worker, worker_inputs))
-pool.close_pool()
+with pycbc.pool.choose_pool(args.nprocesses) as pool:
+    results = list(pool.imap_unordered(validation_worker, worker_inputs))
 
 decimated_ffs, stable_ffs, buflens = zip(*results)
 stable_ffs = numpy.array(stable_ffs)
-
-# Calculate summary metrics
 mean_ff = stable_ffs.mean()
 holes = (stable_ffs < args.minimal_match).sum()
 logging.info("Validation Pass Complete: Mean FF: %.4f, Holes Found: %d/%d", 
