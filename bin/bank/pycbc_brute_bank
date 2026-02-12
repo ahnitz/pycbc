@@ -44,14 +44,6 @@ parser.add_argument('--input-file', nargs='*', default=[],
 parser.add_argument('--keep-entire-input-file', help="All of the templates in the input file will be kept in the output file, even if they do not pass normal mismatch criteria.", action='store_true')
 parser.add_argument('--input-config',
     help='Draw parameters from the given configure file.')
-parser.add_argument('--params',
-    help='list of paramaters to use', nargs='+')
-parser.add_argument('--min',
-    help='list of the minimum parameter values', nargs='+', type=float)
-parser.add_argument('--max',
-    help='list of the maximum parameter values', nargs='+', type=float)
-parser.add_argument('--approximant',  required=False,
-    help='The waveform approximant to place.')
 parser.add_argument('--minimal-match', default=0.97, type=float)
 parser.add_argument('--buffer-length', default=2, type=float,
     help='size of waveform buffer in seconds')
@@ -72,11 +64,6 @@ parser.add_argument('--placement-iterations', default=1000, type=int,
     help='Specify the number of attempts the bank should make when placing points. Use this option if the bank fails to place any points.')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--tolerance', type=float)
-parser.add_argument('--max-mtotal', type=float)
-parser.add_argument('--min-mchirp', type=float)
-parser.add_argument('--max-mchirp', type=float)
-parser.add_argument('--fixed-params', type=str, nargs='*')
-parser.add_argument('--fixed-values', type=float, nargs='*')
 parser.add_argument('--use-cross', action='store_true')
 parser.add_argument('--max-q', type=float)
 parser.add_argument('--tau0-crawl', type=float)
@@ -99,30 +86,23 @@ pycbc.init_logging(args.verbose)
 numpy.random.seed(args.seed)
 
 validation_data = None  # Initialize to avoid NameError
+config_parser = pycbc.types.config.InterpolatingConfigParser()
+file = open(args.input_config, 'r')
+config_parser.read_file(file)
+file.close()
 
-# Read the .ini file if it's in the input.
-if args.input_config is not None:
-    config_parser = pycbc.types.config.InterpolatingConfigParser()
-    file = open(args.input_config, 'r')
-    config_parser.read_file(file)
-    file.close()
+variable_args, static_args = read_params_from_config(
+    config_parser, prior_section='prior',
+    vargs_section='variable_params',
+    sargs_section='static_params')
 
-    variable_args, static_args = read_params_from_config(
-        config_parser, prior_section='prior',
-        vargs_section='variable_params',
-        sargs_section='static_params')
+if any(config_parser.get_subsections('waveform_transforms')):
+    waveform_transforms = transforms.read_transforms_from_config(
+            config_parser, 'waveform_transforms')
+else:
+    waveform_transforms = None
 
-    if any(config_parser.get_subsections('waveform_transforms')):
-        waveform_transforms = transforms.read_transforms_from_config(
-                config_parser, 'waveform_transforms')
-    else:
-        waveform_transforms = None
-
-    dists_joint = prior_from_config(cp=config_parser)
-
-fdict = {}
-if args.fixed_params:
-    fdict = {p: v for (p, v) in zip(args.fixed_params, args.fixed_values)}
+dists_joint = prior_from_config(cp=config_parser)
 
 def get_stable_match(p_inj, p_tmplt):
     """Iteratively doubles buffer length until the match stabilizes."""
@@ -411,7 +391,6 @@ class GenUniformWaveform(object):
             self.md2 = q._data[0:100]
 
     def generate(self, **kwds):
-        kwds.update(fdict)
         if args.max_signal_length is not None:
                 flow = numpy.arange(self.f_lower, 100, .1)[::-1]
                 length = spa_length_in_time(mass1=kwds['mass1'], mass2=kwds['mass2'], f_lower=flow, phase_order=-1)
@@ -502,8 +481,8 @@ def silent_child_exit(signum, frame):
 def wf_wrapper(args):
     p, parallel_check, threshold = args
     
-    #signal.signal(signal.SIGINT, silent_child_exit)
-    #signal.signal(signal.SIGTERM, silent_child_exit)
+    signal.signal(signal.SIGINT, silent_child_exit)
+    signal.signal(signal.SIGTERM, silent_child_exit)
     try:
         hp = gen.generate(**p)
         hp.checked = None
@@ -516,89 +495,6 @@ def wf_wrapper(args):
     except Exception as e:
         print(e)
         return None
-
-def nudge_worker(target_idx):
-    hp = bank.waveforms[target_idx]
-    old_params = hp.params.copy()
-    
-    target_m = args.minimal_match**2 
-    # Tension threshold: if neighbors are further than this, pull them back 
-    # to keep the lattice connected (Surface Tension).
-    tension_m = target_m - 0.02 
-    
-    eta = 0.2
-    v_total = {k: 0.0 for k in variable_args}
-    total_weight = 0.0
-    
-    # Track these properly for the validation step
-    neighbor_indices = []
-    current_matches = []
-    
-    hp.gen = gen
-    for j, h_bank in enumerate(bank.waveforms):
-        if target_idx == j: continue
-        m = gen.match(hp, h_bank)
-        
-        # Wide discovery range to calculate local neighborhood energy
-        if m > (target_m - 0.1):
-            neighbor_indices.append(j)
-            current_matches.append(m)
-            
-            if m > target_m:
-                # STRONG REPULSION (Push away from clumps)
-                # Weight increases as match -> 1
-                weight = (m - target_m) / (1.0001 - m)
-                direction = 1.0
-            elif m < tension_m:
-                # WEAK ATTRACTION (Pull toward holes to maintain connectivity)
-                # Prevents the bank from expanding into a lower-coverage state
-                weight = (tension_m - m) * 0.5 
-                direction = -1.0
-            else:
-                weight = 0.0
-                direction = 0.0
-                
-            if weight > 0:
-                total_weight += weight
-                for k in variable_args:
-                    # Still relative to the coordinate distance to neighbor
-                    diff = old_params[k] - h_bank.params[k]
-                    v_total[k] += diff * direction * weight
-
-    # If no neighbors are close enough to exert pressure or tension, stay put
-    if not neighbor_indices or total_weight == 0:
-        hp.gen = None
-        return target_idx, hp
-
-    # 1. Propose Move
-    new_params = old_params.copy()
-    for k in variable_args:
-        # Step is a weighted average of neighbor directions, scaled by eta
-        new_params[k] = old_params[k] + (v_total[k] / total_weight) * eta
-
-    # 2. Prior Check & Transform
-    p_check = {k: numpy.array([new_params[k], new_params[k]]) for k in variable_args}
-    if dists_joint.contains(p_check)[0]:
-        new_params = transforms.apply_transforms(new_params, waveform_transforms)
-        new_hp = gen.generate(**new_params)
-        new_hp.gen = gen 
-        
-        # 3. Validation
-        new_matches = [gen.match(new_hp, bank.waveforms[j]) for j in neighbor_indices]
-        
-        current_energy = sum(m**2 for m in current_matches)
-        new_energy = sum(m**2 for m in new_matches)
-
-        # Accept if the total local overlap pressure decreased
-        if new_energy < current_energy:
-            # logging.info("ID %d ACCEPTED: E %.4f->%.4f", target_idx, current_energy, new_energy)
-            new_hp.tau0, new_hp.tbin = hp.tau0, hp.tbin
-            new_hp.gen = None
-            hp.gen = None 
-            return target_idx, new_hp
-            
-    hp.gen = None 
-    return target_idx, hp
     
 def validation_worker(inj_params):
     h_inj = gen.generate(**inj_params)
@@ -633,73 +529,36 @@ if len(args.input_file) > 0:
 
 def draw(rtype):
     if rtype == 'uniform':
-        if args.input_config is None:
-            params = {name: numpy.random.uniform(pmin, pmax, size=size)
-                      for name, pmin, pmax in zip(args.params, args.min, args.max)}
-        else:
-            # `draw_samples_from_config` has its own fixed seed, so must overwrite it.
-            random_seed = numpy.random.randint(low=0, high=2**32-1)
-            samples = draw_samples_from_config(args.input_config, size, random_seed)
-            params = {name: samples[name] for name in samples.fieldnames}
-            # Add `static_args` back.
-            if static_args is not None:
-                for k in static_args.keys():
-                    params[k] = numpy.array([static_args[k]]*size)
+        # `draw_samples_from_config` has its own fixed seed, so must overwrite it.
+        random_seed = numpy.random.randint(low=0, high=2**32-1)
+        samples = draw_samples_from_config(args.input_config, size, random_seed)
+        params = {name: samples[name] for name in samples.fieldnames}
+        # Add `static_args` back.
+        if static_args is not None:
+            for k in static_args.keys():
+                params[k] = numpy.array([static_args[k]]*size)
 
     elif rtype == 'kde':
         trail = 300
         if trail > len(bank):
             trail = len(bank)
-        p = bank.keys()
-        p = [k for k in p if k not in fdict]
-        p.remove('approximant')
-        p.remove('f_lower')
-        if args.input_config is not None:
-            p = variable_args
+        p = variable_args
         bdata = numpy.array([bank.key(k)[-trail:] for k in p])
         kde = gaussian_kde(bdata)
         points = kde.resample(size=size)
         params = {k: v for k, v in zip(p, points)}
 
         # Add `static_args` back, some transformations may need them.
-        if args.input_config is not None and static_args is not None:
+        if static_args is not None:
             for k in static_args.keys():
                 params[k] = numpy.array([static_args[k]]*size)
 
         # Apply `waveform_transforms` defined in the .ini file to samples.
-        if args.input_config is not None and waveform_transforms is not None:
+        if waveform_transforms is not None:
             params = transforms.apply_transforms(params, waveform_transforms)
 
-    if args.approximant is not None:
-        params['approximant'] = numpy.array([args.approximant]*size)
-
     # Filter out stuff (kde method may also generate samples outside boundaries).
-    l = None
-    if args.input_config is None:
-        for name, pmin, pmax in zip(args.params, args.min, args.max):
-            nl = (params[name] < pmax) & (params[name] > pmin)
-            l = (nl & l) if l is not None else nl
-
-        if args.max_q:
-            q =  numpy.maximum(params['mass1'] / params['mass2'], params['mass2'] / params['mass1'])
-            l &= q < args.max_q
-
-        if args.max_mtotal:
-            l &= params['mass1'] + params['mass2'] < args.max_mtotal
-
-        if args.max_mchirp:
-            from pycbc.conversions import mchirp_from_mass1_mass2
-            mc = mchirp_from_mass1_mass2(params['mass1'], params['mass2'])
-            l &= mc < args.max_mchirp
-
-        if args.min_mchirp:
-            from pycbc.conversions import mchirp_from_mass1_mass2
-            mc = mchirp_from_mass1_mass2(params['mass1'], params['mass2'])
-            l &= mc > args.min_mchirp
-
-    else:
-        l = dists_joint.contains(params)
-
+    l = dists_joint.contains(params)
     params = {k: params[k][l] for k in params}
     return params
 
@@ -734,8 +593,8 @@ def cdraw(rtype, ts, te):
 
     return p
 
-#signal.signal(signal.SIGINT, handle_exit_signal)
-#signal.signal(signal.SIGTERM, handle_exit_signal)
+signal.signal(signal.SIGINT, handle_exit_signal)
+signal.signal(signal.SIGTERM, handle_exit_signal)
 
 tau0s = args.tau0_start
 tau0e = tau0s + args.tau0_crawl
@@ -795,78 +654,41 @@ while tau0s < args.tau0_end:
     tau0s += args.tau0_crawl / 2
     tau0e += args.tau0_crawl / 2
 
-def validate():
-    if args.input_config is not None:
-        logging.info("Starting Final Validation Pass (10x density)...")
-        val_size = size * 100
-        samples = draw_samples_from_config(args.input_config, val_size, numpy.random.randint(0, 2**32-1))
-        val_params = {n: samples[n] for n in samples.fieldnames}
-        
-        if static_args is not None:
-            for k in static_args.keys():
-                val_params[k] = numpy.array([static_args[k]]*val_size)
+logging.info("Starting Final Validation Pass (10x density)...")
+val_size = size * 10
 
-        logging.info("Validating bank against %i injections using fork-shared waveforms", val_size)
-        
-        worker_inputs = [{k: val_params[k][i] for k in val_params}
-                         for i in range(val_size)]
-        
-        pool = pycbc.pool.choose_pool(args.nprocesses)
-        # Using imap_unordered to mirror the successful check_params pattern
-        results = list(pool.imap_unordered(validation_worker, worker_inputs))
-        pool.close_pool()
-        
-        decimated_ffs, stable_ffs, buflens = zip(*results)
-        stable_ffs = numpy.array(stable_ffs)
-        
-        # Calculate summary metrics
-        mean_ff = stable_ffs.mean()
-        holes = (stable_ffs < args.minimal_match).sum()
-        logging.info("Validation Pass Complete: Mean FF: %.4f, Holes Found: %d/%d", 
-                     mean_ff, holes, val_size)    
-        
-        validation_data = {
-            'decimated_ff': numpy.array(decimated_ffs),
-            'stable_ff': numpy.array(stable_ffs),
-            'final_buflen': numpy.array(buflens)
-        }
+# This should *not* be the same seed as the code uses, so we choose
+# a random one
+samples = draw_samples_from_config(args.input_config, val_size, numpy.random.randint(0, 2**32-1))
+val_params = {n: samples[n] for n in samples.fieldnames}
 
-# Constants for the relaxation
-NUM_NUDGE_ITERATIONS = 50
+if static_args is not None:
+    for k in static_args.keys():
+        val_params[k] = numpy.array([static_args[k]]*val_size)
 
-validate()
-for iteration in range(NUM_NUDGE_ITERATIONS):
-    logging.info("Starting Bank Relaxation Iteration %d/%d...", 
-                 iteration + 1, NUM_NUDGE_ITERATIONS)
-    
-    pool = pycbc.pool.choose_pool(args.nprocesses)
-    
-    # nudge_worker remains as we discussed: 
-    # brute-force match, calculate shift, check prior, generate, clear .gen
-    nudge_results = list(pool.imap_unordered(nudge_worker, range(len(bank))))
-    
-    pool.close_pool()
-    
-    # Update the bank for the next iteration to see
-    updated_this_round = 0
-    for idx, new_hp in nudge_results:
-        # Check if the parameters actually changed to track progress
-        if new_hp.params != bank.waveforms[idx].params:
-            updated_this_round += 1
-        bank.waveforms[idx] = new_hp
-    
-    logging.info("Iteration %d complete: %d templates shifted and regenerated.", 
-                 iteration + 1, updated_this_round)
-    
-    # If progress stalls, we could theoretically break early
-    if updated_this_round == 0:
-        logging.info("Bank has equilibrated. Stopping iterations.")
-        
-        break
-validate()
+logging.info("Validating bank against %i injections using fork-shared waveforms", val_size)
 
-# Final save logic
-if validation_data:
-    save_bank(validation_data)
-else:
-    save_bank()
+worker_inputs = [{k: val_params[k][i] for k in val_params}
+                 for i in range(val_size)]
+
+pool = pycbc.pool.choose_pool(args.nprocesses)
+# Using imap_unordered to mirror the successful check_params pattern
+results = list(pool.imap_unordered(validation_worker, worker_inputs))
+pool.close_pool()
+
+decimated_ffs, stable_ffs, buflens = zip(*results)
+stable_ffs = numpy.array(stable_ffs)
+
+# Calculate summary metrics
+mean_ff = stable_ffs.mean()
+holes = (stable_ffs < args.minimal_match).sum()
+logging.info("Validation Pass Complete: Mean FF: %.4f, Holes Found: %d/%d", 
+             mean_ff, holes, val_size)    
+
+validation_data = {
+    'decimated_ff': numpy.array(decimated_ffs),
+    'stable_ff': numpy.array(stable_ffs),
+    'final_buflen': numpy.array(buflens)
+}
+
+save_bank(validation_data)
