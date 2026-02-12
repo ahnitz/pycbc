@@ -98,6 +98,8 @@ args = parser.parse_args()
 pycbc.init_logging(args.verbose)
 numpy.random.seed(args.seed)
 
+validation_data = None  # Initialize to avoid NameError
+
 # Read the .ini file if it's in the input.
 if args.input_config is not None:
     config_parser = pycbc.types.config.InterpolatingConfigParser()
@@ -122,6 +124,29 @@ fdict = {}
 if args.fixed_params:
     fdict = {p: v for (p, v) in zip(args.fixed_params, args.fixed_values)}
 
+def get_stable_match(p_inj, p_tmplt):
+    """Iteratively doubles buffer length until the match stabilizes."""
+    current_buflen = args.buffer_length
+    last_match = -1.0
+    
+    # We loop until convergence or a safety cap (e.g., 64s)
+    while current_buflen <= 64:
+        # Create a transient generator for this specific resolution
+        tmp_gen = GenUniformWaveform(current_buflen, args.sample_rate, args.low_frequency_cutoff)
+        h_inj = tmp_gen.generate(**p_inj)
+        h_tmplt = tmp_gen.generate(**p_tmplt)
+        current_match = tmp_gen.match(h_inj, h_tmplt)
+        
+        # If the change is sub-leading, we are done
+        if abs(current_match - last_match) < 1e-4:
+            return current_match, current_buflen
+            
+        last_match = current_match
+        current_buflen *= 2
+        
+    return last_match, current_buflen
+    
+    
 class Shrinker(object):
     def __init__(self, data):
         self.data = data
@@ -346,7 +371,7 @@ def handle_exit_signal(signum, frame):
     # Force exit so the script doesn't try to resume the loops
     os._exit(0)
 
-def save_bank():
+def save_bank(val_data=None): # Use a local name
     logging.info("Saving current bank to %s", args.output_file)
     with HFile(args.output_file, 'w') as o:
         o.attrs['minimal_match'] = args.minimal_match
@@ -356,6 +381,12 @@ def save_bank():
                 val = val.astype('bytes')
             o[k] = val
         o['max_matches'] = numpy.array(bank.max_matches)
+        
+        # Check the passed argument
+        if val_data:
+            v_grp = o.create_group('validation')
+            for k, v in val_data.items():
+                v_grp[k] = v
     logging.info("Save complete.")
 
 class GenUniformWaveform(object):
@@ -471,8 +502,8 @@ def silent_child_exit(signum, frame):
 def wf_wrapper(args):
     p, parallel_check, threshold = args
     
-    signal.signal(signal.SIGINT, silent_child_exit)
-    signal.signal(signal.SIGTERM, silent_child_exit)
+    #signal.signal(signal.SIGINT, silent_child_exit)
+    #signal.signal(signal.SIGTERM, silent_child_exit)
     try:
         hp = gen.generate(**p)
         hp.checked = None
@@ -486,12 +517,92 @@ def wf_wrapper(args):
         print(e)
         return None
 
+def nudge_worker(target_idx):
+    hp = bank.waveforms[target_idx]
+    eta = 0.1
+    tolerance = 1e-3 
+    discovery_threshold = args.minimal_match - 0.1
+    
+    # 1. Initialize repulsion only for variable parameters
+    v_repel = {k: 0.0 for k in variable_args if k in hp.params}
+    neighbors_found = 0
+    hp.gen = gen
+    
+    # Discovery
+    for j, h_bank in enumerate(bank.waveforms):
+        if target_idx == j:
+            continue
+        
+        m = gen.match(hp, h_bank)
+        if m > discovery_threshold:
+            neighbors_found += 1
+            weight = (m - discovery_threshold)
+            for k in v_repel:
+                val_neighbor = h_bank.params.get(k)
+                v_repel[k] += (hp.params[k] - val_neighbor) * weight
+
+    if neighbors_found > 0:
+        # Calculate proposed shift for variable params
+        shift_vector = {k: eta * (v_repel[k] / neighbors_found) for k in v_repel}
+        
+        # Significance check
+        is_significant = any(
+            abs(shift_vector[k]) > abs(hp.params[k]) * tolerance 
+            for k in shift_vector if hp.params[k] != 0
+        )
+
+        if is_significant:
+            new_params = hp.params.copy()
+            # 2. Construct the check dictionary explicitly as 1-D arrays
+            p_check = {}
+            for k in variable_args:
+                # Use updated value if nudged, otherwise current value
+                val = hp.params[k] + shift_vector.get(k, 0.0)
+                new_params[k] = val
+                # Ensure it's a 1-D array so len(p_check[k]) == 1
+                p_check[k] = numpy.array([val, val], ndmin=1)
+                
+            # 3. Prior Space Check
+            print(p_check)
+            if dists_joint.contains(p_check)[0]:
+                try:
+                    # 4. Regeneration
+                    new_hp = gen.generate(**new_params)
+                    new_hp.tau0 = hp.tau0 
+                    new_hp.tbin = hp.tbin
+                    new_hp.gen = None
+                    hp.gen = None 
+                    return target_idx, new_hp
+                except Exception:
+                    pass
+                
+    hp.gen = None 
+    return target_idx, hp
+
+def validation_worker(inj_params):
+    h_inj = gen.generate(**inj_params)
+    
+    best_m = -1.0
+    best_idx = -1
+    # Independent brute-force search
+    for i, h_bank in enumerate(bank.waveforms):
+        # Match using local_gen's private IFFT/buffers
+        m = gen.match(h_inj, h_bank)
+        if m > best_m:
+            best_m = m
+            best_idx = i            
+
+    stable_ff, final_buflen = get_stable_match(inj_params, 
+                                               bank.waveforms[best_idx].params)
+    
+    return best_m, stable_ff, final_buflen
+
 if len(args.input_file) > 0:
     total_raw_templates = 0
     for input_file in args.input_file:
         logging.info("Loading: %s", input_file)
         with HFile(input_file, 'r') as f:
-            params = {k: f[k][:] for k in f.keys() if k not in ['max_matches']}
+            params = {k: f[k][:] for k in f.keys() if k not in ['max_matches', 'validation']}
             total_raw_templates += len(params[list(params.keys())[0]])
             bank, _ = bank.check_params(gen, params, args.minimal_match, 
                                         force_add=args.keep_entire_input_file)
@@ -602,8 +713,8 @@ def cdraw(rtype, ts, te):
 
     return p
 
-signal.signal(signal.SIGINT, handle_exit_signal)
-signal.signal(signal.SIGTERM, handle_exit_signal)
+#signal.signal(signal.SIGINT, handle_exit_signal)
+#signal.signal(signal.SIGTERM, handle_exit_signal)
 
 tau0s = args.tau0_start
 tau0e = tau0s + args.tau0_crawl
@@ -663,4 +774,74 @@ while tau0s < args.tau0_end:
     tau0s += args.tau0_crawl / 2
     tau0e += args.tau0_crawl / 2
 
-save_bank()
+# Constants for the relaxation
+NUM_NUDGE_ITERATIONS = 20
+
+for iteration in range(NUM_NUDGE_ITERATIONS):
+    logging.info("Starting Bank Relaxation Iteration %d/%d...", 
+                 iteration + 1, NUM_NUDGE_ITERATIONS)
+    
+    pool = pycbc.pool.choose_pool(args.nprocesses)
+    
+    # nudge_worker remains as we discussed: 
+    # brute-force match, calculate shift, check prior, generate, clear .gen
+    nudge_results = list(pool.imap_unordered(nudge_worker, range(len(bank))))
+    
+    pool.close_pool()
+    
+    # Update the bank for the next iteration to see
+    updated_this_round = 0
+    for idx, new_hp in nudge_results:
+        # Check if the parameters actually changed to track progress
+        if new_hp.params != bank.waveforms[idx].params:
+            updated_this_round += 1
+        bank.waveforms[idx] = new_hp
+    
+    logging.info("Iteration %d complete: %d templates shifted and regenerated.", 
+                 iteration + 1, updated_this_round)
+    
+    # If progress stalls, we could theoretically break early
+    if updated_this_round == 0:
+        logging.info("Bank has equilibrated. Stopping iterations.")
+        break
+
+if args.input_config is not None:
+    logging.info("Starting Final Validation Pass (10x density)...")
+    val_size = size * 10
+    samples = draw_samples_from_config(args.input_config, val_size, numpy.random.randint(0, 2**32-1))
+    val_params = {n: samples[n] for n in samples.fieldnames}
+    
+    if static_args is not None:
+        for k in static_args.keys():
+            val_params[k] = numpy.array([static_args[k]]*val_size)
+
+    logging.info("Validating bank against %i injections using fork-shared waveforms", val_size)
+    
+    worker_inputs = [{k: val_params[k][i] for k in val_params}
+                     for i in range(val_size)]
+    
+    pool = pycbc.pool.choose_pool(args.nprocesses)
+    # Using imap_unordered to mirror the successful check_params pattern
+    results = list(pool.imap_unordered(validation_worker, worker_inputs))
+    pool.close_pool()
+    
+    decimated_ffs, stable_ffs, buflens = zip(*results)
+    stable_ffs = numpy.array(stable_ffs)
+    
+    # Calculate summary metrics
+    mean_ff = stable_ffs.mean()
+    holes = (stable_ffs < args.minimal_match).sum()
+    logging.info("Validation Pass Complete: Mean FF: %.4f, Holes Found: %d/%d", 
+                 mean_ff, holes, val_size)    
+    
+    validation_data = {
+        'decimated_ff': numpy.array(decimated_ffs),
+        'stable_ff': numpy.array(stable_ffs),
+        'final_buflen': numpy.array(buflens)
+    }
+
+# Final save logic
+if validation_data:
+    save_bank(validation_data)
+else:
+    save_bank()
