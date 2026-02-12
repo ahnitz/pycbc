@@ -519,66 +519,87 @@ def wf_wrapper(args):
 
 def nudge_worker(target_idx):
     hp = bank.waveforms[target_idx]
-    eta = 0.1
-    tolerance = 1e-3 
-    discovery_threshold = args.minimal_match - 0.1
+    old_params = hp.params.copy()
     
-    # 1. Initialize repulsion only for variable parameters
-    v_repel = {k: 0.0 for k in variable_args if k in hp.params}
-    neighbors_found = 0
+    target_m = args.minimal_match**2 
+    # Tension threshold: if neighbors are further than this, pull them back 
+    # to keep the lattice connected (Surface Tension).
+    tension_m = target_m - 0.02 
+    
+    eta = 0.2
+    v_total = {k: 0.0 for k in variable_args}
+    total_weight = 0.0
+    
+    # Track these properly for the validation step
+    neighbor_indices = []
+    current_matches = []
+    
     hp.gen = gen
-    
-    # Discovery
     for j, h_bank in enumerate(bank.waveforms):
-        if target_idx == j:
-            continue
-        
+        if target_idx == j: continue
         m = gen.match(hp, h_bank)
-        if m > discovery_threshold:
-            neighbors_found += 1
-            weight = (m - discovery_threshold)
-            for k in v_repel:
-                val_neighbor = h_bank.params.get(k)
-                v_repel[k] += (hp.params[k] - val_neighbor) * weight
-
-    if neighbors_found > 0:
-        # Calculate proposed shift for variable params
-        shift_vector = {k: eta * (v_repel[k] / neighbors_found) for k in v_repel}
         
-        # Significance check
-        is_significant = any(
-            abs(shift_vector[k]) > abs(hp.params[k]) * tolerance 
-            for k in shift_vector if hp.params[k] != 0
-        )
+        # Wide discovery range to calculate local neighborhood energy
+        if m > (target_m - 0.1):
+            neighbor_indices.append(j)
+            current_matches.append(m)
+            
+            if m > target_m:
+                # STRONG REPULSION (Push away from clumps)
+                # Weight increases as match -> 1
+                weight = (m - target_m) / (1.0001 - m)
+                direction = 1.0
+            elif m < tension_m:
+                # WEAK ATTRACTION (Pull toward holes to maintain connectivity)
+                # Prevents the bank from expanding into a lower-coverage state
+                weight = (tension_m - m) * 0.5 
+                direction = -1.0
+            else:
+                weight = 0.0
+                direction = 0.0
+                
+            if weight > 0:
+                total_weight += weight
+                for k in variable_args:
+                    # Still relative to the coordinate distance to neighbor
+                    diff = old_params[k] - h_bank.params[k]
+                    v_total[k] += diff * direction * weight
 
-        if is_significant:
-            new_params = hp.params.copy()
-            # 2. Construct the check dictionary explicitly as 1-D arrays
-            p_check = {}
-            for k in variable_args:
-                # Use updated value if nudged, otherwise current value
-                val = hp.params[k] + shift_vector.get(k, 0.0)
-                new_params[k] = val
-                # Ensure it's a 1-D array so len(p_check[k]) == 1
-                p_check[k] = numpy.array([val, val], ndmin=1)
-                
-            # 3. Prior Space Check
-            print(p_check)
-            if dists_joint.contains(p_check)[0]:
-                try:
-                    # 4. Regeneration
-                    new_hp = gen.generate(**new_params)
-                    new_hp.tau0 = hp.tau0 
-                    new_hp.tbin = hp.tbin
-                    new_hp.gen = None
-                    hp.gen = None 
-                    return target_idx, new_hp
-                except Exception:
-                    pass
-                
+    # If no neighbors are close enough to exert pressure or tension, stay put
+    if not neighbor_indices or total_weight == 0:
+        hp.gen = None
+        return target_idx, hp
+
+    # 1. Propose Move
+    new_params = old_params.copy()
+    for k in variable_args:
+        # Step is a weighted average of neighbor directions, scaled by eta
+        new_params[k] = old_params[k] + (v_total[k] / total_weight) * eta
+
+    # 2. Prior Check & Transform
+    p_check = {k: numpy.array([new_params[k], new_params[k]]) for k in variable_args}
+    if dists_joint.contains(p_check)[0]:
+        new_params = transforms.apply_transforms(new_params, waveform_transforms)
+        new_hp = gen.generate(**new_params)
+        new_hp.gen = gen 
+        
+        # 3. Validation
+        new_matches = [gen.match(new_hp, bank.waveforms[j]) for j in neighbor_indices]
+        
+        current_energy = sum(m**2 for m in current_matches)
+        new_energy = sum(m**2 for m in new_matches)
+
+        # Accept if the total local overlap pressure decreased
+        if new_energy < current_energy:
+            # logging.info("ID %d ACCEPTED: E %.4f->%.4f", target_idx, current_energy, new_energy)
+            new_hp.tau0, new_hp.tbin = hp.tau0, hp.tbin
+            new_hp.gen = None
+            hp.gen = None 
+            return target_idx, new_hp
+            
     hp.gen = None 
     return target_idx, hp
-
+    
 def validation_worker(inj_params):
     h_inj = gen.generate(**inj_params)
     
@@ -774,9 +795,46 @@ while tau0s < args.tau0_end:
     tau0s += args.tau0_crawl / 2
     tau0e += args.tau0_crawl / 2
 
-# Constants for the relaxation
-NUM_NUDGE_ITERATIONS = 20
+def validate():
+    if args.input_config is not None:
+        logging.info("Starting Final Validation Pass (10x density)...")
+        val_size = size * 100
+        samples = draw_samples_from_config(args.input_config, val_size, numpy.random.randint(0, 2**32-1))
+        val_params = {n: samples[n] for n in samples.fieldnames}
+        
+        if static_args is not None:
+            for k in static_args.keys():
+                val_params[k] = numpy.array([static_args[k]]*val_size)
 
+        logging.info("Validating bank against %i injections using fork-shared waveforms", val_size)
+        
+        worker_inputs = [{k: val_params[k][i] for k in val_params}
+                         for i in range(val_size)]
+        
+        pool = pycbc.pool.choose_pool(args.nprocesses)
+        # Using imap_unordered to mirror the successful check_params pattern
+        results = list(pool.imap_unordered(validation_worker, worker_inputs))
+        pool.close_pool()
+        
+        decimated_ffs, stable_ffs, buflens = zip(*results)
+        stable_ffs = numpy.array(stable_ffs)
+        
+        # Calculate summary metrics
+        mean_ff = stable_ffs.mean()
+        holes = (stable_ffs < args.minimal_match).sum()
+        logging.info("Validation Pass Complete: Mean FF: %.4f, Holes Found: %d/%d", 
+                     mean_ff, holes, val_size)    
+        
+        validation_data = {
+            'decimated_ff': numpy.array(decimated_ffs),
+            'stable_ff': numpy.array(stable_ffs),
+            'final_buflen': numpy.array(buflens)
+        }
+
+# Constants for the relaxation
+NUM_NUDGE_ITERATIONS = 50
+
+validate()
 for iteration in range(NUM_NUDGE_ITERATIONS):
     logging.info("Starting Bank Relaxation Iteration %d/%d...", 
                  iteration + 1, NUM_NUDGE_ITERATIONS)
@@ -803,42 +861,9 @@ for iteration in range(NUM_NUDGE_ITERATIONS):
     # If progress stalls, we could theoretically break early
     if updated_this_round == 0:
         logging.info("Bank has equilibrated. Stopping iterations.")
+        
         break
-
-if args.input_config is not None:
-    logging.info("Starting Final Validation Pass (10x density)...")
-    val_size = size * 10
-    samples = draw_samples_from_config(args.input_config, val_size, numpy.random.randint(0, 2**32-1))
-    val_params = {n: samples[n] for n in samples.fieldnames}
-    
-    if static_args is not None:
-        for k in static_args.keys():
-            val_params[k] = numpy.array([static_args[k]]*val_size)
-
-    logging.info("Validating bank against %i injections using fork-shared waveforms", val_size)
-    
-    worker_inputs = [{k: val_params[k][i] for k in val_params}
-                     for i in range(val_size)]
-    
-    pool = pycbc.pool.choose_pool(args.nprocesses)
-    # Using imap_unordered to mirror the successful check_params pattern
-    results = list(pool.imap_unordered(validation_worker, worker_inputs))
-    pool.close_pool()
-    
-    decimated_ffs, stable_ffs, buflens = zip(*results)
-    stable_ffs = numpy.array(stable_ffs)
-    
-    # Calculate summary metrics
-    mean_ff = stable_ffs.mean()
-    holes = (stable_ffs < args.minimal_match).sum()
-    logging.info("Validation Pass Complete: Mean FF: %.4f, Holes Found: %d/%d", 
-                 mean_ff, holes, val_size)    
-    
-    validation_data = {
-        'decimated_ff': numpy.array(decimated_ffs),
-        'stable_ff': numpy.array(stable_ffs),
-        'final_buflen': numpy.array(buflens)
-    }
+validate()
 
 # Final save logic
 if validation_data:
