@@ -117,9 +117,9 @@ def get_stable_match(p_inj, p_tmplt):
         h_inj = tmp_gen.generate(**p_inj)
         h_tmplt = tmp_gen.generate(**p_tmplt)
         current_match = tmp_gen.match(h_inj, h_tmplt)
-        
+
         # If the change is sub-leading, we are done
-        if abs(current_match - last_match) < 1e-4:
+        if (args.full_resolution_buffer_length) is not None or (abs(current_match - last_match) < 1e-4):
             return current_match, current_buflen
             
         last_match = current_match
