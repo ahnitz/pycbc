@@ -526,12 +526,13 @@ if len(args.input_file) > 0:
         with HFile(input_file, 'r') as f:
             params = {k: f[k][:] for k in f.keys() if k not in ['max_matches', 'validation']}
             total_raw_templates += len(params[list(params.keys())[0]])
-            bank, _ = bank.check_params(gen, params, args.minimal_match, 
+            bank, _ = bank.check_params(gen, params, args.minimal_match,
                                         force_add=args.keep_entire_input_file,
+                                        parallel_check=args.parallel_check,
                                         progress=True)
-    reduction = total_raw_templates - len(bank)
-    logging.info("Combined Size: %i (Naive Total: %i, Removed: %i)", 
-                 len(bank), total_raw_templates, reduction)
+            reduction = total_raw_templates - len(bank)
+            logging.info("Combined Size: %i (Naive Total: %i, Removed: %i)", 
+                         len(bank), total_raw_templates, reduction)
 
 def draw(rtype):
     if rtype == 'uniform':
