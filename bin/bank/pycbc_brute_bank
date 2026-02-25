@@ -285,34 +285,40 @@ class TriangleBank(object):
                            parallel_check=False, progress=False):
         num_added = 0
         total_num = len(tuple(params.values())[0])
-        waveform_cache = []
 
-        pool = pycbc.pool.choose_pool(args.nprocesses)
-        for return_wf in tqdm.tqdm(pool.imap_unordered(
-                wf_wrapper,
-                (({k: params[k][idx] for k in params}, parallel_check, threshold) for idx in range(total_num))),
-                total=total_num, disable=not progress):
-            waveform_cache += [return_wf]
+        idxs = numpy.arange(0, total_num)
+        chunks = numpy.array_split(idxs, max(total_num // args.nprocesses // 4, 1))
 
-        pool.close_pool()
-        del pool
+        for chunk in chunks:
+            waveform_cache = []
+            pool = pycbc.pool.choose_pool(args.nprocesses)
 
-        for hp in waveform_cache:
-            if hp is not None:
-                if hp.checked is None:
-                    hp.gen = gen
-                    hp.checked = hp not in self
+            for return_wf in tqdm.tqdm(pool.imap_unordered(
+                    wf_wrapper,
+                    (({k: params[k][idx] for k in params}, parallel_check, threshold) for idx in chunk)),
+                    total=total_num, disable=not progress):
+                waveform_cache += [return_wf]
+
+
+            for hp in waveform_cache:
+                if hp is not None:
+                    if hp.checked is None:
+                        hp.gen = gen
+                        hp.checked = hp not in self
  
-                if hp.checked:
-                    self.max_matches.append(hp.max_match)
+                    if hp.checked:
+                        self.max_matches.append(hp.max_match)
                 
-                if hp.checked or force_add:
-                    num_added += 1
-                    self.insert(hp)    
-            else:
-                logging.info("Waveform generation failed!")
-                continue
-                
+                    if hp.checked or force_add:
+                        num_added += 1
+                        self.insert(hp)
+                else:
+                    logging.info("Waveform generation failed!")
+                    continue
+
+            pool.close_pool()
+            del pool
+
         return bank, num_added / total_num
 
 def decimate_frequency_domain(template, target_df):
