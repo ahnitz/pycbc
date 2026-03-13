@@ -447,7 +447,7 @@ class GenUniformWaveform(object):
 
         if args.full_resolution_buffer_length is not None:
             # Decimate the generated signal to a reduced frequency resolution
-            hp = decimate_frequency_domain(hp, 1 / args.buffer_length)
+            hp = decimate_frequency_domain(hp, 1 / self.delta_f)
 
         hp.resize(self.flen)
         hp = hp.astype(numpy.complex64)
