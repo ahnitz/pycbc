@@ -428,16 +428,18 @@ class GenUniformWaveform(object):
 
                 hp = hp.to_frequencyseries(delta_f = 1.0 / buff_len)
                 hc = hc.to_frequencyseries(delta_f = 1.0 / buff_len)
-   
+
             else:
                 hp, hc = pycbc.waveform.get_fd_waveform(delta_f = 1.0 / buff_len,
                                                     **kwds)
-      
-            if  args.use_cross:
-                hp = hc
 
-            if 'fratio' in kwds:
-                hp = hc * kwds['fratio'] + hp * (1 - kwds['fratio'])
+        elif kwds['approximant'] in pycbc.waveform.td_approximants():
+
+            hp, hc = pycbc.waveform.get_td_waveform(delta_t=1.0 / args.sample_rate,
+                                                    **kwds)
+
+            hp = hp.to_frequencyseries(delta_f = 1.0 / buff_len)
+            hc = hc.to_frequencyseries(delta_f = 1.0 / buff_len)
 
         else:
             dt = 1.0 / args.sample_rate
@@ -446,6 +448,13 @@ class GenUniformWaveform(object):
                         dtype=numpy.complex64),
                         delta_f=1.0 / buff_len, delta_t=dt,
                         **kwds)
+            hc = None
+            
+        if  args.use_cross:
+                hp = hc
+
+        if 'fratio' in kwds:
+            hp = hc * kwds['fratio'] + hp * (1 - kwds['fratio'])
 
         if args.full_resolution_buffer_length is not None:
             # Decimate the generated signal to a reduced frequency resolution
