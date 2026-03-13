@@ -419,46 +419,35 @@ class GenUniformWaveform(object):
         else:
             buff_len = 1.0 / self.delta_f
 
-        if kwds['approximant'] in pycbc.waveform.fd_approximants():
-
-            # Optionally generate time-domain waveform
-            if args.use_td_waveform:
-                hp, hc = pycbc.waveform.get_td_waveform(delta_t=1.0 / args.sample_rate,
-                                                    **kwds)
-
-                hp = hp.to_frequencyseries(delta_f = 1.0 / buff_len)
-                hc = hc.to_frequencyseries(delta_f = 1.0 / buff_len)
-
-            else:
-                hp, hc = pycbc.waveform.get_fd_waveform(delta_f = 1.0 / buff_len,
-                                                    **kwds)
-
-        elif kwds['approximant'] in pycbc.waveform.td_approximants():
+        if kwds['approximant'] in pycbc.waveform.td_approximants() or args.use_td_waveform:
 
             hp, hc = pycbc.waveform.get_td_waveform(delta_t=1.0 / args.sample_rate,
-                                                    **kwds)
+                                                **kwds)
 
             hp = hp.to_frequencyseries(delta_f = 1.0 / buff_len)
             hc = hc.to_frequencyseries(delta_f = 1.0 / buff_len)
 
+        if kwds['approximant'] in pycbc.waveform.fd_approximants():
+
+            hp, hc = pycbc.waveform.get_fd_waveform(delta_f = 1.0 / buff_len,
+                                                **kwds)
+
+            if  args.use_cross:
+                hp = hc
+
+            if 'fratio' in kwds:
+                hp = hc * kwds['fratio'] + hp * (1 - kwds['fratio'])
+
         else:
             dt = 1.0 / args.sample_rate
             hp = pycbc.waveform.get_waveform_filter(
-                        pycbc.types.zeros(buff_len * args.sample_rate // 2 + 1,
-                        dtype=numpy.complex64),
-                        delta_f=1.0 / buff_len, delta_t=dt,
+                        pycbc.types.zeros(self.flen, dtype=numpy.complex64),
+                        delta_f=self.delta_f, delta_t=dt,
                         **kwds)
-            hc = None
-            
-        if  args.use_cross:
-                hp = hc
-
-        if 'fratio' in kwds:
-            hp = hc * kwds['fratio'] + hp * (1 - kwds['fratio'])
 
         if args.full_resolution_buffer_length is not None:
             # Decimate the generated signal to a reduced frequency resolution
-            hp = decimate_frequency_domain(hp, self.delta_f)
+            hp = decimate_frequency_domain(hp, 1 / args.buffer_length)
 
         hp.resize(self.flen)
         hp = hp.astype(numpy.complex64)
