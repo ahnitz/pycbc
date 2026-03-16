@@ -589,13 +589,13 @@ def cdraw(rtype, ts, te):
     while len(p[list(p.keys())[0]]) < size:
 
         tp = draw(rtype)
-        p = {k: numpy.concatenate([p[k], tp[k]]) for k in p}
-
-        if  len(p[list(p.keys())[0]]) > 0:
-            t = tau0_from_mass1_mass2(p['mass1'], p['mass2'],
+        if  len(tp[list(tp.keys())[0]]) > 0:
+            t = tau0_from_mass1_mass2(tp['mass1'], tp['mass2'],
                                       args.tau0_cutoff_frequency)
             l = (t < te) & (t > ts)
-            p = {k: p[k][l] for k in p}
+            tp = {k: tp[k][l] for k in tp}
+            
+        p = {k: numpy.concatenate([p[k], tp[k]]) for k in p}
 
         i += 1
         if i > args.placement_iterations:
@@ -603,7 +603,7 @@ def cdraw(rtype, ts, te):
 
     if len(p[list(p.keys())[0]]) == 0:
         return None
-
+        
     return p
 
 signal.signal(signal.SIGINT, handle_exit_signal)
@@ -616,6 +616,9 @@ go = True
 
 region = 0
 while tau0s < args.tau0_end:
+
+    tau0e = min(tau0e, args.tau0_end)
+
     conv = 1
     r = 0
     while conv > tolerance:
