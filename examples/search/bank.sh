@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+<<<<<<< HEAD
+=======
+LDIR=`dirname -- "${BASH_SOURCE[0]}"`
+echo $LDIR
+
+export OMP_NUM_THREADS=1
+>>>>>>> 356945dc2 (make shell script more flexible)
 pycbc_brute_bank \
 --verbose \
 --output-file bank.hdf \
@@ -12,7 +19,12 @@ pycbc_brute_bank \
 --approximant IMRPhenomD \
 --tau0-crawl 5 \
 --tau0-start 0 \
+<<<<<<< HEAD
 --tau0-end 50 \
+=======
+--tau0-end 15 \
+--input-config $LDIR/bank.ini \
+>>>>>>> 356945dc2 (make shell script more flexible)
 --psd-model aLIGOZeroDetLowPower \
 --min 10 10 0 0 \
 --max 40 40 .2 .2 \
