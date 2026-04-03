@@ -578,8 +578,7 @@ class EventManager(object):
 
         if self.write_performance:
             self.analysis_time = search_end_time - search_start_time
-            time_ratio = numpy.array(
-                [float(self.analysis_time) / float(self.run_time)])
+            time_ratio = float(self.analysis_time) / float(self.run_time)
             temps_per_core = float(self.ntemplates) / float(self.ncores)
             filters_per_core = float(self.nfilters) / float(self.ncores)
             f['search/templates_per_core'] = \
