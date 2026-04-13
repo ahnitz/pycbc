@@ -183,6 +183,9 @@ def main():
                                          inj_filter_rejector=inj_filter_rejector)
         
         strain_segments = pycbc.strain.StrainSegments.from_cli(args, gwstrain)
+
+        if hasattr(gwstrain, "injections"):
+            strain_segments.injections = gwstrain.injections
         
         tlen = strain_segments.time_len
         flen = strain_segments.freq_len
@@ -273,6 +276,9 @@ def main():
             logging.info(f"  Ratio Batch {i+1}/{n_coarse}, {len(taps)} FIR templates")
 
             for s_num, stilde in enumerate(segments):
+                if not inj_filter_rejector.template_segment_checker(
+                        bank, coarse_idx, stilde):
+                    continue
                 logging.info(f"Processing Segment {s_num}")
                 t1 = time.time()
 
