@@ -177,6 +177,8 @@ def vecdiff(htilde, hinterp, sample_points, psd=None):
     vecdiffs = numpy.zeros(sample_points.size-1, dtype=float)
     for kk,thisf in enumerate(sample_points[:-1]):
         nextf = sample_points[kk+1]
+        if nextf - thisf < 0.001:
+            continue
         vecdiffs[kk] = abs(_vecdiff(htilde, hinterp, thisf, nextf, psd=psd))
     return vecdiffs
 
