@@ -214,3 +214,190 @@ def find_peaks_in_block_cython(
             snr_list.append(final_max_z)
             
     return (f_idx_list, t_idx_list, snr_list)
+    
+from libc.math cimport sin, floor, sqrt, M_PI
+import numpy as np
+cimport numpy as numpy
+
+cdef inline float sinc_f(float x) nogil:
+    if x == 0.0:
+        return 1.0
+    return sin(M_PI * x) / (M_PI * x)
+
+@cython.boundscheck(False) 
+@cython.wraparound(False) 
+@cython.cdivision(True)   
+def find_peaks_fused_lanczos_cython(
+    numpy.ndarray[complex64_t, ndim=2, mode="c"] corr_output,
+    numpy.ndarray[complex64_t, ndim=2, mode="c"] low_snr_block,
+    long t_start,
+    long n_valid,
+    float threshold_sq,
+    long f_start_offset,
+    double dt_high,
+    double dt_low,
+    double t0_high,
+    double t0_low,
+    long input_offset=0
+):
+    """
+    Fused Cython kernel that performs high-order Lanczos interpolation,
+    coherent subband addition, and max-reduction triggering in a single cache-local pass.
+    """
+    cdef long n_filters_in_batch = corr_output.shape[0]
+    cdef list f_idx_list = []
+    cdef list t_idx_list = []
+    cdef list snr_list = []
+    cdef int VEC_WIDTH = 8
+    
+    cdef float32_t current_max_snr_sq_vec[8]
+    cdef int64_t current_max_idx_vec[8]
+    cdef complex64_t current_max_z_vec[8]
+    
+    cdef long f_batch_idx, i, idx, read_idx, k
+    cdef int v_lane, k_idx
+    cdef int32_t f_global_idx
+    cdef complex64_t z_high, z_total, z_low0, z_low1
+    cdef float32_t mag_sq, high_mag, low_mag0, low_mag1, low_envelope, max_possible_snr_sq
+    cdef float32_t final_max_snr_sq
+    cdef int64_t final_max_idx
+    cdef complex64_t final_max_z
+    
+    # Interpolation variables
+    cdef double time_diff_base = t0_high - t0_low
+    cdef double exact_low_idx, w
+    cdef long idx0
+    cdef float weights[64]
+    cdef float w_sum, t_val
+    cdef complex64_t interp_low_snr
+    
+    for f_batch_idx in range(n_filters_in_batch):
+        f_global_idx = <int32_t>(f_start_offset + f_batch_idx)
+
+        # --- Initialize C stack arrays ---
+        for v_lane in range(VEC_WIDTH):
+            current_max_snr_sq_vec[v_lane] = threshold_sq
+            current_max_idx_vec[v_lane] = -1
+
+        # --- Main vectorized loop ---
+        for i in range(n_valid // VEC_WIDTH):
+            for v_lane in range(VEC_WIDTH):
+                idx = i * VEC_WIDTH + v_lane
+                read_idx = idx + input_offset
+                
+                # 1. Fetch raw highband data point
+                z_high = corr_output[f_batch_idx, read_idx]
+                high_mag = sqrt(z_high.real * z_high.real + z_high.imag * z_high.imag)
+                
+                # 2. Map highband point to lowband grid coordinate
+                exact_low_idx = (time_diff_base + <double>(t_start + idx) * dt_high) / dt_low
+                idx0 = <long>floor(exact_low_idx)
+                
+                # 3. O(1) Coarse Cache-Local Envelope Short-Circuit Check
+                z_low0 = low_snr_block[f_batch_idx, idx0]
+                z_low1 = low_snr_block[f_batch_idx, idx0 + 1]
+                low_mag0 = sqrt(z_low0.real * z_low0.real + z_low0.imag * z_low0.imag)
+                low_mag1 = sqrt(z_low1.real * z_low1.real + z_low1.imag * z_low1.imag)
+                
+                low_envelope = low_mag0 if low_mag0 > low_mag1 else low_mag1
+                # 1.15 multiplier acts as a guard cushion against windowed sinc Gibbs overshoots
+                low_envelope = low_envelope * 1.15
+                
+                max_possible_snr_sq = (high_mag + low_envelope) * (high_mag + low_envelope)
+                
+                if max_possible_snr_sq <= current_max_snr_sq_vec[v_lane]:
+                    # SHORT-CIRCUIT GATE: Skip all 64-point interpolation loops entirely
+                    continue
+                
+                # 4. Heavy Math: Compute Lanczos-32 Weights (64-point stencil)
+                w = exact_low_idx - <double>idx0
+                w_sum = 0.0
+                for k_idx in range(64):
+                    k = k_idx - 31
+                    t_val = <float>(w - <double>k)
+                    weights[k_idx] = sinc_f(t_val) * sinc_f(t_val / 32.0)
+                    w_sum += weights[k_idx]
+                
+                # 5. Evaluate Dot Product and Combine
+                interp_low_snr.real = 0.0
+                interp_low_snr.imag = 0.0
+                if w_sum != 0.0:
+                    for k_idx in range(64):
+                        k = k_idx - 31
+                        # Normalize weight inline to preserve absolute DC stability
+                        weights[k_idx] /= w_sum
+                        interp_low_snr.real += weights[k_idx] * low_snr_block[f_batch_idx, idx0 + k].real
+                        interp_low_snr.imag += weights[k_idx] * low_snr_block[f_batch_idx, idx0 + k].imag
+                
+                z_total.real = z_high.real + interp_low_snr.real
+                z_total.imag = z_high.imag + interp_low_snr.imag
+                mag_sq = z_total.real * z_total.real + z_total.imag * z_total.imag
+
+                # 6. Maximum reduction update
+                if mag_sq > current_max_snr_sq_vec[v_lane]:
+                    current_max_snr_sq_vec[v_lane] = mag_sq
+                    current_max_idx_vec[v_lane] = t_start + idx
+                    current_max_z_vec[v_lane] = z_total
+
+        # --- Epilogue (Remainder Handling) ---
+        for i in range((n_valid // VEC_WIDTH) * VEC_WIDTH, n_valid):
+            read_idx = i + input_offset
+            z_high = corr_output[f_batch_idx, read_idx]
+            high_mag = sqrt(z_high.real * z_high.real + z_high.imag * z_high.imag)
+            
+            exact_low_idx = (time_diff_base + <double>(t_start + i) * dt_high) / dt_low
+            idx0 = <long>floor(exact_low_idx)
+            
+            z_low0 = low_snr_block[f_batch_idx, idx0]
+            z_low1 = low_snr_block[f_batch_idx, idx0 + 1]
+            low_mag0 = sqrt(z_low0.real * z_low0.real + z_low0.imag * z_low0.imag)
+            low_mag1 = sqrt(z_low1.real * z_low1.real + z_low1.imag * z_low1.imag)
+            low_envelope = (low_mag0 if low_mag0 > low_mag1 else low_mag1) * 1.15
+            
+            max_possible_snr_sq = (high_mag + low_envelope) * (high_mag + low_envelope)
+            
+            if max_possible_snr_sq <= current_max_snr_sq_vec[0]:
+                continue
+                
+            w = exact_low_idx - <double>idx0
+            w_sum = 0.0
+            for k_idx in range(64):
+                k = k_idx - 31
+                t_val = <float>(w - <double>k)
+                weights[k_idx] = sinc_f(t_val) * sinc_f(t_val / 32.0)
+                w_sum += weights[k_idx]
+            
+            interp_low_snr.real = 0.0
+            interp_low_snr.imag = 0.0
+            if w_sum != 0.0:
+                for k_idx in range(64):
+                    k = k_idx - 31
+                    weights[k_idx] /= w_sum
+                    interp_low_snr.real += weights[k_idx] * low_snr_block[f_batch_idx, idx0 + k].real
+                    interp_low_snr.imag += weights[k_idx] * low_snr_block[f_batch_idx, idx0 + k].imag
+            
+            z_total.real = z_high.real + interp_low_snr.real
+            z_total.imag = z_high.imag + interp_low_snr.imag
+            mag_sq = z_total.real * z_total.real + z_total.imag * z_total.imag
+            
+            if mag_sq > current_max_snr_sq_vec[0]:
+                current_max_snr_sq_vec[0] = mag_sq
+                current_max_idx_vec[0] = t_start + i
+                current_max_z_vec[0] = z_total
+        
+        # --- Final Reduction ---
+        final_max_snr_sq = threshold_sq
+        final_max_idx = -1
+        final_max_z = 0 + 0j
+        for v_lane in range(VEC_WIDTH):
+            if current_max_snr_sq_vec[v_lane] > final_max_snr_sq:
+                final_max_snr_sq = current_max_snr_sq_vec[v_lane]
+                final_max_idx = current_max_idx_vec[v_lane]
+                final_max_z = current_max_z_vec[v_lane]
+        
+        if final_max_idx != -1:
+            f_idx_list.append(f_global_idx)
+            t_idx_list.append(final_max_idx)
+            snr_list.append(final_max_z)
+            
+    return (f_idx_list, t_idx_list, snr_list)

@@ -29,7 +29,7 @@ import types
 import logging
 import os.path
 import h5py
-from copy import copy
+from copy import copy, deepcopy
 import numpy as np
 from igwn_ligolw import lsctables, utils as ligolw_utils
 import pycbc.waveform
@@ -1211,7 +1211,7 @@ class RatioFilterBank(FilterBank):
         
         templates = []
         for fid in fine_indices:
-            templates += [self[fid].copy()]
+            templates += [deepcopy(self[fid])]
         return templates
 
     def get_coarse_template(self, coarse_index):
