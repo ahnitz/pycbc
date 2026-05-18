@@ -178,7 +178,7 @@ class RatioMatchedFilterControl(object):
         else:
             v_start = 0
             v_stop = n_samples
- 
+
         block_f_cache = {}
         # --- OUTER LOOP: Time Blocks ---
         for f_start in range(0, n_filters, self.batch_size):  
@@ -201,6 +201,19 @@ class RatioMatchedFilterControl(object):
             # Determine Loop Bounds
             first_block_idx = (v_start - bad_start) // STEP
             loop_start = first_block_idx * STEP
+
+            if lowband_snrs is not None:
+                low_snr_batch = lowband_snrs[f_start:f_end]
+                # Convert the batch into a contiguous 2D C-aligned array
+                low_snr_block = np.ascontiguousarray(
+                    np.stack([obj.numpy() if hasattr(obj, 'numpy') else obj.data for obj in low_snr_batch]),
+                    dtype=np.complex64
+                )
+                # Extract grid references
+                t0_low = float(lowband_snrs[0].start_time)
+                dt_low = lowband_snrs[0].delta_t
+                dt_high = stilde.delta_t
+                t0_high = float(stilde.start_time)
 
             for t_start in range(loop_start, n_samples, STEP):
 
@@ -365,20 +378,7 @@ class RatioMatchedFilterControl(object):
                 # -----------------------------------------------------------------
                 import time
                 if lowband_snrs is not None:
-                    low_snr_batch = lowband_snrs[f_start:f_end]
-                    # Convert the batch into a contiguous 2D C-aligned array
-                    low_snr_block = np.ascontiguousarray(
-                        np.stack([obj.numpy() if hasattr(obj, 'numpy') else obj.data for obj in low_snr_batch]),
-                        dtype=np.complex64
-                    )
-                    # Extract grid references
-                    t0_low = float(lowband_snrs[0].start_time)
-                    dt_low = lowband_snrs[0].delta_t
-                    dt_high = stilde.delta_t
-                    t0_high = float(stilde.start_time)
-
-
-                    t1 = time.time()
+                    #t1 = time.time()
                     f_list, t_list, s_list = find_peaks_fused_lanczos_cython(
                                             current_corr_view,
                                             low_snr_block,
@@ -392,18 +392,19 @@ class RatioMatchedFilterControl(object):
                                             t0_low,
                                             input_offset=buf_slice_start
                                         )
-                    t2 = time.time()
-                             
-                    f_list2, t_list2, s_list2 = find_peaks_in_block_cython(
-                        current_corr_view, 
-                        roi_start,          
-                        roi_len,            
-                        self.threshold_sq, 
-                        f_start,
-                        input_offset=buf_slice_start
-                    )
-                    t3 = time.time()
-                    print(t3-t2, t2-t1)
+                    #t2 = time.time()
+                    
+                    if False:         
+                        f_list2, t_list2, s_list2 = find_peaks_in_block_cython(
+                            current_corr_view, 
+                            roi_start,          
+                            roi_len,            
+                            self.threshold_sq, 
+                            f_start,
+                            input_offset=buf_slice_start
+                        )
+                   # t3 = time.time()
+                    #print(t3-t2, t2-t1)
 
                 if f_list:
                     all_f_idxs.extend(f_list)
