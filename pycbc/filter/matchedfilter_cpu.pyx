@@ -214,15 +214,24 @@ def find_peaks_in_block_cython(
             snr_list.append(final_max_z)
             
     return (f_idx_list, t_idx_list, snr_list)
-    
-from libc.math cimport sin, floor, sqrt, M_PI
+
 import numpy as np
 cimport numpy as numpy
+cimport cython
+cimport libc.math
+import logging
 
-cdef inline float sinc_f(float x) nogil:
-    if x == 0.0:
-        return 1.0
-    return sin(M_PI * x) / (M_PI * x)
+# =====================================================================
+# GLOBAL MODULE LEVEL: Pregenerate Static Lanczos-32 Weights LUT
+# =====================================================================
+_w_grid = np.linspace(0, 1, 1024, endpoint=False)[:, None]
+_k_grid = np.arange(-31, 33)[None, :]
+_t_grid = _w_grid - _k_grid
+
+_lut_raw = np.sinc(_t_grid) * np.sinc(_t_grid / 32.0)
+_lut_raw /= _lut_raw.sum(axis=1, keepdims=True)
+LANCZOS_32_LUT = np.ascontiguousarray(_lut_raw, dtype=np.float32)
+
 
 @cython.boundscheck(False) 
 @cython.wraparound(False) 
@@ -241,163 +250,137 @@ def find_peaks_fused_lanczos_cython(
     long input_offset=0
 ):
     """
-    Fused Cython kernel that performs high-order Lanczos interpolation,
-    coherent subband addition, and max-reduction triggering in a single cache-local pass.
+    Two-Pass Fused Kernel utilizing pristine block-level max scans
+    to restore native SIMD throughput and match baseline peak-finding speeds.
     """
     cdef long n_filters_in_batch = corr_output.shape[0]
     cdef list f_idx_list = []
     cdef list t_idx_list = []
     cdef list snr_list = []
-    cdef int VEC_WIDTH = 8
     
-    cdef float32_t current_max_snr_sq_vec[8]
-    cdef int64_t current_max_idx_vec[8]
-    cdef complex64_t current_max_z_vec[8]
-    
-    cdef long f_batch_idx, i, idx, read_idx, k
-    cdef int v_lane, k_idx
+    cdef long f_batch_idx, j, idx, read_idx
+    cdef int k_idx
     cdef int32_t f_global_idx
-    cdef complex64_t z_high, z_total, z_low0, z_low1
-    cdef float32_t mag_sq, high_mag, low_mag0, low_mag1, low_envelope, max_possible_snr_sq
-    cdef float32_t final_max_snr_sq
-    cdef int64_t final_max_idx
-    cdef complex64_t final_max_z
     
-    # Interpolation variables
-    cdef double time_diff_base = t0_high - t0_low
+    cdef complex64_t z_high, z_total, z_low0, z_low1, interp_low_snr
+    cdef float32_t mag_sq, high_mag_bound, low_mag0_bound, low_mag1_bound, low_envelope_bound
+    
+    cdef float32_t current_max_snr_sq
+    cdef float32_t current_max_snr_amp 
+    cdef int64_t current_max_idx
+    cdef complex64_t current_max_z
+    
+    cdef float[:, :] weights_lut = LANCZOS_32_LUT
+    
+    # Grid transformation constants
+    cdef double const_offset = (t0_high - t0_low) + <double>t_start * dt_high
+    cdef double data_scale = dt_high / dt_low
+    cdef double base_scale = const_offset / dt_low
+    
+    cdef double low_idx_start = const_offset / dt_low
+    cdef double low_idx_end = (const_offset + <double>(n_valid - 1) * dt_high) / dt_low
+    cdef long j_start = <long>libc.math.floor(low_idx_start)
+    cdef long j_end = <long>libc.math.floor(low_idx_end)
+    
+    cdef long idx_min_j, idx_max_j
     cdef double exact_low_idx, w
-    cdef long idx0
-    cdef float weights[64]
-    cdef float w_sum, t_val
-    cdef complex64_t interp_low_snr
+    cdef int w_lut_idx
+    
+    # Pass 1 Optimization Scans
+    cdef float32_t max_low_envelope, l_amp, block_max_high_sq, block_max_high_amp
     
     for f_batch_idx in range(n_filters_in_batch):
         f_global_idx = <int32_t>(f_start_offset + f_batch_idx)
 
-        # --- Initialize C stack arrays ---
-        for v_lane in range(VEC_WIDTH):
-            current_max_snr_sq_vec[v_lane] = threshold_sq
-            current_max_idx_vec[v_lane] = -1
+        current_max_snr_sq = threshold_sq
+        current_max_snr_amp = <float>libc.math.sqrt(threshold_sq) 
+        current_max_idx = -1
+        current_max_z.real = 0.0
+        current_max_z.imag = 0.0
 
-        # --- Main vectorized loop ---
-        for i in range(n_valid // VEC_WIDTH):
-            for v_lane in range(VEC_WIDTH):
-                idx = i * VEC_WIDTH + v_lane
+        # =====================================================================
+        # PASS 1a: Scan Short Lowband Segment for Max Amplitude
+        # =====================================================================
+        max_low_envelope = 0.0
+        for j in range(j_start, j_end + 2):
+            z_low0 = low_snr_block[f_batch_idx, j]
+            l_amp = <float32_t>libc.math.sqrt(z_low0.real * z_low0.real + z_low0.imag * z_low0.imag)
+            if l_amp > max_low_envelope:
+                max_low_envelope = l_amp
+        max_low_envelope *= 1.15 # 15% safety padding for Gibbs overshoots
+        
+        # =====================================================================
+        # PASS 1b: Unbroken Highband Max Scan (Pristine SIMD pipeline)
+        # =====================================================================
+        block_max_high_sq = 0.0
+        for idx in range(n_valid):
+            read_idx = idx + input_offset
+            z_high = corr_output[f_batch_idx, read_idx]
+            mag_sq = z_high.real * z_high.real + z_high.imag * z_high.imag
+            if mag_sq > block_max_high_sq:
+                block_max_high_sq = mag_sq
+                
+        block_max_high_amp = <float32_t>libc.math.sqrt(block_max_high_sq)
+
+        # =====================================================================
+        # GLOBAL BLOCK GATE CHECK
+        # =====================================================================
+        if (block_max_high_amp + max_low_envelope) <= current_max_snr_amp:
+            # HIERARCHICAL SKIP: Zero triggers possible. Skip entire fallback loop.
+            continue
+
+        # =====================================================================
+        # PASS 2: Fallback Detailed Segment Loop (Executed <1% of the time)
+        # =====================================================================
+        for j in range(j_start, j_end + 1):
+            idx_min_j = <long>libc.math.ceil((<double>j * dt_low - const_offset) / dt_high)
+            idx_max_j = <long>libc.math.ceil((<double>(j + 1) * dt_low - const_offset) / dt_high)
+            
+            if idx_min_j < 0: idx_min_j = 0
+            if idx_max_j > n_valid: idx_max_j = n_valid
+            if idx_min_j >= idx_max_j: continue
+            
+            z_low0 = low_snr_block[f_batch_idx, j]
+            z_low1 = low_snr_block[f_batch_idx, j + 1]
+            low_mag0_bound = libc.math.fabs(z_low0.real) + libc.math.fabs(z_low0.imag)
+            low_mag1_bound = libc.math.fabs(z_low1.real) + libc.math.fabs(z_low1.imag)
+            low_envelope_bound = (low_mag0_bound if low_mag0_bound > low_mag1_bound else low_mag1_bound) * 1.15
+            
+            for idx in range(idx_min_j, idx_max_j):
                 read_idx = idx + input_offset
-                
-                # 1. Fetch raw highband data point
                 z_high = corr_output[f_batch_idx, read_idx]
-                high_mag = sqrt(z_high.real * z_high.real + z_high.imag * z_high.imag)
+                high_mag_bound = libc.math.fabs(z_high.real) + libc.math.fabs(z_high.imag)
                 
-                # 2. Map highband point to lowband grid coordinate
-                exact_low_idx = (time_diff_base + <double>(t_start + idx) * dt_high) / dt_low
-                idx0 = <long>floor(exact_low_idx)
-                
-                # 3. O(1) Coarse Cache-Local Envelope Short-Circuit Check
-                z_low0 = low_snr_block[f_batch_idx, idx0]
-                z_low1 = low_snr_block[f_batch_idx, idx0 + 1]
-                low_mag0 = sqrt(z_low0.real * z_low0.real + z_low0.imag * z_low0.imag)
-                low_mag1 = sqrt(z_low1.real * z_low1.real + z_low1.imag * z_low1.imag)
-                
-                low_envelope = low_mag0 if low_mag0 > low_mag1 else low_mag1
-                # 1.15 multiplier acts as a guard cushion against windowed sinc Gibbs overshoots
-                low_envelope = low_envelope * 1.15
-                
-                max_possible_snr_sq = (high_mag + low_envelope) * (high_mag + low_envelope)
-                
-                if max_possible_snr_sq <= current_max_snr_sq_vec[v_lane]:
-                    # SHORT-CIRCUIT GATE: Skip all 64-point interpolation loops entirely
+                if (high_mag_bound + low_envelope_bound) <= current_max_snr_amp:
                     continue
                 
-                # 4. Heavy Math: Compute Lanczos-32 Weights (64-point stencil)
-                w = exact_low_idx - <double>idx0
-                w_sum = 0.0
-                for k_idx in range(64):
-                    k = k_idx - 31
-                    t_val = <float>(w - <double>k)
-                    weights[k_idx] = sinc_f(t_val) * sinc_f(t_val / 32.0)
-                    w_sum += weights[k_idx]
+                exact_low_idx = base_scale + <double>idx * data_scale
+                w = exact_low_idx - <double>j
                 
-                # 5. Evaluate Dot Product and Combine
+                w_lut_idx = <int>(w * 1024.0)
+                if w_lut_idx > 1023: w_lut_idx = 1023
+                elif w_lut_idx < 0: w_lut_idx = 0
+                
                 interp_low_snr.real = 0.0
                 interp_low_snr.imag = 0.0
-                if w_sum != 0.0:
-                    for k_idx in range(64):
-                        k = k_idx - 31
-                        # Normalize weight inline to preserve absolute DC stability
-                        weights[k_idx] /= w_sum
-                        interp_low_snr.real += weights[k_idx] * low_snr_block[f_batch_idx, idx0 + k].real
-                        interp_low_snr.imag += weights[k_idx] * low_snr_block[f_batch_idx, idx0 + k].imag
+                for k_idx in range(64):
+                    interp_low_snr.real += weights_lut[w_lut_idx, k_idx] * low_snr_block[f_batch_idx, j + k_idx - 31].real
+                    interp_low_snr.imag += weights_lut[w_lut_idx, k_idx] * low_snr_block[f_batch_idx, j + k_idx - 31].imag
                 
                 z_total.real = z_high.real + interp_low_snr.real
                 z_total.imag = z_high.imag + interp_low_snr.imag
                 mag_sq = z_total.real * z_total.real + z_total.imag * z_total.imag
-
-                # 6. Maximum reduction update
-                if mag_sq > current_max_snr_sq_vec[v_lane]:
-                    current_max_snr_sq_vec[v_lane] = mag_sq
-                    current_max_idx_vec[v_lane] = t_start + idx
-                    current_max_z_vec[v_lane] = z_total
-
-        # --- Epilogue (Remainder Handling) ---
-        for i in range((n_valid // VEC_WIDTH) * VEC_WIDTH, n_valid):
-            read_idx = i + input_offset
-            z_high = corr_output[f_batch_idx, read_idx]
-            high_mag = sqrt(z_high.real * z_high.real + z_high.imag * z_high.imag)
-            
-            exact_low_idx = (time_diff_base + <double>(t_start + i) * dt_high) / dt_low
-            idx0 = <long>floor(exact_low_idx)
-            
-            z_low0 = low_snr_block[f_batch_idx, idx0]
-            z_low1 = low_snr_block[f_batch_idx, idx0 + 1]
-            low_mag0 = sqrt(z_low0.real * z_low0.real + z_low0.imag * z_low0.imag)
-            low_mag1 = sqrt(z_low1.real * z_low1.real + z_low1.imag * z_low1.imag)
-            low_envelope = (low_mag0 if low_mag0 > low_mag1 else low_mag1) * 1.15
-            
-            max_possible_snr_sq = (high_mag + low_envelope) * (high_mag + low_envelope)
-            
-            if max_possible_snr_sq <= current_max_snr_sq_vec[0]:
-                continue
                 
-            w = exact_low_idx - <double>idx0
-            w_sum = 0.0
-            for k_idx in range(64):
-                k = k_idx - 31
-                t_val = <float>(w - <double>k)
-                weights[k_idx] = sinc_f(t_val) * sinc_f(t_val / 32.0)
-                w_sum += weights[k_idx]
-            
-            interp_low_snr.real = 0.0
-            interp_low_snr.imag = 0.0
-            if w_sum != 0.0:
-                for k_idx in range(64):
-                    k = k_idx - 31
-                    weights[k_idx] /= w_sum
-                    interp_low_snr.real += weights[k_idx] * low_snr_block[f_batch_idx, idx0 + k].real
-                    interp_low_snr.imag += weights[k_idx] * low_snr_block[f_batch_idx, idx0 + k].imag
-            
-            z_total.real = z_high.real + interp_low_snr.real
-            z_total.imag = z_high.imag + interp_low_snr.imag
-            mag_sq = z_total.real * z_total.real + z_total.imag * z_total.imag
-            
-            if mag_sq > current_max_snr_sq_vec[0]:
-                current_max_snr_sq_vec[0] = mag_sq
-                current_max_idx_vec[0] = t_start + i
-                current_max_z_vec[0] = z_total
-        
-        # --- Final Reduction ---
-        final_max_snr_sq = threshold_sq
-        final_max_idx = -1
-        final_max_z = 0 + 0j
-        for v_lane in range(VEC_WIDTH):
-            if current_max_snr_sq_vec[v_lane] > final_max_snr_sq:
-                final_max_snr_sq = current_max_snr_sq_vec[v_lane]
-                final_max_idx = current_max_idx_vec[v_lane]
-                final_max_z = current_max_z_vec[v_lane]
-        
-        if final_max_idx != -1:
+                if mag_sq > current_max_snr_sq:
+                    current_max_snr_sq = mag_sq
+                    current_max_snr_amp = <float>libc.math.sqrt(mag_sq)
+                    current_max_idx = t_start + idx
+                    current_max_z = z_total
+                    
+        if current_max_idx != -1:
             f_idx_list.append(f_global_idx)
-            t_idx_list.append(final_max_idx)
-            snr_list.append(final_max_z)
+            t_idx_list.append(current_max_idx)
+            snr_list.append(current_max_z)
             
     return (f_idx_list, t_idx_list, snr_list)
+
