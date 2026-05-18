@@ -803,7 +803,6 @@ class FilterBank(TemplateBank):
             parameters=parameters, **kwds)
         self.ensure_standard_filter_columns(low_frequency_cutoff=low_frequency_cutoff)
 
-
     def get_decompressed_waveform(self, tempout, index, f_lower=None,
                                   approximant=None, df=None):
         """Returns a frequency domain decompressed waveform for the template
@@ -926,7 +925,7 @@ class FilterBank(TemplateBank):
         # Get the waveform filter
         distance = 1.0 / DYN_RANGE_FAC
         full_calculate_waveform = True
-        
+
         if (self.has_compressed_waveforms and self.enable_compressed_waveforms):
             try:
                 htilde = self.get_decompressed_waveform(
@@ -1118,11 +1117,17 @@ class RatioFilterBank(FilterBank):
 
     def __init__(self, filename, filter_length, delta_f, dtype,
                  approximant=None, **kwds):
+                 
+        if isinstance(filter_length, tuple):
+            filter_length_fine = filter_length[0]
+            filter_length_coarse = filter_length[1]
+        else:
+            filter_length_fine = filter_length_coarse = filter_length
         
         # 1. Initialize self as the "Fine" bank (Root of HDF5)
         # This gives us access to self.table (the target parameters)
         super(RatioFilterBank, self).__init__(
-            filename, filter_length, delta_f, dtype, 
+            filename, filter_length_fine, delta_f, dtype, 
             approximant=approximant, **kwds
         )
         
@@ -1136,7 +1141,7 @@ class RatioFilterBank(FilterBank):
         # We use the reuse strategy: passing our own filehandler to avoid 
         # re-opening the file, and using group_key to point to the params.
         self.coarse_bank = FilterBank(
-            filename, filter_length, delta_f, dtype,
+            filename, filter_length_coarse, delta_f, dtype,
             approximant=approximant, # We assume coarse/fine use same approximant
             group_key='fir_data/coarse_bank_params',
             file_handler=self.filehandler,
@@ -1199,6 +1204,15 @@ class RatioFilterBank(FilterBank):
             self.coarse_indices = indices_unique
         else:
             self.coarse_indices = []
+
+    def get_fine_templates(self, coarse_index):
+        c_group = self.fir_group[str(coarse_index)]
+        fine_indices = c_group['fine_bank_index'][:]
+        
+        templates = []
+        for fid in fine_indices:
+            templates += [self[fid].copy()]
+        return templates
 
     def get_coarse_template(self, coarse_index):
         """Wrapper to get the frequency-domain waveform from the internal coarse bank.

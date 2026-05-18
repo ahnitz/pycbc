@@ -12,7 +12,10 @@ class RatioMatchedFilterControl(object):
     """
 
     def __init__(self, snr_threshold, delta_f, 
-                 high_frequency_cutoff=None, fir_fft_length=4096, batch_size=64):
+                 high_frequency_cutoff=None,
+                 fir_fft_length=4096,
+                 batch_size=64, 
+                 multiband_frequency=None):
         self.delta_f = delta_f
         self.snr_threshold = snr_threshold
         self.f_high = high_frequency_cutoff
@@ -33,6 +36,8 @@ class RatioMatchedFilterControl(object):
         
         # Direct MKL handle
         self.fft_lib = mkl_fft
+        
+        self.multiband_frequency = multiband_frequency
 
     def prepare_filters(self, fir_taps, tap_counts):
         """
@@ -61,9 +66,10 @@ class RatioMatchedFilterControl(object):
         h_norm = ref_template.sigmasq(psd)
 
         # 2. Calculate Reference SNR
+        flow = self.multiband_frequency if self.multiband_frequency is not None else ref_template.f_lower
         snr, _, norm = matched_filter_core(
             ref_template, stilde, psd=psd,
-            low_frequency_cutoff=ref_template.f_lower,
+            low_frequency_cutoff=flow,
             high_frequency_cutoff=self.f_high,
             h_norm=h_norm
         )
