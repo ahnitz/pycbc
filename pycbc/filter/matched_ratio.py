@@ -76,7 +76,6 @@ class RatioMatchedFilterControl(object):
             h_norm=h_norm
         )
         
-        self.ref_snr = snr.numpy() * (norm * stilde.delta_t)
         t2 = time.time()
 
         # Calculate lowband template SNRs
@@ -103,33 +102,33 @@ class RatioMatchedFilterControl(object):
             filter_batch_f[:flen] = ltem      
             x = sow2 * filter_batch_f
             lowband_snrs += [self.fft_lib.ifft(x)]
-                    
-
-        lowband_snrs = [TimeSeries(x,
-         delta_t=sow.delta_t, 
-         epoch=stilde.start_time) for x in lowband_snrs]     
         
-        # Reweight 
+        # Reweighting factors so you can just add the high / low
+        # snrs directly
         h_norm = 1.0 / norm**2.0
         h_norm2 = 1.0 / norm2**2.0
         sigma_total = (h_norm + h_norm2)**0.5
-        
         rw_low = h_norm2 ** 0.5 / sigma_total
         rw_high = h_norm ** 0.5 / sigma_total
-        print(rw_low, rw_high)
         
-        self.ref_snr *= rw_high
-        lowband_snrs = [x * (rw_low * norm2 * flen2) for x in lowband_snrs]
-       
-        logging.info('.....done')                
+        # Prenormalize the SNRs
+        # Opt note: could move all this multiplication to the peak finding..
         t3 = time.time()
-        
-        print("PRE TIMING", t3 - t2, t2-t1)
+        self.ref_snr = snr.numpy() * (norm * stilde.delta_t * rw_high)    
+        lowband_snrs = [TimeSeries(x * (rw_low * norm2 * flen2),
+                                   delta_t=sow.delta_t, 
+                                   epoch=stilde.start_time) for x in lowband_snrs]             
+ 
+        logging.info('.....done')                
+        t4 = time.time()
         
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
             self.ref_snr, filters_f, n_taps, valid_slice, stilde, lowband_snrs=lowband_snrs,
         )
+        t5 = time.time()
+         
+        print("PRE TIMING", "RF", t5-t4, "NORM", t4 - t3, "LB", t3 - t2, "REF", t2-t1)
         
         # 4. Map indices
         if len(local_idxs) > 0:
