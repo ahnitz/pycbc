@@ -1,8 +1,8 @@
 import logging
 import numpy as np
 import mkl_fft
-from pycbc.types import zeros, complex64
-from pycbc.filter.matchedfilter import matched_filter_core
+from pycbc.types import zeros, complex64, TimeSeries
+from pycbc.filter.matchedfilter import matched_filter_core, sigmasq
 from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython, find_peaks_in_block_cython, find_peaks_fused_lanczos_cython
 
 class RatioMatchedFilterControl(object):
@@ -62,33 +62,91 @@ class RatioMatchedFilterControl(object):
         if valid_slice is None:
             valid_slice = getattr(stilde, 'analyze', None)
 
-        # 1. Calculate Reference Normalization
-        h_norm = ref_template.sigmasq(psd)
-
+        import time
+        
+        t1 =time.time()
         # 2. Calculate Reference SNR
-        flow = self.multiband_frequency if self.multiband_frequency is not None else ref_template.f_lower
+        flow = self.multiband_frequency if self.multiband_frequency is not None else ref_template.f_lower        
+        h_norm = sigmasq(ref_template, psd=psd, low_frequency_cutoff=flow, high_frequency_cutoff=self.f_high)
+        
         snr, _, norm = matched_filter_core(
             ref_template, stilde, psd=psd,
             low_frequency_cutoff=flow,
             high_frequency_cutoff=self.f_high,
-            #h_norm=h_norm
+            h_norm=h_norm
         )
+        
         self.ref_snr = snr.numpy() * (norm * stilde.delta_t)
+        t2 = time.time()
 
         # Calculate lowband template SNRs
+        
         logging.info('processing lowband templates')
-        lowband_snrs = []
+        #lowband_snrs = []
+
+        # Fix up this normalization step to do mchirp rescaling?
+        h_norm2 = sigmasq(lowband_templates[0], psd=psd,
+                         low_frequency_cutoff=lowband_templates[0].f_lower,
+                         high_frequency_cutoff=self.multiband_frequency)
+        norm2 =  4.0 * stilde.delta_f / h_norm2 ** 0.5
         if lowband_templates is not None:
-            for ltemplate in lowband_templates:
-                h_norm2 = ltemplate.sigmasq(psd)
-                snr, _, norm2 = matched_filter_core(
-                    ltemplate, stilde[:len(ltemplate)], psd=psd,
-                    low_frequency_cutoff=ltemplate.f_lower,
-                    high_frequency_cutoff=self.multiband_frequency,
-                    #h_norm=h_norm2,
-                )
-                lowband_snrs += [snr.copy() * norm2]
+            flen = len(lowband_templates[0])
+            sow = stilde[:flen] / psd[:flen]
+            
+            #for ltemplate in lowband_templates:
+            #    snr, _, norm2 = matched_filter_core(
+            #        ltemplate, sow,
+            #        low_frequency_cutoff=ltemplate.f_lower,
+            #        high_frequency_cutoff=self.multiband_frequency,
+            #        h_norm=h_norm2,
+            #    )
+            #    lowband_snrs += [snr.copy()]        
+
+            flen2 = (flen - 1) * 2
+            filter_batch_f = np.zeros((len(lowband_templates), flen2), dtype=np.complex64)
+            for j, ltemplate in enumerate(lowband_templates):
+                ltem = ltemplate.numpy().conj()
+                kmax = int(self.multiband_frequency / ltemplate.delta_f)
+                ltem[kmax:] = 0
+                filter_batch_f[j, :flen] = ltem      
                 
+            sow2 = sow.numpy().copy()
+            sow2.resize(flen2)
+            
+            tlen = len(lowband_templates) * flen2
+            current_mult_view = zeros(tlen, dtype=np.complex64).data.reshape((len(lowband_templates), flen2))
+            current_corr_view =  zeros(tlen, dtype=np.complex64).data.reshape((len(lowband_templates), flen2))
+
+            t5 = time.time()
+            
+            if False:
+                fast_multiply_analytic_cython(
+                    sow2, filter_batch_f, current_mult_view
+                )
+                
+                t55 = time.time()
+                self.fft_lib.ifft(
+                    current_mult_view, 
+                    axis=-1, 
+                    out=current_corr_view
+                )
+                lowband_snrs = [current_corr_view[i,:]
+                                for i in range(len(lowband_templates))]
+                                             
+            else:      
+                lowband_snrs = []
+                for j in range(len(lowband_templates)):
+                    x = sow2 * filter_batch_f[j, :]
+                    lowband_snrs += [self.fft_lib.ifft(x)]
+                        
+            t6 = time.time()
+            #breakpoint()
+            
+            print(t6-t5)
+
+        lowband_snrs = [TimeSeries(x,
+         delta_t=sow.delta_t, 
+         epoch=stilde.start_time) for x in lowband_snrs]     
         
         # Reweight 
         h_norm = 1.0 / norm**2.0
@@ -100,14 +158,17 @@ class RatioMatchedFilterControl(object):
         print(rw_low, rw_high)
         
         self.ref_snr *= rw_high
-        lowband_snrs = [x * rw_low for x in lowband_snrs]
-        
+        lowband_snrs = [x * (rw_low * norm2 * flen2) for x in lowband_snrs]
+        t3 = time.time()
+       
         logging.info('.....done')                
             
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
             self.ref_snr, filters_f, n_taps, valid_slice, stilde, lowband_snrs=lowband_snrs,
         )
+        t4 = time.time()
+        print("MF ref timing", t2 - t1, t3 - t2, t4 - t3)
         
         # 4. Map indices
         if len(local_idxs) > 0:

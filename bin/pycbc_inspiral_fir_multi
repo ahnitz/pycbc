@@ -364,7 +364,6 @@ def main():
                     lowband_templates=lowband_templates,
                 )
 
-
                 if len(ids_local) > 0:
                     chi, chi_dof = compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
                         fine_indices, tstarts, stilde, bank, power_chisq, engine, filters_f, ref_template, args)
@@ -381,6 +380,7 @@ def main():
 
 
                 t2 = time.time()
+                print("pass loop", t2 - t1)
                 tperf = (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t / (t2 - t1) * len(taps)
                 logging.info(f"batch perf: {tperf} templates s/s")
                 
