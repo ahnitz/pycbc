@@ -80,69 +80,30 @@ class RatioMatchedFilterControl(object):
         t2 = time.time()
 
         # Calculate lowband template SNRs
-        
         logging.info('processing lowband templates')
-        #lowband_snrs = []
 
         # Fix up this normalization step to do mchirp rescaling?
         h_norm2 = sigmasq(lowband_templates[0], psd=psd,
                          low_frequency_cutoff=lowband_templates[0].f_lower,
                          high_frequency_cutoff=self.multiband_frequency)
         norm2 =  4.0 * stilde.delta_f / h_norm2 ** 0.5
-        if lowband_templates is not None:
-            flen = len(lowband_templates[0])
-            sow = stilde[:flen] / psd[:flen]
-            
-            #for ltemplate in lowband_templates:
-            #    snr, _, norm2 = matched_filter_core(
-            #        ltemplate, sow,
-            #        low_frequency_cutoff=ltemplate.f_lower,
-            #        high_frequency_cutoff=self.multiband_frequency,
-            #        h_norm=h_norm2,
-            #    )
-            #    lowband_snrs += [snr.copy()]        
-
-            flen2 = (flen - 1) * 2
-            filter_batch_f = np.zeros((len(lowband_templates), flen2), dtype=np.complex64)
-            for j, ltemplate in enumerate(lowband_templates):
-                ltem = ltemplate.numpy().conj()
-                kmax = int(self.multiband_frequency / ltemplate.delta_f)
-                ltem[kmax:] = 0
-                filter_batch_f[j, :flen] = ltem      
-                
-            sow2 = sow.numpy().copy()
-            sow2.resize(flen2)
-            
-            tlen = len(lowband_templates) * flen2
-            current_mult_view = zeros(tlen, dtype=np.complex64).data.reshape((len(lowband_templates), flen2))
-            current_corr_view =  zeros(tlen, dtype=np.complex64).data.reshape((len(lowband_templates), flen2))
-
-            t5 = time.time()
-            
-            if False:
-                fast_multiply_analytic_cython(
-                    sow2, filter_batch_f, current_mult_view
-                )
-                
-                t55 = time.time()
-                self.fft_lib.ifft(
-                    current_mult_view, 
-                    axis=-1, 
-                    out=current_corr_view
-                )
-                lowband_snrs = [current_corr_view[i,:]
-                                for i in range(len(lowband_templates))]
-                                             
-            else:      
-                lowband_snrs = []
-                for j in range(len(lowband_templates)):
-                    x = sow2 * filter_batch_f[j, :]
-                    lowband_snrs += [self.fft_lib.ifft(x)]
-                        
-            t6 = time.time()
-            #breakpoint()
-            
-            print(t6-t5)
+        
+        flen = len(lowband_templates[0])
+        sow = stilde[:flen] / psd[:flen]
+        flen2 = (flen - 1) * 2
+        sow2 = sow.numpy().copy()
+        sow2.resize(flen2)
+        lowband_snrs = []
+        
+        filter_batch_f = np.zeros(flen2, dtype=np.complex64)
+        for j, ltemplate in enumerate(lowband_templates):
+            ltem = ltemplate.numpy().conj()
+            kmax = int(self.multiband_frequency / ltemplate.delta_f)
+            ltem[kmax:] = 0
+            filter_batch_f[:flen] = ltem      
+            x = sow2 * filter_batch_f
+            lowband_snrs += [self.fft_lib.ifft(x)]
+                    
 
         lowband_snrs = [TimeSeries(x,
          delta_t=sow.delta_t, 
@@ -159,16 +120,16 @@ class RatioMatchedFilterControl(object):
         
         self.ref_snr *= rw_high
         lowband_snrs = [x * (rw_low * norm2 * flen2) for x in lowband_snrs]
-        t3 = time.time()
        
         logging.info('.....done')                
-            
+        t3 = time.time()
+        
+        print("PRE TIMING", t3 - t2, t2-t1)
+        
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
             self.ref_snr, filters_f, n_taps, valid_slice, stilde, lowband_snrs=lowband_snrs,
         )
-        t4 = time.time()
-        print("MF ref timing", t2 - t1, t3 - t2, t4 - t3)
         
         # 4. Map indices
         if len(local_idxs) > 0:
@@ -243,7 +204,6 @@ class RatioMatchedFilterControl(object):
         block_f_cache = {}
         # --- OUTER LOOP: Time Blocks ---
         for f_start in range(0, n_filters, self.batch_size):  
-        
             f_end = min(f_start + self.batch_size, n_filters)
             actual_batch_size = f_end - f_start
  
@@ -318,126 +278,6 @@ class RatioMatchedFilterControl(object):
                     out=current_corr_view
                 )
 
-                # --- NEW: Coherent Lowband SNR Addition with Bandlimited Cubic Approximation ---
-# --- NEW: Coherent Lowband SNR Addition via Full FFT/IFFT Exact Interpolation ---
-
-# --- NEW: Coherent Lowband SNR Addition via Fast Lanczos-3 Windowed Sinc Interpolation ---
-# --- NEW: Coherent Lowband SNR Addition via Fast Lanczos-3 Windowed Sinc Interpolation ---
-# --- NEW: Coherent Lowband SNR Addition via Arbitrary-Order Lanczos Interpolation ---
-                if False and lowband_snrs is not None:
-                    # =========================================================================
-                    # CONTROLLABLE ACCURACY PARAMETER
-                    # lanczos_a defines the kernel radius. Total stencil size = 2 * lanczos_a.
-                    # Higher values (e.g., 6, 8, 12) increase accuracy toward exact FFT upsampling.
-                    # =========================================================================
-                    lanczos_a = 32 
-                    
-                    # 1. Get highband metadata
-                    dt_high = stilde.delta_t
-                    t0_high = float(stilde.start_time)
-                    roi_high_samples = np.arange(roi_start, roi_stop)
-                    
-                    # 2. Get lowband metadata (using the first item as a grid reference)
-                    t0_low = float(lowband_snrs[0].start_time)
-                    dt_low = lowband_snrs[0].delta_t
-                    
-                    # Calculate continuous fractional lowband indices directly
-                    exact_low_indices = ((t0_high - t0_low) + roi_high_samples * dt_high) / dt_low
-                    idx0 = np.floor(exact_low_indices).astype(np.int64)
-                    w = exact_low_indices - idx0
-                    
-                    # Construct a dynamic stencil coordinate matrix
-                    stencil_offsets = np.arange(-lanczos_a + 1, lanczos_a + 1)
-                    weights_list = []
-                    
-                    # Vectorized calculation of windowed sinc weights for the chosen radius
-                    for k in stencil_offsets:
-                        t = w - k
-                        wk = np.sinc(t) * np.sinc(t / lanczos_a)
-                        weights_list.append(wk)
-                        
-                    # Convert to a 2D array of shape: (2 * lanczos_a, roi_len)
-                    weights = np.array(weights_list)
-                    
-                    # Normalize weights along the stencil axis to guarantee absolute gain stability
-                    w_sum = np.sum(weights, axis=0)
-                    weights /= w_sum
-                    
-                    # 3. Slice the buffer view corresponding to the ROI
-                    buf_end = buf_slice_start + roi_len
-                    
-                    # 4. In-place interpolated addition for the filter batch
-                    for b in range(actual_batch_size):
-                        # Extract the raw numpy array to bypass PyCBC container overhead
-                        low_snr_obj = low_snr_batch[b]
-                        low_snr_arr = low_snr_obj.numpy() if hasattr(low_snr_obj, 'numpy') else low_snr_obj.data
-                        
-                        # Accumulate the stencil contributions across the entire ROI vector
-                        interp_snr = np.zeros(roi_len, dtype=np.complex64)
-                        for i, k in enumerate(stencil_offsets):
-                            interp_snr += weights[i] * low_snr_arr[idx0 + k]
-                            
-                        # Add coherently into the pre-allocated highband buffer view
-                        current_corr_view[b, buf_slice_start:buf_end] += interp_snr
-
-                if False and lowband_snrs is not None:
-                    # 1. Get highband metadata
-                    dt_high = stilde.delta_t
-                    t0_high = float(stilde.start_time)
-                    
-                    # 2. Get lowband metadata (using the first item as a grid reference)
-                    t0_low = float(lowband_snrs[0].start_time)
-                    dt_low = lowband_snrs[0].delta_t
-                    
-                    # Calculate the exact static sample index offset between the two grids
-                    global_time_offset_idx = int(np.round((t0_high - t0_low) / dt_high))
-                    
-                    # Map the current highband ROI boundaries directly to the upsampled grid
-                    slice_start = global_time_offset_idx + roi_start
-                    slice_end = global_time_offset_idx + roi_stop
-                    
-                    # Slice the buffer view corresponding to the ROI
-                    buf_end = buf_slice_start + roi_len
-                    
-                    # 3. Perform the exact Fourier upsampling per filter in the batch
-                    for b in range(actual_batch_size):
-                        # Extract the raw numpy array to bypass PyCBC container overhead
-                        low_snr_obj = low_snr_batch[b]
-                        low_snr_arr = low_snr_obj.numpy() if hasattr(low_snr_obj, 'numpy') else low_snr_obj.data
-                        
-                        N_low = len(low_snr_arr)
-                        N_high = int(np.round(N_low * dt_low / dt_high))
-                        
-                        # Forward FFT to frequency domain
-                        Y = self.fft_lib.fft(low_snr_arr)
-                        
-                        # Zero-pad the high frequencies to match the highband grid dimensions
-                        Y_padded = np.zeros(N_high, dtype=np.complex64)
-                        mid = N_low // 2
-                        
-                        if N_low % 2 == 0:
-                            # Even length: split the Nyquist component symmetrically
-                            Y_padded[:mid] = Y[:mid]
-                            Y_padded[mid] = Y[mid] * 0.5
-                            Y_padded[mid + (N_high - N_low)] = Y[mid] * 0.5
-                            Y_padded[mid + (N_high - N_low) + 1:] = Y[mid + 1:]
-                        else:
-                            # Odd length
-                            mid_odd = (N_low + 1) // 2
-                            Y_padded[:mid_odd] = Y[:mid_odd]
-                            Y_padded[mid_odd + (N_high - N_low):] = Y[mid_odd:]
-                            
-                        # Inverse FFT back to time domain (applying energy conservation scaling)
-                        low_snr_upsampled = self.fft_lib.ifft(Y_padded) * (float(N_high) / N_low)
-                        
-                        # Extract the exact matching slice and add coherently into the highband view
-                        current_corr_view[b, buf_slice_start:buf_end] += low_snr_upsampled[slice_start:slice_end]
-                # ------------------------------------------
-
-                # -----------------------------------------------------------------
-                # --- NEW DROP-IN 1: Prepare 2D Lowband Array for Cython Batching ---
-                # -----------------------------------------------------------------
-                import time
                 if lowband_snrs is not None:
                     #t1 = time.time()
                     f_list, t_list, s_list = find_peaks_fused_lanczos_cython(
@@ -453,19 +293,15 @@ class RatioMatchedFilterControl(object):
                                             t0_low,
                                             input_offset=buf_slice_start
                                         )
-                    #t2 = time.time()
-                    
-                    if False:         
-                        f_list2, t_list2, s_list2 = find_peaks_in_block_cython(
-                            current_corr_view, 
-                            roi_start,          
-                            roi_len,            
-                            self.threshold_sq, 
-                            f_start,
-                            input_offset=buf_slice_start
-                        )
-                   # t3 = time.time()
-                    #print(t3-t2, t2-t1)
+                else:      
+                    f_list2, t_list2, s_list2 = find_peaks_in_block_cython(
+                        current_corr_view, 
+                        roi_start,          
+                        roi_len,            
+                        self.threshold_sq, 
+                        f_start,
+                        input_offset=buf_slice_start
+                    )
 
                 if f_list:
                     all_f_idxs.extend(f_list)

@@ -380,7 +380,7 @@ def main():
 
 
                 t2 = time.time()
-                print("pass loop", t2 - t1)
+                print("pass loop", t2 - t1, (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t, len(taps))
                 tperf = (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t / (t2 - t1) * len(taps)
                 logging.info(f"batch perf: {tperf} templates s/s")
                 
