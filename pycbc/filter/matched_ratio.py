@@ -116,7 +116,8 @@ class RatioMatchedFilterControl(object):
         logging.info('.....done')                
         t4 = time.time()
 
-        gate_threshold_sq = max(0.0, self.snr_threshold - 4.0 * rw_high) ** 2.0
+        safety_sigma = 4.0
+        gate_threshold_sq = max(0.0, self.snr_threshold - safety_sigma * rw_high) ** 2.0
 
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
@@ -204,6 +205,9 @@ class RatioMatchedFilterControl(object):
             v_stop = n_samples
 
         block_f_cache = {}
+        
+        calc = 0
+        skip = 0
         # --- OUTER LOOP: Time Blocks ---
         for f_start in range(0, n_filters, self.batch_size):  
         
@@ -255,7 +259,10 @@ class RatioMatchedFilterControl(object):
                 # Using 3.4 as the amplitude gate, 3.4^2 = 11.56
                 # If the max squared amplitude in this slice is too low, skip this batch
                 if np.max(np.abs(low_snr_batch)**2) < gate_threshold_sq:
+                    skip += 1
                     continue
+                else:
+                    calc += 1
                     
                 # ... proceed to FFT, multiply, and IFFT ...
 
@@ -329,7 +336,7 @@ class RatioMatchedFilterControl(object):
                     all_t_idxs.extend(t_list)
                     all_snrs.extend(s_list)
                     all_tstarts.extend([t_start] * len(s_list)) 
-                    
+        print("SKIP RATIO", skip / (skip + calc))             
         return (np.array(all_f_idxs, dtype=np.int32), 
                 np.array(all_t_idxs, dtype=np.int64), 
                 np.array(all_snrs, dtype=np.complex64),
