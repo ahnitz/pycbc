@@ -77,7 +77,6 @@ class RatioMatchedFilterControl(object):
             h_norm=h_norm
         )
         
-
         # Calculate lowband template SNRs
         logging.info('processing lowband templates')
 
@@ -86,24 +85,7 @@ class RatioMatchedFilterControl(object):
                          low_frequency_cutoff=lowband_templates[0].f_lower,
                          high_frequency_cutoff=self.multiband_frequency)
         norm2 =  4.0 * stilde.delta_f / h_norm2 ** 0.5
-        
-        flen = len(lowband_templates[0])
-        flen2 = (flen - 1) * 2
-        sow = stilde[:flen] / psd[:flen]
-        sow2 = sow.numpy().copy()
-        sow2.resize(flen2)
 
-        t2 = time.time()
-        lowband_snrs = np.zeros((len(lowband_templates), flen2), dtype=np.complex64)
-        kmax = int(self.multiband_frequency / stilde.delta_f)
-        
-        for j, ltemplate in enumerate(lowband_templates):
-            lowband_snrs[j,:kmax] = ltemplate.conj()[:kmax]      
-            lowband_snrs[j] *= sow2
-       
-        t22 = time.time()
-        self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
-        t3 = time.time()        
         # Reweighting factors so you can just add the high / low
         # snrs directly
         h_norm = 1.0 / norm**2.0
@@ -112,10 +94,26 @@ class RatioMatchedFilterControl(object):
         rw_low = h_norm2 ** 0.5 / sigma_total
         rw_high = h_norm ** 0.5 / sigma_total
         
+        flen = len(lowband_templates[0])
+        flen2 = (flen - 1) * 2
+        kmax = int(self.multiband_frequency / stilde.delta_f)
+        sow = stilde[:flen] / psd[:flen]
+        sow2 = sow.numpy() * rw_low * norm2 * flen2
+
+        t2 = time.time()
+        lowband_snrs = np.zeros((len(lowband_templates), flen2), dtype=np.complex64)
+        
+        for j, ltemplate in enumerate(lowband_templates):
+            lowband_snrs[j,:kmax] = ltemplate[:kmax].conj()      
+            lowband_snrs[j,:kmax] *= sow2[:kmax]
+       
+        t22 = time.time()
+        self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
+        t3 = time.time()        
+        
         # Prenormalize the SNRs
         # Opt note: could move all this multiplication to the peak finding..
-        self.ref_snr = snr.numpy() * (norm * stilde.delta_t * rw_high) 
-        lowband_snrs *= rw_low * norm2 * flen2
+        self.ref_snr = snr.numpy() * (norm * stilde.delta_t * rw_high)
            
         logging.info('.....done')                
         t4 = time.time()
