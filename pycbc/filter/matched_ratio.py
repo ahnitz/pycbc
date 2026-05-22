@@ -117,12 +117,12 @@ class RatioMatchedFilterControl(object):
         t4 = time.time()
 
         safety_sigma = 4.0
-        gate_threshold_sq = max(0.0, self.snr_threshold - safety_sigma * rw_high) ** 2.0
+        gate_threshold = max(0.0, self.snr_threshold - safety_sigma * rw_high)
 
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
             self.ref_snr, filters_f, n_taps, valid_slice, stilde,
-            lowband_snrs=(lowband_snrs, 1.0 / self.multiband_frequency, gate_threshold_sq),
+            lowband_snrs=(lowband_snrs, 1.0 / self.multiband_frequency, gate_threshold),
         )
         t5 = time.time()
          
@@ -193,7 +193,7 @@ class RatioMatchedFilterControl(object):
 
         if lowband_snrs is not None:
             # Let's just use exactly matched series for now...
-            lowband_snrs, dt_low, gate_threshold_sq = lowband_snrs
+            lowband_snrs, dt_low, gate_threshold = lowband_snrs
             t0_low = t0_high = float(stilde.start_time)
             dt_high = stilde.delta_t
 
@@ -234,36 +234,6 @@ class RatioMatchedFilterControl(object):
 
             for t_start in range(loop_start, n_samples, STEP):
 
-                # ... inside _execute_blocked_kernel, inside the time block loop:
-
-                # 1. Calculate the lowband index range for this time block (same logic as Cython)
-                # We need the indices corresponding to [t_start, t_start + N_VALID]
-                # t0_high/dt_high defines the global highband time axis.
-                # dt_low is 1.0 / self.multiband_frequency
-                
-                c0 = (float(t_start) * dt_high) / dt_low
-                c1 = (float(t_start + N_VALID) * dt_high) / dt_low
-                
-                j_start = int(np.floor(c0))
-                j_end = int(np.ceil(c1))
-                
-                # Ensure bounds are safe for slicing
-                j_start = max(0, j_start)
-                j_end = min(lowband_snrs.shape[1], j_end)
-
-                # 2. Extract the lowband block for this batch
-                # lowband_snrs is shape (n_filters, flen)
-                low_snr_batch = lowband_snrs[f_start:f_end, j_start:j_end]
-
-                # 3. Probabilistic Gate
-                # Using 3.4 as the amplitude gate, 3.4^2 = 11.56
-                # If the max squared amplitude in this slice is too low, skip this batch
-                if np.max(np.abs(low_snr_batch)**2) < gate_threshold_sq:
-                    skip += 1
-                    continue
-                else:
-                    calc += 1
-                    
                 # ... proceed to FFT, multiply, and IFFT ...
 
                 block_valid_t0 = t_start + bad_start
@@ -276,6 +246,27 @@ class RatioMatchedFilterControl(object):
 
                 roi_start = max(v_start, block_valid_t0)
                 roi_stop = min(v_stop, block_valid_t0 + N_VALID)
+
+                # 1. Map highband ROI to lowband sampling
+                # We add/subtract 1 to ensure we capture the full footprint, 
+                # accounting for potential rounding jitter between the two grids.
+                j_start = int(round((float(roi_start) * dt_high) / dt_low)) - 1
+                j_end = int(round((float(roi_stop) * dt_high) / dt_low)) + 1
+
+                # 2. Safety clamp
+                j_start = max(0, j_start)
+                j_end = min(lowband_snrs.shape[1], j_end)
+
+                # 3. Perform the gate
+                low_snr_batch = lowband_snrs[f_start:f_end, j_start:j_end]
+
+                # 4. Check against the gate threshold
+                if np.max(np.abs(low_snr_batch)) < gate_threshold:
+                    skip += 1
+                    continue
+                else:
+                    calc += 1
+
                 
                 roi_len = roi_stop - roi_start
                 
@@ -305,31 +296,20 @@ class RatioMatchedFilterControl(object):
                     axis=-1, 
                     out=current_corr_view
                 )
-
-                if lowband_snrs is not None:
-                    #t1 = time.time()
-                    f_list, t_list, s_list = find_peaks_fused_lanczos_cython(
-                                            current_corr_view,
-                                            low_snr_block,
-                                            roi_start,
-                                            roi_len,
-                                            self.threshold_sq,
-                                            f_start,
-                                            dt_high,
-                                            dt_low,
-                                            t0_high,
-                                            t0_low,
-                                            input_offset=buf_slice_start
-                                        )
-                else:      
-                    f_list2, t_list2, s_list2 = find_peaks_in_block_cython(
-                        current_corr_view, 
-                        roi_start,          
-                        roi_len,            
-                        self.threshold_sq, 
-                        f_start,
-                        input_offset=buf_slice_start
-                    )
+                
+                f_list, t_list, s_list = find_peaks_fused_lanczos_cython(
+                                        current_corr_view,
+                                        low_snr_block,
+                                        roi_start,
+                                        roi_len,
+                                        self.threshold_sq,
+                                        f_start,
+                                        dt_high,
+                                        dt_low,
+                                        t0_high,
+                                        t0_low,
+                                        input_offset=buf_slice_start
+                                    )
 
                 if f_list:
                     all_f_idxs.extend(f_list)
