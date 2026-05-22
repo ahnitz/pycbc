@@ -1,5 +1,6 @@
 import logging
 import numpy as np
+import time
 import mkl_fft
 from pycbc.types import zeros, complex64, TimeSeries
 from pycbc.filter.matchedfilter import matched_filter_core, sigmasq
@@ -206,11 +207,17 @@ class RatioMatchedFilterControl(object):
 
         block_f_cache = {}
         
+        tspend = 0
+        tspend2 = 0
+        
         calc = 0
         skip = 0
-        # --- OUTER LOOP: Time Blocks ---
+        t0 = time.time()
+        low_snr_abs = np.abs(lowband_snrs)
+
         for f_start in range(0, n_filters, self.batch_size):  
         
+            ts1 = time.time()
         
             f_end = min(f_start + self.batch_size, n_filters)
             actual_batch_size = f_end - f_start
@@ -225,57 +232,52 @@ class RatioMatchedFilterControl(object):
             n_taps_max = nsizes[i]
             
             N_VALID = N_FFT - n_taps_max + 1
-            STEP = N_VALID
             bad_start = n_taps_max // 2
 
             # Determine Loop Bounds
-            first_block_idx = (v_start - bad_start) // STEP
-            loop_start = first_block_idx * STEP
+            first_block_idx = (v_start - bad_start) // N_VALID
+            loop_start = first_block_idx * N_VALID
 
-            for t_start in range(loop_start, n_samples, STEP):
+            # Set up the time chunk book keeping info
+            t_starts = np.arange(loop_start, n_samples, N_VALID)
+            valid = np.ones(len(t_starts), dtype=bool)
+            block_valid_t0s = t_starts + bad_start
+    
+            # Remove parts not within the total valid data boundaries
+            valid[block_valid_t0s >= v_stop] = False
+            valid[block_valid_t0s + N_VALID <= v_start] = False
+            
+            roi_starts = np.maximum(v_start, block_valid_t0s)
+            roi_stops = np.minimum(v_stop, block_valid_t0s + N_VALID)
+            
+            roi_len = roi_stops - roi_starts
+            valid[roi_len <= 0] = False
+           
+            j_starts = np.round(roi_starts * dt_high / dt_low).astype(np.int32) - 1
+            j_starts = np.maximum(0, j_starts)
+            j_ends = np.round(roi_stops * dt_high / dt_low).astype(np.int32) + 1
+            j_ends = np.minimum(lowband_snrs.shape[1], j_ends)
+            
+            low_snr_fbatch = lowband_snrs[f_start:f_end]
+                    
+            for j, (js, je) in enumerate(zip(j_starts, j_ends)):
+                if valid[j]:
+                    valid[j] = np.max(low_snr_abs[f_start:f_end, js:je] > gate_threshold)
 
-                # ... proceed to FFT, multiply, and IFFT ...
+            t_starts = t_starts[valid]
+            roi_starts = roi_starts[valid]
+            roi_stops = roi_stops[valid]
+                        
+            ts2 = time.time()
 
-                block_valid_t0 = t_start + bad_start
-                
-                if block_valid_t0 >= v_stop:
-                    break
-                
-                if block_valid_t0 + N_VALID <= v_start:
-                    continue
-
-                roi_start = max(v_start, block_valid_t0)
-                roi_stop = min(v_stop, block_valid_t0 + N_VALID)
-
-                # 1. Map highband ROI to lowband sampling
-                # We add/subtract 1 to ensure we capture the full footprint, 
-                # accounting for potential rounding jitter between the two grids.
-                j_start = int(round((float(roi_start) * dt_high) / dt_low)) - 1
-                j_end = int(round((float(roi_stop) * dt_high) / dt_low)) + 1
-
-                # 2. Safety clamp
-                j_start = max(0, j_start)
-                j_end = min(lowband_snrs.shape[1], j_end)
-
-                # 3. Perform the gate
-                low_snr_batch = lowband_snrs[f_start:f_end, j_start:j_end]
-
-                # 4. Check against the gate threshold
-                if np.max(np.abs(low_snr_batch)) < gate_threshold:
-                    skip += 1
-                    continue
-                else:
-                    calc += 1
-
-                
+            for t_start, roi_start, roi_stop in zip(t_starts, roi_starts, roi_stops):
+                t1 = time.time()
+                        
                 roi_len = roi_stop - roi_start
-                
-                if roi_len <= 0: 
-                    continue
 
                 buf_slice_start = roi_start - t_start
-
                 t_end = min(t_start + N_FFT, n_samples)
+
                 if t_start not in block_f_cache:
                     block_in_view = np.zeros(self.fir_fft_len, dtype=complex64)
                     block_in_view[0:t_end-t_start] = data[t_start:t_end]
@@ -283,10 +285,10 @@ class RatioMatchedFilterControl(object):
                     block_f_view = self.fft_lib.fft(block_in_view)
                     block_f_cache[t_start] = block_f_view
                 
+                
                 block_f_view = block_f_cache[t_start]
                 filter_batch_f = filters_f[f_start:f_end]
-                low_snr_batch = lowband_snrs[f_start:f_end]
-                
+
                 fast_multiply_analytic_cython(
                     block_f_view, filter_batch_f, current_mult_view
                 )
@@ -316,7 +318,12 @@ class RatioMatchedFilterControl(object):
                     all_t_idxs.extend(t_list)
                     all_snrs.extend(s_list)
                     all_tstarts.extend([t_start] * len(s_list)) 
-        print("SKIP RATIO", skip / (skip + calc))             
+                t2 = time.time()
+                tspend += t2 - t1
+            tspend2 += ts2 - ts1
+        tf = time.time()
+        print("SKIP RATIO", "INNER", tspend, "OUTER", tspend2, "total", tf-t0)        
+             
         return (np.array(all_f_idxs, dtype=np.int32), 
                 np.array(all_t_idxs, dtype=np.int64), 
                 np.array(all_snrs, dtype=np.complex64),
