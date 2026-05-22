@@ -67,8 +67,9 @@ class RatioMatchedFilterControl(object):
         t1 =time.time()
         # 2. Calculate Reference SNR
         flow = self.multiband_frequency if self.multiband_frequency is not None else ref_template.f_lower        
-        h_norm = sigmasq(ref_template, psd=psd, low_frequency_cutoff=flow, high_frequency_cutoff=self.f_high)
-        
+        h_norm = sigmasq(ref_template, psd=psd, 
+                         low_frequency_cutoff=flow,
+                         high_frequency_cutoff=self.f_high)    
         snr, _, norm = matched_filter_core(
             ref_template, stilde, psd=psd,
             low_frequency_cutoff=flow,
@@ -76,7 +77,6 @@ class RatioMatchedFilterControl(object):
             h_norm=h_norm
         )
         
-        t2 = time.time()
 
         # Calculate lowband template SNRs
         logging.info('processing lowband templates')
@@ -88,21 +88,21 @@ class RatioMatchedFilterControl(object):
         norm2 =  4.0 * stilde.delta_f / h_norm2 ** 0.5
         
         flen = len(lowband_templates[0])
-        sow = stilde[:flen] / psd[:flen]
         flen2 = (flen - 1) * 2
+        sow = stilde[:flen] / psd[:flen]
         sow2 = sow.numpy().copy()
         sow2.resize(flen2)
-        lowband_snrs = []
+
+        t2 = time.time()
+        lowband_snrs = np.zeros((len(lowband_templates), flen2), dtype=np.complex64)
+        kmax = int(self.multiband_frequency / stilde.delta_f)
         
-        filter_batch_f = np.zeros(flen2, dtype=np.complex64)
         for j, ltemplate in enumerate(lowband_templates):
-            ltem = ltemplate.numpy().conj()
-            kmax = int(self.multiband_frequency / ltemplate.delta_f)
-            ltem[kmax:] = 0
-            filter_batch_f[:flen] = ltem      
-            x = sow2 * filter_batch_f
-            lowband_snrs += [self.fft_lib.ifft(x)]
-        
+            lowband_snrs[j,:kmax] = ltemplate.conj()[:kmax]      
+            lowband_snrs[j] *= sow2
+            self.fft_lib.ifft(lowband_snrs[j], out=lowband_snrs[j])
+
+        t3 = time.time()        
         # Reweighting factors so you can just add the high / low
         # snrs directly
         h_norm = 1.0 / norm**2.0
@@ -113,18 +113,16 @@ class RatioMatchedFilterControl(object):
         
         # Prenormalize the SNRs
         # Opt note: could move all this multiplication to the peak finding..
-        t3 = time.time()
-        self.ref_snr = snr.numpy() * (norm * stilde.delta_t * rw_high)    
-        lowband_snrs = [TimeSeries(x * (rw_low * norm2 * flen2),
-                                   delta_t=sow.delta_t, 
-                                   epoch=stilde.start_time) for x in lowband_snrs]             
- 
+        self.ref_snr = snr.numpy() * (norm * stilde.delta_t * rw_high) 
+        lowband_snrs *= rw_low * norm2 * flen2
+           
         logging.info('.....done')                
         t4 = time.time()
         
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
-            self.ref_snr, filters_f, n_taps, valid_slice, stilde, lowband_snrs=lowband_snrs,
+            self.ref_snr, filters_f, n_taps, valid_slice, stilde,
+            lowband_snrs=(lowband_snrs, sow.delta_t),
         )
         t5 = time.time()
          
@@ -193,6 +191,12 @@ class RatioMatchedFilterControl(object):
         freq_mult_view = self.temp_freq_mult
         corr_out_view = self.corr_output_buffer
 
+        if lowband_snrs is not None:
+            # Let's just use exactly matched series for now...
+            lowband_snrs, dt_low = lowband_snrs
+            t0_low = t0_high = float(stilde.start_time)
+            dt_high = stilde.delta_t
+
         if valid_slice:
             v_start = valid_slice.start
             v_stop = valid_slice.stop
@@ -203,9 +207,12 @@ class RatioMatchedFilterControl(object):
         block_f_cache = {}
         # --- OUTER LOOP: Time Blocks ---
         for f_start in range(0, n_filters, self.batch_size):  
+        
+        
             f_end = min(f_start + self.batch_size, n_filters)
             actual_batch_size = f_end - f_start
  
+            low_snr_block = lowband_snrs[f_start:f_end]
             current_mult_view = freq_mult_view[:actual_batch_size]
             current_corr_view = corr_out_view[:actual_batch_size]
             
@@ -221,19 +228,6 @@ class RatioMatchedFilterControl(object):
             # Determine Loop Bounds
             first_block_idx = (v_start - bad_start) // STEP
             loop_start = first_block_idx * STEP
-
-            if lowband_snrs is not None:
-                low_snr_batch = lowband_snrs[f_start:f_end]
-                # Convert the batch into a contiguous 2D C-aligned array
-                low_snr_block = np.ascontiguousarray(
-                    np.stack([obj.numpy() if hasattr(obj, 'numpy') else obj.data for obj in low_snr_batch]),
-                    dtype=np.complex64
-                )
-                # Extract grid references
-                t0_low = float(lowband_snrs[0].start_time)
-                dt_low = lowband_snrs[0].delta_t
-                dt_high = stilde.delta_t
-                t0_high = float(stilde.start_time)
 
             for t_start in range(loop_start, n_samples, STEP):
 
