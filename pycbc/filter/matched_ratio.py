@@ -100,8 +100,9 @@ class RatioMatchedFilterControl(object):
         for j, ltemplate in enumerate(lowband_templates):
             lowband_snrs[j,:kmax] = ltemplate.conj()[:kmax]      
             lowband_snrs[j] *= sow2
-            self.fft_lib.ifft(lowband_snrs[j], out=lowband_snrs[j])
-
+       
+        t22 = time.time()
+        self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
         t3 = time.time()        
         # Reweighting factors so you can just add the high / low
         # snrs directly
@@ -126,7 +127,7 @@ class RatioMatchedFilterControl(object):
         )
         t5 = time.time()
          
-        print("PRE TIMING", "RF", t5-t4, "NORM", t4 - t3, "LB", t3 - t2, "REF", t2-t1)
+        print("PRE TIMING", "RF", t5-t4, "NORM", t4 - t3, "LB", t3 - t2, t3-t22, t22-t2, "REF", t2-t1)
         
         # 4. Map indices
         if len(local_idxs) > 0:
