@@ -115,11 +115,13 @@ class RatioMatchedFilterControl(object):
            
         logging.info('.....done')                
         t4 = time.time()
-        
+
+        gate_threshold_sq = max(0.0, self.snr_threshold - 4.0 * rw_high) ** 2.0
+
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
             self.ref_snr, filters_f, n_taps, valid_slice, stilde,
-            lowband_snrs=(lowband_snrs, 1.0 / self.multiband_frequency),
+            lowband_snrs=(lowband_snrs, 1.0 / self.multiband_frequency, gate_threshold_sq),
         )
         t5 = time.time()
          
@@ -190,7 +192,7 @@ class RatioMatchedFilterControl(object):
 
         if lowband_snrs is not None:
             # Let's just use exactly matched series for now...
-            lowband_snrs, dt_low = lowband_snrs
+            lowband_snrs, dt_low, gate_threshold_sq = lowband_snrs
             t0_low = t0_high = float(stilde.start_time)
             dt_high = stilde.delta_t
 
@@ -227,6 +229,35 @@ class RatioMatchedFilterControl(object):
             loop_start = first_block_idx * STEP
 
             for t_start in range(loop_start, n_samples, STEP):
+
+                # ... inside _execute_blocked_kernel, inside the time block loop:
+
+                # 1. Calculate the lowband index range for this time block (same logic as Cython)
+                # We need the indices corresponding to [t_start, t_start + N_VALID]
+                # t0_high/dt_high defines the global highband time axis.
+                # dt_low is 1.0 / self.multiband_frequency
+                
+                c0 = (float(t_start) * dt_high) / dt_low
+                c1 = (float(t_start + N_VALID) * dt_high) / dt_low
+                
+                j_start = int(np.floor(c0))
+                j_end = int(np.ceil(c1))
+                
+                # Ensure bounds are safe for slicing
+                j_start = max(0, j_start)
+                j_end = min(lowband_snrs.shape[1], j_end)
+
+                # 2. Extract the lowband block for this batch
+                # lowband_snrs is shape (n_filters, flen)
+                low_snr_batch = lowband_snrs[f_start:f_end, j_start:j_end]
+
+                # 3. Probabilistic Gate
+                # Using 3.4 as the amplitude gate, 3.4^2 = 11.56
+                # If the max squared amplitude in this slice is too low, skip this batch
+                if np.max(np.abs(low_snr_batch)**2) < gate_threshold_sq:
+                    continue
+                    
+                # ... proceed to FFT, multiply, and IFFT ...
 
                 block_valid_t0 = t_start + bad_start
                 
