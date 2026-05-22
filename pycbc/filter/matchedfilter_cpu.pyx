@@ -252,6 +252,9 @@ def find_peaks_fused_lanczos_cython(
     """
     Two-Pass Fused Kernel utilizing pristine block-level max scans
     to restore native SIMD throughput and match baseline peak-finding speeds.
+    
+    UPDATED: Integrates the Analytic Lanczos algorithm to correctly interpolate
+    critically-sampled complex analytic signals (FFT halved in size).
     """
     cdef long n_filters_in_batch = corr_output.shape[0]
     cdef list f_idx_list = []
@@ -285,6 +288,11 @@ def find_peaks_fused_lanczos_cython(
     cdef long idx_min_j, idx_max_j
     cdef double exact_low_idx, w
     cdef int w_lut_idx
+    
+    # Analytic Lanczos Variables
+    cdef double PI = 3.14159265358979323846
+    cdef double theta, c_rot, s_rot, rot_r, rot_i
+    cdef float sign
     
     # Pass 1 Optimization Scans
     cdef float32_t max_low_envelope, l_amp, block_max_high_sq, block_max_high_amp
@@ -363,9 +371,29 @@ def find_peaks_fused_lanczos_cython(
                 
                 interp_low_snr.real = 0.0
                 interp_low_snr.imag = 0.0
+                
+                # --- ANALYTIC LANCZOS MODIFICATION 1: ALTERNATING SIGN ---
+                # Determine the initial sign based on the starting index (j - 31)
+                sign = 1.0 if ((j - 31) % 2) == 0 else -1.0
+                
                 for k_idx in range(64):
-                    interp_low_snr.real += weights_lut[w_lut_idx, k_idx] * low_snr_block[f_batch_idx, j + k_idx - 31].real
-                    interp_low_snr.imag += weights_lut[w_lut_idx, k_idx] * low_snr_block[f_batch_idx, j + k_idx - 31].imag
+                    interp_low_snr.real += sign * weights_lut[w_lut_idx, k_idx] * low_snr_block[f_batch_idx, j + k_idx - 31].real
+                    interp_low_snr.imag += sign * weights_lut[w_lut_idx, k_idx] * low_snr_block[f_batch_idx, j + k_idx - 31].imag
+                    # Branchless toggle for the next tap
+                    sign = -sign
+                
+                # --- ANALYTIC LANCZOS MODIFICATION 2: PHASE ROTATION ---
+                # Multiply the final interpolated value by e^(i * pi * exact_low_idx)
+                theta = PI * exact_low_idx
+                c_rot = libc.math.cos(theta)
+                s_rot = libc.math.sin(theta)
+                
+                rot_r = interp_low_snr.real * c_rot - interp_low_snr.imag * s_rot
+                rot_i = interp_low_snr.real * s_rot + interp_low_snr.imag * c_rot
+                
+                interp_low_snr.real = rot_r
+                interp_low_snr.imag = rot_i
+                # --------------------------------------------------------
                 
                 z_total.real = z_high.real + interp_low_snr.real
                 z_total.imag = z_high.imag + interp_low_snr.imag
@@ -383,4 +411,3 @@ def find_peaks_fused_lanczos_cython(
             snr_list.append(current_max_z)
             
     return (f_idx_list, t_idx_list, snr_list)
-

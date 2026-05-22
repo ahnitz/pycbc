@@ -94,18 +94,16 @@ class RatioMatchedFilterControl(object):
         rw_low = h_norm2 ** 0.5 / sigma_total
         rw_high = h_norm ** 0.5 / sigma_total
         
-        flen = len(lowband_templates[0])
-        flen2 = (flen - 1) * 2
-        kmax = int(self.multiband_frequency / stilde.delta_f)
+        flen = int(self.multiband_frequency / stilde.delta_f)
         sow = stilde[:flen] / psd[:flen]
-        sow2 = sow.numpy() * rw_low * norm2 * flen2
+        sow2 = sow.numpy() * rw_low * norm2 * flen
 
         t2 = time.time()
-        lowband_snrs = np.zeros((len(lowband_templates), flen2), dtype=np.complex64)
+        lowband_snrs = np.zeros((len(lowband_templates), flen), dtype=np.complex64)
         
         for j, ltemplate in enumerate(lowband_templates):
-            lowband_snrs[j,:kmax] = ltemplate[:kmax].conj()      
-            lowband_snrs[j,:kmax] *= sow2[:kmax]
+            lowband_snrs[j] = ltemplate[:flen].conj()      
+            lowband_snrs[j] *= sow2
        
         t22 = time.time()
         self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
@@ -121,7 +119,7 @@ class RatioMatchedFilterControl(object):
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
             self.ref_snr, filters_f, n_taps, valid_slice, stilde,
-            lowband_snrs=(lowband_snrs, sow.delta_t),
+            lowband_snrs=(lowband_snrs, 1.0 / self.multiband_frequency),
         )
         t5 = time.time()
          
