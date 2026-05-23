@@ -98,13 +98,12 @@ class RatioMatchedFilterControl(object):
         flen = int(self.multiband_frequency / stilde.delta_f)
         sow = stilde[:flen] / psd[:flen]
         sow2 = sow.numpy() * rw_low * norm2 * flen
-
+        sow2 = sow2.astype(np.complex64)
         t2 = time.time()
-        lowband_snrs = np.zeros((len(lowband_templates), flen), dtype=np.complex64)
-        
+
+        lowband_snrs = np.resize(sow2, len(lowband_templates) * flen).reshape((len(lowband_templates), flen)) 
         for j, ltemplate in enumerate(lowband_templates):
-            lowband_snrs[j] = ltemplate[:flen].conj()      
-            lowband_snrs[j] *= sow2
+            lowband_snrs[j] *= ltemplate[:flen].conj()      
        
         t22 = time.time()
         self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
@@ -177,6 +176,7 @@ class RatioMatchedFilterControl(object):
         """
         Inner loop: Time-Blocking + Filter-Batching using mkl_fft.
         """
+        tx1 = time.time()
         tap_groups = 3
         nsizes = np.quantile(n_taps, np.linspace(0, 1, tap_groups+1)[1:]).astype(int)
         n_samples = len(data)
@@ -210,11 +210,9 @@ class RatioMatchedFilterControl(object):
         tspend = 0
         tspend2 = 0
         
-        calc = 0
-        skip = 0
         t0 = time.time()
         low_snr_abs = np.abs(lowband_snrs)
-
+        tx2 = time.time()
         for f_start in range(0, n_filters, self.batch_size):  
         
             ts1 = time.time()
@@ -259,11 +257,10 @@ class RatioMatchedFilterControl(object):
             j_ends = np.minimum(lowband_snrs.shape[1], j_ends)
             
             low_snr_fbatch = lowband_snrs[f_start:f_end]
-                    
             for j, (js, je) in enumerate(zip(j_starts, j_ends)):
                 if valid[j]:
-                    valid[j] = np.max(low_snr_abs[f_start:f_end, js:je] > gate_threshold)
-
+                    valid[j] = np.max(low_snr_abs[f_start:f_end, js:je]) > gate_threshold     
+            print(valid.sum() / len(valid))  
             t_starts = t_starts[valid]
             roi_starts = roi_starts[valid]
             roi_stops = roi_stops[valid]
@@ -302,14 +299,11 @@ class RatioMatchedFilterControl(object):
                 f_list, t_list, s_list = find_peaks_fused_lanczos_cython(
                                         current_corr_view,
                                         low_snr_block,
-                                        roi_start,
-                                        roi_len,
+                                        roi_start, roi_len,
                                         self.threshold_sq,
                                         f_start,
-                                        dt_high,
-                                        dt_low,
-                                        t0_high,
-                                        t0_low,
+                                        dt_high, dt_low,
+                                        t0_high, t0_low,
                                         input_offset=buf_slice_start
                                     )
 
@@ -322,7 +316,7 @@ class RatioMatchedFilterControl(object):
                 tspend += t2 - t1
             tspend2 += ts2 - ts1
         tf = time.time()
-        print("SKIP RATIO", "INNER", tspend, "OUTER", tspend2, "total", tf-t0)        
+        print("SKIP RATIO", "INNER", tspend, "OUTER", tspend2, "top", tx2-tx1, "total", tf-t0)        
              
         return (np.array(all_f_idxs, dtype=np.int32), 
                 np.array(all_t_idxs, dtype=np.int64), 
