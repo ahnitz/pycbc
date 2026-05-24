@@ -356,6 +356,14 @@ def main():
             for s_num, stilde in enumerate(segments):
                 logging.info(f"Processing Segment {s_num}")
                 t1 = time.time()
+                
+                scale_low = bank.snr_rescale(fine_indices, 'mchirp')
+                scale_high = bank.snr_rescale(fine_indices, 'precalculated_sigma')
+                
+                filters_f /= scale_high[:, None]
+                sf0 = scale_low[0]
+                for lt, sf in zip(lowband_templates, scale_low):
+                    lt /= (sf / sf0)
 
                 ids_local, t_idxs, snrs, tstarts, h_norm = engine.process_segment(
                     stilde, stilde.psd, ref_template, filters_f, counts,

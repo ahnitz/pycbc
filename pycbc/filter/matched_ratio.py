@@ -260,7 +260,6 @@ class RatioMatchedFilterControl(object):
             for j, (js, je) in enumerate(zip(j_starts, j_ends)):
                 if valid[j]:
                     valid[j] = np.max(low_snr_abs[f_start:f_end, js:je]) > gate_threshold     
-            print(valid.sum() / len(valid))  
             t_starts = t_starts[valid]
             roi_starts = roi_starts[valid]
             roi_stops = roi_stops[valid]
