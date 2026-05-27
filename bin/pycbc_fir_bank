@@ -162,7 +162,7 @@ def process_template(i):
 
     current_taps = g_args.n_taps
     
-    best = (i, -1, -1, -1, -1)
+    best = (i, -1, -1, -1, -1, -1)
     while current_taps <= g_args.max_taps:
         round_matches = []
         for c_idx in msearch:

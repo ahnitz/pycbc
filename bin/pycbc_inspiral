@@ -247,9 +247,9 @@ def template_triggers(t_num):
         # Filter check checks the 'inj_filter_rejector' options to
         # determine whether
         # to filter this template/segment if injections are present.
-        if not inj_filter_rejector.template_segment_checker(
-                bank, t_num, stilde):
-            continue
+        #if not inj_filter_rejector.template_segment_checker(
+        #        bank, t_num, stilde):
+        #    continue
         if template is None:
             template = bank[t_num]
             tparam = template.params

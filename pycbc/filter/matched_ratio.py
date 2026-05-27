@@ -66,14 +66,14 @@ class RatioMatchedFilterControl(object):
         import time
         
         t1 =time.time()
-        # 2. Calculate Reference SNR
-        flow = self.multiband_frequency if self.multiband_frequency is not None else ref_template.f_lower        
+        print(self.f_high)
+        # 2. Calculate Reference SNR    
         h_norm = sigmasq(ref_template, psd=psd, 
-                         low_frequency_cutoff=flow,
+                         low_frequency_cutoff=self.multiband_frequency,
                          high_frequency_cutoff=self.f_high)    
         snr, _, norm = matched_filter_core(
             ref_template, stilde, psd=psd,
-            low_frequency_cutoff=flow,
+            low_frequency_cutoff=self.multiband_frequency,
             high_frequency_cutoff=self.f_high,
             h_norm=h_norm
         )
@@ -85,7 +85,12 @@ class RatioMatchedFilterControl(object):
         h_norm2 = sigmasq(lowband_templates[0], psd=psd,
                          low_frequency_cutoff=lowband_templates[0].f_lower,
                          high_frequency_cutoff=self.multiband_frequency)
+        
         norm2 =  4.0 * stilde.delta_f / h_norm2 ** 0.5
+
+        #hnorms = [sigmasq(ltem, psd=psd,
+        #                 low_frequency_cutoff=lowband_templates[0].f_lower,
+        #                 high_frequency_cutoff=self.multiband_frequency) for ltem in lowband_templates]
 
         # Reweighting factors so you can just add the high / low
         # snrs directly
@@ -96,14 +101,18 @@ class RatioMatchedFilterControl(object):
         rw_high = h_norm ** 0.5 / sigma_total
         
         flen = int(self.multiband_frequency / stilde.delta_f)
+        dt_low = 1.0 / (flen * stilde.delta_f)
         sow = stilde[:flen] / psd[:flen]
         sow2 = sow.numpy() * rw_low * norm2 * flen
         sow2 = sow2.astype(np.complex64)
         t2 = time.time()
-
+        
+        kmax = min(len(lowband_templates[0]), flen)
         lowband_snrs = np.resize(sow2, len(lowband_templates) * flen).reshape((len(lowband_templates), flen)) 
         for j, ltemplate in enumerate(lowband_templates):
-            lowband_snrs[j] *= ltemplate[:flen].conj()      
+            lowband_snrs[j][:kmax] *= ltemplate[:kmax].conj() #* (hnorms[0] / hnorms[j]) ** 0.5  
+            
+        #print("norm ratio", hnorms[0] / hnorms[1], hnorms[0] / hnorms[-1])
        
         t22 = time.time()
         self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
@@ -117,12 +126,15 @@ class RatioMatchedFilterControl(object):
         t4 = time.time()
 
         safety_sigma = 4.0
-        gate_threshold = max(0.0, self.snr_threshold - safety_sigma * rw_high)
+        extra_margin = 0.2
+        gate_threshold = max(0.0, self.snr_threshold - safety_sigma * rw_high - extra_margin)
 
         # 3. Execute Blocked Kernel
+       
+        
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
             self.ref_snr, filters_f, n_taps, valid_slice, stilde,
-            lowband_snrs=(lowband_snrs, 1.0 / self.multiband_frequency, gate_threshold),
+            lowband_snrs=(lowband_snrs, dt_low, gate_threshold),
         )
         t5 = time.time()
          
@@ -168,7 +180,8 @@ class RatioMatchedFilterControl(object):
             fft_out = self.fft_lib.fft(padded_reshaped[:batch_len], axis=-1)
             
             # 4. Conjugate & Store
-            filters_f[start:end] = np.conj(fft_out)
+            kmax = self.fir_fft_len // 2
+            filters_f[start:end][:kmax] = np.conj(fft_out[:kmax])
             
         return filters_f
 

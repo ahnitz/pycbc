@@ -215,6 +215,7 @@ def find_peaks_in_block_cython(
             
     return (f_idx_list, t_idx_list, snr_list)
 
+
 import numpy as np
 cimport numpy as numpy
 cimport cython
@@ -222,20 +223,28 @@ cimport libc.math
 import logging
 
 # =====================================================================
-# GLOBAL MODULE LEVEL: Pregenerate Static Lanczos-32 Weights LUT
+# GLOBAL MODULE LEVEL: Pregenerate Static Kaiser-128 Weights LUT
 # =====================================================================
 _w_grid = np.linspace(0, 1, 1024, endpoint=False)[:, None]
-_k_grid = np.arange(-31, 33)[None, :]
+_k_grid = np.arange(-63, 65)[None, :]  # 128 taps total
 _t_grid = _w_grid - _k_grid
 
-_lut_raw = np.sinc(_t_grid) * np.sinc(_t_grid / 32.0)
+# Kaiser Window setup for 128 taps (N_half = 64)
+beta = 4.0
+_x = _t_grid / 64.0
+_x_sq = np.clip(1.0 - _x**2, 0.0, 1.0)
+_kaiser_window = np.i0(beta * np.sqrt(_x_sq)) / np.i0(beta)
+
+_ideal_sinc = np.sinc(_t_grid)
+_lut_raw = _ideal_sinc * _kaiser_window
 _lut_raw /= _lut_raw.sum(axis=1, keepdims=True)
-LANCZOS_32_LUT = np.ascontiguousarray(_lut_raw, dtype=np.float32)
+
+KAISER_128_LUT = np.ascontiguousarray(_lut_raw, dtype=np.float32)
 
 
 @cython.boundscheck(False) 
 @cython.wraparound(False) 
-@cython.cdivision(True)   
+@cython.cdivision(True)    
 def find_peaks_fused_lanczos_cython(
     numpy.ndarray[complex64_t, ndim=2, mode="c"] corr_output,
     numpy.ndarray[complex64_t, ndim=2, mode="c"] low_snr_block,
@@ -250,11 +259,8 @@ def find_peaks_fused_lanczos_cython(
     long input_offset=0
 ):
     """
-    Two-Pass Fused Kernel utilizing pristine block-level max scans
-    to restore native SIMD throughput and match baseline peak-finding speeds.
-    
-    UPDATED: Integrates the Analytic Lanczos algorithm to correctly interpolate
-    critically-sampled complex analytic signals (FFT halved in size).
+    Two-Pass Fused Kernel utilizing pristine block-level max scans.
+    UPDATED: 128-Tap Kaiser-Sinc for ultra-low SNR sub-sample stability.
     """
     cdef long n_filters_in_batch = corr_output.shape[0]
     cdef list f_idx_list = []
@@ -273,7 +279,7 @@ def find_peaks_fused_lanczos_cython(
     cdef int64_t current_max_idx
     cdef complex64_t current_max_z
     
-    cdef float[:, :] weights_lut = LANCZOS_32_LUT
+    cdef float[:, :] weights_lut = KAISER_128_LUT
     
     # Grid transformation constants
     cdef double const_offset = (t0_high - t0_low) + <double>t_start * dt_high
@@ -315,10 +321,10 @@ def find_peaks_fused_lanczos_cython(
             l_amp = <float32_t>libc.math.sqrt(z_low0.real * z_low0.real + z_low0.imag * z_low0.imag)
             if l_amp > max_low_envelope:
                 max_low_envelope = l_amp
-        max_low_envelope *= 1.15 # 15% safety padding for Gibbs overshoots
+        max_low_envelope *= 1.25
         
         # =====================================================================
-        # PASS 1b: Unbroken Highband Max Scan (Pristine SIMD pipeline)
+        # PASS 1b: Unbroken Highband Max Scan
         # =====================================================================
         block_max_high_sq = 0.0
         for idx in range(n_valid):
@@ -334,11 +340,10 @@ def find_peaks_fused_lanczos_cython(
         # GLOBAL BLOCK GATE CHECK
         # =====================================================================
         if (block_max_high_amp + max_low_envelope) <= current_max_snr_amp:
-            # HIERARCHICAL SKIP: Zero triggers possible. Skip entire fallback loop.
             continue
 
         # =====================================================================
-        # PASS 2: Fallback Detailed Segment Loop (Executed <1% of the time)
+        # PASS 2: Fallback Detailed Segment Loop
         # =====================================================================
         for j in range(j_start, j_end + 1):
             idx_min_j = <long>libc.math.ceil((<double>j * dt_low - const_offset) / dt_high)
@@ -372,18 +377,16 @@ def find_peaks_fused_lanczos_cython(
                 interp_low_snr.real = 0.0
                 interp_low_snr.imag = 0.0
                 
-                # --- ANALYTIC LANCZOS MODIFICATION 1: ALTERNATING SIGN ---
-                # Determine the initial sign based on the starting index (j - 31)
-                sign = 1.0 if ((j - 31) % 2) == 0 else -1.0
+                # --- EXACT PHASE SIGN ALIGNMENT (128 Taps) ---
+                # Based on center tap offset of -63
+                sign = 1.0 if ((j - 63) % 2) == 0 else -1.0
                 
-                for k_idx in range(64):
-                    interp_low_snr.real += sign * weights_lut[w_lut_idx, k_idx] * low_snr_block[f_batch_idx, j + k_idx - 31].real
-                    interp_low_snr.imag += sign * weights_lut[w_lut_idx, k_idx] * low_snr_block[f_batch_idx, j + k_idx - 31].imag
-                    # Branchless toggle for the next tap
+                for k_idx in range(128):
+                    interp_low_snr.real += sign * weights_lut[w_lut_idx, k_idx] * low_snr_block[f_batch_idx, j + k_idx - 63].real
+                    interp_low_snr.imag += sign * weights_lut[w_lut_idx, k_idx] * low_snr_block[f_batch_idx, j + k_idx - 63].imag
                     sign = -sign
                 
-                # --- ANALYTIC LANCZOS MODIFICATION 2: PHASE ROTATION ---
-                # Multiply the final interpolated value by e^(i * pi * exact_low_idx)
+                # --- PHASE ROTATION ---
                 theta = PI * exact_low_idx
                 c_rot = libc.math.cos(theta)
                 s_rot = libc.math.sin(theta)
@@ -393,7 +396,6 @@ def find_peaks_fused_lanczos_cython(
                 
                 interp_low_snr.real = rot_r
                 interp_low_snr.imag = rot_i
-                # --------------------------------------------------------
                 
                 z_total.real = z_high.real + interp_low_snr.real
                 z_total.imag = z_high.imag + interp_low_snr.imag
