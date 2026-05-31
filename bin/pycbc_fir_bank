@@ -245,7 +245,8 @@ def process_template(i):
 # --- 4. MAIN PROCESS ---
 def main():
     parser = argparse.ArgumentParser(description="Generate Optimized FIR Filter Bank (MP)")
-    parser.add_argument('--coarse-bank', required=True)
+    parser.add_argument('--coarse-bank')
+    parser.add_argument('--flat-reference', nargs=2, type=float)
     parser.add_argument('--fine-bank', required=True)
     parser.add_argument('--output-file', required=True)
     parser.add_argument('--f-low', type=float, default=20.0)
@@ -274,22 +275,27 @@ def main():
             log.handlers[0].stream = sys.stdout
 
     f_final = args.sample_rate / 2.0
-    df = args.delta_f * args.dec_factor
     flen = int(f_final / args.delta_f) + 1
-    flen_small = int(f_final / df) + 1
     logging.info(f"Setup: Rate={args.sample_rate}, df={args.delta_f}, flen={flen}")
 
     psd = pycbc.psd.from_cli(args, length=flen, delta_f=args.delta_f, 
                              low_frequency_cutoff=args.f_low)
 
     logging.info("Loading coarse bank references...")
-    coarse_bank = FilterBank(args.coarse_bank, flen, args.delta_f,
-                             dtype=np.complex128, 
-                             enable_compressed_waveforms=False)
-    show_progress = (args.verbose == 0)
-    coarse_waveforms = [h.copy() for h in tqdm(coarse_bank, desc="Generating References", disable=not show_progress, file=sys.stderr)]
-
-    if not coarse_waveforms: sys.exit("ERROR: Coarse bank empty!")
+    if args.coarse_bank:
+        coarse_bank = FilterBank(args.coarse_bank, flen, args.delta_f,
+                                 dtype=np.complex128, 
+                                 enable_compressed_waveforms=False)
+        show_progress = (args.verbose == 0)
+        coarse_waveforms = [h.copy() for h in tqdm(coarse_bank, desc="Generating References", disable=not show_progress, file=sys.stderr)]
+    elif args.flat_reference:
+        ref_vals = np.zeros(flen, dtype=np.complex128)
+        kmin = int(args.flat_reference[0] / args.delta_f)
+        kmax = int(args.flat_reference[1] / args.delta_f)
+        ref_vals[kmin:kmax] = 1.0 + 1.0j
+        coarse_waveforms = [FrequencySeries(ref_vals,
+                                            delta_f=args.delta_f,
+                                            epoch=0)]
 
     logging.info("Opening fine bank...")
     fine_bank = FilterBank(args.fine_bank, flen, args.delta_f,
@@ -305,9 +311,10 @@ def main():
                                    write_compressed_waveforms=True)
 
     # 2. Write Coarse Bank to Subgroup
-    coarse_bank.write_to_hdf(args.output_file, file_handler=f_out, 
-                             group_key="fir_data/coarse_bank_params",
-                             write_compressed_waveforms=True)
+    if args.coarse_bank:
+        coarse_bank.write_to_hdf(args.output_file, file_handler=f_out, 
+                                 group_key="fir_data/coarse_bank_params",
+                                 write_compressed_waveforms=True)
     
     # 3. Add Metadata attributes
     # We use require_group because the previous step created 'fir_data/coarse_bank_params'
