@@ -273,7 +273,6 @@ def main():
             delta_f=delta_f,
             dtype=np.complex64,
         )
-        bank.template_thinning(inj_filter_rejector)
         
         logging.info("Initializing Ratio Filter Engine...")
         engine = RatioMatchedFilterControl(
@@ -355,9 +354,10 @@ def main():
             scale_low = bank.snr_rescale(fine_indices, 'mchirp')
             scale_high = bank.snr_rescale(fine_indices, 'precalculated_sigma')
             filters_f /= scale_high[:, None]
-            sf0 = scale_low[0]
-            for lt, sf in zip(lowband_templates, scale_low):
-                lt /= (sf / sf0)
+            
+            #sf0 = scale_low[0]
+            #for lt, sf in zip(lowband_templates, scale_low):
+            #    lt /= (sf / sf0)
 
             for s_num, stilde in enumerate(segments):
                 logging.info(f"Processing Segment {s_num}")
@@ -369,6 +369,7 @@ def main():
                     np.arange(len(fine_indices)),
                     valid_slice=stilde.analyze,
                     lowband_templates=lowband_templates,
+                    scale=(scale_low, scale_high),
                 )
 
                 if len(ids_local) > 0:
@@ -425,13 +426,13 @@ def main():
             out_vals['time_index'] = np.array(time_list)
             
             # Renorm snr
-            snr_rescale = bank.snr_rescale(global_id, 
-                             method=args.template_normalization_method)
-            sigmasq_rescale = bank.sigma_rescale(global_id, 
-                             method=args.template_normalization_method) ** 2.0
+            #snr_rescale = bank.snr_rescale(global_id, 
+            #                 method=args.template_normalization_method)
+            #sigmasq_rescale = bank.sigma_rescale(global_id, 
+            #                 method=args.template_normalization_method) ** 2.0
             
             out_vals['snr'] = np.array(snr) #/ snr_rescale
-            out_vals['sigmasq'] = np.ones(len(time_list)) * norm * sigmasq_rescale
+            out_vals['sigmasq'] = np.ones(len(time_list)) #* norm * sigmasq_rescale
             out_vals['chisq'] = chi
             out_vals['chisq_dof'] = chi_dof
 

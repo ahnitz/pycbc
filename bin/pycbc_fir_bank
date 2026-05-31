@@ -315,6 +315,8 @@ def main():
         coarse_bank.write_to_hdf(args.output_file, file_handler=f_out, 
                                  group_key="fir_data/coarse_bank_params",
                                  write_compressed_waveforms=True)
+    elif args.flat_reference:
+        f_out['fir_data/flat_reference'] = np.array(args.flat_reference)
     
     # 3. Add Metadata attributes
     # We use require_group because the previous step created 'fir_data/coarse_bank_params'

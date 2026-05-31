@@ -1,8 +1,9 @@
 import logging
+import time
 import numpy as np
 import time
 import mkl_fft
-from pycbc.types import zeros, complex64, TimeSeries
+from pycbc.types import zeros, complex64, TimeSeries, FrequencySeries
 from pycbc.filter.matchedfilter import matched_filter_core, sigmasq
 from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython, find_peaks_in_block_cython, find_peaks_fused_lanczos_cython
 
@@ -56,18 +57,14 @@ class RatioMatchedFilterControl(object):
         return filters_f, n_taps_max
 
     def process_segment(self, stilde, psd, ref_template, filters_f, n_taps, indices, 
-                        valid_slice=None, lowband_templates=None):
+                        valid_slice=None, lowband_templates=None, scale=None):
         """
         Process a single data segment.
         """
         if valid_slice is None:
             valid_slice = getattr(stilde, 'analyze', None)
-
-        import time
         
-        t1 =time.time()
-        print(self.f_high)
-        # 2. Calculate Reference SNR    
+        t1 = time.time()
         h_norm = sigmasq(ref_template, psd=psd, 
                          low_frequency_cutoff=self.multiband_frequency,
                          high_frequency_cutoff=self.f_high)    
@@ -77,61 +74,58 @@ class RatioMatchedFilterControl(object):
             high_frequency_cutoff=self.f_high,
             h_norm=h_norm
         )
-        
+        t2 = time.time()    
+                
         # Calculate lowband template SNRs
         logging.info('processing lowband templates')
+        ltem = lowband_templates[0]
+        hnorm_low_ref = sigmasq(ltem, psd=psd,
+              low_frequency_cutoff=ltem.f_lower,
+              high_frequency_cutoff=self.multiband_frequency)
+                 
+        # This won't work if we call this function multiple times with different templates!      
+        dec = 5        
+        if not hasattr(self, 'hnorms_low'):        
+            hnorms_low = [sigmasq(ltem[::dec], psd=psd[::dec],
+                              low_frequency_cutoff=ltem.f_lower,
+                              high_frequency_cutoff=self.multiband_frequency) for ltem in lowband_templates]
+            self.hnorms_low = np.array(hnorms_low)      
+            
+        hnorms_low = self.hnorms_low * (hnorm_low_ref / self.hnorms_low[0])
+        norm_low = 4.0 * stilde.delta_f / hnorms_low ** 0.5        
+        slow, shigh = scale
+        hnorms_high = h_norm * shigh ** 2.0
+        sigma_total = hnorms_low + hnorms_high
+        rw_low = (hnorms_low / sigma_total) ** 0.5
+        rw_high = (hnorms_high / sigma_total) ** 0.5
 
-        # Fix up this normalization step to do mchirp rescaling?
-        h_norm2 = sigmasq(lowband_templates[0], psd=psd,
-                         low_frequency_cutoff=lowband_templates[0].f_lower,
-                         high_frequency_cutoff=self.multiband_frequency)
-        
-        norm2 =  4.0 * stilde.delta_f / h_norm2 ** 0.5
-
-        #hnorms = [sigmasq(ltem, psd=psd,
-        #                 low_frequency_cutoff=lowband_templates[0].f_lower,
-        #                 high_frequency_cutoff=self.multiband_frequency) for ltem in lowband_templates]
-
-        # Reweighting factors so you can just add the high / low
-        # snrs directly
-        h_norm = 1.0 / norm**2.0
-        h_norm2 = 1.0 / norm2**2.0
-        sigma_total = (h_norm + h_norm2)**0.5
-        rw_low = h_norm2 ** 0.5 / sigma_total
-        rw_high = h_norm ** 0.5 / sigma_total
-        
         flen = int(self.multiband_frequency / stilde.delta_f)
         dt_low = 1.0 / (flen * stilde.delta_f)
         sow = stilde[:flen] / psd[:flen]
-        sow2 = sow.numpy() * rw_low * norm2 * flen
-        sow2 = sow2.astype(np.complex64)
-        t2 = time.time()
+        sow2 = sow.astype(np.complex64).numpy()
         
         kmax = min(len(lowband_templates[0]), flen)
         lowband_snrs = np.resize(sow2, len(lowband_templates) * flen).reshape((len(lowband_templates), flen)) 
         for j, ltemplate in enumerate(lowband_templates):
-            lowband_snrs[j][:kmax] *= ltemplate[:kmax].conj() #* (hnorms[0] / hnorms[j]) ** 0.5  
-            
-        #print("norm ratio", hnorms[0] / hnorms[1], hnorms[0] / hnorms[-1])
-       
+            lowband_snrs[j][:kmax] *= ltemplate[:kmax].conj() * (norm_low[j] * rw_low[j] * flen)
+             
         t22 = time.time()
         self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
         t3 = time.time()        
         
         # Prenormalize the SNRs
         # Opt note: could move all this multiplication to the peak finding..
-        self.ref_snr = snr.numpy() * (norm * stilde.delta_t * rw_high)
+        self.ref_snr = snr.numpy() * (norm * stilde.delta_t)
+        filters_f  = (filters_f * rw_high[:, None]).astype(filters_f.dtype)
            
         logging.info('.....done')                
         t4 = time.time()
 
         safety_sigma = 4.0
-        extra_margin = 0.2
-        gate_threshold = max(0.0, self.snr_threshold - safety_sigma * rw_high - extra_margin)
+        extra_margin = 0.15
+        gate_threshold = max(0.0, self.snr_threshold - safety_sigma * np.mean(rw_high) - extra_margin)
 
         # 3. Execute Blocked Kernel
-       
-        
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
             self.ref_snr, filters_f, n_taps, valid_slice, stilde,
             lowband_snrs=(lowband_snrs, dt_low, gate_threshold),
@@ -190,12 +184,13 @@ class RatioMatchedFilterControl(object):
         Inner loop: Time-Blocking + Filter-Batching using mkl_fft.
         """
         tx1 = time.time()
-        tap_groups = 3
-        nsizes = np.quantile(n_taps, np.linspace(0, 1, tap_groups+1)[1:]).astype(int)
+
+        N_FFT = self.fir_fft_len        
+        n_taps_max = n_taps.max()
         n_samples = len(data)
-        n_filters = len(filters_f)
-        
-        N_FFT = self.fir_fft_len
+        n_filters = len(filters_f)       
+        N_VALID = N_FFT - n_taps_max + 1
+        bad_start = n_taps_max // 2      
         
         all_f_idxs = []
         all_t_idxs = []
@@ -222,64 +217,60 @@ class RatioMatchedFilterControl(object):
         
         tspend = 0
         tspend2 = 0
-        
-        t0 = time.time()
+
         low_snr_abs = np.abs(lowband_snrs)
+
+        # Determine Loop Bounds
+        first_block_idx = (v_start - bad_start) // N_VALID
+        loop_start = first_block_idx * N_VALID
+
+        # Set up the time chunk book keeping info
+        t_starts = np.arange(loop_start, n_samples, N_VALID)
+        valid = np.ones(len(t_starts), dtype=bool)
+        block_valid_t0s = t_starts + bad_start
+
+        # Remove parts not within the total valid data boundaries
+        valid[block_valid_t0s >= v_stop] = False
+        valid[block_valid_t0s + N_VALID <= v_start] = False
+        
+        roi_starts = np.maximum(v_start, block_valid_t0s)
+        roi_stops = np.minimum(v_stop, block_valid_t0s + N_VALID)
+        
+        roi_len = roi_stops - roi_starts
+        valid[roi_len <= 0] = False
+       
+        j_starts = np.round(roi_starts * dt_high / dt_low).astype(np.int32) - 1
+        j_starts = np.maximum(0, j_starts)
+        j_ends = np.round(roi_stops * dt_high / dt_low).astype(np.int32) + 1
+        j_ends = np.minimum(lowband_snrs.shape[1], j_ends)
+
+        valid = np.resize(valid, len(filters_f) * len(t_starts)).reshape(len(filters_f), len(t_starts))
+
         tx2 = time.time()
-        for f_start in range(0, n_filters, self.batch_size):  
-        
-            ts1 = time.time()
-        
+                                
+        t0 = time.time() 
+              
+        for f_start in range(0, n_filters, self.batch_size): 
             f_end = min(f_start + self.batch_size, n_filters)
             actual_batch_size = f_end - f_start
  
             low_snr_block = lowband_snrs[f_start:f_end]
             current_mult_view = freq_mult_view[:actual_batch_size]
             current_corr_view = corr_out_view[:actual_batch_size]
-            
-            # Valid output samples per block (Overlap-Save)
-            n_taps_max = n_taps[f_start:f_end].max()
-            i = np.searchsorted(nsizes, n_taps_max)
-            n_taps_max = nsizes[i]
-            
-            N_VALID = N_FFT - n_taps_max + 1
-            bad_start = n_taps_max // 2
 
-            # Determine Loop Bounds
-            first_block_idx = (v_start - bad_start) // N_VALID
-            loop_start = first_block_idx * N_VALID
-
-            # Set up the time chunk book keeping info
-            t_starts = np.arange(loop_start, n_samples, N_VALID)
-            valid = np.ones(len(t_starts), dtype=bool)
-            block_valid_t0s = t_starts + bad_start
-    
-            # Remove parts not within the total valid data boundaries
-            valid[block_valid_t0s >= v_stop] = False
-            valid[block_valid_t0s + N_VALID <= v_start] = False
-            
-            roi_starts = np.maximum(v_start, block_valid_t0s)
-            roi_stops = np.minimum(v_stop, block_valid_t0s + N_VALID)
-            
-            roi_len = roi_stops - roi_starts
-            valid[roi_len <= 0] = False
-           
-            j_starts = np.round(roi_starts * dt_high / dt_low).astype(np.int32) - 1
-            j_starts = np.maximum(0, j_starts)
-            j_ends = np.round(roi_stops * dt_high / dt_low).astype(np.int32) + 1
-            j_ends = np.minimum(lowband_snrs.shape[1], j_ends)
-            
+            ts1 = time.time()
+            valid2 = valid[f_start:f_end]
             low_snr_fbatch = lowband_snrs[f_start:f_end]
             for j, (js, je) in enumerate(zip(j_starts, j_ends)):
-                if valid[j]:
-                    valid[j] = np.max(low_snr_abs[f_start:f_end, js:je]) > gate_threshold     
-            t_starts = t_starts[valid]
-            roi_starts = roi_starts[valid]
-            roi_stops = roi_stops[valid]
-                        
+                if valid2[0, j]:
+                    valid2[:, j] = np.max(low_snr_abs[f_start:f_end, js:je]) > gate_threshold     
+            t_starts2 = t_starts[valid2[0,:]]
+            roi_starts2 = roi_starts[valid2[0,:]]
+            roi_stops2 = roi_stops[valid2[0,:]]
+            
             ts2 = time.time()
 
-            for t_start, roi_start, roi_stop in zip(t_starts, roi_starts, roi_stops):
+            for t_start, roi_start, roi_stop in zip(t_starts2, roi_starts2, roi_stops2):
                 t1 = time.time()
                         
                 roi_len = roi_stop - roi_start

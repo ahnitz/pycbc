@@ -1140,13 +1140,24 @@ class RatioFilterBank(FilterBank):
         # 2. Initialize the internal Coarse Bank
         # We use the reuse strategy: passing our own filehandler to avoid 
         # re-opening the file, and using group_key to point to the params.
-        self.coarse_bank = FilterBank(
-            filename, filter_length_coarse, delta_f, dtype,
-            approximant=approximant, # We assume coarse/fine use same approximant
-            group_key='fir_data/coarse_bank_params',
-            file_handler=self.filehandler,
-            **kwds
-        )
+        
+        if 'coarse_bank_params' in self.fir_group:
+            self.coarse_bank = FilterBank(
+                filename, filter_length_coarse, delta_f, dtype,
+                approximant=approximant, # We assume coarse/fine use same approximant
+                group_key='fir_data/coarse_bank_params',
+                file_handler=self.filehandler,
+                **kwds
+            )
+        elif 'flat_reference' in self.fir_group:
+            flat_reference = self.fir_group['flat_reference'][:]
+            ref_vals = np.zeros(filter_length_coarse, dtype=np.complex64)
+            kmin = int(flat_reference[0] / delta_f)
+            kmax = int(flat_reference[1] / delta_f)
+            ref_vals[kmin:kmax] = 1.0 + 1.0j
+            self.coarse_bank = [FrequencySeries(ref_vals,
+                                        delta_f=delta_f,
+                                        epoch=0)]
         
         # Load metadata attributes
         self.n_taps = self.fir_group.attrs.get('n_taps', None)
@@ -1236,8 +1247,12 @@ class RatioFilterBank(FilterBank):
         # reference. Ideally call this once.
         mc_bank = mchirp_from_mass1_mass2(self.table['mass1'], 
                                           self.table['mass2']) 
-        mc_coarse = mchirp_from_mass1_mass2(self.coarse_bank.table['mass1'],
-                                            self.coarse_bank.table['mass2'])
+                                          
+        try:
+            mc_coarse = mchirp_from_mass1_mass2(self.coarse_bank.table['mass1'],
+                                                self.coarse_bank.table['mass2'])
+        except:
+            mc_coarse = np.array([1.0], ndmin=1)
          
         self.mchirp_norm_rescale = np.ones(len(self.table))      
         for coarse_id in self.coarse_indices:
