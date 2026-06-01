@@ -162,9 +162,9 @@ class RatioMatchedFilterControl(object):
         # 4. Map indices
         if len(local_idxs) > 0:
             global_ids = indices[local_idxs]
-            return global_ids, t_idxs, snr_vals, tstarts, sigma_total
+            return global_ids, t_idxs, snr_vals, tstarts, hnorms_low[local_idxs]
         else:
-            return [], [], [], tstarts, sigma_total
+            return [], [], [], tstarts, sigma_
 
     def _fft_all_filters(self, taps, counts):
         """Helper to FFT all filters using mkl_fft."""

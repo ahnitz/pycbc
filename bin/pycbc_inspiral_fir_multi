@@ -32,7 +32,7 @@ tstart = time.time()
 
 def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
                         fine_indices, tstarts, stilde, bank, chisq_estimator, engine,
-                        filters_f, ref_template,
+                        lowband_templates,
                         args):
     logging.info('starting chisq calculation')
     chisq_window_samp = int(args.chisq_window * stilde.sample_rate)
@@ -71,75 +71,24 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
             tstart = tstarts[idx]
             
             local_id = ids_local[idx] # Within batch id
- 
-            # Regenerate full resolution correlation vector
-            rescale = bank.snr_rescale(target_global_id, 
-                                       method=args.template_normalization_method)
 
             # We do one point at a time, this is just the snr vallue array
             # and time index array that we need to calculate the chisq at
-            snrvs = np.array([snrv], ndmin=1) / rescale
+            snrvs = np.array([snrv], ndmin=1)
             tids = np.array([t_idx], ndmin=1)
             
-            if not args.fast_chisq: # Slow chisq
-                logging.info('regenerating template')
-                ratio_filter = bank.get_fd_fir(target_global_id, len(stilde), 
-                                               delta_f=stilde.delta_f)     
-                logging.info('finished template regeneration')
-                template = ratio_filter * ref_template
-                template.params = ratio_filter.params
-                template.f_lower = ref_template.f_lower
-                             
-                corr = template.conj() * stilde / stilde.psd * (4 * stilde.delta_f / h_norm ** 0.5 / rescale)
-                corr.resize((len(stilde) - 1)*2)
-           
-                psd = stilde.psd.copy()
-                psd[:] = 1
-                template = template / stilde.psd ** 0.5
-                template[:] = abs(template)
-                template.params = ratio_filter.params
-                template.f_lower = ref_template.f_lower
-                
-                logging.info('done')
-                chi, dof = chisq_estimator.values(corr, snrvs, 1, psd, tids, template)    
+            template = lowband_templates[local_id]                         
+            kmax = len(template)
+            corr = template.conj() * stilde[:kmax] / stilde.psd[:kmax] * (4 * stilde.delta_f / h_norm[idx] ** 0.5)
+            corr.resize((len(stilde) - 1)*2)
             
-            else: # Fast chisq
-                # Reconstruct template (decimated)
-                logging.info('regenerating chisq inputs')
-                refine = 1 # hmm doesn't work for some reason
-                df = args.sample_rate / args.fir_length
-                
-                dfr = df / refine
-                ratio = filters_f[local_id]
-
-                # This block can be precalculated once per 
-                if _ref_weight is None:
-                    dec = int(dfr / stilde.delta_f)
-                    w = ref_template[::dec] / stilde.psd[::dec] ** 0.5    
-                    newf = np.arange(0, args.fir_length) * dfr
-                    
-                    # Only bother with this because I didn't want to handle
-                    # delta_f exact decimation issues
-                    _ref_weight = np.interp(newf, w.sample_frequencies, w)
-                
-                template2 = FrequencySeries(ratio * _ref_weight, delta_f=dfr, dtype=stilde.dtype)
-                template2[:] = abs(template2) / args.sample_rate
-                template2.params = bank.table[target_global_id]
-                template2.f_lower = ref_template.f_lower
-                
-                
-                psd2 = FrequencySeries(np.ones(len(ratio), dtype=np.float32), delta_f=dfr)
-                
-                # Reconstruct fd correlation vector
-                import mkl_fft
-                ref = engine.ref_snr[tstart:tstart+args.fir_length]
-                corr2 = FrequencySeries(ratio *  mkl_fft.fft(ref), delta_f=df) / rescale / args.fir_length
-                corr2 = corr2.to_timeseries().to_frequencyseries(delta_f=dfr) / refine
-                
-                tids2 = tids - tstart
-                logging.info('...done')
-                chi, dof = chisq_estimator.values(corr2, snrvs, 1, psd2, tids2, template2)   
-
+            template2 = template.copy()
+            template2.resize(len(stilde))
+            template2.params = template.params
+            template2.f_lower = template.f_lower
+            
+            chi, dof = chisq_estimator.values(corr, snrvs, 1, stilde.psd, tids, template2)    
+        
             # Determine which points we should use the same chisq value for
             window_mask = (abs(t_idxs - t_idx) <= chisq_window_samp)
             update_mask = window_mask & (~assigned_mask)
@@ -386,7 +335,7 @@ def main():
 
                     if len(ids_local) > 0:
                         chi, chi_dof = compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
-                            fine_indices, tstarts, stilde, bank, power_chisq, engine, filters_f, ref_template, args)
+                            fine_indices, tstarts, stilde, bank, power_chisq, engine, lowband_templates, args)
                         
                         t_idxs += (-stilde.analyze.start + stilde.cumulative_index)
                         seg_ids_local.append(ids_local)
