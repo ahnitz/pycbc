@@ -405,7 +405,7 @@ def main():
                     logging.info(f"batch perf: {tperf} templates s/s")
                 
                 # Reset some caches    
-                engine.hnorms_low = None   
+                engine.hnorms_low = None
                 gc.collect()
                          
         logging.info(f"Grouping triggers...")

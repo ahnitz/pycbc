@@ -66,17 +66,26 @@ class RatioMatchedFilterControl(object):
             valid_slice = getattr(stilde, 'analyze', None)
         
         t1 = time.time()
-        h_norm = sigmasq(ref_template, psd=psd, 
-                         low_frequency_cutoff=self.multiband_frequency,
-                         high_frequency_cutoff=self.f_high)    
-        snr, _, norm = matched_filter_core(
-            ref_template, stilde, psd=psd,
-            low_frequency_cutoff=self.multiband_frequency,
-            high_frequency_cutoff=self.f_high,
-            h_norm=h_norm
-        )
-        self.ref_snr = snr.numpy() * (norm * stilde.delta_t)
-                
+        
+        # Cache if we keep the same ref_template, otherwise remake
+        if not hasattr(stilde, 'ref_snr') or stilde.ref_template_id != id(ref_template):
+            h_norm = sigmasq(ref_template, psd=psd, 
+                             low_frequency_cutoff=self.multiband_frequency,
+                             high_frequency_cutoff=self.f_high)    
+            snr, _, norm = matched_filter_core(
+                ref_template, stilde, psd=psd,
+                low_frequency_cutoff=self.multiband_frequency,
+                high_frequency_cutoff=self.f_high,
+                h_norm=h_norm
+            )
+            ref_snr = snr.numpy() * (norm * stilde.delta_t)
+            stilde.ref_hnorm = h_norm    
+            stilde.ref_snr = ref_snr
+            stilde.ref_template_id = id(ref_template)
+        
+        ref_snr = stilde.ref_snr
+        ref_hnorm = stilde.ref_hnorm
+        
         # Calculate lowband template SNRs
         logging.info('processing lowband templates')
         ltem = lowband_templates[0]
@@ -86,7 +95,8 @@ class RatioMatchedFilterControl(object):
                  
         # This won't work if we call this function multiple times with different templates!      
         dec = 5        
-        if self.hnorms_low is None:       
+        if self.hnorms_low is None:  
+            print('recalculating hnorms')     
             hnorms_low = [sigmasq(ltem[::dec], psd=psd[::dec],
                               low_frequency_cutoff=ltem.f_lower,
                               high_frequency_cutoff=self.multiband_frequency) for ltem in lowband_templates]
@@ -101,7 +111,7 @@ class RatioMatchedFilterControl(object):
 
         norm_low = 4.0 * stilde.delta_f / hnorms_low ** 0.5        
         slow, shigh = scale
-        hnorms_high = h_norm * shigh ** 2.0
+        hnorms_high = ref_hnorm * shigh ** 2.0
         sigma_total = hnorms_low + hnorms_high
         rw_low = (hnorms_low / sigma_total) ** 0.5
         rw_high = (hnorms_high / sigma_total) ** 0.5
@@ -110,11 +120,11 @@ class RatioMatchedFilterControl(object):
         dt_low = 1.0 / (flen * stilde.delta_f)
         sow = stilde[:flen] / psd[:flen]
         sow2 = sow.astype(np.complex64).numpy()
-        
-        kmax = min(len(lowband_templates[0]), flen)
-        
-        lens = [len(ltem) for ltem in lowband_templates]
-        t2 = time.time()
+        kmax = min(len(lowband_templates[0]), flen)        
+
+
+        t2 = time.time()   
+
         lowband_snrs = np.resize(sow2, len(lowband_templates) * flen).reshape((len(lowband_templates), flen)) 
         for j, ltemplate in enumerate(lowband_templates):
             lowband_snrs[j][:kmax] *= ltemplate[:kmax].conj() * (norm_low[j] * rw_low[j] * flen)
@@ -142,7 +152,7 @@ class RatioMatchedFilterControl(object):
 
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
-            self.ref_snr, filters_f, n_taps, valid_slice, stilde,
+            ref_snr, filters_f, n_taps, valid_slice, stilde,
             lowband_snrs=(lowband_snrs, dt_low, gate_threshold),
         )
         t5 = time.time()
@@ -152,9 +162,9 @@ class RatioMatchedFilterControl(object):
         # 4. Map indices
         if len(local_idxs) > 0:
             global_ids = indices[local_idxs]
-            return global_ids, t_idxs, snr_vals, tstarts, h_norm
+            return global_ids, t_idxs, snr_vals, tstarts, sigma_total
         else:
-            return [], [], [], tstarts, h_norm
+            return [], [], [], tstarts, sigma_total
 
     def _fft_all_filters(self, taps, counts):
         """Helper to FFT all filters using mkl_fft."""
