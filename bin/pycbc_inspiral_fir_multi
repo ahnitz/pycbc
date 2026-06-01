@@ -223,6 +223,7 @@ def get_args():
                         default='mchirp')  
     parser.add_argument("--multiband-frequency", type=float)
     parser.add_argument("--fast-chisq", action='store_true')  
+    parser.add_argument("--template-batch-size", type=int, default=1000)
 
     return parser, parser.parse_args()
 
@@ -343,55 +344,67 @@ def main():
         tsetup = time.time() - tstart
         
         for i, coarse_idx in enumerate(bank.coarse_indices):
-            lowband_templates = bank.get_fine_templates(coarse_idx)
-            
             ref_template = bank.get_coarse_template(coarse_idx)
-            taps, counts, fine_indices = bank.get_firs(coarse_idx)
-            filters_f, n_taps_max = engine.prepare_filters(taps, counts)
-            
-            logging.info(f"  Ratio Batch {i+1}/{n_coarse}, {len(taps)} FIR templates")
+            all_fine_indices = bank.get_fine_indices(coarse_idx)
 
-            scale_low = bank.snr_rescale(fine_indices, 'mchirp')
-            scale_high = bank.snr_rescale(fine_indices, 'precalculated_sigma')
-            filters_f /= scale_high[:, None]
-            
-            #sf0 = scale_low[0]
-            #for lt, sf in zip(lowband_templates, scale_low):
-            #    lt /= (sf / sf0)
-
-            for s_num, stilde in enumerate(segments):
-                logging.info(f"Processing Segment {s_num}")
-                t1 = time.time()
+            for temp_start in np.arange(0, len(all_fine_indices), args.template_batch_size):
+                temp_end = temp_start + args.template_batch_size
+                if temp_end > len(all_fine_indices):
+                    temp_end = len(all_fine_indices)
                 
+                lowband_templates = bank.get_fine_templates(coarse_idx, indices=slice(temp_start, temp_end))
+                taps, counts, fine_indices = bank.get_firs(coarse_idx, indices=slice(temp_start, temp_end))
+            
+                print("COUNT CHECK", temp_start, temp_end, len(counts))
+                
+                filters_f, n_taps_max = engine.prepare_filters(taps, counts)
+                
+                logging.info(f"  Ratio Batch {i+1}/{n_coarse}, {len(taps)} FIR templates")
 
-                ids_local, t_idxs, snrs, tstarts, h_norm = engine.process_segment(
-                    stilde, stilde.psd, ref_template, filters_f, counts,
-                    np.arange(len(fine_indices)),
-                    valid_slice=stilde.analyze,
-                    lowband_templates=lowband_templates,
-                    scale=(scale_low, scale_high),
-                )
+                scale_low = bank.snr_rescale(fine_indices, 'mchirp')
+                scale_high = bank.snr_rescale(fine_indices, 'precalculated_sigma')
+                
+                # We prenormalize the highband filters, lowband we calculate
+                # h_norm explicitly in the code.
+                filters_f /= scale_high[:, None]
+            
 
-                if len(ids_local) > 0:
-                    chi, chi_dof = compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
-                        fine_indices, tstarts, stilde, bank, power_chisq, engine, filters_f, ref_template, args)
+                for s_num, stilde in enumerate(segments):
+                    logging.info(f"Processing Segment {s_num}")
+                    t1 = time.time()
                     
-                    t_idxs += (-stilde.analyze.start + stilde.cumulative_index)
-                    seg_ids_local.append(ids_local)
-                    seg_t_idxs.append(t_idxs)
-                    seg_snr_sqs.append(snrs)
-                    seg_fine_mappings.append(fine_indices)
-                    seg_h_norms.append(h_norm)
-                    seg_coarse_ids.append(coarse_idx)
-                    seg_chi.append(chi)
-                    seg_chi_dof.append(chi_dof)
+
+                    ids_local, t_idxs, snrs, tstarts, h_norm = engine.process_segment(
+                        stilde, stilde.psd, ref_template, filters_f, counts,
+                        np.arange(len(fine_indices)),
+                        valid_slice=stilde.analyze,
+                        lowband_templates=lowband_templates,
+                        scale=(scale_low, scale_high),
+                    )
+
+                    if len(ids_local) > 0:
+                        chi, chi_dof = compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
+                            fine_indices, tstarts, stilde, bank, power_chisq, engine, filters_f, ref_template, args)
+                        
+                        t_idxs += (-stilde.analyze.start + stilde.cumulative_index)
+                        seg_ids_local.append(ids_local)
+                        seg_t_idxs.append(t_idxs)
+                        seg_snr_sqs.append(snrs)
+                        seg_fine_mappings.append(fine_indices)
+                        seg_h_norms.append(h_norm)
+                        seg_coarse_ids.append(coarse_idx)
+                        seg_chi.append(chi)
+                        seg_chi_dof.append(chi_dof)
 
 
-                t2 = time.time()
-                print("pass loop", t2 - t1, (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t, len(taps))
-                tperf = (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t / (t2 - t1) * len(taps)
-                logging.info(f"batch perf: {tperf} templates s/s")
+                    t2 = time.time()
+                    print("pass loop", t2 - t1, (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t, len(taps))
+                    tperf = (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t / (t2 - t1) * len(taps)
+                    logging.info(f"batch perf: {tperf} templates s/s")
                 
+                # Reset some caches    
+                engine.hnorms_low = None   
+                         
         logging.info(f"Grouping triggers...")
         
         triggers_by_template = {}

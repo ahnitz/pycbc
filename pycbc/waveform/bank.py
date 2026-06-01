@@ -1216,9 +1216,17 @@ class RatioFilterBank(FilterBank):
         else:
             self.coarse_indices = []
 
-    def get_fine_templates(self, coarse_index):
+    def get_fine_indices(self, coarse_index):
+        c_group = self.fir_group[str(coarse_index)]
+        fine_indices = c_group['fine_bank_index'][:]    
+        return fine_indices    
+
+    def get_fine_templates(self, coarse_index, indices=None):
         c_group = self.fir_group[str(coarse_index)]
         fine_indices = c_group['fine_bank_index'][:]
+        
+        if indices is not None:
+            fine_indices = fine_indices[indices]
         
         templates = []
         for fid in fine_indices:
@@ -1335,7 +1343,7 @@ class RatioFilterBank(FilterBank):
         fs.params = self.table[fine_index]
         return fs
 
-    def get_firs(self, coarse_index):
+    def get_firs(self, coarse_index, indices=None):
         """Retrieve the FIR tap information for the batch of fine templates
         associated with a specific coarse reference.
 
@@ -1363,12 +1371,19 @@ class RatioFilterBank(FilterBank):
         
         # Load datasets entirely into memory as they are processed in a batch
         # These keys match the output of the generation script provided
-        taps = c_group['taps'][:]
-        actual_tap_counts = c_group['actual_tap_count'][:]
-        fine_indices = c_group['fine_bank_index'][:]
-        
+        if indices is not None:
+            taps = c_group['taps'][indices]
+            actual_tap_counts = c_group['actual_tap_count'][indices]
+            fine_indices = c_group['fine_bank_index'][indices]
+        else:
+            taps = c_group['taps'][:]
+            actual_tap_counts = c_group['actual_tap_count'][:]
+            fine_indices = c_group['fine_bank_index'][:]            
+       
         # --- NEW: Sort by tap count ---
         sort_idx = np.argsort(actual_tap_counts)
+        
+        return taps, actual_tap_counts, fine_indices
         return taps[sort_idx], actual_tap_counts[sort_idx], fine_indices[sort_idx]
 
     @property

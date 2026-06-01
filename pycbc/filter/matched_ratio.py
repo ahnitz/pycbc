@@ -40,6 +40,7 @@ class RatioMatchedFilterControl(object):
         self.fft_lib = mkl_fft
         
         self.multiband_frequency = multiband_frequency
+        self.hnorms_low = None
 
     def prepare_filters(self, fir_taps, tap_counts):
         """
@@ -74,6 +75,7 @@ class RatioMatchedFilterControl(object):
             high_frequency_cutoff=self.f_high,
             h_norm=h_norm
         )
+        self.ref_snr = snr.numpy() * (norm * stilde.delta_t)
                 
         # Calculate lowband template SNRs
         logging.info('processing lowband templates')
@@ -84,13 +86,19 @@ class RatioMatchedFilterControl(object):
                  
         # This won't work if we call this function multiple times with different templates!      
         dec = 5        
-        if not hasattr(self, 'hnorms_low'):        
+        if self.hnorms_low is None:       
             hnorms_low = [sigmasq(ltem[::dec], psd=psd[::dec],
                               low_frequency_cutoff=ltem.f_lower,
                               high_frequency_cutoff=self.multiband_frequency) for ltem in lowband_templates]
             self.hnorms_low = np.array(hnorms_low)      
             
         hnorms_low = self.hnorms_low * (hnorm_low_ref / self.hnorms_low[0])
+
+        #hnorms_low = [sigmasq(ltem[::dec], psd=psd[::dec],
+        #                  low_frequency_cutoff=ltem.f_lower,
+        #                  high_frequency_cutoff=self.multiband_frequency) for ltem in lowband_templates]
+        #hnorms_low = np.array(hnorms_low)
+
         norm_low = 4.0 * stilde.delta_f / hnorms_low ** 0.5        
         slow, shigh = scale
         hnorms_high = h_norm * shigh ** 2.0
@@ -104,11 +112,13 @@ class RatioMatchedFilterControl(object):
         sow2 = sow.astype(np.complex64).numpy()
         
         kmax = min(len(lowband_templates[0]), flen)
+        
+        lens = [len(ltem) for ltem in lowband_templates]
         t2 = time.time()
         lowband_snrs = np.resize(sow2, len(lowband_templates) * flen).reshape((len(lowband_templates), flen)) 
         for j, ltemplate in enumerate(lowband_templates):
             lowband_snrs[j][:kmax] *= ltemplate[:kmax].conj() * (norm_low[j] * rw_low[j] * flen)
-
+            
         #lowband_templates = np.array(lowband_templates, dtype=np.complex64)
         #lowband_snrs = np.zeros((len(lowband_templates), flen), dtype=np.complex64)
         #scale = (norm_low * rw_low * flen).astype(np.float32)
@@ -116,18 +126,18 @@ class RatioMatchedFilterControl(object):
         t22 = time.time()
         #fast_multiply_scale_cython(sow2, lowband_templates, scale, lowband_snrs)
         self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
+        
         t3 = time.time()        
         
         # Prenormalize the SNRs
         # Opt note: could move all this multiplication to the peak finding..
-        self.ref_snr = snr.numpy() * (norm * stilde.delta_t)
         filters_f  = (filters_f * rw_high[:, None]).astype(filters_f.dtype)
            
         logging.info('.....done')                
         t4 = time.time()
 
         safety_sigma = 4.0
-        extra_margin = 0.05
+        extra_margin = 0.25
         gate_threshold = max(0.0, self.snr_threshold * np.min(rw_low) - safety_sigma * np.max(rw_high) - extra_margin)
 
         # 3. Execute Blocked Kernel
