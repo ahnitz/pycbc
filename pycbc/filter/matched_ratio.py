@@ -137,8 +137,8 @@ class RatioMatchedFilterControl(object):
         t4 = time.time()
 
         safety_sigma = 4.0
-        extra_margin = 0.25
-        gate_threshold = max(0.0, self.snr_threshold * np.min(rw_low) - safety_sigma * np.max(rw_high) - extra_margin)
+        extra_margin = 0.05
+        gate_threshold = np.maximum(0.0, self.snr_threshold * rw_low - safety_sigma * rw_high - extra_margin)
 
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(

@@ -452,17 +452,19 @@ def block_max_threshold(
     int[:] starts, 
     int[:] ends, 
     unsigned char[:, ::1] valid,       
-    float threshold
+    double[:] threshold,
 ):
     cdef int num_blocks = starts.shape[0]
     cdef int num_rows = snrs.shape[0]
     cdef int j, i, k, js, je
     
-    cdef float threshold_sq = threshold * threshold
     cdef float val_real, val_imag, mag_sq, local_max_sq
+
+    cdef float threshold_sq = 0
 
     with nogil:
         for i in range(num_rows):
+            threshold_sq = threshold[i] * threshold[i]
             for j in range(num_blocks):
                 
                 if valid[i, j] == 1:

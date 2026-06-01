@@ -10,6 +10,7 @@ import numpy as np
 import h5py
 import time
 import sys
+import gc
 
 import pycbc
 import pycbc.strain
@@ -27,6 +28,7 @@ from pycbc.filter.matched_ratio import RatioMatchedFilterControl
 from pycbc.waveform.bank import RatioFilterBank
 
 tstart = time.time()
+
 
 def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
                         fine_indices, tstarts, stilde, bank, chisq_estimator, engine,
@@ -404,6 +406,7 @@ def main():
                 
                 # Reset some caches    
                 engine.hnorms_low = None   
+                gc.collect()
                          
         logging.info(f"Grouping triggers...")
         

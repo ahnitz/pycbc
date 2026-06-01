@@ -1230,7 +1230,7 @@ class RatioFilterBank(FilterBank):
         
         templates = []
         for fid in fine_indices:
-            templates += [deepcopy(self[fid])]
+            templates += [self[fid]]
         return templates
 
     def get_coarse_template(self, coarse_index):
