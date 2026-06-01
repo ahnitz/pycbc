@@ -77,6 +77,7 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
             snrvs = np.array([snrv], ndmin=1)
             tids = np.array([t_idx], ndmin=1)
             
+            logging.info('starting chisq corr')
             template = lowband_templates[local_id]                         
             kmax = len(template)
             corr = template.conj() * stilde[:kmax] / stilde.psd[:kmax] * (4 * stilde.delta_f / h_norm[idx] ** 0.5)
@@ -87,7 +88,8 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
             template2.params = template.params
             template2.f_lower = template.f_lower
             
-            chi, dof = chisq_estimator.values(corr, snrvs, 1, stilde.psd, tids, template2)    
+            logging.info('start chisq calc')
+            chi, dof = chisq_estimator.values(corr, snrvs, 1, stilde.psd, tids, template2)
         
             # Determine which points we should use the same chisq value for
             window_mask = (abs(t_idxs - t_idx) <= chisq_window_samp)
