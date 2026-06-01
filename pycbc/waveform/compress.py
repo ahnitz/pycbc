@@ -896,7 +896,11 @@ class CompressedWaveform(object):
         outdtype = _real_dtypes[precision]
         group = '%scompressed_waveforms/%s' %(root, str(template_hash))
         for param in ['amplitude', 'phase', 'sample_points']:
-            fp['%s/%s' %(group, param)] = self._get(param).astype(outdtype)
+            fp.create_dataset('%s/%s' %(group, param), 
+                              data=self._get(param).astype(outdtype),
+                              compression='gzip',
+                              shuffle=True,
+                              compression_opts=9)
         fp_group = fp[group]
         fp_group.attrs['mismatch'] = self.mismatch
         fp_group.attrs['interpolation'] = self.interpolation
