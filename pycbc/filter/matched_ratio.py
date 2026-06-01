@@ -5,7 +5,7 @@ import time
 import mkl_fft
 from pycbc.types import zeros, complex64, TimeSeries, FrequencySeries
 from pycbc.filter.matchedfilter import matched_filter_core, sigmasq
-from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython, find_peaks_in_block_cython, find_peaks_fused_lanczos_cython
+from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython, find_peaks_in_block_cython, find_peaks_fused_lanczos_cython, block_max_threshold
 
 class RatioMatchedFilterControl(object):
     """
@@ -183,7 +183,7 @@ class RatioMatchedFilterControl(object):
         """
         Inner loop: Time-Blocking + Filter-Batching using mkl_fft.
         """
-        tx1 = time.time()
+        t0 = time.time()
 
         N_FFT = self.fir_fft_len        
         n_taps_max = n_taps.max()
@@ -218,8 +218,6 @@ class RatioMatchedFilterControl(object):
         tspend = 0
         tspend2 = 0
 
-        low_snr_abs = np.abs(lowband_snrs)
-
         # Determine Loop Bounds
         first_block_idx = (v_start - bad_start) // N_VALID
         loop_start = first_block_idx * N_VALID
@@ -246,10 +244,16 @@ class RatioMatchedFilterControl(object):
 
         valid = np.resize(valid, len(filters_f) * len(t_starts)).reshape(len(filters_f), len(t_starts))
 
-        tx2 = time.time()
-                                
-        t0 = time.time() 
-              
+        tx1 = time.time()
+        
+        block_max_threshold(lowband_snrs, j_starts, j_ends, valid, gate_threshold)
+        
+        #for j, (js, je) in enumerate(zip(j_starts, j_ends)):
+        #    if valid[0, j]:
+        #        snr_slice = abs(lowband_snrs[:, js:je])
+        #        valid[:, j] = np.max(snr_slice, axis=-1) > gate_threshold 
+
+        tx2 = time.time()             
         for f_start in range(0, n_filters, self.batch_size): 
             f_end = min(f_start + self.batch_size, n_filters)
             actual_batch_size = f_end - f_start
@@ -258,18 +262,16 @@ class RatioMatchedFilterControl(object):
             current_mult_view = freq_mult_view[:actual_batch_size]
             current_corr_view = corr_out_view[:actual_batch_size]
 
-            ts1 = time.time()
             valid2 = valid[f_start:f_end]
             low_snr_fbatch = lowband_snrs[f_start:f_end]
-            for j, (js, je) in enumerate(zip(j_starts, j_ends)):
-                if valid2[0, j]:
-                    valid2[:, j] = np.max(low_snr_abs[f_start:f_end, js:je]) > gate_threshold     
+            ts1 = time.time()
+    
+            ts2 = time.time()
+
             t_starts2 = t_starts[valid2[0,:]]
             roi_starts2 = roi_starts[valid2[0,:]]
             roi_stops2 = roi_stops[valid2[0,:]]
             
-            ts2 = time.time()
-
             for t_start, roi_start, roi_stop in zip(t_starts2, roi_starts2, roi_stops2):
                 t1 = time.time()
                         

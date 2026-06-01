@@ -413,3 +413,52 @@ def find_peaks_fused_lanczos_cython(
             snr_list.append(current_max_z)
             
     return (f_idx_list, t_idx_list, snr_list)
+    
+    
+import numpy as np
+import cython
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.initializedcheck(False)
+def block_max_threshold(
+    float complex[:, ::1] snrs,   
+    int[:] starts, 
+    int[:] ends, 
+    unsigned char[:, ::1] valid,       
+    float threshold
+):
+    cdef int num_blocks = starts.shape[0]
+    cdef int num_rows = snrs.shape[0]
+    cdef int j, i, k, js, je
+    
+    cdef float threshold_sq = threshold * threshold
+    cdef float val_real, val_imag, mag_sq, local_max_sq
+
+    with nogil:
+        for i in range(num_rows):
+            for j in range(num_blocks):
+                
+                if valid[i, j] == 1:
+                    js = starts[j]
+                    je = ends[j]
+                    
+                    # Reset the max tracker for this block
+                    local_max_sq = -1.0
+                    
+                    # ---------------------------------------------------
+                    # PURE MATH INNER LOOP (No Branches, No Breaks)
+                    # The compiler will convert this to SIMD AVX instructions
+                    # ---------------------------------------------------
+                    for k in range(js, je):
+                        val_real = snrs[i, k].real
+                        val_imag = snrs[i, k].imag
+                        mag_sq = val_real * val_real + val_imag * val_imag
+                        
+                        # A simple max assignment is easily vectorized
+                        if mag_sq > local_max_sq:
+                            local_max_sq = mag_sq
+
+                    # Check threshold once at the very end
+                    if local_max_sq < threshold_sq:
+                        valid[i, j] = 0
