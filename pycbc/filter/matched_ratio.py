@@ -5,7 +5,7 @@ import time
 import mkl_fft
 from pycbc.types import zeros, complex64, TimeSeries, FrequencySeries
 from pycbc.filter.matchedfilter import matched_filter_core, sigmasq
-from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython, find_peaks_in_block_cython, find_peaks_fused_lanczos_cython, block_max_threshold
+from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython, find_peaks_in_block_cython, find_peaks_fused_lanczos_cython, block_max_threshold, fast_multiply_scale_cython
 
 class RatioMatchedFilterControl(object):
     """
@@ -74,7 +74,6 @@ class RatioMatchedFilterControl(object):
             high_frequency_cutoff=self.f_high,
             h_norm=h_norm
         )
-        t2 = time.time()    
                 
         # Calculate lowband template SNRs
         logging.info('processing lowband templates')
@@ -105,11 +104,17 @@ class RatioMatchedFilterControl(object):
         sow2 = sow.astype(np.complex64).numpy()
         
         kmax = min(len(lowband_templates[0]), flen)
+        t2 = time.time()
         lowband_snrs = np.resize(sow2, len(lowband_templates) * flen).reshape((len(lowband_templates), flen)) 
         for j, ltemplate in enumerate(lowband_templates):
             lowband_snrs[j][:kmax] *= ltemplate[:kmax].conj() * (norm_low[j] * rw_low[j] * flen)
-             
+
+        #lowband_templates = np.array(lowband_templates, dtype=np.complex64)
+        #lowband_snrs = np.zeros((len(lowband_templates), flen), dtype=np.complex64)
+        #scale = (norm_low * rw_low * flen).astype(np.float32)
+
         t22 = time.time()
+        #fast_multiply_scale_cython(sow2, lowband_templates, scale, lowband_snrs)
         self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
         t3 = time.time()        
         
@@ -122,8 +127,8 @@ class RatioMatchedFilterControl(object):
         t4 = time.time()
 
         safety_sigma = 4.0
-        extra_margin = 0.15
-        gate_threshold = max(0.0, self.snr_threshold - safety_sigma * np.mean(rw_high) - extra_margin)
+        extra_margin = 0.05
+        gate_threshold = max(0.0, self.snr_threshold * np.min(rw_low) - safety_sigma * np.max(rw_high) - extra_margin)
 
         # 3. Execute Blocked Kernel
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
@@ -278,7 +283,7 @@ class RatioMatchedFilterControl(object):
                 )
 
                 self.fft_lib.ifft(
-                    current_mult_view, 
+                    current_mult_view,
                     axis=-1, 
                     out=current_corr_view
                 )             

@@ -126,7 +126,33 @@ def fast_multiply_analytic_cython(
             # Direct C-level complex multiplication
             out_batch[i, j] = data_f[j] * filter_batch_f[i, j]
 
-# ... (Previous imports and fast_multiply remain the same) ...
+@cython.boundscheck(False) 
+@cython.wraparound(False) 
+@cython.cdivision(True)   
+def fast_multiply_scale_cython(
+    numpy.ndarray[complex64_t, ndim=1, mode="c"] data_f,
+    numpy.ndarray[complex64_t, ndim=2, mode="c"] filter_batch_f,
+    numpy.ndarray[float, ndim=1, mode="c"] scale,
+    numpy.ndarray[complex64_t, ndim=2, mode="c"] out_batch
+):
+    """
+    Cython version of the "half-only" analytic signal multiply.
+    
+    This kernel is single-threaded and relies on the C compiler's
+    autovectorizer (enabled by -march=native) to use AVX.
+    """
+    
+    # --- C-level variable declarations ---
+    cdef long batch_size = filter_batch_f.shape[0]
+    cdef long n_fft = filter_batch_f.shape[1]
+    
+    cdef long i, j # Loop iterators
+
+    # This is a pure C-loop, no Python overhead.
+    for i in range(batch_size):
+        for j in range(n_fft):
+            # Direct C-level complex multiplication
+            out_batch[i, j] = scale[i] * data_f[j] * filter_batch_f[i, j].conjugate()
 
 @cython.boundscheck(False) 
 @cython.wraparound(False) 
