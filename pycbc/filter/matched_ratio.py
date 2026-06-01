@@ -216,7 +216,6 @@ class RatioMatchedFilterControl(object):
         block_f_cache = {}
         
         tspend = 0
-        tspend2 = 0
 
         # Determine Loop Bounds
         first_block_idx = (v_start - bad_start) // N_VALID
@@ -244,52 +243,35 @@ class RatioMatchedFilterControl(object):
 
         valid = np.resize(valid, len(filters_f) * len(t_starts)).reshape(len(filters_f), len(t_starts))
 
-        tx1 = time.time()
         
         block_max_threshold(lowband_snrs, j_starts, j_ends, valid, gate_threshold)
-        
-        #for j, (js, je) in enumerate(zip(j_starts, j_ends)):
-        #    if valid[0, j]:
-        #        snr_slice = abs(lowband_snrs[:, js:je])
-        #        valid[:, j] = np.max(snr_slice, axis=-1) > gate_threshold 
+        current_mult_view = freq_mult_view[:1]
+        current_corr_view = corr_out_view[:1]
+
+        print(valid.sum() / (valid.shape[0] * valid.shape[1]))
 
         tx2 = time.time()             
-        for f_start in range(0, n_filters, self.batch_size): 
-            f_end = min(f_start + self.batch_size, n_filters)
-            actual_batch_size = f_end - f_start
- 
+        for f_start in range(n_filters): 
+            f_end = f_start + 1
             low_snr_block = lowband_snrs[f_start:f_end]
-            current_mult_view = freq_mult_view[:actual_batch_size]
-            current_corr_view = corr_out_view[:actual_batch_size]
-
-            valid2 = valid[f_start:f_end]
             low_snr_fbatch = lowband_snrs[f_start:f_end]
-            ts1 = time.time()
-    
-            ts2 = time.time()
-
-            t_starts2 = t_starts[valid2[0,:]]
-            roi_starts2 = roi_starts[valid2[0,:]]
-            roi_stops2 = roi_stops[valid2[0,:]]
+            filter_batch_f = filters_f[f_start:f_end]
+            valid2 = valid[f_start]
             
+            t_starts2 = t_starts[valid2]
+            roi_starts2 = roi_starts[valid2]
+            roi_stops2 = roi_stops[valid2]
             for t_start, roi_start, roi_stop in zip(t_starts2, roi_starts2, roi_stops2):
-                t1 = time.time()
-                        
+                t1 = time.time()      
                 roi_len = roi_stop - roi_start
 
                 buf_slice_start = roi_start - t_start
                 t_end = min(t_start + N_FFT, n_samples)
 
                 if t_start not in block_f_cache:
-                    block_in_view = np.zeros(self.fir_fft_len, dtype=complex64)
-                    block_in_view[0:t_end-t_start] = data[t_start:t_end]
-                    
-                    block_f_view = self.fft_lib.fft(block_in_view)
+                    block_f_view = self.fft_lib.fft(data[t_start:t_end])
                     block_f_cache[t_start] = block_f_view
-                
-                
                 block_f_view = block_f_cache[t_start]
-                filter_batch_f = filters_f[f_start:f_end]
 
                 fast_multiply_analytic_cython(
                     block_f_view, filter_batch_f, current_mult_view
@@ -299,8 +281,7 @@ class RatioMatchedFilterControl(object):
                     current_mult_view, 
                     axis=-1, 
                     out=current_corr_view
-                )
-                
+                )             
                 f_list, t_list, s_list = find_peaks_fused_lanczos_cython(
                                         current_corr_view,
                                         low_snr_block,
@@ -319,9 +300,8 @@ class RatioMatchedFilterControl(object):
                     all_tstarts.extend([t_start] * len(s_list)) 
                 t2 = time.time()
                 tspend += t2 - t1
-            tspend2 += ts2 - ts1
         tf = time.time()
-        print("SKIP RATIO", "INNER", tspend, "OUTER", tspend2, "top", tx2-tx1, "total", tf-t0)        
+        print("SKIP RATIO", "INNER", tspend, "top", tx2-t0, "total", tf-t0)        
              
         return (np.array(all_f_idxs, dtype=np.int32), 
                 np.array(all_t_idxs, dtype=np.int64), 
