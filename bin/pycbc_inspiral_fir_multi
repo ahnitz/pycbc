@@ -308,7 +308,6 @@ def main():
                 lowband_templates = bank.get_fine_templates(coarse_idx, indices=slice(temp_start, temp_end))
                 taps, counts, fine_indices = bank.get_firs(coarse_idx, indices=slice(temp_start, temp_end))
             
-                print("COUNT CHECK", temp_start, temp_end, len(counts))
                 
                 filters_f, n_taps_max = engine.prepare_filters(taps, counts)
                 
@@ -381,7 +380,7 @@ def main():
                 
                 triggers_by_template[global_idx][0].append(snrs[j])
                 triggers_by_template[global_idx][1].append(times[j])
-                triggers_by_template[global_idx][2].append(norms)
+                triggers_by_template[global_idx][2].append(norms[j])
                 triggers_by_template[global_idx][3].append(coarse_id)
                 triggers_by_template[global_idx][4].append(chi[j])
                 triggers_by_template[global_idx][5].append(chi_dof[j])
@@ -391,15 +390,9 @@ def main():
             
             out_vals = out_vals_ref.copy()
             out_vals['time_index'] = np.array(time_list)
-            
-            # Renorm snr
-            #snr_rescale = bank.snr_rescale(global_id, 
-            #                 method=args.template_normalization_method)
-            #sigmasq_rescale = bank.sigma_rescale(global_id, 
-            #                 method=args.template_normalization_method) ** 2.0
-            
-            out_vals['snr'] = np.array(snr) #/ snr_rescale
-            out_vals['sigmasq'] = np.ones(len(time_list)) #* norm * sigmasq_rescale
+                        
+            out_vals['snr'] = np.array(snr)
+            out_vals['sigmasq'] = norm
             out_vals['chisq'] = chi
             out_vals['chisq_dof'] = chi_dof
 
