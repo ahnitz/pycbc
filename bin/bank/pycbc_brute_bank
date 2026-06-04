@@ -79,7 +79,7 @@ pycbc.psd.insert_psd_option_group(parser)
 parser.add_argument('--use-trimmed-buffer', action='store_true',
     help=('When specified, the match calculation will use only the first and last 100 samples '
         'of the waveform instead of the full buffer. Enabling this option makes match computation faster.'))
-
+parser.add_argument('--do-not-add-templates', action='store_true')
 
 args = parser.parse_args()
 
@@ -254,7 +254,7 @@ class TriangleBank(object):
                 hp.matches = msorted[keep].copy()
                 hp.indices = rsorted[keep].copy()
 
-                logging.info("TADD MaxMatch:%0.3f Size:%i "
+                logging.debug("TADD MaxMatch:%0.3f Size:%i "
                              "AfterSigma:%i AfterTau0:%i Matches:%i"
                               % (mmax, len(self), msig, mtau, mnum))
                 hp.max_match = mmax
@@ -289,6 +289,7 @@ class TriangleBank(object):
         idxs = numpy.arange(0, total_num)
         chunks = numpy.array_split(idxs, max(total_num // args.nprocesses // 4, 1))
 
+        initial = 0
         for chunk in chunks:
             waveform_cache = []
             pool = pycbc.pool.choose_pool(args.nprocesses)
@@ -296,10 +297,9 @@ class TriangleBank(object):
             for return_wf in tqdm.tqdm(pool.imap_unordered(
                     wf_wrapper,
                     (({k: params[k][idx] for k in params}, parallel_check, threshold) for idx in chunk)),
-                    total=total_num, disable=not progress):
+                    total=total_num, initial=initial, disable=not progress):
                 waveform_cache += [return_wf]
-
-
+            initial += len(chunk)
             for hp in waveform_cache:
                 if hp is not None:
                     if hp.checked is None:
@@ -614,7 +614,7 @@ tau0e = tau0s + args.tau0_crawl
 go = True
 
 region = 0
-while tau0s < args.tau0_end:
+while not args.do_not_add_templates and tau0s < args.tau0_end:
 
     tau0e = min(tau0e, args.tau0_end)
 
