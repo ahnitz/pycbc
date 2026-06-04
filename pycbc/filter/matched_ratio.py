@@ -286,6 +286,8 @@ class RatioMatchedFilterControl(object):
             t_starts2 = t_starts[valid2]
             roi_starts2 = roi_starts[valid2]
             roi_stops2 = roi_stops[valid2]
+            roi_len = roi_starts2 - roi_stops2
+            
             for t_start, roi_start, roi_stop in zip(t_starts2, roi_starts2, roi_stops2):
                 t1 = time.time()      
                 roi_len = roi_stop - roi_start

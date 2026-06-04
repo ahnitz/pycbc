@@ -301,6 +301,11 @@ def compress_waveform(htilde, sample_points, tolerance, interpolation,
             addidx = int(add_freq / df)
             if addidx not in sample_index and addidx not in new_addidxs:
                 new_addidxs.append(addidx)
+                
+            # Don't propose points within a sample of existing ones
+            new_addidxs = numpy.array(new_addidxs)
+            valid = ~numpy.any(abs(new_addidxs[:, None] - numpy.array(added_points)) <= 2, axis=1)
+            new_addidxs = list(new_addidxs[valid])
 
         # --- 3. Update and Sort ---
         sample_index = numpy.unique(numpy.concatenate((sample_index, new_addidxs)))
@@ -345,6 +350,10 @@ def compress_waveform(htilde, sample_points, tolerance, interpolation,
             iteration_count, mismatch, len(new_addidxs), len(sample_points),
             (time.time() - iteration_start_time) * 1000
         )
+        
+        if len(new_addidxs) == 0:
+            logging.info("Can't add any more points, stopping here..")
+            break
 
     # Cast compression_factor to float to avoid HDF5 TypeErrors
     compression_factor = float(len(htilde)) / float(len(sample_points))
