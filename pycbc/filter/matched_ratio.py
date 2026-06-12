@@ -151,20 +151,19 @@ class RatioMatchedFilterControl(object):
         gate_threshold = np.maximum(0.0, self.snr_threshold * rw_low - safety_sigma * rw_high - extra_margin)
 
         # 3. Execute Blocked Kernel
-        local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
+        local_idxs, t_idxs, snr_vals, snr_low_vals, tstarts = self._execute_blocked_kernel(
             ref_snr, filters_f, n_taps, valid_slice, stilde,
             lowband_snrs=(lowband_snrs, dt_low, gate_threshold),
         )
         t5 = time.time()
          
         print("PRE TIMING", "RF", t5-t4, "NORM", t4 - t3, "LB", t3 - t2, t3-t22, t22-t2, "REF", t2-t1)
-        
         # 4. Map indices
         if len(local_idxs) > 0:
             global_ids = indices[local_idxs]
-            return global_ids, t_idxs, snr_vals, tstarts, hnorms_low[local_idxs]
+            return global_ids, t_idxs, snr_vals, snr_low_vals, tstarts, hnorms_low[local_idxs]
         else:
-            return [], [], [], [], []
+            return [], [], [], [], [], []
 
     def _fft_all_filters(self, taps, counts):
         """Helper to FFT all filters using mkl_fft."""
@@ -220,6 +219,7 @@ class RatioMatchedFilterControl(object):
         all_f_idxs = []
         all_t_idxs = []
         all_snrs = []
+        all_low_snrs = []
         all_tstarts = []
 
         freq_mult_view = self.temp_freq_mult
@@ -309,7 +309,7 @@ class RatioMatchedFilterControl(object):
                     axis=-1, 
                     out=current_corr_view
                 )             
-                f_list, t_list, s_list = find_peaks_fused_lanczos_cython(
+                f_list, t_list, s_list, s_low_list = find_peaks_fused_lanczos_cython(
                                         current_corr_view,
                                         low_snr_block,
                                         roi_start, roi_len,
@@ -324,6 +324,7 @@ class RatioMatchedFilterControl(object):
                     all_f_idxs.extend(f_list)
                     all_t_idxs.extend(t_list)
                     all_snrs.extend(s_list)
+                    all_low_snrs.extend(s_low_list)
                     all_tstarts.extend([t_start] * len(s_list)) 
                 t2 = time.time()
                 tspend += t2 - t1
@@ -333,4 +334,5 @@ class RatioMatchedFilterControl(object):
         return (np.array(all_f_idxs, dtype=np.int32), 
                 np.array(all_t_idxs, dtype=np.int64), 
                 np.array(all_snrs, dtype=np.complex64),
+                np.array(all_low_snrs, dtype=np.complex64),
                 np.array(all_tstarts, dtype=np.int32))

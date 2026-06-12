@@ -292,6 +292,7 @@ def find_peaks_fused_lanczos_cython(
     cdef list f_idx_list = []
     cdef list t_idx_list = []
     cdef list snr_list = []
+    cdef list snr_low_list = []
     
     cdef long f_batch_idx, j, idx, read_idx
     cdef int k_idx
@@ -304,6 +305,7 @@ def find_peaks_fused_lanczos_cython(
     cdef float32_t current_max_snr_amp 
     cdef int64_t current_max_idx
     cdef complex64_t current_max_z
+    cdef complex64_t current_max_z_low
     
     cdef float[:, :] weights_lut = KAISER_128_LUT
     
@@ -337,6 +339,8 @@ def find_peaks_fused_lanczos_cython(
         current_max_idx = -1
         current_max_z.real = 0.0
         current_max_z.imag = 0.0
+        current_max_z_low.real = 0.0
+        current_max_z_low.imag = 0.0
 
         # =====================================================================
         # PASS 1a: Scan Short Lowband Segment for Max Amplitude
@@ -432,13 +436,15 @@ def find_peaks_fused_lanczos_cython(
                     current_max_snr_amp = <float>libc.math.sqrt(mag_sq)
                     current_max_idx = t_start + idx
                     current_max_z = z_total
+                    current_max_z_low = interp_low_snr
                     
         if current_max_idx != -1:
             f_idx_list.append(f_global_idx)
             t_idx_list.append(current_max_idx)
             snr_list.append(current_max_z)
+            snr_low_list.append(current_max_z_low)
             
-    return (f_idx_list, t_idx_list, snr_list)
+    return (f_idx_list, t_idx_list, snr_list, snr_low_list)
     
     
 import numpy as np
