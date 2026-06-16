@@ -1,0 +1,226 @@
+#!/usr/bin/env python
+import argparse
+import h5py
+import matplotlib
+# Use non-interactive backend so it runs cleanly on cluster nodes without an X-server
+matplotlib.use('Agg')
+from matplotlib import pyplot as plt
+import numpy
+import numpy.random
+import pycbc.distributions
+import pycbc.psd
+import pycbc.types
+from pycbc.filter import match
+from pycbc.waveform import get_td_waveform
+from pycbc.waveform.bank import FilterBank
+import tqdm
+
+parser = argparse.ArgumentParser(
+    description="Run a two-pass template bank match simulation using PyCBC."
+)
+
+# Required arguments
+parser.add_argument(
+    "--config-files",
+    required=True,
+    help="Path to the prior configuration file (.ini)",
+)
+parser.add_argument(
+    "--bank-file",
+    required=True,
+    help="Path to the template bank HDF5 file",
+)
+parser.add_argument(
+    "--psd-file", required=True, help="Path to the PSD text file"
+)
+parser.add_argument(
+    "--output-file",
+    required=True,
+    help="Path to the output HDF5 file to save results",
+)
+
+# Optional configuration parameters with defaults from the notebook
+parser.add_argument(
+    "--sample-size", type=int, default=100, help="Number of samples to draw"
+)
+parser.add_argument(
+    "--buffer-size",
+    type=int,
+    default=512,
+    help="Buffer size in seconds (default: 512)",
+)
+parser.add_argument(
+    "--sample-rate",
+    type=int,
+    default=2048,
+    help="Sample rate in Hz (default: 2048)",
+)
+parser.add_argument(
+    "--low-frequency-cutoff",
+    type=float,
+    default=20.0,
+    help="Low frequency cutoff in Hz (default: 20.0)",
+)
+parser.add_argument(
+    "--decimation-factor",
+    type=int,
+    default=256,
+    help="Decimation factor for the first pass (default: 256)",
+)
+parser.add_argument(
+    "--top-candidates",
+    type=int,
+    default=10,
+    help="Number of top candidates to verify in second pass (default: 10)",
+)
+parser.add_argument(
+    "--plot-file",
+    type=str,
+    default=None,
+    help="Optional path to save the FF cumulative distribution plot (e.g. plot.png)",
+)
+
+args = parser.parse_args()
+
+# Derived parameters
+fhigh = 1024
+tlen = args.buffer_size * args.sample_rate
+flen = tlen // 2 + 1
+df = 1.0 / args.buffer_size
+dt = 1.0 / args.sample_rate
+
+# Load filter bank
+print("Loading filter bank...")
+bank = FilterBank(args.bank_file, flen, df, numpy.complex64)
+coarse_templates = [
+    bank[b][:: args.decimation_factor].copy() for b in range(len(bank))
+]
+
+# Load PSD
+print("Loading PSD...")
+p = pycbc.psd.from_txt(
+    args.psd_file, flen, df, args.low_frequency_cutoff, is_asd_file=False
+)
+
+# Read params and draw samples
+config_parser = pycbc.types.config.InterpolatingConfigParser(
+    [args.config_files]
+)
+variable_args, static_args = pycbc.distributions.read_params_from_config(
+    config_parser,
+    prior_section="prior",
+    vargs_section="variable_params",
+    sargs_section="static_params",
+)
+
+samples = pycbc.distributions.draw_samples_from_config(
+    args.config_files, args.sample_size, 10
+)
+params = {name: samples[name] for name in samples.fieldnames}
+
+if static_args is not None:
+    for k in static_args.keys():
+        params[k] = numpy.array([static_args[k]] * args.sample_size)
+
+ffs = []
+idxs = []
+
+print("Running match simulation...")
+for i in tqdm.tqdm(range(args.sample_size)):
+    parg = {k: params[k][i] for k in params}
+
+    hp, hc = get_td_waveform(**parg, delta_t=dt)
+
+    hp.resize(tlen)
+    hc.resize(tlen)
+
+    hpf = hp.to_frequencyseries()
+    h1 = hpf[:: args.decimation_factor]
+
+    # First pass, find templates with roughly a good match
+    cmatches = []
+    cidxs = []
+    for j in range(len(coarse_templates)):
+        h2 = coarse_templates[j].astype(numpy.complex128)
+        m, _ = match(
+            h1,
+            h2,
+            psd=p[:: args.decimation_factor],
+            low_frequency_cutoff=args.low_frequency_cutoff,
+            high_frequency_cutoff=fhigh,
+        )
+        cmatches.append(m)
+        cidxs.append(j)
+
+    cmatches = numpy.array(cmatches)
+    cidxs = numpy.array(cidxs)
+
+    # Second pass, verify top candidates at higher resolution
+    tsort = cmatches.argsort()[::-1]
+    cmatches = cmatches[tsort]
+    cidxs = cidxs[tsort]
+
+    cmatches2 = []
+    cidxs2 = []
+    for j in range(args.top_candidates):
+        idv = cidxs[j]
+        h3 = bank[idv]
+        m, _ = match(
+            hpf,
+            h3.astype(numpy.complex128),
+            psd=p,
+            low_frequency_cutoff=args.low_frequency_cutoff,
+            high_frequency_cutoff=fhigh,
+        )
+        cmatches2.append(m)
+        cidxs2.append(idv)
+
+    cmatches2 = numpy.array(cmatches2)
+    k = cmatches2.argmax()
+    ffs.append(cmatches2[k])
+    idxs.append(cidxs2[k])
+
+# Display final statistics output
+ffs = numpy.array(ffs)
+mean_ff = numpy.mean(ffs)
+
+print(f"\nResults:")
+print(f"Matches < 0.95: {(ffs < 0.95).sum()}")
+print(f"Mean match: {mean_ff}")
+
+# Write to HDF5 file
+print(f"Saving results to {args.output_file}...")
+with h5py.File(args.output_file, "w") as f:
+    f.create_dataset("fitting_factor", data=ffs)
+    f.create_dataset("template_index", data=numpy.array(idxs))
+
+    grp = f.create_group("injections")
+    for key, val in params.items():
+        if numpy.issubdtype(val.dtype, numpy.str_) or numpy.issubdtype(
+            val.dtype, numpy.object_
+        ):
+            utf8_type = h5py.string_dtype(encoding="utf-8")
+            encoded_val = numpy.array([v.encode("utf-8") for v in val], dtype=utf8_type)
+            grp.create_dataset(key, data=encoded_val)
+        else:
+            grp.create_dataset(key, data=val)
+
+    f.attrs["mean_fitting_factor"] = mean_ff
+
+# Plotting block
+if args.plot_file is not None:
+    print(f"Generating plot and saving to {args.plot_file}...")
+    plt.figure()
+    
+    fsort = numpy.sort(ffs)
+    count = numpy.arange(0, len(fsort)) + 1
+    count = count / count.max()
+    
+    plt.plot(fsort, count)
+    plt.yscale('log')
+    plt.xlabel('Fitting Factor')
+    plt.ylabel('Cumulative Fraction')
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    
+    plt.savefig(args.plot_file, bbox_inches='tight')
+    plt.close()
