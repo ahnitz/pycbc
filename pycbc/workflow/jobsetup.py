@@ -92,7 +92,8 @@ def select_matchedfilter_class(curr_exe):
         'pycbc_inspiral_fir'      : PyCBCInspiralExecutable,
         'pycbc_inspiral_skymax'   : PyCBCInspiralExecutable,
         'pycbc_multi_inspiral'    : PyCBCMultiInspiralExecutable,
-    }
+        'pycbc_inspiral_fir_multi': PyCBCInspiralExecutable, 
+   }
     try:
         return exe_to_class_map[curr_exe]
     except KeyError:
