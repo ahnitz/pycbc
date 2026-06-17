@@ -88,6 +88,7 @@ def select_matchedfilter_class(curr_exe):
         * job.get_valid_times(ifo, )
     """
     exe_to_class_map = {
+        'pycbc_inspiral_fir_multi': PyCBCInspiralExecutable,
         'pycbc_inspiral'          : PyCBCInspiralExecutable,
         'pycbc_inspiral_fir'      : PyCBCInspiralExecutable,
         'pycbc_inspiral_skymax'   : PyCBCInspiralExecutable,
