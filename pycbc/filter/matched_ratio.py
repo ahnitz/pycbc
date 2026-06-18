@@ -221,6 +221,10 @@ class RatioMatchedFilterControl(object):
         all_snrs = []
         all_low_snrs = []
         all_tstarts = []
+        indices = np.arange(n_filters)
+        
+        if not hasattr(stilde, 'block_f_cache'):
+            stilde.block_f_cache = {}
 
         freq_mult_view = self.temp_freq_mult
         corr_out_view = self.corr_output_buffer
@@ -237,10 +241,11 @@ class RatioMatchedFilterControl(object):
         else:
             v_start = 0
             v_stop = n_samples
-
-        block_f_cache = {}
         
         tspend = 0
+        tspend1 = 0
+        tspend2 = 0
+        tspend3 = 0
 
         # Determine Loop Bounds
         first_block_idx = (v_start - bad_start) // N_VALID
@@ -267,69 +272,80 @@ class RatioMatchedFilterControl(object):
         j_ends = np.minimum(lowband_snrs.shape[1], j_ends)
 
         valid = np.resize(valid, len(filters_f) * len(t_starts)).reshape(len(filters_f), len(t_starts))
-
-        
         block_max_threshold(lowband_snrs, j_starts, j_ends, valid, gate_threshold)
+
         current_mult_view = freq_mult_view[:1]
         current_corr_view = corr_out_view[:1]
+         
+        n_time_blocks = len(t_starts)
+        time_chunks_with_work = np.any(valid, axis=0)
+        valid_t_idxs = np.where(time_chunks_with_work)[0]
 
-        print(valid.sum() / (valid.shape[0] * valid.shape[1]))
+        #print(valid.sum() / (valid.shape[0] * valid.shape[1]), time_chunks_with_work.sum(), n_time_blocks)
 
-        tx2 = time.time()             
-        for f_start in range(n_filters): 
-            f_end = f_start + 1
-            low_snr_block = lowband_snrs[f_start:f_end]
-            low_snr_fbatch = lowband_snrs[f_start:f_end]
-            filter_batch_f = filters_f[f_start:f_end]
-            valid2 = valid[f_start]
-            
-            t_starts2 = t_starts[valid2]
-            roi_starts2 = roi_starts[valid2]
-            roi_stops2 = roi_stops[valid2]
-            roi_len = roi_starts2 - roi_stops2
-            
-            for t_start, roi_start, roi_stop in zip(t_starts2, roi_starts2, roi_stops2):
-                t1 = time.time()      
-                roi_len = roi_stop - roi_start
+        tx2 = time.time()    
+        for t_idx in valid_t_idxs:
+            t_start = t_starts[t_idx]
 
-                buf_slice_start = roi_start - t_start
+            # Compute or fetch FFT once per time block
+            if t_start not in stilde.block_f_cache:
                 t_end = min(t_start + N_FFT, n_samples)
+                stilde.block_f_cache[t_start] = self.fft_lib.fft(data[t_start:t_end])
+            block_f_view = stilde.block_f_cache[t_start]
 
-                if t_start not in block_f_cache:
-                    block_f_view = self.fft_lib.fft(data[t_start:t_end])
-                    block_f_cache[t_start] = block_f_view
-                block_f_view = block_f_cache[t_start]
+            active_f_idxs = indices[valid[:, t_idx]]
+            roi_start = roi_starts[t_idx]
+            roi_stop = roi_stops[t_idx]
+            roi_len = roi_stop - roi_start
+            buf_slice_start = roi_start - t_start
+
+            # 2. INNER LOOP: Step through original arrays using light integer indices
+            for f_start in active_f_idxs:
+                t1 = time.time()      
+                
+                # Slicing the master arrays directly by index creates a zero-copy memory VIEW.
+                # No allocations, no memory copying!
+                filter_batch_f = filters_f[f_start : f_start + 1]
+                low_snr_block = lowband_snrs[f_start : f_start + 1]
 
                 fast_multiply_analytic_cython(
                     block_f_view, filter_batch_f, current_mult_view
                 )
+                t11 = time.time()
 
                 self.fft_lib.ifft(
                     current_mult_view,
                     axis=-1, 
                     out=current_corr_view
-                )             
+                )     
+                t12 = time.time()        
+                
                 f_list, t_list, s_list, s_low_list = find_peaks_fused_lanczos_cython(
-                                        current_corr_view,
-                                        low_snr_block,
-                                        roi_start, roi_len,
-                                        self.threshold_sq,
-                                        f_start,
-                                        dt_high, dt_low,
-                                        t0_high, t0_low,
-                                        input_offset=buf_slice_start
-                                    )
-
+                    current_corr_view,
+                    low_snr_block,
+                    roi_start, roi_len,
+                    self.threshold_sq,
+                    f_start, # Maps back perfectly to the original identity
+                    dt_high, dt_low,
+                    t0_high, t0_low,
+                    input_offset=buf_slice_start
+                )
+                t13 = time.time()
                 if f_list:
                     all_f_idxs.extend(f_list)
                     all_t_idxs.extend(t_list)
                     all_snrs.extend(s_list)
                     all_low_snrs.extend(s_low_list)
                     all_tstarts.extend([t_start] * len(s_list)) 
+                
                 t2 = time.time()
                 tspend += t2 - t1
+                tspend1 += t11 - t1
+                tspend2 += t12 - t11
+                tspend3 += t13 - t12
+                
         tf = time.time()
-        print("SKIP RATIO", "INNER", tspend, "top", tx2-t0, "total", tf-t0)        
+        print("SKIP RATIO", "INNER", tspend, tspend1, tspend2, tspend3, "top", tx2-t0, "total", tf-t0)        
              
         return (np.array(all_f_idxs, dtype=np.int32), 
                 np.array(all_t_idxs, dtype=np.int64), 
