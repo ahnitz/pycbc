@@ -42,6 +42,9 @@ class RatioMatchedFilterControl(object):
         self.multiband_frequency = multiband_frequency
         self.hnorms_low = None
 
+        self.flen = int(self.multiband_frequency / self.delta_f)
+        self.lowband_snrs = np.empty((self.batch_size, self.flen), dtype=np.complex64) 
+
     def prepare_filters(self, fir_taps, tap_counts):
         """
         Prepare frequency-domain filters for a batch of taps.
@@ -118,16 +121,15 @@ class RatioMatchedFilterControl(object):
         rw_low = (hnorms_low / sigma_total) ** 0.5
         rw_high = (hnorms_high / sigma_total) ** 0.5
 
-        flen = int(self.multiband_frequency / stilde.delta_f)
-        dt_low = 1.0 / (flen * stilde.delta_f)
-        sow = stilde[:flen] / psd[:flen]
+        dt_low = 1.0 / (self.flen * stilde.delta_f)
+        sow = stilde[:self.flen] / psd[:self.flen]
         sow2 = sow.astype(np.complex64).numpy()
-        kmax = min(len(lowband_templates[0]), flen)        
+        kmax = min(len(lowband_templates[0]), self.flen)        
 
         t2 = time.time()   
-
-        lowband_snrs = np.empty((len(lowband_templates), flen), dtype=np.complex64) 
-        scale_factors = (norm_low * rw_low * flen).astype(np.float32)
+        
+        lowband_snrs = self.lowband_snrs[0:len(lowband_templates)]
+        scale_factors = (norm_low * rw_low * self.flen).astype(np.float32)
         fast_multiply_scale_cython(sow2, lowband_templates2, scale_factors, lowband_snrs)
         
         t22 = time.time()
