@@ -5,7 +5,7 @@ import time
 import mkl_fft
 from pycbc.types import zeros, complex64, TimeSeries, FrequencySeries
 from pycbc.filter.matchedfilter import matched_filter_core, sigmasq
-from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython, find_peaks_in_block_cython, find_peaks_fused_lanczos_cython, block_max_threshold, fast_multiply_scale_cython
+from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython, find_peaks_in_block_cython, find_peaks_fused_lanczos_cython, block_max_threshold, fast_multiply_scale_cython, fast_multiply_indexed_cython, find_peaks_indexed_cython
 
 class RatioMatchedFilterControl(object):
     """
@@ -67,6 +67,8 @@ class RatioMatchedFilterControl(object):
         
         t1 = time.time()
         
+        lowband_templates, lowband_templates2 = lowband_templates
+        
         # Cache if we keep the same ref_template, otherwise remake
         if not hasattr(stilde, 'ref_snr') or stilde.ref_template_id != id(ref_template):
             h_norm = sigmasq(ref_template, psd=psd, 
@@ -122,21 +124,14 @@ class RatioMatchedFilterControl(object):
         sow2 = sow.astype(np.complex64).numpy()
         kmax = min(len(lowband_templates[0]), flen)        
 
-
         t2 = time.time()   
 
-        lowband_snrs = np.resize(sow2, len(lowband_templates) * flen).reshape((len(lowband_templates), flen)) 
-        for j, ltemplate in enumerate(lowband_templates):
-            lowband_snrs[j][:kmax] *= ltemplate[:kmax].conj() * (norm_low[j] * rw_low[j] * flen)
-            
-        #lowband_templates = np.array(lowband_templates, dtype=np.complex64)
-        #lowband_snrs = np.zeros((len(lowband_templates), flen), dtype=np.complex64)
-        #scale = (norm_low * rw_low * flen).astype(np.float32)
-
-        t22 = time.time()
-        #fast_multiply_scale_cython(sow2, lowband_templates, scale, lowband_snrs)
-        self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
+        lowband_snrs = np.empty((len(lowband_templates), flen), dtype=np.complex64) 
+        scale_factors = (norm_low * rw_low * flen).astype(np.float32)
+        fast_multiply_scale_cython(sow2, lowband_templates2, scale_factors, lowband_snrs)
         
+        t22 = time.time()
+        self.fft_lib.ifft(lowband_snrs, out=lowband_snrs, axis=-1)
         t3 = time.time()        
         
         # Prenormalize the SNRs
@@ -302,15 +297,13 @@ class RatioMatchedFilterControl(object):
             # 2. INNER LOOP: Step through original arrays using light integer indices
             for f_start in active_f_idxs:
                 t1 = time.time()      
-                
-                # Slicing the master arrays directly by index creates a zero-copy memory VIEW.
-                # No allocations, no memory copying!
-                filter_batch_f = filters_f[f_start : f_start + 1]
-                low_snr_block = lowband_snrs[f_start : f_start + 1]
 
-                fast_multiply_analytic_cython(
-                    block_f_view, filter_batch_f, current_mult_view
+                low_snr_block = lowband_snrs[f_start : f_start + 1]
+                indices_b = indices[f_start: f_start + 1]
+                fast_multiply_indexed_cython(
+                    block_f_view, filters_f, indices_b, current_mult_view
                 )
+
                 t11 = time.time()
 
                 self.fft_lib.ifft(
@@ -320,16 +313,17 @@ class RatioMatchedFilterControl(object):
                 )     
                 t12 = time.time()        
                 
-                f_list, t_list, s_list, s_low_list = find_peaks_fused_lanczos_cython(
-                    current_corr_view,
-                    low_snr_block,
+                f_list, t_list, s_list, s_low_list = find_peaks_indexed_cython(
+                    current_corr_view, # Dense 1-row view from IFFT
+                    lowband_snrs,      # The FULL master lowband array (No slicing!)
+                    indices_b,         # Single index mapping
                     roi_start, roi_len,
                     self.threshold_sq,
-                    f_start, # Maps back perfectly to the original identity
                     dt_high, dt_low,
                     t0_high, t0_low,
                     input_offset=buf_slice_start
                 )
+
                 t13 = time.time()
                 if f_list:
                     all_f_idxs.extend(f_list)

@@ -321,6 +321,10 @@ def main():
                 lowband_templates = bank.get_fine_templates(coarse_idx, indices=slice(temp_start, temp_end))
                 taps, counts, fine_indices = bank.get_firs(coarse_idx, indices=slice(temp_start, temp_end))
             
+                # Explicit copy , faster?
+                lowband_templates2 = np.empty((len(lowband_templates), len(lowband_templates[0])), dtype=np.complex64)
+                for j, ltem in enumerate(lowband_templates):
+                    lowband_templates2[j, :] = ltem.data[:]
                 
                 filters_f, n_taps_max = engine.prepare_filters(taps, counts)
                 
@@ -343,7 +347,7 @@ def main():
                         stilde, stilde.psd, ref_template, filters_f, counts,
                         np.arange(len(fine_indices)),
                         valid_slice=stilde.analyze,
-                        lowband_templates=lowband_templates,
+                        lowband_templates=(lowband_templates, lowband_templates2),
                         scale=(scale_low, scale_high),
                     )
                     if len(ids_local) > 0:

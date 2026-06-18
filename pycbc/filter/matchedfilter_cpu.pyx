@@ -98,6 +98,31 @@ def _correlate_factory(x, y, z):
 
 @cython.boundscheck(False) 
 @cython.wraparound(False) 
+@cython.cdivision(True)
+@cython.initializedcheck(False)
+def fast_multiply_indexed_cython(
+    numpy.complex64_t[::1] data_f,           
+    numpy.complex64_t[:, ::1] filters_master,
+    numpy.int64_t[::1] active_idxs,          # The list of surviving filter indices
+    numpy.complex64_t[:, ::1] out_batch      
+):
+    """
+    Pulls non-contiguous rows directly from the master filter bank 
+    using a list of indices. Computes the analytic half-signal.
+    """
+    cdef long n_active = active_idxs.shape[0]
+    cdef long n_fft = filters_master.shape[1]
+    cdef long n_half_plus_one = (n_fft // 2) + 1
+    
+    cdef long i, j, row_idx
+
+    for i in range(n_active):
+        row_idx = active_idxs[i]
+        for j in range(n_half_plus_one):
+            out_batch[i, j] = data_f[j] * filters_master[row_idx, j]
+
+@cython.boundscheck(False) 
+@cython.wraparound(False) 
 @cython.cdivision(True)   
 def fast_multiply_analytic_cython(
     numpy.ndarray[complex64_t, ndim=1, mode="c"] data_f,
@@ -128,12 +153,13 @@ def fast_multiply_analytic_cython(
 
 @cython.boundscheck(False) 
 @cython.wraparound(False) 
-@cython.cdivision(True)   
+@cython.cdivision(True)
+@cython.initializedcheck(False)
 def fast_multiply_scale_cython(
-    numpy.ndarray[complex64_t, ndim=1, mode="c"] data_f,
-    numpy.ndarray[complex64_t, ndim=2, mode="c"] filter_batch_f,
-    numpy.ndarray[float, ndim=1, mode="c"] scale,
-    numpy.ndarray[complex64_t, ndim=2, mode="c"] out_batch
+    numpy.complex64_t[::1] data_f,           # Modern Memoryview, strictly contiguous
+    numpy.complex64_t[:, ::1] filter_batch_f,# Modern Memoryview, contiguous in last dimension
+    numpy.float32_t[::1] scale,              # Modern Memoryview, strictly contiguous
+    numpy.complex64_t[:, ::1] out_batch      # Modern Memoryview, contiguous in last dimension
 ):
     """
     Cython version of the "half-only" analytic signal multiply.
@@ -142,18 +168,17 @@ def fast_multiply_scale_cython(
     autovectorizer (enabled by -march=native) to use AVX.
     """
     
-    # --- C-level variable declarations ---
     cdef long batch_size = filter_batch_f.shape[0]
     cdef long n_fft = filter_batch_f.shape[1]
     
-    cdef long i, j # Loop iterators
+    cdef long i, j 
+    cdef float current_scale
 
-    # This is a pure C-loop, no Python overhead.
     for i in range(batch_size):
+        current_scale = scale[i] # Explicit loop hoisting
         for j in range(n_fft):
-            # Direct C-level complex multiplication
-            out_batch[i, j] = scale[i] * data_f[j] * filter_batch_f[i, j].conjugate()
-
+            out_batch[i, j] = current_scale * data_f[j] * filter_batch_f[i, j].conjugate()
+            
 @cython.boundscheck(False) 
 @cython.wraparound(False) 
 @cython.cdivision(True)   
@@ -266,6 +291,175 @@ _lut_raw = _ideal_sinc * _kaiser_window
 _lut_raw /= _lut_raw.sum(axis=1, keepdims=True)
 
 KAISER_128_LUT = np.ascontiguousarray(_lut_raw, dtype=np.float32)
+
+
+@cython.boundscheck(False) 
+@cython.wraparound(False) 
+@cython.cdivision(True)    
+@cython.initializedcheck(False)
+def find_peaks_indexed_cython(
+    numpy.complex64_t[:, ::1] corr_output,     # Dense 2D output from the IFFT
+    numpy.complex64_t[:, ::1] lowband_master,  # The FULL 2D master lowband array
+    numpy.int64_t[::1] active_idxs,            # 1D array of global filter indices
+    long t_start,
+    long n_valid,
+    float threshold_sq,
+    double dt_high,
+    double dt_low,
+    double t0_high,
+    double t0_low,
+    long input_offset=0
+):
+    """
+    Two-Pass Fused Kernel utilizing pristine block-level max scans.
+    Reads dense highband data, but sparsely looks up lowband data using active_idxs.
+    """
+    cdef long n_filters_in_batch = corr_output.shape[0]
+    cdef list f_idx_list = []
+    cdef list t_idx_list = []
+    cdef list snr_list = []
+    cdef list snr_low_list = []
+    
+    cdef long f_batch_idx, j, idx, read_idx
+    cdef int k_idx
+    cdef int32_t f_global_idx
+    
+    cdef complex64_t z_high, z_total, z_low0, z_low1, interp_low_snr
+    cdef float32_t mag_sq, high_mag_bound, low_mag0_bound, low_mag1_bound, low_envelope_bound
+    
+    cdef float32_t current_max_snr_sq, current_max_snr_amp 
+    cdef int64_t current_max_idx
+    cdef complex64_t current_max_z, current_max_z_low
+    
+    cdef float[:, :] weights_lut = KAISER_128_LUT
+    
+    cdef double const_offset = (t0_high - t0_low) + <double>t_start * dt_high
+    cdef double data_scale = dt_high / dt_low
+    cdef double base_scale = const_offset / dt_low
+    
+    cdef double low_idx_start = const_offset / dt_low
+    cdef double low_idx_end = (const_offset + <double>(n_valid - 1) * dt_high) / dt_low
+    cdef long j_start = <long>libc.math.floor(low_idx_start)
+    cdef long j_end = <long>libc.math.floor(low_idx_end)
+    
+    cdef long idx_min_j, idx_max_j
+    cdef double exact_low_idx, w
+    cdef int w_lut_idx
+    
+    cdef double PI = 3.14159265358979323846
+    cdef double theta, c_rot, s_rot, rot_r, rot_i
+    cdef float sign
+    cdef float32_t max_low_envelope, l_amp, block_max_high_sq, block_max_high_amp
+    
+    for f_batch_idx in range(n_filters_in_batch):
+        # Maps the local batch row to the true global template identity
+        f_global_idx = <int32_t>active_idxs[f_batch_idx]
+
+        current_max_snr_sq = threshold_sq
+        current_max_snr_amp = <float>libc.math.sqrt(threshold_sq) 
+        current_max_idx = -1
+        current_max_z.real = 0.0
+        current_max_z.imag = 0.0
+        current_max_z_low.real = 0.0
+        current_max_z_low.imag = 0.0
+
+        # === PASS 1a: Scan Lowband ===
+        max_low_envelope = 0.0
+        for j in range(j_start, j_end + 2):
+            # NEW: We look up using f_global_idx instead of f_batch_idx
+            z_low0 = lowband_master[f_global_idx, j]
+            l_amp = <float32_t>libc.math.sqrt(z_low0.real * z_low0.real + z_low0.imag * z_low0.imag)
+            if l_amp > max_low_envelope:
+                max_low_envelope = l_amp
+        max_low_envelope *= 1.25
+        
+        # === PASS 1b: Unbroken Highband Max Scan ===
+        block_max_high_sq = 0.0
+        for idx in range(n_valid):
+            read_idx = idx + input_offset
+            # HIGHBAND uses f_batch_idx because it's dense
+            z_high = corr_output[f_batch_idx, read_idx]
+            mag_sq = z_high.real * z_high.real + z_high.imag * z_high.imag
+            if mag_sq > block_max_high_sq:
+                block_max_high_sq = mag_sq
+                
+        block_max_high_amp = <float32_t>libc.math.sqrt(block_max_high_sq)
+
+        if (block_max_high_amp + max_low_envelope) <= current_max_snr_amp:
+            continue
+
+        # === PASS 2: Fallback Detailed Segment Loop ===
+        for j in range(j_start, j_end + 1):
+            idx_min_j = <long>libc.math.ceil((<double>j * dt_low - const_offset) / dt_high)
+            idx_max_j = <long>libc.math.ceil((<double>(j + 1) * dt_low - const_offset) / dt_high)
+            
+            if idx_min_j < 0: idx_min_j = 0
+            if idx_max_j > n_valid: idx_max_j = n_valid
+            if idx_min_j >= idx_max_j: continue
+            
+            # LOWBAND uses f_global_idx
+            z_low0 = lowband_master[f_global_idx, j]
+            z_low1 = lowband_master[f_global_idx, j + 1]
+            low_mag0_bound = libc.math.fabs(z_low0.real) + libc.math.fabs(z_low0.imag)
+            low_mag1_bound = libc.math.fabs(z_low1.real) + libc.math.fabs(z_low1.imag)
+            low_envelope_bound = (low_mag0_bound if low_mag0_bound > low_mag1_bound else low_mag1_bound) * 1.15
+            
+            for idx in range(idx_min_j, idx_max_j):
+                read_idx = idx + input_offset
+                
+                # HIGHBAND uses f_batch_idx
+                z_high = corr_output[f_batch_idx, read_idx]
+                high_mag_bound = libc.math.fabs(z_high.real) + libc.math.fabs(z_high.imag)
+                
+                if (high_mag_bound + low_envelope_bound) <= current_max_snr_amp:
+                    continue
+                
+                exact_low_idx = base_scale + <double>idx * data_scale
+                w = exact_low_idx - <double>j
+                
+                w_lut_idx = <int>(w * 1024.0)
+                if w_lut_idx > 1023: w_lut_idx = 1023
+                elif w_lut_idx < 0: w_lut_idx = 0
+                
+                interp_low_snr.real = 0.0
+                interp_low_snr.imag = 0.0
+                
+                sign = 1.0 if ((j - 63) % 2) == 0 else -1.0
+                
+                for k_idx in range(128):
+                    # LOWBAND uses f_global_idx
+                    interp_low_snr.real += sign * weights_lut[w_lut_idx, k_idx] * lowband_master[f_global_idx, j + k_idx - 63].real
+                    interp_low_snr.imag += sign * weights_lut[w_lut_idx, k_idx] * lowband_master[f_global_idx, j + k_idx - 63].imag
+                    sign = -sign
+                
+                theta = PI * exact_low_idx
+                c_rot = libc.math.cos(theta)
+                s_rot = libc.math.sin(theta)
+                
+                rot_r = interp_low_snr.real * c_rot - interp_low_snr.imag * s_rot
+                rot_i = interp_low_snr.real * s_rot + interp_low_snr.imag * c_rot
+                
+                interp_low_snr.real = rot_r
+                interp_low_snr.imag = rot_i
+                
+                z_total.real = z_high.real + interp_low_snr.real
+                z_total.imag = z_high.imag + interp_low_snr.imag
+                mag_sq = z_total.real * z_total.real + z_total.imag * z_total.imag
+                
+                if mag_sq > current_max_snr_sq:
+                    current_max_snr_sq = mag_sq
+                    current_max_snr_amp = <float>libc.math.sqrt(mag_sq)
+                    current_max_idx = t_start + idx
+                    current_max_z = z_total
+                    current_max_z_low = interp_low_snr
+                    
+        if current_max_idx != -1:
+            f_idx_list.append(f_global_idx)
+            t_idx_list.append(current_max_idx)
+            snr_list.append(current_max_z)
+            snr_low_list.append(current_max_z_low)
+            
+    return (f_idx_list, t_idx_list, snr_list, snr_low_list)
 
 
 @cython.boundscheck(False) 
