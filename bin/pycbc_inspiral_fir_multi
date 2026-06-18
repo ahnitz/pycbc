@@ -144,8 +144,6 @@ def get_args():
     group = parser.add_argument_group("Ratio Filter Options")
     group.add_argument('--high-frequency-cutoff', type=float,
                        help="High frequency cutoff (defaults to Nyquist).")
-    group.add_argument('--batch-size', type=int, default=64,
-                       help="Number of filters to process in one FFT batch.")
     group.add_argument('--fir-length', type=int, default=4096,
                        help="")
 
@@ -245,7 +243,7 @@ def main():
             delta_f=delta_f,
             high_frequency_cutoff=args.high_frequency_cutoff,
             fir_fft_length=args.fir_length,
-            batch_size=args.batch_size,
+            batch_size=args.template_batch_size,
             multiband_frequency=args.multiband_frequency,
         )
         

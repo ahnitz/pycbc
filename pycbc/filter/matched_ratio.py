@@ -268,9 +268,6 @@ class RatioMatchedFilterControl(object):
 
         valid = np.resize(valid, len(filters_f) * len(t_starts)).reshape(len(filters_f), len(t_starts))
         block_max_threshold(lowband_snrs, j_starts, j_ends, valid, gate_threshold)
-
-        current_mult_view = freq_mult_view[:1]
-        current_corr_view = corr_out_view[:1]
          
         n_time_blocks = len(t_starts)
         time_chunks_with_work = np.any(valid, axis=0)
@@ -289,54 +286,67 @@ class RatioMatchedFilterControl(object):
             block_f_view = stilde.block_f_cache[t_start]
 
             active_f_idxs = indices[valid[:, t_idx]]
+            n_active = len(active_f_idxs)
+            
+            if n_active == 0:
+                continue
+
             roi_start = roi_starts[t_idx]
             roi_stop = roi_stops[t_idx]
             roi_len = roi_stop - roi_start
             buf_slice_start = roi_start - t_start
 
-            # 2. INNER LOOP: Step through original arrays using light integer indices
-            for f_start in active_f_idxs:
-                t1 = time.time()      
+            # --- BULK EXECUTION PHASE ---
+            t1 = time.time()      
+            
+            # 1. Dynamically size the views for this specific time block
+            current_mult_view = freq_mult_view[:n_active]
+            current_corr_view = corr_out_view[:n_active]
 
-                low_snr_block = lowband_snrs[f_start : f_start + 1]
-                indices_b = indices[f_start: f_start + 1]
-                fast_multiply_indexed_cython(
-                    block_f_view, filters_f, indices_b, current_mult_view
-                )
+            # 2. BULK C-MULTIPLY (1 Python-to-C hop for all ~10 filters)
+            fast_multiply_indexed_cython(
+                block_f_view, 
+                filters_f, 
+                active_f_idxs, 
+                current_mult_view
+            )
+            t11 = time.time()
 
-                t11 = time.time()
+            # 3. BULK MKL IFFT (1 Engine Spin-up for all ~10 rows)
+            self.fft_lib.ifft(
+                current_mult_view,
+                axis=-1, 
+                out=current_corr_view
+            )     
+            t12 = time.time()        
 
-                self.fft_lib.ifft(
-                    current_mult_view,
-                    axis=-1, 
-                    out=current_corr_view
-                )     
-                t12 = time.time()        
-                
-                f_list, t_list, s_list, s_low_list = find_peaks_indexed_cython(
-                    current_corr_view, # Dense 1-row view from IFFT
-                    lowband_snrs,      # The FULL master lowband array (No slicing!)
-                    indices_b,         # Single index mapping
-                    roi_start, roi_len,
-                    self.threshold_sq,
-                    dt_high, dt_low,
-                    t0_high, t0_low,
-                    input_offset=buf_slice_start
-                )
-
-                t13 = time.time()
-                if f_list:
-                    all_f_idxs.extend(f_list)
-                    all_t_idxs.extend(t_list)
-                    all_snrs.extend(s_list)
-                    all_low_snrs.extend(s_low_list)
-                    all_tstarts.extend([t_start] * len(s_list)) 
-                
-                t2 = time.time()
-                tspend += t2 - t1
-                tspend1 += t11 - t1
-                tspend2 += t12 - t11
-                tspend3 += t13 - t12
+            # 4. BULK C-PEAK FINDER (1 Python-to-C hop for all ~10 rows)
+            f_list, t_list, s_list, s_low_list = find_peaks_indexed_cython(
+                current_corr_view,
+                lowband_snrs,
+                active_f_idxs,
+                roi_start, roi_len,
+                self.threshold_sq,
+                dt_high, dt_low,
+                t0_high, t0_low,
+                input_offset=buf_slice_start
+            )
+            
+            # Append aggregated results for the entire batch
+            if f_list:
+                all_f_idxs.extend(f_list)
+                all_t_idxs.extend(t_list)
+                all_snrs.extend(s_list)
+                all_low_snrs.extend(s_low_list)
+                all_tstarts.extend([t_start] * len(s_list)) 
+            
+            t13 = time.time()
+            
+            # Aggregate the timers
+            tspend += (t13 - t1)
+            tspend1 += (t11 - t1)
+            tspend2 += (t12 - t11)
+            tspend3 += (t13 - t12)
                 
         tf = time.time()
         print("SKIP RATIO", "INNER", tspend, tspend1, tspend2, tspend3, "top", tx2-t0, "total", tf-t0)        
