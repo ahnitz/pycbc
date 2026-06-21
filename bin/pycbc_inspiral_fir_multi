@@ -305,7 +305,9 @@ def main():
         seg_chi_dof = []
         seg_snr_low_sqs = []
 
-        tsetup = time.time() - tstart
+        tsetup_ref = time.time()
+        tsetup = tsetup_ref - tstart
+        tanalysis = 0
         
         for i, coarse_idx in enumerate(bank.coarse_indices):
             ref_template = bank.get_coarse_template(coarse_idx)
@@ -366,8 +368,11 @@ def main():
 
                     t2 = time.time()
                     print("pass loop", t2 - t1, (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t, len(taps))
-                    tperf = (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t / (t2 - t1) * len(taps)
-                    logging.info(f"batch perf: {tperf} templates s/s")
+                    tpart = (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t * len(taps)
+                    tanalysis += tpart
+                    tperf = tpart / (t2 - t1) # Just the filtering hot loop
+                    tperf_cum = tanalysis / (t2 - tsetup_ref) # Everyting minus initial setup / teardown
+                    logging.info(f"batch perf: {tperf} templates s/s: total perf: {tperf_cum} s/s --- {t2-t1} - {tpart/len(taps)} - {len(taps)}")
                 
                 # Reset some caches    
                 engine.hnorms_low = None
