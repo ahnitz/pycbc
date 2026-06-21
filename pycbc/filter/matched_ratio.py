@@ -152,6 +152,9 @@ class RatioMatchedFilterControl(object):
             ref_snr, filters_f, n_taps, valid_slice, stilde,
             lowband_snrs=(lowband_snrs, dt_low, gate_threshold),
         )
+        
+        # Undo coherent addition weighting so it is back to SNR normalized
+        snr_low_vals = snr_low_vals / rw_low[local_idxs]
         t5 = time.time()
          
         print("PRE TIMING", "RF", t5-t4, "NORM", t4 - t3, "LB", t3 - t2, t3-t22, t22-t2, "REF", t2-t1)
