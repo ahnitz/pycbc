@@ -493,6 +493,13 @@ class EventManager(object):
 
         if len(self.events):
             f['snr'] = abs(self.events['snr'])
+            
+            try:
+                f['snr_low'] = self.events['snr_low']
+                f['snr_high'] = self.events['snr_high']
+            except Exception:
+                pass
+            
             try:
                 # Precessing
                 f['u_vals'] = self.events['u_vals']

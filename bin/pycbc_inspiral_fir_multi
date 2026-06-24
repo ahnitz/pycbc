@@ -30,7 +30,7 @@ from pycbc.waveform.bank import RatioFilterBank
 tstart = time.time()
 
 
-def compute_batch_chisq(ids_local, t_idxs, snrs, snrs_low, h_norm,
+def compute_batch_chisq(ids_local, t_idxs, snrs, snrs_low, snrs_high, h_norm,
                         fine_indices, tstarts, stilde, bank, chisq_estimator, engine,
                         lowband_templates,
                         args):
@@ -95,8 +95,8 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, snrs_low, h_norm,
                 logging.info('start chisq calc')
                 chi, dof = chisq_estimator.values(corr, snrvs, 1, stilde.psd, tids, template2)
                 if dof == -100:
-                    chi, dof = 0, 0 
-                chi += abs(snrv_high)**2.0
+                    chi, dof = 10, 10 
+                chi += abs(snrs_high[idx])**2.0
                 dof += 2
             else:
                 logging.info(f'Too much SNR comes from high frequency only, killing...')
@@ -263,6 +263,7 @@ def main():
             'sg_chisq' : float32,
             'psd_var_val': float32,
             'snr_low': complex64,
+            'snr_high': complex64,
         }
         
         out_vals_ref = {key: None for key in out_types}
@@ -304,11 +305,15 @@ def main():
         seg_chi = []
         seg_chi_dof = []
         seg_snr_low_sqs = []
+        seg_snr_high_sqs = []
 
         tsetup_ref = time.time()
         tsetup = tsetup_ref - tstart
         tanalysis = 0
-        
+
+        lowband_templates_work = np.empty((args.template_batch_size, flen_fine),
+                                          dtype=np.complex64)        
+
         for i, coarse_idx in enumerate(bank.coarse_indices):
             ref_template = bank.get_coarse_template(coarse_idx)
             all_fine_indices = bank.get_fine_indices(coarse_idx)
@@ -318,14 +323,16 @@ def main():
                 if temp_end > len(all_fine_indices):
                     temp_end = len(all_fine_indices)
                 
+                tb1 = time.time()
                 lowband_templates = bank.get_fine_templates(coarse_idx, indices=slice(temp_start, temp_end))
+                tb2 = time.time()
                 taps, counts, fine_indices = bank.get_firs(coarse_idx, indices=slice(temp_start, temp_end))
-            
-                # Explicit copy , faster?
-                lowband_templates2 = np.empty((len(lowband_templates), len(lowband_templates[0])), dtype=np.complex64)
+                tb3 = time.time()
+
+                lowband_templates2 = lowband_templates_work[:len(lowband_templates)]
                 for j, ltem in enumerate(lowband_templates):
                     lowband_templates2[j, :] = ltem.data[:]
-                
+                tb4 = time.time()
                 filters_f, n_taps_max = engine.prepare_filters(taps, counts)
                 
                 logging.info(f"  Ratio Batch {i+1}/{n_coarse}, {len(taps)} FIR templates")
@@ -336,14 +343,15 @@ def main():
                 # We prenormalize the highband filters, lowband we calculate
                 # h_norm explicitly in the code.
                 filters_f /= scale_high[:, None]
-            
+                tb5 = time.time()
+                print("BANK COSTS", tb5 - tb1, tb5-tb4, tb4-tb3, tb3-tb2, tb2-tb1)            
 
                 for s_num, stilde in enumerate(segments):
                     logging.info(f"Processing Segment {s_num}")
                     t1 = time.time()
                     
 
-                    ids_local, t_idxs, snrs, snrs_low, tstarts, h_norm = engine.process_segment(
+                    ids_local, t_idxs, snrs, snrs_low, snrs_high, tstarts, h_norm = engine.process_segment(
                         stilde, stilde.psd, ref_template, filters_f, counts,
                         np.arange(len(fine_indices)),
                         valid_slice=stilde.analyze,
@@ -351,7 +359,7 @@ def main():
                         scale=(scale_low, scale_high),
                     )
                     if len(ids_local) > 0:
-                        chi, chi_dof = compute_batch_chisq(ids_local, t_idxs, snrs, snrs_low, h_norm,
+                        chi, chi_dof = compute_batch_chisq(ids_local, t_idxs, snrs, snrs_low, snrs_high, h_norm,
                             fine_indices, tstarts, stilde, bank, power_chisq, engine, lowband_templates, args)
                         
                         t_idxs += (-stilde.analyze.start + stilde.cumulative_index)
@@ -359,6 +367,7 @@ def main():
                         seg_t_idxs.append(t_idxs)
                         seg_snr_sqs.append(snrs)
                         seg_snr_low_sqs.append(snrs_low)
+                        seg_snr_high_sqs.append(snrs_high)
                         seg_fine_mappings.append(fine_indices)
                         seg_h_norms.append(h_norm)
                         seg_coarse_ids.append(coarse_idx)
@@ -386,6 +395,7 @@ def main():
             times = seg_t_idxs[k]
             snrs = seg_snr_sqs[k]
             snrs_low = seg_snr_low_sqs[k]
+            snrs_high = seg_snr_high_sqs[k]
             coarse_id = seg_coarse_ids[k]
             norms = seg_h_norms[k]
             mapping = seg_fine_mappings[k]
@@ -397,7 +407,7 @@ def main():
                 global_idx = mapping[local_idx]
                 
                 if global_idx not in triggers_by_template:
-                    triggers_by_template[global_idx] = ([], [], [], [], [], [], [])
+                    triggers_by_template[global_idx] = ([], [], [], [], [], [], [], [])
                 
                 triggers_by_template[global_idx][0].append(snrs[j])
                 triggers_by_template[global_idx][1].append(times[j])
@@ -406,19 +416,21 @@ def main():
                 triggers_by_template[global_idx][4].append(chi[j])
                 triggers_by_template[global_idx][5].append(chi_dof[j])
                 triggers_by_template[global_idx][6].append(snrs_low[j])
-                
+                triggers_by_template[global_idx][7].append(snrs_high[j])
+                                
         # C. Store
-        for global_id, (snr, time_list, norm, coarse_id, chi, chi_dof, snr_low) in triggers_by_template.items():
+        for global_id, (snr, time_list, norm, coarse_id, chi, chi_dof, snr_low, snr_high) in triggers_by_template.items():
             
             out_vals = out_vals_ref.copy()
             out_vals['time_index'] = np.array(time_list)
                         
             out_vals['snr'] = np.array(snr)
             out_vals['snr_low'] = np.array(snr_low)
+            out_vals['snr_high'] = np.array(snr_high)
             out_vals['sigmasq'] = norm
             out_vals['chisq'] = chi
             out_vals['chisq_dof'] = chi_dof
-
+            
             if args.psdvar_short_segment is not None:
                 out_vals['psd_var_val'] = \
                         pycbc.psd.find_trigger_value(psd_var,

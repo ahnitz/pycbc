@@ -916,6 +916,7 @@ class FilterBank(TemplateBank):
                                               self.table[index],
                                               self.f_lower,
                                               self.max_template_length)
+                                              
         logging.info('%s: generating %s from %s Hz' % (index, approximant, f_low))
 
         # Clear the storage memory
@@ -928,6 +929,7 @@ class FilterBank(TemplateBank):
 
         if (self.has_compressed_waveforms and self.enable_compressed_waveforms):
             try:
+                logging.info('start decompress')
                 htilde = self.get_decompressed_waveform(
                     tempout,
                     index,
@@ -935,6 +937,7 @@ class FilterBank(TemplateBank):
                     approximant=approximant,
                     df=None
                 )
+                logging.info('end decompress')
                 full_calculate_waveform = False
             except KeyError:
                 # This is the error caused when the compressed waveform is

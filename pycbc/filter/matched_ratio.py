@@ -154,6 +154,8 @@ class RatioMatchedFilterControl(object):
         )
         
         # Undo coherent addition weighting so it is back to SNR normalized
+        snr_high_vals = snr_vals - snr_low_vals
+        snr_high_vals = snr_high_vals / rw_high[local_idxs]
         snr_low_vals = snr_low_vals / rw_low[local_idxs]
         t5 = time.time()
          
@@ -161,9 +163,9 @@ class RatioMatchedFilterControl(object):
         # 4. Map indices
         if len(local_idxs) > 0:
             global_ids = indices[local_idxs]
-            return global_ids, t_idxs, snr_vals, snr_low_vals, tstarts, hnorms_low[local_idxs]
+            return global_ids, t_idxs, snr_vals, snr_low_vals, snr_high_vals, tstarts, hnorms_low[local_idxs]
         else:
-            return [], [], [], [], [], []
+            return [], [], [], [], [], [], []
 
     def _fft_all_filters(self, taps, counts):
         """Helper to FFT all filters using mkl_fft."""
