@@ -85,15 +85,10 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, snrs_low, snrs_high, h_norm,
                 template = lowband_templates[local_id]                         
                 kmax = len(template)
                 corr = template.conj() * stilde[:kmax] / stilde.psd[:kmax] * (4 * stilde.delta_f / h_norm[idx] ** 0.5)
-                corr.resize((len(stilde) - 1)*2)
-                
-                template2 = template.copy()
-                template2.resize(len(stilde))
-                template2.params = template.params
-                template2.f_lower = template.f_lower
-                
                 logging.info('start chisq calc')
-                chi, dof = chisq_estimator.values(corr, snrvs, 1, stilde.psd, tids, template2)
+
+                tids2 = tids * kmax / ((len(stilde) - 1)*2)
+                chi, dof = chisq_estimator.values(corr, snrvs, 1, stilde.psd[:kmax], tids2, template)
                 if dof == -100:
                     chi, dof = 10, 10 
                 chi += abs(snrs_high[idx])**2.0

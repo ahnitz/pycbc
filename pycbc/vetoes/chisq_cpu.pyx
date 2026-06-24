@@ -138,14 +138,15 @@ def chisq_accum_bin(chisq, q):
     N = len(chisq)
     chisq_accum_bin_cython(chisq, q, N)
 
-def shift_sum(v1, shifts, bins):
+def shift_sum(v1, shifts, bins, slen=None):
     real_type = real_same_precision_as(v1)
     shifts = numpy.array(shifts, dtype=real_type)
 
     bins = numpy.array(bins, dtype=numpy.uint32)
     blen = len(bins) - 1 #
     v1 = numpy.array(v1.data, copy=False)
-    slen = len(v1)
+    if slen is None:
+        slen = len(v1)
     n = int(len(shifts))
 
     # Create some output memory
