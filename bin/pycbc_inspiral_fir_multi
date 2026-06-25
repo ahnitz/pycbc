@@ -88,11 +88,7 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, snrs_low, snrs_high, h_norm,
                 logging.info('start chisq calc')
                 tids2 = tids * kmax / ((len(stilde) - 1)*2)
                 chi, dof = chisq_estimator.values(corr, snrvs, 1, stilde.psd[:kmax], tids2, template)
-                if dof == -100:
-                    chi, dof = 10, 10 
-                    
-                print(chi, dof, abs(snrs_high[idx])**2.0)
-                chi += abs(snrs_high[idx])**2.0
+                chi += abs(snrs_high[idx])**2.0 + abs(snrs_low[idx])**2.0 - abs(snrs[idx])**2.0
                 dof += 2
                 
                 
