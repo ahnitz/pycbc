@@ -86,13 +86,17 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, snrs_low, snrs_high, h_norm,
                 kmax = len(template)
                 corr = template.conj() * stilde[:kmax] / stilde.psd[:kmax] * (4 * stilde.delta_f / h_norm[idx] ** 0.5)
                 logging.info('start chisq calc')
-
                 tids2 = tids * kmax / ((len(stilde) - 1)*2)
                 chi, dof = chisq_estimator.values(corr, snrvs, 1, stilde.psd[:kmax], tids2, template)
                 if dof == -100:
                     chi, dof = 10, 10 
+                    
+                print(chi, dof, abs(snrs_high[idx])**2.0)
                 chi += abs(snrs_high[idx])**2.0
                 dof += 2
+                
+                
+                
             else:
                 logging.info(f'Too much SNR comes from high frequency only, killing...')
                 chi, dof = 1e9, 1
@@ -242,8 +246,7 @@ def main():
             multiband_frequency=args.multiband_frequency,
         )
         
-        power_chisq = pycbc.vetoes.SingleDetPowerChisq(args.chisq_bins,
-                                                       args.chisq_snr_threshold)
+        power_chisq = pycbc.vetoes.SingleDetPowerChisq(args.chisq_bins)
         
         # --- 5. Event Manager Setup ---
         out_types = {
