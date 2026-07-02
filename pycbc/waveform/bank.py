@@ -414,7 +414,7 @@ class TemplateBank(object):
             return
 
         # The fields to use in making a template hash
-        hash_fields = ['mass1', 'mass2', 'inclination',
+        hash_fields = ['mass1', 'mass2', 'inclination', 'eccentricity', 'anomaly',
                        'spin1x', 'spin1y', 'spin1z',
                        'spin2x', 'spin2y', 'spin2z',]
 
