@@ -124,8 +124,16 @@ template_ids = cuts.apply_template_cuts(
 logging.info("%d out of %d templates kept after applying template cuts",
              len(template_ids), original_bank_len)
 
-if args.cluster_window is not None:
-  logging.info('Clustering events over %s s window within each template',
+snrt = trigf[ifo + '/snr'][:]
+xi = trigf[ifo + '/chisq'][:] / (2 * trigf[ifo + '/chisq_dof'][:] - 2)
+from pycbc.events.ranking import newsnr
+nsnr = newsnr(snrt, xi)
+k = (nsnr > 7.5) 
+temp_ids = trigf[ifo + '/template_id'][k]
+template_ids = np.intersect1d(template_ids, temp_ids)
+print(len(template_ids))
+
+if args.cluster_window is not None: logging.info('Clustering events over %s s window within each template',
                args.cluster_window)
 
 loudest_keep_vals = args.loudest_keep_values.strip('[]').split(',')
@@ -163,8 +171,9 @@ for i, tnum in enumerate(template_ids):
             "Calculating statistic in template %d out of %d",
             i, len(template_ids),
         )
+    logging.info('here')
     tids_uncut = trigs.set_template(tnum)
-
+    logging.info('here2')
     trigger_keep_ids = cuts.apply_trigger_cuts(trigs, trigger_cut_dict,
                                                statistic=rank_method)
     tids_full = tids_uncut[trigger_keep_ids]
