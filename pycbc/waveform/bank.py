@@ -410,8 +410,9 @@ class TemplateBank(object):
         already exist.
         """
         fields = self.table.fieldnames
-        if 'template_hash' in fields:
-            return
+        #if 'template_hash' in fields:
+        #    return
+        # forc e recalculation of the hashes since the initial ones are bad
 
         # The fields to use in making a template hash
         hash_fields = ['mass1', 'mass2', 'inclination', 'eccentricity', 'anomaly',
@@ -424,7 +425,10 @@ class TemplateBank(object):
         if not np.unique(template_hash).size == template_hash.size:
             raise RuntimeError("Some template hashes clash. This should not "
                                "happen.")
-        self.table = self.table.add_fields(template_hash, 'template_hash')
+        if 'template_hash' in self.table.fieldnames:
+            self.table['template_hash'] = template_hash
+        else:
+            self.table = self.table.add_fields(template_hash, 'template_hash')
 
     def write_to_hdf(self, filename, start_index=None, stop_index=None,
                      force=False, skip_fields=None,

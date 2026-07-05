@@ -162,9 +162,11 @@ class RatioMatchedFilterControl(object):
         print("PRE TIMING", "RF", t5-t4, "NORM", t4 - t3, "LB", t3 - t2, t3-t22, t22-t2, "REF", t2-t1)
         # 4. Map indices
         if len(local_idxs) > 0:
+            print("NON EMPTRY RETURN")
             global_ids = indices[local_idxs]
             return global_ids, t_idxs, snr_vals, snr_low_vals, snr_high_vals, tstarts, hnorms_low[local_idxs]
         else:
+            print("EMPTRY RETURN")
             return [], [], [], [], [], [], []
 
     def _fft_all_filters(self, taps, counts):
