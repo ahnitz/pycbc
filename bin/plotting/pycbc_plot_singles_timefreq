@@ -156,7 +156,6 @@ if len(indices) > 0:
     logging.info('Loading bank')
     bank = pycbc.waveform.bank.TemplateBank(opts.bank_file,
             approximant=opts.approximant,
-            parameters=['mass1', 'mass2', 'spin1z', 'spin2z', 'approximant'],
             load_compressed=False)
     tmplts = bank.table
 
