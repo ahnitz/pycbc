@@ -163,8 +163,8 @@ def setup_splittable_manual_directory(workflow, tags=None):
             tags=tags + [bank_tag]
         )
         curr_file.add_pfn(pfn_local, site='local')
+        curr_file.add_pfn(pfn_local, site='condorpool_shared')
         tmplt_banks.append(curr_file)
-        
     return tmplt_banks
 
 def setup_splittable_dax_generated(workflow, input_tables, out_dir, tags):
