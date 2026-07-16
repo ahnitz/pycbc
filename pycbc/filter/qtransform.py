@@ -173,11 +173,16 @@ def _iter_frequencies(q, frange, mismatch, dur):
     nfreq = int(max(1, ceil(fcum_mismatch / deltam_f(mismatch))))
     fstep = fcum_mismatch / nfreq
     fstepmin = 1. / dur
-    # for each frequency, yield a QTile
+
+    last_freq = None
     for i in range(nfreq):
-        yield (float(minf) *
-               exp(2 / (2 + q**2)**(1/2.) * (i + .5) * fstep) //
-               fstepmin * fstepmin)
+        current_freq = (float(minf) *
+                        exp(2 / (2 + q**2)**(1/2.) * (i + .5) * fstep) //
+                        fstepmin * fstepmin)
+        # Only yield if it's a new discrete bin
+        if current_freq != last_freq:
+            yield current_freq
+            last_freq = current_freq
     return
 
 def qseries(fseries, Q, f0, return_complex=False):
