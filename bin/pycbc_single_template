@@ -222,7 +222,11 @@ fft.verify_fft_options(opt,parser)
 
 ctx = scheme.from_cli(opt)
 gwstrain = strain.from_cli(opt, pycbc.DYN_RANGE_FAC)
-strain_segments = strain.StrainSegments.from_cli(opt, gwstrain)
+try:
+    strain_segments = strain.StrainSegments.from_cli(opt, gwstrain)
+except ValueError:
+    import sys
+    sys.exit(0)
 
 if not opt.use_params_of_closest_injection:
     row = WaveformArray.from_kwargs(
