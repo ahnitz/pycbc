@@ -1471,8 +1471,15 @@ class ReadByTemplate(object):
         data: numpy.ndarray
             The requested column of data
         """
-        ref = self.file['%s/%s_template' % (self.ifo, col)][num]
-        return self.file['%s/%s' % (self.ifo, col)][ref]
+        template_ds_name = '%s/%s_template' % (self.ifo, col)
+        if template_ds_name in self.file:
+            # File has optimzied region references
+            ref = self.file[template_ds_name][num]
+            return self.file['%s/%s' % (self.ifo, col)][ref]
+        else:
+            # file has integer slices
+            l, r = self.file['%s/template_slices' % self.ifo][num]
+            return self.file['%s/%s' % (self.ifo, col)][l:r]
 
     def set_template(self, num):
         """Set the active template to read from.
