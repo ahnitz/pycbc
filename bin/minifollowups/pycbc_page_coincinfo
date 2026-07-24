@@ -180,7 +180,7 @@ for ifo in files.keys():
         k: numpy.array([d[k][i]])
         for k in d.keys()
         if not k.endswith('_template')
-        and k not in ['gating', 'search', 'template_boundaries']
+        and k not in ['gating', 'search', 'template_boundaries', 'template_slices']
     }
     # Headers will store the headers that will appear in the table.
     headers = []
