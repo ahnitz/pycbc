@@ -503,6 +503,29 @@ class PyCBCInspiralExecutable(Executable):
         if tags is None:
             tags = []
         node = Node(self, valid_seg=valid_seg)
+
+        profile_sec = f"pegasus_profile-{self.name}"
+        if self.cp.has_option(profile_sec, 'pycbc|same-bank-cluster'):
+            bank_id = parent.name + self.tagged_name
+            
+            # Initialize the instance-level counter dynamically if it doesn't exist
+            if not hasattr(self, '_bank_counts'):
+                self._bank_counts = {}
+            
+            # Read the cluster size directly from the custom option
+            val = self.cp.get(profile_sec, 'pycbc|same-bank-cluster')
+            try:
+                size_limit = int(val)
+            except ValueError:
+                raise ValueError(f"The option 'pycbc|same-bank-cluster' in [{profile_sec}] must "
+                                 f"be an integer specifying the cluster size. Got: '{val}'")
+                
+            count = self._bank_counts.get(bank_id, 0)
+            chunk_id = count // size_limit
+            self._bank_counts[bank_id] = count + 1
+            
+            node.add_profile('pegasus', 'label', f"{bank_id}_c{chunk_id}")
+
         if not self.has_opt('pad-data'):
             raise ValueError("The option pad-data is a required option of "
                              "%s. Please check the ini file." % self.name)
