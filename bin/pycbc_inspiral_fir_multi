@@ -4,6 +4,9 @@ pycbc_inspiral_ratio: A pipeline-compatible script for inspiral analysis
 using the Ratio Matched Filter method.
 """
 
+import os
+import shutil
+import fcntl
 import argparse
 import logging
 import numpy as np
@@ -29,6 +32,41 @@ from pycbc.waveform.bank import RatioFilterBank
 
 tstart = time.time()
 
+import random
+
+def stage_bank_to_shm(bank_path):
+    bank_name = os.path.basename(bank_path)
+    shm_dest = os.path.join("/dev/shm", bank_name)
+    
+    # If the file is already there, return immediately
+    if os.path.exists(shm_dest):
+        return shm_dest
+        
+    # THE CULPRIT: If this lock path was set to os.getcwd() or bank_path + ".lock", 
+    # it forced the NFS/network drive to handle 32 simultaneous lock requests.
+    # 
+    # THE FIX: Force the lock file into /dev/shm so it stays strictly in local RAM.
+    lock_path = os.path.join("/dev/shm", f"{bank_name}.lock")
+    
+    # Add a tiny jitter so 32 jobs don't hit the filesystem at the exact same millisecond
+    time.sleep(random.uniform(0, 2.0))
+    
+    with open(lock_path, 'w') as lock_file:
+        # Request an exclusive lock (this will block until acquired)
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            # Double check if another process finished the copy while we were waiting
+            if not os.path.exists(shm_dest):
+                tmp_dest = shm_dest + ".tmp"
+                # Copy to a temporary file first
+                shutil.copy2(bank_path, tmp_dest)
+                # Atomic rename ensures no process reads a partially copied file
+                os.rename(tmp_dest, shm_dest)
+        finally:
+            # Release the lock
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            
+    return shm_dest
 
 def compute_batch_chisq(ids_local, t_idxs, snrs, snrs_low, snrs_high, h_norm,
                         fine_indices, tstarts, stilde, bank, chisq_estimator, engine,
@@ -127,7 +165,7 @@ def get_args():
     
     parser.add_argument("--bank-file", type=str, required=True,
                         help="Path to the HDF5 Ratio Bank file.")
-
+    parser.add_argument("--stage-bank", action='store_true')
     parser.add_argument('--snr-threshold', type=float, default=5.5,
                        help="SNR threshold for trigger generation.")
     parser.add_argument("--newsnr-threshold", type=float, metavar='THRESHOLD',
@@ -157,7 +195,7 @@ def get_args():
     parser.add_argument("--chisq-window", type=float, default=1.0)
     parser.add_argument("--chisq-iterations", type=int, default=100)
     parser.add_argument("--chisq-delta", type=float, default=0, help="FIXME: ADD")
-    
+
     # Clustering
     parser.add_argument("--cluster-window", type=float, default=0,
                        help="Length of clustering window in seconds.")
@@ -225,8 +263,13 @@ def main():
         
         # --- 4. Initialize Classes ---
         logging.info("Initializing Ratio Filter Bank...")
+        bank_file = args.bank_file
+
+        if args.stage_bank:
+            bank_file = stage_bank_to_shm(bank_file)
+
         bank = RatioFilterBank(
-            args.bank_file,
+            bank_file,
             filter_length=(flen_fine, flen_coarse),
             delta_f=delta_f,
             dtype=np.complex64,
