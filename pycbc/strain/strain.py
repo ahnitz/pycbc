@@ -59,6 +59,71 @@ def next_power_of_2(n):
     """
     return 1 << n.bit_length()
 
+import numpy as np
+from scipy.stats import norm
+
+import numpy as np
+from scipy.stats import norm
+
+def block_interpolate_normalize(x, m):
+    x_arr = np.asarray(x)
+    is_complex = np.iscomplexobj(x_arr)
+    out = np.array(x_arr, dtype=complex if is_complex else float)
+    
+    n = len(out)
+    remainder = n % m
+    main_len = n - remainder
+    
+    # Pre-allocate an array to hold the scale factor for every element
+    full_scales = np.empty(n, dtype=float)
+    
+    if is_complex:
+        MAD_TO_SD = 1.0 / np.sqrt(2 * np.log(2))
+    else:
+        MAD_TO_SD = 1.0 / norm.ppf(0.75)
+    
+    def get_scale(data):
+        if is_complex:
+            med = np.median(data.real, axis=-1, keepdims=True) + 1j * np.median(data.imag, axis=-1, keepdims=True)
+        else:
+            med = np.median(data, axis=-1, keepdims=True)
+            
+        mad = np.median(np.abs(data - med), axis=-1)
+        scale = mad * MAD_TO_SD
+        
+        return np.where(scale == 0, 1.0, scale)
+
+    if main_len > 0:
+        blocks = out[:main_len].reshape(-1, m)
+        scales = get_scale(blocks)
+        
+        scales_padded = np.append(scales, scales[-1])
+        t = np.linspace(0.0, 1.0, m, endpoint=False)
+        
+        lefts = scales_padded[:-1, None]
+        rights = scales_padded[1:, None]
+        
+        # Calculate the 2D matrix of interpolation factors
+        factors = lefts * (1.0 - t) + rights * t
+        
+        # Normalize the blocks
+        blocks /= factors 
+        
+        # Flatten the 2D factors into the 1D scale array
+        full_scales[:main_len] = factors.ravel()
+        
+    if remainder > 0:
+        tail = out[main_len:]
+        tail_scale = get_scale(tail)
+        
+        # Normalize the tail
+        out[main_len:] /= tail_scale
+        
+        # Apply the constant tail scale to the remaining elements
+        full_scales[main_len:] = tail_scale
+        
+    return out, full_scales
+
 def detect_loud_glitches(strain, psd_duration=4., psd_stride=2.,
                          psd_avg_method='median', low_freq_cutoff=30.,
                          threshold=50., cluster_window=5., corrupt_time=4.,
@@ -152,6 +217,17 @@ def detect_loud_glitches(strain, psd_duration=4., psd_stride=2.,
     strain_tilde *= (psd * norm) ** (-0.5)
 
     strain_pad = strain_tilde.to_timeseries()
+
+    from matplotlib import pyplot as plt
+    strain_pad2 = strain_pad.copy()
+    ndata, scale = block_interpolate_normalize(strain_pad2.numpy(), 2048)
+    strain_pad2.data = ndata
+    plt.plot(scale) 
+    plt.plot(ndata)
+    plt.plot(strain_pad)
+    plt.show()
+    
+    strain_pad = strain_pad2
 
     if output_intermediates:
         strain_pad[pad_start:pad_end].save_to_wav('strain_whitened.wav')
@@ -382,6 +458,9 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
     if opt.autogating_threshold is not None:
         gating_info['auto'] = []
         for _ in range(opt.autogating_max_iterations):
+            print("GLITCHING STUFF", strain.start_time, strain.end_time)
+            
+            
             glitch_times = detect_loud_glitches(
                     strain, threshold=opt.autogating_threshold,
                     cluster_window=opt.autogating_cluster,
