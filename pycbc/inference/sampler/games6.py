@@ -71,7 +71,8 @@ class GaussianMixtureProposal:
     """
 
     def __init__(self, centres, cov, rng, stretch_pairs=0,
-                 stretch_scale=1.0, weights=None):
+                 stretch_scale=1.0, weights=None, defensive_frac=0.0,
+                 defensive_scale=3.0):
         self.rng = rng
         centres = numpy.atleast_2d(centres)
         if weights is None:
@@ -114,10 +115,48 @@ class GaussianMixtureProposal:
         self._lognorm = -0.5 * (self.dim * numpy.log(2 * numpy.pi)
                                 + self.log_det)
 
+        # Defensive component: a single broad Gaussian covering the whole
+        # sample spread, mixed in with probability defensive_frac. Efficiency
+        # here is not limited by mild over-dispersion -- a proposal 10% too
+        # wide in 6-D would still be ~91% efficient -- but by rare draws where
+        # q is small while the target is not, which produce enormous weights
+        # and collapse the ESS. Mixing in a broad component bounds the weight
+        # ratio pi/q from above everywhere the broad component has support,
+        # which is the standard defensive-mixture remedy. It costs a little
+        # efficiency in the bulk and removes the tail catastrophe.
+        self.defensive_frac = float(defensive_frac)
+        if self.defensive_frac > 0:
+            self.def_mean = numpy.average(self.centres, axis=0,
+                                          weights=self.weights)
+            spread = numpy.cov(self.centres.T, aweights=self.weights)
+            self.def_cov = spread * defensive_scale ** 2
+            eps2 = 1e-12 * numpy.trace(self.def_cov) / self.dim
+            for _ in range(8):
+                try:
+                    self.def_chol = numpy.linalg.cholesky(self.def_cov)
+                    break
+                except numpy.linalg.LinAlgError:
+                    self.def_cov = self.def_cov + eps2 * numpy.eye(self.dim)
+                    eps2 *= 10
+            else:
+                self.defensive_frac = 0.0
+        if self.defensive_frac > 0:
+            self.def_inv = numpy.linalg.inv(self.def_cov)
+            self.def_lognorm = -0.5 * (
+                self.dim * numpy.log(2 * numpy.pi)
+                + 2.0 * numpy.log(numpy.diag(self.def_chol)).sum())
+
     def sample(self, size):
         idx = self.rng.choice(self.n, size=size, p=self.weights)
         z = self.rng.normal(size=(size, self.dim))
-        return self.centres[idx] + z @ self.chol.T
+        x = self.centres[idx] + z @ self.chol.T
+        if self.defensive_frac > 0:
+            use = self.rng.random(size) < self.defensive_frac
+            k = int(use.sum())
+            if k:
+                zb = self.rng.normal(size=(k, self.dim))
+                x[use] = self.def_mean + zb @ self.def_chol.T
+        return x
 
     def logpdf(self, x):
         """ log density, exact: logsumexp over centres minus log(n). """
@@ -129,6 +168,13 @@ class GaussianMixtureProposal:
             m = numpy.einsum('ijk,kl,ijl->ij', d, self.inv, d)
             out[s:s+chunk] = (logsumexp(-0.5 * m + self.logw[None, :], axis=1)
                               + self._lognorm)
+        if self.defensive_frac > 0:
+            zb = x - self.def_mean
+            mb = numpy.einsum('ij,jk,ik->i', zb, self.def_inv, zb)
+            logb = -0.5 * mb + self.def_lognorm
+            out = numpy.logaddexp(
+                numpy.log1p(-self.defensive_frac) + out,
+                numpy.log(self.defensive_frac) + logb)
         return out
 
 
@@ -189,6 +235,9 @@ class GameSampler6(DummySampler):
                  gen_max_centres=3000,
                  gen_refit=1,
                  gen_bandwidth=1.0,
+                 gen_bandwidths=None,
+                 gen_defensive=0.1,
+                 gen_defensive_scale=3.0,
                  stretch_pairs=0,
                  stretch_scale=1.0,
                  **kwargs):
@@ -214,6 +263,20 @@ class GameSampler6(DummySampler):
         self.gen_max_centres = int(gen_max_centres)
         self.gen_refit = int(gen_refit)
         self.gen_bandwidth = float(gen_bandwidth)
+        # One generative stratum per bandwidth. Because strata are combined
+        # with beta proportional to ESS, the mixture automatically shifts
+        # toward whichever bandwidth is working, with no switching rule to
+        # tune: a bandwidth that proposes badly earns a small ESS and so a
+        # small beta. Budget is also reallocated toward the better strata.
+        if gen_bandwidths is None:
+            self.gen_bandwidths = [self.gen_bandwidth]
+        elif isinstance(gen_bandwidths, str):
+            self.gen_bandwidths = [float(v) for v in
+                                   gen_bandwidths.replace(',', ' ').split()]
+        else:
+            self.gen_bandwidths = [float(v) for v in gen_bandwidths]
+        self.gen_defensive = float(gen_defensive)
+        self.gen_defensive_scale = float(gen_defensive_scale)
         self.stretch_pairs = int(stretch_pairs)
         self.stretch_scale = float(stretch_scale)
         # seeded from the legacy global RNG, which pycbc_inference --seed sets,
@@ -276,7 +339,7 @@ class GameSampler6(DummySampler):
 
     # ---------------- generative stratum -----------------------------------
 
-    def gen_round(self, proposal, budget):
+    def gen_round(self, proposal, budget, stratum='gen'):
         """ One round from the generative proposal. Out-of-prior draws are
         dropped before any likelihood call.
         """
@@ -291,7 +354,7 @@ class GameSampler6(DummySampler):
         psamp = FieldArray(len(x), dtype=self.dtype)
         for k, p in enumerate(names):
             psamp[p] = x[:, k]
-        loglr = self._likelihoods(psamp, stratum='gen')
+        loglr = self._likelihoods(psamp, stratum=stratum)
         # uniform prior => its density is a constant that cancels in the
         # stratum's own self-normalisation
         return psamp, loglr, loglr - logq
@@ -363,20 +426,26 @@ class GameSampler6(DummySampler):
 
         weight = lengths / lengths.sum()
         # per-stratum accumulators
-        strata = {'pool': {'samp': None, 'loglr': None, 'logw': None},
-                  'gen': {'samp': None, 'loglr': None, 'logw': None}}
-        proposal = None
+        gen_keys = [f'gen:bw{bw:g}' for bw in self.gen_bandwidths]
+        strata = {'pool': {'samp': None, 'loglr': None, 'logw': None}}
+        for k in gen_keys:
+            strata[k] = {'samp': None, 'loglr': None, 'logw': None}
+        self.stratum_calls = {k: 0 for k in ['pool'] + gen_keys}
+        proposals = {}
+        # per-stratum share of the generative budget, adapted by ESS per call
+        share = {k: 1.0 / len(gen_keys) for k in gen_keys}
         pool_dead = False
         frac = self.gen_fraction
 
         for rnd in range(1, self.rounds + 1):
             gen_budget = 0
-            if proposal is not None:
+            if proposals:
                 gen_budget = int(self.target_likelihood_calls
                                  * (1.0 if pool_dead else frac))
             pool_budget = self.target_likelihood_calls - gen_budget
 
-            pool_gain = gen_gain = None
+            pool_gain = None
+            gen_gains = {}
             if pool_budget > 0 and not pool_dead:
                 try:
                     ps, pl, pw, bid = self.pool_round(
@@ -393,33 +462,49 @@ class GameSampler6(DummySampler):
                         weight[j] += v
                 except OutOfSamples:
                     logging.info('pool exhausted at round %i; handing its '
-                                 'budget to the generative proposal', rnd)
+                                 'budget to the generative proposals', rnd)
                     pool_dead = True
-                    if proposal is None:
-                        # nothing to fall back on yet -- try to build it now
-                        proposal = self._fit_proposal(strata)
-                    if proposal is None:
+                    if not proposals:
+                        proposals = self._fit_proposals(strata, gen_keys)
+                    if not proposals:
                         logging.info('no generative proposal available; stop')
                         break
                     gen_budget = self.target_likelihood_calls
 
-            if gen_budget > 0 and proposal is not None:
-                got = self.gen_round(proposal, gen_budget)
-                if got is not None:
+            if gen_budget > 0 and proposals:
+                live = [k for k in gen_keys if k in proposals]
+                tot_share = sum(share[k] for k in live) or 1.0
+                for k in live:
+                    b = int(gen_budget * share[k] / tot_share)
+                    if b <= 0:
+                        continue
+                    got = self.gen_round(proposals[k], b, stratum=k)
+                    if got is None:
+                        continue
                     gs, gl, gw = got
-                    before = self._ess(strata['gen']['logw'])
-                    strata['gen'] = self._accumulate(strata['gen'],
-                                                     gs, gl, gw)
-                    after = self._ess(strata['gen']['logw'])
-                    gen_gain = (after - before) / max(len(gw), 1)
+                    before = self._ess(strata[k]['logw'])
+                    strata[k] = self._accumulate(strata[k], gs, gl, gw)
+                    after = self._ess(strata[k]['logw'])
+                    gen_gains[k] = (after - before) / max(len(gw), 1)
+                if gen_gains:
+                    tot = sum(max(v, 0) for v in gen_gains.values())
+                    if tot > 0:
+                        for k in gen_keys:
+                            g = max(gen_gains.get(k, 0.0), 0.0) / tot
+                            share[k] = 0.5 * share[k] + 0.5 * g
+                        ssum = sum(share.values()) or 1.0
+                        for k in gen_keys:
+                            share[k] = max(share[k] / ssum, 0.02)
 
             # shift budget toward whichever stratum yields more ESS per call.
             # gen_fraction <= 0 means "hold the generative proposal in reserve":
             # the pool keeps the entire budget, so behaviour before exhaustion
             # is identical to games3, and the generative stratum only runs once
             # the pool dies and hands over its budget.
+            best_gen = max(gen_gains.values()) if gen_gains else None
             if self.gen_fraction > 0 and pool_gain is not None \
-                    and gen_gain is not None:
+                    and best_gen is not None:
+                gen_gain = best_gen
                 tot = max(pool_gain, 0) + max(gen_gain, 0)
                 if tot > 0:
                     frac = 0.5 * frac + 0.5 * (max(gen_gain, 0) / tot)
@@ -435,15 +520,18 @@ class GameSampler6(DummySampler):
             # that round.
             if rnd >= self.gen_start_round and self.gen_refit > 0 and \
                     (rnd - self.gen_start_round) % self.gen_refit == 0:
-                new = self._fit_proposal(strata)
-                if new is not None:
-                    proposal = new
+                new = self._fit_proposals(strata, gen_keys)
+                if new:
+                    proposals = new
 
             ess_p = self._ess(strata['pool']['logw'])
-            ess_g = self._ess(strata['gen']['logw'])
-            logging.info('round %i: ESS pool=%.1f gen=%.1f total=%.1f '
-                         'ncalls=%i gen_frac=%.2f', rnd, ess_p, ess_g,
-                         ess_p + ess_g, self.ncalls, frac)
+            gsum = sum(self._ess(strata[k]['logw']) for k in gen_keys)
+            detail = ' '.join(
+                f'{k.split(":")[1]}={self._ess(strata[k]["logw"]):.0f}'
+                for k in gen_keys)
+            logging.info('round %i: ESS pool=%.1f gen[%s] total=%.1f '
+                         'ncalls=%i', rnd, ess_p, detail, ess_p + gsum,
+                         self.ncalls)
 
         self._finalise(strata)
 
@@ -454,7 +542,18 @@ class GameSampler6(DummySampler):
                 'loglr': numpy.concatenate([loglr, st['loglr']]),
                 'logw': numpy.concatenate([logw, st['logw']])}
 
-    def _fit_proposal(self, strata):
+    def _fit_proposals(self, strata, gen_keys):
+        out = {}
+        for bw, k in zip(self.gen_bandwidths, gen_keys):
+            p = self._fit_proposal(strata, bw)
+            if p is not None:
+                out[k] = p
+        if out:
+            logging.info('fitted %i generative proposals: %s', len(out),
+                         ', '.join(sorted(out)))
+        return out
+
+    def _fit_proposal(self, strata, bandwidth=None):
         """ Fit the generative proposal to the accumulated posterior samples
         from every stratum, resampled to equal weight.
         """
@@ -489,9 +588,14 @@ class GameSampler6(DummySampler):
         # keeps every sample's contribution proportional to its posterior mass
         # while retaining full tail coverage.
         n = min(self.gen_max_centres, len(x))
-        order = numpy.argsort(w)[::-1][:n]
+        if n < len(x):
+            order = self._rng.choice(len(x), size=n, replace=False)
+        else:
+            order = numpy.arange(len(x))
         centres = x[order]
         cw = w[order]
+        if cw.sum() <= 0:
+            return None
         # weighted covariance over ALL samples, which uses the full posterior
         # information rather than only the retained centres
         mu = (w[:, None] * x).sum(0)
@@ -501,9 +605,13 @@ class GameSampler6(DummySampler):
             return None
         try:
             prop = GaussianMixtureProposal(
-                centres, cov * self.gen_bandwidth ** 2, self._rng,
+                centres,
+                cov * (self.gen_bandwidth if bandwidth is None
+                       else bandwidth) ** 2, self._rng,
                 stretch_pairs=self.stretch_pairs,
-                stretch_scale=self.stretch_scale, weights=cw)
+                stretch_scale=self.stretch_scale, weights=cw,
+                defensive_frac=self.gen_defensive,
+                defensive_scale=self.gen_defensive_scale)
         except numpy.linalg.LinAlgError:
             logging.info('generative proposal fit failed (singular kernel)')
             return None
