@@ -47,6 +47,19 @@ Consequences worth stating:
     does not bias a self-normalised estimate.
   * Pool exhaustion no longer ends the run: the exhausted stratum's budget is
     handed to the generative stratum for the remaining rounds.
+
+Validated configuration
+------------------------
+The constructor defaults below ARE the validated settings (see
+example_bns/GAMES6_RESULTS.md): local-covariance kernel (``gen_local_k=160``,
+not the global ``GaussianMixtureProposal`` fallback), raw coordinates
+(``gen_logit=0`` -- the logit/prior-box map made things worse, kept only as a
+documented negative result), no defensive component (``gen_defensive=0``),
+reserve mode (``gen_fraction=0`` -- the pool keeps the full budget until it
+exhausts, then hands over), and weighted-without-replacement centre
+subsampling once accumulated samples exceed ``gen_max_centres``. Only two
+knobs need a per-case override away from these defaults: ``gen_max_centres``
+and ``gen_min_ess`` at the most extreme SNR (see prior_g6final_snr100.ini).
 """
 import os
 import logging
@@ -407,16 +420,16 @@ class GameSampler6(DummySampler):
                  loglr_region=25,
                  target_likelihood_calls=1e5,
                  rounds=1,
-                 gen_start_round=3,
-                 gen_min_ess=200,
-                 gen_fraction=0.3,
-                 gen_max_centres=3000,
+                 gen_start_round=1,
+                 gen_min_ess=100,
+                 gen_fraction=0.0,
+                 gen_max_centres=20000,
                  gen_refit=1,
                  gen_bandwidth=1.0,
                  gen_bandwidths=None,
-                 gen_local_k=0,
-                 gen_logit=1,
-                 gen_defensive=0.1,
+                 gen_local_k=160,
+                 gen_logit=0,
+                 gen_defensive=0.0,
                  gen_defensive_scale=3.0,
                  stretch_pairs=0,
                  stretch_scale=1.0,
