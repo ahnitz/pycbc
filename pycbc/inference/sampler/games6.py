@@ -48,6 +48,7 @@ Consequences worth stating:
   * Pool exhaustion no longer ends the run: the exhausted stratum's budget is
     handed to the generative stratum for the remaining rounds.
 """
+import os
 import logging
 import tqdm
 import h5py
@@ -473,7 +474,27 @@ class GameSampler6(DummySampler):
 
         loglr = self._likelihoods(psamp, stratum='pool')
         logw = loglr + numpy.log(lengths[bin_id]) - pweight
+        self._dump('pool', loglr=loglr, logw=logw, bin_id=bin_id,
+                   binlen=lengths[bin_id], pweight=pweight,
+                   bin_weight=bin_weight, drawcount=drawcount,
+                   x=numpy.column_stack([psamp[p] for p in
+                                         self.model.variable_params]))
         return psamp, loglr, logw, bin_id
+
+    # ---------------- temporary diagnostics (env-var gated) -----------------
+
+    def _dump(self, tag, **kwargs):
+        """ Write per-round weight forensics if GAMES6_DUMP is set to a path
+        prefix. Purely diagnostic: no effect on the sampler when unset.
+        """
+        prefix = os.environ.get('GAMES6_DUMP')
+        if not prefix:
+            return
+        fn = '%s_%s_r%02i.npz' % (prefix, tag.replace(':', '-'),
+                                  getattr(self, '_round', 0))
+        kwargs['names'] = numpy.array(list(self.model.variable_params))
+        numpy.savez(fn, **kwargs)
+        logging.info('dumped %s diagnostics to %s', tag, fn)
 
     # ---------------- generative stratum -----------------------------------
 
@@ -482,17 +503,35 @@ class GameSampler6(DummySampler):
         dropped before any likelihood call.
         """
         names = list(self.model.variable_params)
-        x = proposal.sample(budget)
-        keep = self._in_prior(x, names)
+        xall = proposal.sample(budget)
+        keep = self._in_prior(xall, names)
         if keep.sum() == 0:
+            self._dump(stratum + '-rejected', x=xall,
+                       is_logit=int(isinstance(proposal, BoundedProposal)),
+                       lo=getattr(proposal, 'lo', numpy.zeros(0)),
+                       hi=getattr(proposal, 'hi', numpy.zeros(0)))
             return None
-        x = x[keep]
+        x = xall[keep]
         logq = proposal.logpdf(x)
 
         psamp = FieldArray(len(x), dtype=self.dtype)
         for k, p in enumerate(names):
             psamp[p] = x[:, k]
         loglr = self._likelihoods(psamp, stratum=stratum)
+        self._dump(stratum, x=x, loglr=loglr, logq=logq, budget=budget,
+                   nkept=int(keep.sum()),
+                   centres=getattr(proposal, 'centres',
+                                   getattr(getattr(proposal, 'inner', None),
+                                           'centres', numpy.zeros(0))),
+                   cweights=getattr(proposal, 'weights',
+                                    getattr(getattr(proposal, 'inner', None),
+                                            'weights', numpy.zeros(0))),
+                   kcov=getattr(proposal, 'cov',
+                                getattr(getattr(proposal, 'inner', None),
+                                        'cov', numpy.zeros(0))),
+                   is_logit=int(isinstance(proposal, BoundedProposal)),
+                   lo=getattr(proposal, 'lo', numpy.zeros(0)),
+                   hi=getattr(proposal, 'hi', numpy.zeros(0)))
         # uniform prior => its density is a constant that cancels in the
         # stratum's own self-normalisation
         return psamp, loglr, loglr - logq
@@ -576,6 +615,7 @@ class GameSampler6(DummySampler):
         frac = self.gen_fraction
 
         for rnd in range(1, self.rounds + 1):
+            self._round = rnd
             gen_budget = 0
             if proposals:
                 gen_budget = int(self.target_likelihood_calls
@@ -616,14 +656,19 @@ class GameSampler6(DummySampler):
                     b = int(gen_budget * share[k] / tot_share)
                     if b <= 0:
                         continue
-                    got = self.gen_round(proposals[k], b, stratum=k)
+                    got = self.gen_round(proposals[k], b, stratum=k)  # noqa
                     if got is None:
                         continue
                     gs, gl, gw = got
-                    before = self._ess(strata[k]['logw'])
-                    strata[k] = self._accumulate(strata[k], gs, gl, gw)
-                    after = self._ess(strata[k]['logw'])
-                    gen_gains[k] = (after - before) / max(len(gw), 1)
+                    # one stratum per (bandwidth, round): each round used a
+                    # different refitted proposal, so its samples are only
+                    # commensurate with themselves
+                    rk = f'{k}:r{rnd}'
+                    strata[rk] = {'samp': gs, 'loglr': gl, 'logw': gw}
+                    self.stratum_calls.setdefault(rk, 0)
+                    self.stratum_calls[rk] = len(gw)
+                    self.stratum_calls[k] = self.stratum_calls.get(k, 0)
+                    gen_gains[k] = self._ess(gw) / max(len(gw), 1)
                 if gen_gains:
                     tot = sum(max(v, 0) for v in gen_gains.values())
                     if tot > 0:
@@ -663,10 +708,9 @@ class GameSampler6(DummySampler):
                     proposals = new
 
             ess_p = self._ess(strata['pool']['logw'])
-            gsum = sum(self._ess(strata[k]['logw']) for k in gen_keys)
-            detail = ' '.join(
-                f'{k.split(":")[1]}={self._ess(strata[k]["logw"]):.0f}'
-                for k in gen_keys)
+            gkeys = [q for q in strata if q.startswith('gen')]
+            gsum = sum(self._ess(strata[q]['logw']) for q in gkeys)
+            detail = f'{len(gkeys)} sub-strata'
             logging.info('round %i: ESS pool=%.1f gen[%s] total=%.1f '
                          'ncalls=%i', rnd, ess_p, detail, ess_p + gsum,
                          self.ncalls)
@@ -715,18 +759,31 @@ class GameSampler6(DummySampler):
         """
         names = list(self.model.variable_params)
         xs, ws = [], []
-        for st in strata.values():
+        _diag = []
+        _essfix = os.environ.get('GAMES6_ESSFIX', '0') == '1'
+        for kk, st in strata.items():
             if st['samp'] is None:
                 continue
             xs.append(numpy.column_stack([st['samp'][p] for p in names]))
             lw = st['logw']
-            ws.append(numpy.exp(lw - logsumexp(lw)))
+            wv = numpy.exp(lw - logsumexp(lw))
+            _e = 1.0 / (wv ** 2).sum()
+            _diag.append((kk, len(wv), _e))
+            if _essfix:
+                # scale each block by its own ESS, so a stratum contributes
+                # in proportion to the information it carries
+                wv = wv * _e
+            ws.append(wv)
         if not xs:
             return None
         x = numpy.vstack(xs)
         w = numpy.concatenate(ws)
         w = w / w.sum()
         ess = 1.0 / (w ** 2).sum()
+        logging.info('FITDIAG blocks=%s sum_ess=%.1f pooled_w_ess=%.1f '
+                     'essfix=%i',
+                     ';'.join('%s:n=%i,ess=%.1f' % d for d in _diag),
+                     sum(d[2] for d in _diag), ess, int(_essfix))
         if ess < self.gen_min_ess:
             logging.debug('accumulated ESS %.1f below gen_min_ess %.1f; '
                           'not fitting generative proposal yet',
@@ -752,6 +809,9 @@ class GameSampler6(DummySampler):
         cw = w[order]
         if cw.sum() <= 0:
             return None
+        logging.info('FITDIAG centres=%i centre_w_ess=%.1f (of %i drawn '
+                     'from %i)', len(cw),
+                     cw.sum() ** 2 / (cw ** 2).sum(), n, len(x))
         # weighted covariance over ALL samples, which uses the full posterior
         # information rather than only the retained centres
         mu = (w[:, None] * x).sum(0)
@@ -759,45 +819,47 @@ class GameSampler6(DummySampler):
         cov = (w[:, None] * xc).T @ xc / max(1.0 - (w ** 2).sum(), 1e-12)
         if not numpy.all(numpy.isfinite(cov)):
             return None
+        # Kernel choice and coordinate transform are ORTHOGONAL, and must be
+        # composed rather than raced. An earlier version returned from the logit
+        # branch before the gen_local_k test could run, and since gen_logit
+        # defaults to 1 that made the local-covariance kernel dead code -- it was
+        # then wrongly reported as "tried and ineffective". Build the kernel
+        # first, then optionally wrap it in the logit map.
+        bw = self.gen_bandwidth if bandwidth is None else bandwidth
         bnd = self._prior_bounds() if self.gen_logit else None
+
+        fit_x, lo, hi = centres, None, None
         if bnd is not None:
             lo, hi = bnd
-            yc = BoundedProposal.to_y(centres, lo, hi - lo)
-            ycov = numpy.cov(yc.T)
-            if not numpy.all(numpy.isfinite(ycov)):
-                bnd = None
-            else:
-                try:
-                    inner = GaussianMixtureProposal(
-                        yc, ycov * (self.gen_bandwidth if bandwidth is None
-                                    else bandwidth) ** 2, self._rng,
-                        stretch_pairs=self.stretch_pairs,
-                        stretch_scale=self.stretch_scale, weights=cw)
-                except numpy.linalg.LinAlgError:
-                    return None
-                logging.info('fitted logit-space proposal: %i centres',
-                             inner.n)
-                return BoundedProposal(inner, lo, hi)
+            fit_x = BoundedProposal.to_y(centres, lo, hi - lo)
+            if not numpy.all(numpy.isfinite(fit_x)):
+                fit_x, lo, hi = centres, None, None
+
         try:
             if self.gen_local_k > 0:
-                return LocalCovarianceProposal(
-                    centres, self._rng, k=self.gen_local_k,
-                    scale=(self.gen_bandwidth if bandwidth is None
-                           else bandwidth), weights=cw)
-            prop = GaussianMixtureProposal(
-                centres,
-                cov * (self.gen_bandwidth if bandwidth is None
-                       else bandwidth) ** 2, self._rng,
-                stretch_pairs=self.stretch_pairs,
-                stretch_scale=self.stretch_scale, weights=cw,
-                defensive_frac=self.gen_defensive,
-                defensive_scale=self.gen_defensive_scale)
+                inner = LocalCovarianceProposal(
+                    fit_x, self._rng, k=self.gen_local_k, scale=bw, weights=cw)
+            else:
+                fcov = numpy.cov(fit_x.T, aweights=cw) if lo is not None \
+                    else cov
+                if not numpy.all(numpy.isfinite(fcov)):
+                    return None
+                inner = GaussianMixtureProposal(
+                    fit_x, fcov * bw ** 2, self._rng,
+                    stretch_pairs=self.stretch_pairs,
+                    stretch_scale=self.stretch_scale, weights=cw,
+                    defensive_frac=self.gen_defensive,
+                    defensive_scale=self.gen_defensive_scale)
         except numpy.linalg.LinAlgError:
             logging.info('generative proposal fit failed (singular kernel)')
             return None
-        logging.info('fitted generative proposal: %i centres '
-                     '(%i stretch), accumulated ESS %.1f',
-                     prop.n, self.stretch_pairs, ess)
+
+        prop = inner if lo is None else BoundedProposal(inner, lo, hi)
+        kern = ('local%d' % self.gen_local_k if self.gen_local_k > 0
+                else 'global')
+        logging.info('fitted proposal: kernel=%s space=%s bw=%.2f centres=%i '
+                     'accumulated ESS=%.1f', kern,
+                     'logit' if lo is not None else 'raw', bw, inner.n, ess)
         return prop
 
     def _finalise(self, strata):
