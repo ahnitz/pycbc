@@ -193,7 +193,7 @@ class LocalCovarianceProposal:
     """
 
     def __init__(self, centres, rng, k=40, scale=1.0, weights=None,
-                 ridge=1e-3):
+                 ridge=1e-3, defensive_frac=0.0, defensive_scale=3.0):
         from scipy.spatial import cKDTree
         self.rng = rng
         self.centres = numpy.atleast_2d(centres)
@@ -203,6 +203,7 @@ class LocalCovarianceProposal:
         self.weights = numpy.asarray(weights, float)
         self.weights /= self.weights.sum()
         self.logw = numpy.log(numpy.maximum(self.weights, 1e-300))
+        self.defensive_frac = float(defensive_frac)
 
         # Everything is built in globally WHITENED coordinates, where every
         # parameter is O(1). Doing this in physical units is a trap: the six
@@ -240,10 +241,45 @@ class LocalCovarianceProposal:
             self.lognorm[i] = -0.5 * (self.dim * numpy.log(2 * numpy.pi)
                                       + 2.0 * numpy.log(numpy.diag(L)).sum())
 
+        # Defensive component: a single broad Gaussian in the same whitened
+        # z-space, covering the full weighted spread of centres, mixed in with
+        # probability defensive_frac. Local kernels are tight by design (each
+        # is sized to its own k-NN neighbourhood), so a centre far from where
+        # a query point lands can leave the local mixture density essentially
+        # zero there even though the true posterior is not -- the same
+        # tail-catastrophe risk the global-covariance proposal's defensive
+        # component guards against, here guarding a per-centre kernel instead
+        # of a single global one.
+        if self.defensive_frac > 0:
+            self.def_mean = numpy.average(cz, axis=0, weights=self.weights)
+            spread = numpy.cov(cz.T, aweights=self.weights)
+            def_cov = spread * defensive_scale ** 2
+            eps2 = 1e-12 * numpy.trace(def_cov) / self.dim
+            for _ in range(8):
+                try:
+                    self.def_chol = numpy.linalg.cholesky(def_cov)
+                    break
+                except numpy.linalg.LinAlgError:
+                    def_cov = def_cov + eps2 * numpy.eye(self.dim)
+                    eps2 *= 10
+            else:
+                self.defensive_frac = 0.0
+        if self.defensive_frac > 0:
+            self.def_inv = numpy.linalg.inv(def_cov)
+            self.def_lognorm = -0.5 * (
+                self.dim * numpy.log(2 * numpy.pi)
+                + 2.0 * numpy.log(numpy.diag(self.def_chol)).sum())
+
     def sample(self, size):
         idx = self.rng.choice(self.n, size=size, p=self.weights)
         z0 = self.rng.normal(size=(size, self.dim))
         z = self._cz[idx] + numpy.einsum('nij,nj->ni', self.chol[idx], z0)
+        if self.defensive_frac > 0:
+            use = self.rng.random(size) < self.defensive_frac
+            k = int(use.sum())
+            if k:
+                zb = self.rng.normal(size=(k, self.dim))
+                z[use] = self.def_mean + zb @ self.def_chol.T
         return z @ self._Winv
 
     def logpdf(self, x):
@@ -254,6 +290,13 @@ class LocalCovarianceProposal:
             m = numpy.einsum('ij,jk,ik->i', d, self.inv[i], d)
             out = numpy.logaddexp(out, -0.5 * m + self.lognorm[i]
                                   + self.logw[i])
+        if self.defensive_frac > 0:
+            zb = z - self.def_mean
+            mb = numpy.einsum('ij,jk,ik->i', zb, self.def_inv, zb)
+            logb = -0.5 * mb + self.def_lognorm
+            out = numpy.logaddexp(
+                numpy.log1p(-self.defensive_frac) + out,
+                numpy.log(self.defensive_frac) + logb)
         # change of variables from whitened z back to physical x
         return out + self._logdetW
 
@@ -842,7 +885,9 @@ class GameSampler6(DummySampler):
         try:
             if self.gen_local_k > 0:
                 inner = LocalCovarianceProposal(
-                    fit_x, self._rng, k=self.gen_local_k, scale=bw, weights=cw)
+                    fit_x, self._rng, k=self.gen_local_k, scale=bw,
+                    weights=cw, defensive_frac=self.gen_defensive,
+                    defensive_scale=self.gen_defensive_scale)
             else:
                 fcov = numpy.cov(fit_x.T, aweights=cw) if lo is not None \
                     else cov
