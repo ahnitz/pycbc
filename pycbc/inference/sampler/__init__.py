@@ -30,6 +30,7 @@ from .games import GameSampler
 from .games2 import GameSampler2
 from .games3 import GameSampler3
 from .games4 import GameSampler4
+from .games6 import GameSampler6
 
 # list of available samplers
 samplers = {cls.name: cls for cls in (
@@ -42,6 +43,7 @@ samplers = {cls.name: cls for cls in (
     GameSampler2,
     GameSampler3,
     GameSampler4,
+    GameSampler6,
 )}
 
 try:
