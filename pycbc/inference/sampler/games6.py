@@ -257,6 +257,61 @@ class LocalCovarianceProposal:
         return out + self._logdetW
 
 
+class BoundedProposal:
+    """ Wraps a mixture proposal in a logit map onto the prior box.
+
+    The posterior here runs hard up against its prior boundaries -- it is nearly
+    uniform in lambda2 across the full [0, 1000] range, and 20% of its mass sits
+    within 2% of some edge -- and a Gaussian kernel cannot represent a sharp
+    edge. Fitting in the raw parameters leaks 26% of draws outside the prior and,
+    worse, leaves q deficient just inside each edge (measured: weights within 2%
+    of an edge are 3x the interior), because the kernel mass that should sit
+    there fell outside instead. Uneven q means weight variance, which is ESS.
+
+    Mapping each parameter to y = logit((x - a) / (b - a)) removes both effects
+    at once: the support becomes exactly the prior box, so nothing leaks and
+    nothing is rejected, and a density that is flat against the edge in x is
+    unbounded-and-smooth in y, which is a shape a Gaussian mixture can represent.
+    """
+
+    def __init__(self, inner, lo, hi):
+        self.inner = inner
+        self.lo = numpy.asarray(lo, float)
+        self.hi = numpy.asarray(hi, float)
+        self.span = self.hi - self.lo
+
+    @staticmethod
+    def to_y(x, lo, span, eps=1e-9):
+        u = numpy.clip((x - lo) / span, eps, 1.0 - eps)
+        return numpy.log(u / (1.0 - u))
+
+    # Keep draws strictly inside the prior. sigmoid(y) underflows for large
+    # negative y, and lo + span*4e-18 rounds back to exactly lo in float64 for
+    # a tight parameter like mchirp (span 2e-3), which pycbc's Uniform treats
+    # as outside its bounds -- every such draw would then be rejected. An inset
+    # of 1e-10 of the span is far above the float64 spacing at these values and
+    # displaces a completely negligible amount of probability.
+    INSET = 1e-10
+
+    def to_x(self, y):
+        u = 1.0 / (1.0 + numpy.exp(-y))
+        u = numpy.clip(u, self.INSET, 1.0 - self.INSET)
+        return self.lo + self.span * u
+
+    def _log_jac(self, y):
+        """ log|dy/dx| = -log(span) - log u - log(1-u), with u = sigmoid(y). """
+        logu = -numpy.log1p(numpy.exp(-y))
+        log1mu = -numpy.log1p(numpy.exp(y))
+        return (-numpy.log(self.span)[None, :] - logu - log1mu).sum(axis=1)
+
+    def sample(self, size):
+        return self.to_x(self.inner.sample(size))
+
+    def logpdf(self, x):
+        y = self.to_y(x, self.lo, self.span)
+        return self.inner.logpdf(y) + self._log_jac(y)
+
+
 class GameSampler6(DummySampler):
     """games3 with inexhaustible generative proposals combined by strata.
 
@@ -316,6 +371,7 @@ class GameSampler6(DummySampler):
                  gen_bandwidth=1.0,
                  gen_bandwidths=None,
                  gen_local_k=0,
+                 gen_logit=1,
                  gen_defensive=0.1,
                  gen_defensive_scale=3.0,
                  stretch_pairs=0,
@@ -356,6 +412,7 @@ class GameSampler6(DummySampler):
         else:
             self.gen_bandwidths = [float(v) for v in gen_bandwidths]
         self.gen_local_k = int(gen_local_k)
+        self.gen_logit = int(gen_logit)
         self.gen_defensive = float(gen_defensive)
         self.gen_defensive_scale = float(gen_defensive_scale)
         self.stretch_pairs = int(stretch_pairs)
@@ -634,6 +691,24 @@ class GameSampler6(DummySampler):
                          ', '.join(sorted(out)))
         return out
 
+    def _prior_bounds(self):
+        names = list(self.model.variable_params)
+        lo = numpy.full(len(names), -numpy.inf)
+        hi = numpy.full(len(names), numpy.inf)
+        try:
+            dists = self.model.prior_distribution.distributions
+        except AttributeError:
+            return None
+        for dist in dists:
+            b = getattr(dist, 'bounds', None) or {}
+            for k, v in b.items():
+                if k in names:
+                    i = names.index(k)
+                    lo[i], hi[i] = float(v[0]), float(v[1])
+        if not numpy.all(numpy.isfinite(lo) & numpy.isfinite(hi)):
+            return None
+        return lo, hi
+
     def _fit_proposal(self, strata, bandwidth=None):
         """ Fit the generative proposal to the accumulated posterior samples
         from every stratum, resampled to equal weight.
@@ -684,6 +759,25 @@ class GameSampler6(DummySampler):
         cov = (w[:, None] * xc).T @ xc / max(1.0 - (w ** 2).sum(), 1e-12)
         if not numpy.all(numpy.isfinite(cov)):
             return None
+        bnd = self._prior_bounds() if self.gen_logit else None
+        if bnd is not None:
+            lo, hi = bnd
+            yc = BoundedProposal.to_y(centres, lo, hi - lo)
+            ycov = numpy.cov(yc.T)
+            if not numpy.all(numpy.isfinite(ycov)):
+                bnd = None
+            else:
+                try:
+                    inner = GaussianMixtureProposal(
+                        yc, ycov * (self.gen_bandwidth if bandwidth is None
+                                    else bandwidth) ** 2, self._rng,
+                        stretch_pairs=self.stretch_pairs,
+                        stretch_scale=self.stretch_scale, weights=cw)
+                except numpy.linalg.LinAlgError:
+                    return None
+                logging.info('fitted logit-space proposal: %i centres',
+                             inner.n)
+                return BoundedProposal(inner, lo, hi)
         try:
             if self.gen_local_k > 0:
                 return LocalCovarianceProposal(
