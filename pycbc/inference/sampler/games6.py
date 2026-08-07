@@ -71,14 +71,23 @@ class GaussianMixtureProposal:
     """
 
     def __init__(self, centres, cov, rng, stretch_pairs=0,
-                 stretch_scale=1.0):
+                 stretch_scale=1.0, weights=None):
         self.rng = rng
         centres = numpy.atleast_2d(centres)
+        if weights is None:
+            weights = numpy.full(len(centres), 1.0 / len(centres))
+        weights = numpy.asarray(weights, dtype=float)
         if stretch_pairs > 0 and len(centres) > 2:
             a = centres[rng.integers(0, len(centres), stretch_pairs)]
             b = centres[rng.integers(0, len(centres), stretch_pairs)]
             u = rng.uniform(0.0, stretch_scale, size=(stretch_pairs, 1))
+            # stretch centres inherit the mean component weight, so adding
+            # them reshapes the proposal without reweighting the originals
+            extra = numpy.full(stretch_pairs, weights.mean())
             centres = numpy.vstack([centres, a + u * (b - a)])
+            weights = numpy.concatenate([weights, extra])
+        self.weights = weights / weights.sum()
+        self.logw = numpy.log(numpy.maximum(self.weights, 1e-300))
         self.centres = centres
         self.n, self.dim = centres.shape
 
@@ -106,7 +115,7 @@ class GaussianMixtureProposal:
                                 + self.log_det)
 
     def sample(self, size):
-        idx = self.rng.integers(0, self.n, size)
+        idx = self.rng.choice(self.n, size=size, p=self.weights)
         z = self.rng.normal(size=(size, self.dim))
         return self.centres[idx] + z @ self.chol.T
 
@@ -118,8 +127,8 @@ class GaussianMixtureProposal:
         for s in range(0, len(x), chunk):
             d = x[s:s+chunk, None, :] - self.centres[None, :, :]
             m = numpy.einsum('ijk,kl,ijl->ij', d, self.inv, d)
-            out[s:s+chunk] = (logsumexp(-0.5 * m, axis=1) + self._lognorm
-                              - numpy.log(self.n))
+            out[s:s+chunk] = (logsumexp(-0.5 * m + self.logw[None, :], axis=1)
+                              + self._lognorm)
         return out
 
 
@@ -147,10 +156,21 @@ class GameSampler6(DummySampler):
     gen_min_ess : float
         Minimum accumulated ESS before fitting the generative proposal.
     gen_fraction : float
-        Initial share of the round budget given to the generative stratum. The
+        Initial share of the round budget given to the generative stratum; the
         share then adapts toward whichever stratum delivers more ESS per call.
+        Set to 0 to hold the generative proposal in reserve, so that behaviour
+        before exhaustion is identical to games3 and the generative stratum only
+        takes over once the pools run dry.
     gen_max_centres : int
         Cap on mixture centres taken from the posterior samples.
+    gen_refit : int
+        Refit the generative proposal every this many rounds (1 = every round,
+        0 = fit once and freeze). Refitting is safe because each sample retains
+        the weight computed against the proposal in force when it was drawn.
+    gen_bandwidth : float
+        Extra scale on the kernel covariance. Below 1 tightens the proposal,
+        which raises efficiency when the posterior is much narrower than the
+        sample spread suggests.
     stretch_pairs : int
         Number of extra stretch centres (0 disables the stretch component).
     stretch_scale : float
@@ -167,6 +187,8 @@ class GameSampler6(DummySampler):
                  gen_min_ess=200,
                  gen_fraction=0.3,
                  gen_max_centres=3000,
+                 gen_refit=1,
+                 gen_bandwidth=1.0,
                  stretch_pairs=0,
                  stretch_scale=1.0,
                  **kwargs):
@@ -190,6 +212,8 @@ class GameSampler6(DummySampler):
         self.gen_min_ess = float(gen_min_ess)
         self.gen_fraction = float(gen_fraction)
         self.gen_max_centres = int(gen_max_centres)
+        self.gen_refit = int(gen_refit)
+        self.gen_bandwidth = float(gen_bandwidth)
         self.stretch_pairs = int(stretch_pairs)
         self.stretch_scale = float(stretch_scale)
         # seeded from the legacy global RNG, which pycbc_inference --seed sets,
@@ -198,6 +222,7 @@ class GameSampler6(DummySampler):
         self._rng = numpy.random.default_rng(
             numpy.random.randint(0, 2 ** 31 - 1))
         self.ncalls = 0
+        self.stratum_calls = {'pool': 0, 'gen': 0}
 
     # ---------------- discrete pool stratum (unchanged from games3) ---------
 
@@ -245,7 +270,7 @@ class GameSampler6(DummySampler):
             bin_id[j:j+len(bdraw)] = i
             j += len(bdraw)
 
-        loglr = self._likelihoods(psamp)
+        loglr = self._likelihoods(psamp, stratum='pool')
         logw = loglr + numpy.log(lengths[bin_id]) - pweight
         return psamp, loglr, logw, bin_id
 
@@ -266,7 +291,7 @@ class GameSampler6(DummySampler):
         psamp = FieldArray(len(x), dtype=self.dtype)
         for k, p in enumerate(names):
             psamp[p] = x[:, k]
-        loglr = self._likelihoods(psamp)
+        loglr = self._likelihoods(psamp, stratum='gen')
         # uniform prior => its density is a constant that cancels in the
         # stratum's own self-normalisation
         return psamp, loglr, loglr - logq
@@ -278,12 +303,14 @@ class GameSampler6(DummySampler):
             ok[k] = numpy.isfinite(self.model.prior_distribution(**pset))
         return ok
 
-    def _likelihoods(self, psamp):
+    def _likelihoods(self, psamp, stratum=None):
         args = [{p: psamp[p][i] for p in self.model.variable_params}
                 for i in range(len(psamp))]
         vals = list(tqdm.tqdm(self.pool.imap(call_likelihood, args),
                               total=len(args)))
         self.ncalls += len(args)
+        if stratum is not None:
+            self.stratum_calls[stratum] += len(args)
         return numpy.array(vals)
 
     # ---------------- driver ----------------------------------------------
@@ -386,15 +413,31 @@ class GameSampler6(DummySampler):
                     after = self._ess(strata['gen']['logw'])
                     gen_gain = (after - before) / max(len(gw), 1)
 
-            # shift budget toward whichever stratum yields more ESS per call
-            if pool_gain is not None and gen_gain is not None:
+            # shift budget toward whichever stratum yields more ESS per call.
+            # gen_fraction <= 0 means "hold the generative proposal in reserve":
+            # the pool keeps the entire budget, so behaviour before exhaustion
+            # is identical to games3, and the generative stratum only runs once
+            # the pool dies and hands over its budget.
+            if self.gen_fraction > 0 and pool_gain is not None \
+                    and gen_gain is not None:
                 tot = max(pool_gain, 0) + max(gen_gain, 0)
                 if tot > 0:
                     frac = 0.5 * frac + 0.5 * (max(gen_gain, 0) / tot)
                     frac = min(max(frac, 0.05), 0.95)
 
-            if proposal is None and rnd >= self.gen_start_round:
-                proposal = self._fit_proposal(strata)
+            # Refit the generative proposal as posterior information
+            # accumulates. This is safe because every sample already carries
+            # the logw computed against the proposal that was in force when it
+            # was drawn -- weights are never recomputed against a later
+            # proposal, which would bias the estimate. Refitting is the whole
+            # point of an adaptive scheme: a proposal frozen at the first fit
+            # can only ever be as good as the posterior estimate available at
+            # that round.
+            if rnd >= self.gen_start_round and self.gen_refit > 0 and \
+                    (rnd - self.gen_start_round) % self.gen_refit == 0:
+                new = self._fit_proposal(strata)
+                if new is not None:
+                    proposal = new
 
             ess_p = self._ess(strata['pool']['logw'])
             ess_g = self._ess(strata['gen']['logw'])
@@ -430,20 +473,37 @@ class GameSampler6(DummySampler):
         w = w / w.sum()
         ess = 1.0 / (w ** 2).sum()
         if ess < self.gen_min_ess:
-            logging.info('accumulated ESS %.1f below gen_min_ess %.1f; '
-                         'not fitting generative proposal yet',
-                         ess, self.gen_min_ess)
+            logging.debug('accumulated ESS %.1f below gen_min_ess %.1f; '
+                          'not fitting generative proposal yet',
+                          ess, self.gen_min_ess)
             return None
-        n = min(self.gen_max_centres, max(int(ess), 50))
-        idx = self._rng.choice(len(x), size=n, replace=True, p=w)
-        centres = x[idx]
-        cov = numpy.cov(centres.T)
+        # A properly WEIGHTED mixture over the samples: every sample is a
+        # centre and carries its own posterior weight as its mixture weight.
+        # Two earlier constructions were both wrong. Resampling by weight with
+        # replacement duplicates a handful of points at low ESS (ESS 19 gives
+        # ~19 distinct centres), making the covariance degenerate. Taking the
+        # top-N by weight instead concentrates centres at the peak, which
+        # under-disperses the proposal -- and under-dispersion is fatal for
+        # importance sampling, because the target's tails then have almost no
+        # proposal density and pi/q explodes there. Weighting the components
+        # keeps every sample's contribution proportional to its posterior mass
+        # while retaining full tail coverage.
+        n = min(self.gen_max_centres, len(x))
+        order = numpy.argsort(w)[::-1][:n]
+        centres = x[order]
+        cw = w[order]
+        # weighted covariance over ALL samples, which uses the full posterior
+        # information rather than only the retained centres
+        mu = (w[:, None] * x).sum(0)
+        xc = x - mu
+        cov = (w[:, None] * xc).T @ xc / max(1.0 - (w ** 2).sum(), 1e-12)
         if not numpy.all(numpy.isfinite(cov)):
             return None
         try:
             prop = GaussianMixtureProposal(
-                centres, cov, self._rng, stretch_pairs=self.stretch_pairs,
-                stretch_scale=self.stretch_scale)
+                centres, cov * self.gen_bandwidth ** 2, self._rng,
+                stretch_pairs=self.stretch_pairs,
+                stretch_scale=self.stretch_scale, weights=cw)
         except numpy.linalg.LinAlgError:
             logging.info('generative proposal fit failed (singular kernel)')
             return None
@@ -462,7 +522,11 @@ class GameSampler6(DummySampler):
         beta = esss / esss.sum() if esss.sum() > 0 else \
             numpy.ones(len(parts)) / len(parts)
         for (k, _), e, b in zip(parts, esss, beta):
-            logging.info('stratum %s: ESS=%.1f beta=%.3f', k, e, b)
+            c = self.stratum_calls.get(k, 0)
+            logging.info('stratum %s: ESS=%.1f calls=%i eff=%.2f%% beta=%.3f',
+                         k, e, c, 100.0 * e / c if c else 0.0, b)
+            self.meta[f'ess_{k}'] = float(e)
+            self.meta[f'ncalls_{k}'] = int(c)
         logging.info('combined ESS=%.1f ncalls=%i (setup %i)', total_ess,
                      self.ncalls, self.meta.get('setup_ncalls', 0))
 
