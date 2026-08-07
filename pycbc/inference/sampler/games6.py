@@ -839,18 +839,35 @@ class GameSampler6(DummySampler):
             return None
         # A properly WEIGHTED mixture over the samples: every sample is a
         # centre and carries its own posterior weight as its mixture weight.
-        # Two earlier constructions were both wrong. Resampling by weight with
-        # replacement duplicates a handful of points at low ESS (ESS 19 gives
-        # ~19 distinct centres), making the covariance degenerate. Taking the
-        # top-N by weight instead concentrates centres at the peak, which
-        # under-disperses the proposal -- and under-dispersion is fatal for
-        # importance sampling, because the target's tails then have almost no
-        # proposal density and pi/q explodes there. Weighting the components
-        # keeps every sample's contribution proportional to its posterior mass
-        # while retaining full tail coverage.
+        # Three constructions were tried for which raw draws become centres
+        # when there are more than gen_max_centres of them. Resampling by
+        # weight WITH replacement duplicates a handful of points at low ESS
+        # (ESS 19 gives ~19 distinct centres), making the covariance
+        # degenerate. Taking the top-N by weight concentrates centres at the
+        # peak, which under-disperses the proposal -- fatal for importance
+        # sampling, since the target's tails then have almost no proposal
+        # density and pi/q explodes there. Uniform random selection (ignoring
+        # weight) avoids both, but is blind to information content: as the
+        # raw pool keeps growing past the cap round over round, each
+        # individual high-weight point's chance of survival keeps shrinking
+        # even as accumulated ESS climbs -- measured directly (SNR 30, fixed
+        # gen_max_centres): the fit-input accumulated ESS rose from ~2700 to
+        # ~7900 across rounds while the resulting round's own efficiency
+        # *fell* from 27.5% to 20.0%, the opposite of what more information
+        # should buy.
+        #
+        # Weighted sampling WITHOUT replacement gets both properties at once:
+        # numpy's choice(replace=False, p=w) can never pick the same point
+        # twice (so it cannot reproduce the with-replacement duplication
+        # failure), while still preferring higher-weight points, so the kept
+        # centres retain most of the pool's weight regardless of how peaked
+        # it is (measured: a synthetic pool with weight ~ U(0,1)^8, i.e. very
+        # peaked, keeps 99.6% of total weight when subsampled 40000 -> 20000,
+        # versus ~50% for the uniform selection it replaces).
         n = min(self.gen_max_centres, len(x))
         if n < len(x):
-            order = self._rng.choice(len(x), size=n, replace=False)
+            # w is already normalised to sum to 1 above
+            order = self._rng.choice(len(x), size=n, replace=False, p=w)
         else:
             order = numpy.arange(len(x))
         centres = x[order]
