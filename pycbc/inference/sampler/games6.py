@@ -758,32 +758,37 @@ class GameSampler6(DummySampler):
         from every stratum, resampled to equal weight.
         """
         names = list(self.model.variable_params)
+        # Weight each stratum's contribution by its OWN ESS when pooling for
+        # the fit, unconditionally. Normalising every stratum to sum to 1 and
+        # concatenating gives each equal total mass regardless of quality, so
+        # a weak stratum drags the fit toward wherever it happens to have
+        # drawn -- the same defect as games.py's per-round self-normalisation,
+        # one function away. This matches how _finalise already combines
+        # strata (beta proportional to ESS, the inverse-variance choice).
         xs, ws = [], []
         _diag = []
-        _essfix = os.environ.get('GAMES6_ESSFIX', '0') == '1'
         for kk, st in strata.items():
             if st['samp'] is None:
                 continue
-            xs.append(numpy.column_stack([st['samp'][p] for p in names]))
             lw = st['logw']
             wv = numpy.exp(lw - logsumexp(lw))
-            _e = 1.0 / (wv ** 2).sum()
-            _diag.append((kk, len(wv), _e))
-            if _essfix:
-                # scale each block by its own ESS, so a stratum contributes
-                # in proportion to the information it carries
-                wv = wv * _e
-            ws.append(wv)
+            e = 1.0 / (wv ** 2).sum()
+            _diag.append((kk, len(wv), e))
+            if e <= 0:
+                continue
+            xs.append(numpy.column_stack([st['samp'][p] for p in names]))
+            ws.append(wv * e)
         if not xs:
             return None
         x = numpy.vstack(xs)
         w = numpy.concatenate(ws)
+        if w.sum() <= 0:
+            return None
         w = w / w.sum()
         ess = 1.0 / (w ** 2).sum()
-        logging.info('FITDIAG blocks=%s sum_ess=%.1f pooled_w_ess=%.1f '
-                     'essfix=%i',
-                     ';'.join('%s:n=%i,ess=%.1f' % d for d in _diag),
-                     sum(d[2] for d in _diag), ess, int(_essfix))
+        logging.debug('fit blocks=%s sum_stratum_ess=%.1f pooled_ess=%.1f',
+                      ';'.join('%s:n=%i,ess=%.1f' % d for d in _diag),
+                      sum(d[2] for d in _diag), ess)
         if ess < self.gen_min_ess:
             logging.debug('accumulated ESS %.1f below gen_min_ess %.1f; '
                           'not fitting generative proposal yet',
@@ -809,9 +814,8 @@ class GameSampler6(DummySampler):
         cw = w[order]
         if cw.sum() <= 0:
             return None
-        logging.info('FITDIAG centres=%i centre_w_ess=%.1f (of %i drawn '
-                     'from %i)', len(cw),
-                     cw.sum() ** 2 / (cw ** 2).sum(), n, len(x))
+        logging.debug('centres=%i centre_w_ess=%.1f (of %i drawn from %i)',
+                      len(cw), cw.sum() ** 2 / (cw ** 2).sum(), n, len(x))
         # weighted covariance over ALL samples, which uses the full posterior
         # information rather than only the retained centres
         mu = (w[:, None] * x).sum(0)
