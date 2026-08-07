@@ -178,6 +178,85 @@ class GaussianMixtureProposal:
         return out
 
 
+class LocalCovarianceProposal:
+    """ Mixture with a SEPARATE covariance per centre, from its k nearest
+    neighbours.
+
+    A single global covariance cannot hug a thin *curved* manifold: measured at
+    SNR 30, the bandwidth broad enough to cover the target puts 41% of draws
+    beyond the posterior's own 99th-percentile nearest-neighbour distance, while
+    the bandwidth that keeps draws on-manifold under-disperses and leaves the
+    tails empty. Estimating each kernel's covariance from its own neighbourhood
+    lets the kernel follow the sheet's local orientation and thickness, which is
+    what a global covariance averages away.
+    """
+
+    def __init__(self, centres, rng, k=40, scale=1.0, weights=None,
+                 ridge=1e-3):
+        from scipy.spatial import cKDTree
+        self.rng = rng
+        self.centres = numpy.atleast_2d(centres)
+        self.n, self.dim = self.centres.shape
+        if weights is None:
+            weights = numpy.full(self.n, 1.0 / self.n)
+        self.weights = numpy.asarray(weights, float)
+        self.weights /= self.weights.sum()
+        self.logw = numpy.log(numpy.maximum(self.weights, 1e-300))
+
+        # Everything is built in globally WHITENED coordinates, where every
+        # parameter is O(1). Doing this in physical units is a trap: the six
+        # parameters span ~6 orders of magnitude (mchirp variance ~1e-8 against
+        # lambda ~1e5), so any isotropic regularisation floor applied there is
+        # meaningless -- it swamps the tight parameters completely.
+        g = numpy.cov(self.centres.T)
+        ev, V = numpy.linalg.eigh(g)
+        ev = numpy.maximum(ev, 1e-12 * max(ev.max(), 1e-300))
+        self._W = V / numpy.sqrt(ev)          # x -> z
+        self._Winv = (V * numpy.sqrt(ev)).T   # z -> x
+        self._logdetW = -0.5 * numpy.log(ev).sum()
+
+        cz = self.centres @ self._W
+        self._cz = cz
+        tree = cKDTree(cz)
+        kk = min(max(k, self.dim + 2), self.n)
+        _, idx = tree.query(cz, k=kk)
+
+        f = kk ** (-1.0 / (self.dim + 4)) * scale
+        self.chol = numpy.empty((self.n, self.dim, self.dim))
+        self.inv = numpy.empty((self.n, self.dim, self.dim))
+        self.lognorm = numpy.empty(self.n)
+        eye = numpy.eye(self.dim)
+        for i in range(self.n):
+            c = numpy.cov(cz[idx[i]].T) * f ** 2
+            # floor is dimensionless here, so it regularises without distorting
+            c = c + ridge * f ** 2 * eye
+            try:
+                L = numpy.linalg.cholesky(c)
+            except numpy.linalg.LinAlgError:
+                L = numpy.linalg.cholesky(c + 10 * ridge * f ** 2 * eye)
+            self.chol[i] = L
+            self.inv[i] = numpy.linalg.inv(L @ L.T)
+            self.lognorm[i] = -0.5 * (self.dim * numpy.log(2 * numpy.pi)
+                                      + 2.0 * numpy.log(numpy.diag(L)).sum())
+
+    def sample(self, size):
+        idx = self.rng.choice(self.n, size=size, p=self.weights)
+        z0 = self.rng.normal(size=(size, self.dim))
+        z = self._cz[idx] + numpy.einsum('nij,nj->ni', self.chol[idx], z0)
+        return z @ self._Winv
+
+    def logpdf(self, x):
+        z = x @ self._W
+        out = numpy.full(len(z), -numpy.inf)
+        for i in range(self.n):
+            d = z - self._cz[i]
+            m = numpy.einsum('ij,jk,ik->i', d, self.inv[i], d)
+            out = numpy.logaddexp(out, -0.5 * m + self.lognorm[i]
+                                  + self.logw[i])
+        # change of variables from whitened z back to physical x
+        return out + self._logdetW
+
+
 class GameSampler6(DummySampler):
     """games3 with inexhaustible generative proposals combined by strata.
 
@@ -236,6 +315,7 @@ class GameSampler6(DummySampler):
                  gen_refit=1,
                  gen_bandwidth=1.0,
                  gen_bandwidths=None,
+                 gen_local_k=0,
                  gen_defensive=0.1,
                  gen_defensive_scale=3.0,
                  stretch_pairs=0,
@@ -275,6 +355,7 @@ class GameSampler6(DummySampler):
                                    gen_bandwidths.replace(',', ' ').split()]
         else:
             self.gen_bandwidths = [float(v) for v in gen_bandwidths]
+        self.gen_local_k = int(gen_local_k)
         self.gen_defensive = float(gen_defensive)
         self.gen_defensive_scale = float(gen_defensive_scale)
         self.stretch_pairs = int(stretch_pairs)
@@ -604,6 +685,11 @@ class GameSampler6(DummySampler):
         if not numpy.all(numpy.isfinite(cov)):
             return None
         try:
+            if self.gen_local_k > 0:
+                return LocalCovarianceProposal(
+                    centres, self._rng, k=self.gen_local_k,
+                    scale=(self.gen_bandwidth if bandwidth is None
+                           else bandwidth), weights=cw)
             prop = GaussianMixtureProposal(
                 centres,
                 cov * (self.gen_bandwidth if bandwidth is None
