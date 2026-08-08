@@ -160,18 +160,14 @@ class NessaiSampler(BaseSampler):
         ), "name in section [sampler] must match mine"
 
         if cp.has_option(section, "importance_nested_sampler"):
-            importance_nested_sampler = cp.get(
+            # this picks which set of keywords is valid below, so it has to
+            # be a bool: the string 'False' would select the wrong set
+            importance_nested_sampler = cp.getboolean(
                 section,
                 "importance_nested_sampler",
             )
         else:
             importance_nested_sampler = False
-
-        # Requires additional development work, see the model class below
-        if importance_nested_sampler is True:
-            raise NotImplementedError(
-                "Importance nested sampler is not currently supported"
-            )
 
         default_kwds, default_run_kwds = cls.get_default_kwds(
             importance_nested_sampler
