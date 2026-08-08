@@ -208,6 +208,84 @@ class TestModels(unittest.TestCase):
         self.assertAlmostEqual(self.a2, model.loglr, delta=0.002)
 
 
+    # ------------------------------------------------------------------
+    # Models that marginalize over time. These had no coverage. They locate
+    # the signal from its SNR peak, so unlike the other models they need
+    # data that actually contains a signal, hence they live here rather
+    # than with the signal-free noise used by TestWaveformErrors.
+    #
+    # Note ``a1`` is a phase-marginalized log likelihood ratio, so these are
+    # only comparable to it with phase marginalization turned on as well.
+    # ------------------------------------------------------------------
+
+    # half width of the tc prior, centred on the reference tc
+    tc_half_width = 0.05
+
+    def tc_setup(self):
+        """Returns variable params and a prior including tc.
+
+        Both are fresh each time: setting up a marginalization removes the
+        marginalized parameter from the list and prior it is handed, so
+        sharing them between models corrupts the later ones.
+        """
+        variable = self.variable + ['tc']
+        tc = self.static['tc']
+        prior = JointDistribution(
+            list(variable),
+            SinAngle(inclination=None),
+            Uniform(distance=(10, 100)),
+            Uniform(tc=(tc - self.tc_half_width, tc + self.tc_half_width)))
+        return variable, prior
+
+    def marg_time_model(self):
+        variable, prior = self.tc_setup()
+        static = {k: v for k, v in self.static.items() if k != 'tc'}
+        return models.MarginalizedTime(
+            variable, copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=static, prior=prior,
+            marginalize_vector_params='tc',
+            marginalize_vector_samples=512,
+            marginalize_phase=True, sample_rate=4096)
+
+    def relative_time_model(self, cls):
+        variable, prior = self.tc_setup()
+        static = {k: v for k, v in self.static.items() if k != 'tc'}
+        return cls(
+            variable, copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=static, prior=prior,
+            fiducial_params={'mass1': 1.3756, 'tc': self.static['tc']},
+            epsilon=0.1, sample_rate=4096,
+            marginalize_vector_params='tc',
+            marginalize_vector_samples=512)
+
+    def test_relative_time_matches_fixed_tc(self):
+        # marginalizing tc over a narrow window centred on the peak should
+        # stay close to the fixed-tc answer the other models are checked
+        # against
+        model = self.relative_time_model(models.RelativeTime)
+        model.update(**self.q1)
+        self.assertAlmostEqual(self.a1, model.loglr, delta=2.0)
+
+    def test_marginalized_time_matches_relative_time_dom(self):
+        # two independent implementations of the same time marginalization,
+        # so they should agree far more closely than either does with the
+        # fixed-tc value
+        marg = self.marg_time_model()
+        marg.update(**self.q1)
+        reldom = self.relative_time_model(models.RelativeTimeDom)
+        reldom.update(**self.q1)
+        self.assertAlmostEqual(marg.loglr, reldom.loglr, delta=1.5)
+
+    def test_time_marginalization_is_finite(self):
+        for model in [self.marg_time_model(),
+                      self.relative_time_model(models.RelativeTime),
+                      self.relative_time_model(models.RelativeTimeDom)]:
+            model.update(**self.q1)
+            self.assertTrue(numpy.isfinite(model.loglr))
+
+
 class TestAnalyticModels(unittest.TestCase):
     """Tests the analytic models against their closed-form answers.
 
@@ -416,6 +494,23 @@ class TestWaveformErrors(unittest.TestCase):
             psds=self.psds,
             static_params=self.staticgate2,
             prior=self.prior,
+            ignore_failed_waveforms=True)
+        self._run_tests(model)
+
+    def test_gated_gaussian_margphase(self):
+        static = self.static.copy()
+        static['t_gate_start'] = static['tc'] - 0.05
+        static['t_gate_end'] = static['tc']
+        # the phase being marginalized over still has to be a parameter the
+        # waveform generator knows about, even though its value is irrelevant
+        static['coa_phase'] = 0.
+        model = models.GatedGaussianMargPhase(
+            self.variable, data=copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow,
+            psds=self.psds,
+            static_params=static,
+            prior=self.prior,
+            ref_phase='coa_phase',
             ignore_failed_waveforms=True)
         self._run_tests(model)
 
