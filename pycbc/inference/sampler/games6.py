@@ -435,6 +435,8 @@ class GameSampler6(DummySampler):
                  stretch_scale=1.0,
                  tree_start_level=0,
                  gen_seed_leaves=0,
+                 gen_seed_temper=-1.0,
+                 gen_seed_range=4.0,
                  **kwargs):
         super().__init__(model, *args)
 
@@ -478,6 +480,8 @@ class GameSampler6(DummySampler):
         self.stretch_scale = float(stretch_scale)
         self.tree_start_level = int(tree_start_level)
         self.gen_seed_leaves = int(gen_seed_leaves)
+        self.gen_seed_temper = float(gen_seed_temper)
+        self.gen_seed_range = float(gen_seed_range)
         self.leaf_loglr = {}
         # seeded from the legacy global RNG, which pycbc_inference --seed sets,
         # so generative draws are reproducible alongside the shuffles that the
@@ -724,12 +728,36 @@ class GameSampler6(DummySampler):
                               for k in range(key)], dtype=float)
             ok = numpy.isfinite(ll)
             if ok.any():
+                # TEMPERING. exp(loglr_rep) is the likelihood AT the
+                # representative, but a leaf's actual weight is the
+                # likelihood INTEGRATED over the leaf. Those agree only
+                # while the likelihood barely varies inside a leaf. The
+                # variation is (1 - m^2) * rho^2/2, so it grows as rho^2:
+                # ~1.8 nats at SNR 13.5 but ~9 at SNR 30 and ~95 at SNR
+                # 98, i.e. a round-1 weight ratio of 6:1 rising to
+                # 7750:1 and beyond. Untempered, that piles every draw
+                # into a handful of leaves and drains them immediately --
+                # measured, it cost 20.8% -> 12.7% efficiency at SNR 30,
+                # where the discrete pool is still the workhorse, while
+                # helping at SNR 50/98 where the pool is nearly dead
+                # anyway. The integral is far flatter than the point
+                # value, so temper the exponent to approximate it.
+                spread = float(ll[ok].max() - ll[ok].min())
+                if self.gen_seed_temper > 0:
+                    temper = self.gen_seed_temper
+                else:
+                    # auto: hold the effective dynamic range near
+                    # gen_seed_range nats regardless of SNR
+                    temper = max(1.0, spread / max(self.gen_seed_range,
+                                                   1e-6))
                 w = lengths.astype(float).copy()
-                w[ok] *= numpy.exp(ll[ok] - ll[ok].max())
+                w[ok] *= numpy.exp((ll[ok] - ll[ok].max()) / temper)
                 if w.sum() > 0:
                     weight = w / w.sum()
-                    logging.info('seeded round-1 leaf weights with '
-                                 'exp(loglr_rep) * volume')
+                    logging.info('seeded round-1 leaf weights: '
+                                 'exp((loglr_rep-max)/%.2f) * volume '
+                                 '(loglr spread %.1f nats over %i leaves)',
+                                 temper, spread, int(ok.sum()))
                 else:
                     weight = lengths / lengths.sum()
             else:
