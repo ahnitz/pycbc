@@ -29,7 +29,7 @@ import unittest
 import copy
 from utils import simple_exit
 import numpy
-from scipy import special
+from scipy import special, stats
 from pycbc.catalog import Merger
 from pycbc.psd import interpolate, inverse_spectrum_truncation, aLIGOZeroDetHighPower
 from pycbc.noise import noise_from_psd
@@ -206,6 +206,47 @@ class TestModels(unittest.TestCase):
                         )
         model.update(**self.q1)
         self.assertAlmostEqual(self.a2, model.loglr, delta=0.002)
+
+
+class TestAnalyticModels(unittest.TestCase):
+    """Tests the analytic models against their closed-form answers.
+
+    These have exact answers but were not covered by any test.
+    """
+
+    def test_normal(self):
+        model = models.TestNormal(['x', 'y'])
+        model.update(x=-0.2, y=0.1)
+        expected = stats.multivariate_normal(
+            mean=[0., 0.], cov=[1., 1.]).logpdf([-0.2, 0.1])
+        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
+
+    def test_normal_mean_and_cov(self):
+        # a non-default mean/cov, so the arguments are actually exercised
+        mean, cov = [1., -2.], [4., 0.25]
+        model = models.TestNormal(['x', 'y'], mean=mean, cov=cov)
+        model.update(x=0.5, y=-1.5)
+        expected = stats.multivariate_normal(mean=mean, cov=cov).logpdf(
+            [0.5, -1.5])
+        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
+
+    def test_rosenbrock(self):
+        model = models.TestRosenbrock(['x', 'y'])
+        model.update(x=0.3, y=0.4)
+        expected = -((1 - 0.3) ** 2 + 100 * (0.4 - 0.3 ** 2) ** 2)
+        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
+
+    def test_eggbox(self):
+        model = models.TestEggbox(['x', 'y'])
+        model.update(x=0.3, y=0.4)
+        expected = (2 + numpy.cos(0.3 / 2.) * numpy.cos(0.4 / 2.)) ** 5
+        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
+
+    def test_prior_is_flat(self):
+        # the loglikelihood is constant, so the posterior is just the prior
+        model = models.TestPrior(['x', 'y'])
+        model.update(x=0.3, y=0.4)
+        self.assertEqual(model.loglikelihood, 0.)
 
 
 class TestWaveformErrors(unittest.TestCase):
@@ -495,6 +536,7 @@ class TestMarginalizedPolModels(unittest.TestCase):
 
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestModels))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestAnalyticModels))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestWaveformErrors))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMarginalizedPolModels))
 
