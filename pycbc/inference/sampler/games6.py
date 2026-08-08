@@ -433,6 +433,7 @@ class GameSampler6(DummySampler):
                  gen_defensive_scale=3.0,
                  stretch_pairs=0,
                  stretch_scale=1.0,
+                 tree_start_level=0,
                  **kwargs):
         super().__init__(model, *args)
 
@@ -474,6 +475,7 @@ class GameSampler6(DummySampler):
         self.gen_defensive_scale = float(gen_defensive_scale)
         self.stretch_pairs = int(stretch_pairs)
         self.stretch_scale = float(stretch_scale)
+        self.tree_start_level = int(tree_start_level)
         # seeded from the legacy global RNG, which pycbc_inference --seed sets,
         # so generative draws are reproducible alongside the shuffles that the
         # discrete-pool path uses
@@ -619,16 +621,56 @@ class GameSampler6(DummySampler):
         w = numpy.exp(logw - logsumexp(logw))
         return float(1.0 / (w ** 2).sum())
 
+    def _nodes_at_depth(self, group, depth):
+        """ Groups exactly `depth` levels below `group`; a branch that
+        bottoms out earlier contributes its leaf, so no points are lost.
+        """
+        if depth <= 0 or bool(group.attrs['is_leaf']):
+            return [group]
+        out = []
+        for c in group['children']:
+            out.extend(self._nodes_at_depth(group['children'][c], depth - 1))
+        return out
+
     def run(self):
         logging.info('Retrieving params of parameter space nodes')
         with h5py.File(self.mapfile, 'r') as mapfile:
-            bparams = {p: mapfile['bank'][p][:] for p in self.variable_params}
-            num_nodes = len(bparams[list(bparams.keys())[0]])
             self.dtype = mapfile['map']['0'].dtype
 
+        treefile = h5py.File(self.treefile, 'r') if self.treefile else None
+
+        # Where to start evaluating. The likelihood is evaluated at each
+        # start node's REPRESENTATIVE and everything more than
+        # loglr_region below the best is discarded, so the cut is only as
+        # good as that representative proxies the likelihood across its
+        # whole tile. A coarse representative is a poor proxy -- one at
+        # match m sits roughly (1 - m^2) * rho^2/2 below a perfect one,
+        # ~46 nats for m=0.7 at SNR 13.5 -- so a window tuned for a fine
+        # bank can throw away subtrees that do hold posterior mass.
+        # Coarse levels are still wanted for BUILDING the tree (they make
+        # routing a draw cheap), so this lets construction and evaluation
+        # use different depths instead of forcing one compromise.
+        start_nodes = None
+        if treefile is not None and self.tree_start_level > 0:
+            start_nodes = []
+            for k in sorted(treefile['tree'], key=int):
+                start_nodes.extend(self._nodes_at_depth(
+                    treefile['tree'][k], self.tree_start_level))
+            args = [{p: float(n.attrs[f'param_{p}'])
+                     for p in self.model.variable_params}
+                    for n in start_nodes]
+            logging.info('starting evaluation at tree depth %i: %i nodes '
+                         '(vs %i at depth 0)', self.tree_start_level,
+                         len(start_nodes), len(treefile['tree']))
+        else:
+            with h5py.File(self.mapfile, 'r') as mapfile:
+                bparams = {p: mapfile['bank'][p][:]
+                           for p in self.variable_params}
+                num_nodes = len(bparams[list(bparams.keys())[0]])
+            args = [{p: bparams[p][i] for p in self.model.variable_params}
+                    for i in range(num_nodes)]
+
         logging.info('Calculating likelihood at nodes')
-        args = [{p: bparams[p][i] for p in self.model.variable_params}
-                for i in range(num_nodes)]
         node_loglrs = numpy.array(list(tqdm.tqdm(
             self.pool.imap(call_likelihood, args), total=len(args))))
         self.meta['setup_ncalls'] = len(args)
@@ -639,16 +681,18 @@ class GameSampler6(DummySampler):
         logging.info('...resolving tree leaves for %i passed tiles',
                      len(passed))
         active_lengths, key = [], 0
-        treefile = h5py.File(self.treefile, 'r') if self.treefile else None
         with h5py.File(self.mapfile, 'r') as mapfile:
             for tile in passed:
                 leaves = None
-                if treefile is not None and str(tile) in treefile['tree']:
+                if start_nodes is not None:
+                    leaves = self._find_active_leaves(start_nodes[tile],
+                                                      bound)
+                elif treefile is not None and str(tile) in treefile['tree']:
                     leaves = self._find_active_leaves(
                         treefile['tree'][str(tile)], bound)
-                if not leaves:
+                if not leaves and start_nodes is None:
                     leaves = [mapfile['map'][str(tile)][:]]
-                for pts in leaves:
+                for pts in (leaves or []):
                     self.dmap[key] = pts
                     active_lengths.append(len(pts))
                     key += 1
