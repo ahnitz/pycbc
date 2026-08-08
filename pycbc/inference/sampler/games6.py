@@ -434,6 +434,7 @@ class GameSampler6(DummySampler):
                  stretch_pairs=0,
                  stretch_scale=1.0,
                  tree_start_level=0,
+                 gen_seed_leaves=0,
                  **kwargs):
         super().__init__(model, *args)
 
@@ -476,6 +477,8 @@ class GameSampler6(DummySampler):
         self.stretch_pairs = int(stretch_pairs)
         self.stretch_scale = float(stretch_scale)
         self.tree_start_level = int(tree_start_level)
+        self.gen_seed_leaves = int(gen_seed_leaves)
+        self.leaf_loglr = {}
         # seeded from the legacy global RNG, which pycbc_inference --seed sets,
         # so generative draws are reproducible alongside the shuffles that the
         # discrete-pool path uses
@@ -681,6 +684,7 @@ class GameSampler6(DummySampler):
         logging.info('...resolving tree leaves for %i passed tiles',
                      len(passed))
         active_lengths, key = [], 0
+        self.leaf_loglr = {}
         with h5py.File(self.mapfile, 'r') as mapfile:
             for tile in passed:
                 leaves = None
@@ -691,9 +695,11 @@ class GameSampler6(DummySampler):
                     leaves = self._find_active_leaves(
                         treefile['tree'][str(tile)], bound)
                 if not leaves and start_nodes is None:
-                    leaves = [mapfile['map'][str(tile)][:]]
-                for pts in (leaves or []):
+                    leaves = [(mapfile['map'][str(tile)][:],
+                               node_loglrs[tile])]
+                for pts, ll in (leaves or []):
                     self.dmap[key] = pts
+                    self.leaf_loglr[key] = ll
                     active_lengths.append(len(pts))
                     key += 1
         if treefile is not None:
@@ -702,7 +708,34 @@ class GameSampler6(DummySampler):
         lengths = numpy.array(active_lengths)
         logging.info('...resolved to %i active leaves', key)
 
-        weight = lengths / lengths.sum()
+        # Round-1 draw probability. Plain leaf size is prior VOLUME only:
+        # the representative likelihood computed during the cut is used
+        # there as a pass/fail threshold and its magnitude then thrown
+        # away, so the first round spreads draws by volume and only the
+        # adaptive update below (weight[j] += v) starts concentrating them
+        # from round 2. Seeding with exp(loglr_rep) * volume uses the
+        # information already paid for. This cannot bias the estimate --
+        # logw = loglr + log(lengths) - pweight carries log(drawcount), so
+        # the importance weights self-correct for any draw probability --
+        # it only changes their variance. The adaptive tuning is unchanged
+        # and still runs on top of this.
+        if self.gen_seed_leaves:
+            ll = numpy.array([self.leaf_loglr.get(k, numpy.nan)
+                              for k in range(key)], dtype=float)
+            ok = numpy.isfinite(ll)
+            if ok.any():
+                w = lengths.astype(float).copy()
+                w[ok] *= numpy.exp(ll[ok] - ll[ok].max())
+                if w.sum() > 0:
+                    weight = w / w.sum()
+                    logging.info('seeded round-1 leaf weights with '
+                                 'exp(loglr_rep) * volume')
+                else:
+                    weight = lengths / lengths.sum()
+            else:
+                weight = lengths / lengths.sum()
+        else:
+            weight = lengths / lengths.sum()
         # per-stratum accumulators
         gen_keys = [f'gen:bw{bw:g}' for bw in self.gen_bandwidths]
         strata = {'pool': {'samp': None, 'loglr': None, 'logw': None}}
@@ -710,6 +743,10 @@ class GameSampler6(DummySampler):
             strata[k] = {'samp': None, 'loglr': None, 'logw': None}
         self.stratum_calls = {k: 0 for k in ['pool'] + gen_keys}
         proposals = {}
+        if self.gen_seed_leaves:
+            seed = self._seed_proposal_from_leaves()
+            if seed is not None:
+                proposals = {gen_keys[0]: seed}
         # per-stratum share of the generative budget, adapted by ESS per call
         share = {k: 1.0 / len(gen_keys) for k in gen_keys}
         pool_dead = False
@@ -824,6 +861,60 @@ class GameSampler6(DummySampler):
         return {'samp': numpy.concatenate([samp, st['samp']]),
                 'loglr': numpy.concatenate([loglr, st['loglr']]),
                 'logw': numpy.concatenate([logw, st['logw']])}
+
+    def _seed_proposal_from_leaves(self, max_points=200000):
+        """ Fit a generative proposal to the ACTIVE LEAVES, before any
+        posterior samples exist.
+
+        The setup cut already evaluates the likelihood at each leaf's
+        representative -- we pay for those calls to decide the descent and
+        then normally discard them. But a leaf's posterior mass is
+        approximately exp(loglr_rep) times its prior volume, and its point
+        count is proportional to that volume (the points are uniform prior
+        draws), so weighting every point in leaf i by exp(loglr_i) turns
+        the union of active leaves into an estimate of the posterior --
+        the same estimate that makes the discrete-pool stratum work at
+        all. If a KDE fitted to accumulated posterior samples is a good
+        proposal later, one fitted to this cloud should be a good proposal
+        immediately, without waiting for the pool to deliver gen_min_ess.
+
+        That matters most where games6 is weakest: at high SNR the pool
+        exhausts after a single round with ESS ~10-20, so the generative
+        stratum barely engages under the accumulate-then-fit rule.
+
+        Built as a synthetic stratum and handed to the existing
+        _fit_proposal, so it goes through exactly the same weighted
+        centre-subsampling and kernel construction as every other fit.
+        """
+        names = list(self.model.variable_params)
+        keys = [k for k, v in self.leaf_loglr.items()
+                if numpy.isfinite(v) and len(self.dmap[k])]
+        if not keys:
+            return None
+        total = sum(len(self.dmap[k]) for k in keys)
+        frac = min(1.0, max_points / max(total, 1))
+        xs, lw = [], []
+        for k in keys:
+            pts = self.dmap[k]
+            n = len(pts)
+            if frac < 1.0:
+                take = max(1, int(n * frac))
+                sel = self._rng.choice(n, size=take, replace=False)
+                pts = pts[sel]
+            xs.append(pts)
+            lw.append(numpy.full(len(pts), float(self.leaf_loglr[k])))
+        samp = numpy.concatenate(xs)
+        logw = numpy.concatenate(lw)
+        fa = FieldArray(len(samp), dtype=self.dtype)
+        for p in names:
+            fa[p] = samp[p]
+        stratum = {'samp': fa, 'loglr': logw, 'logw': logw}
+        prop = self._fit_proposal({'seed': stratum}, self.gen_bandwidth)
+        if prop is not None:
+            logging.info('seeded generative proposal from %i active leaves '
+                         '(%i points, subsampled to %i)', len(keys), total,
+                         len(samp))
+        return prop
 
     def _fit_proposals(self, strata, gen_keys):
         out = {}
@@ -1028,6 +1119,19 @@ class GameSampler6(DummySampler):
             idx = numpy.random.choice(len(p), size=take, replace=True, p=p)
             outs.append(v['samp'][idx])
             ols.append(v['loglr'][idx])
+        if not outs:
+            # Every stratum contributed nothing: total ESS collapsed to ~0,
+            # so no stratum's beta rounded up to even one output sample.
+            # Reachable with a very permissive cut -- e.g. loglr_region=60
+            # on a coarse start level admits nearly the whole prior, and
+            # round-1 draws (which are uniform over the active region) then
+            # almost never land anywhere with meaningful likelihood. Fail
+            # loudly with the diagnosis rather than dying in concatenate.
+            raise RuntimeError(
+                'no posterior samples: combined ESS=%.3g across %i strata. '
+                'The active region is almost certainly far too large -- '
+                'reduce loglr_region or use a finer tree_start_level.'
+                % (total_ess, len(parts)))
         fsamp = numpy.concatenate(outs)
         self._samples = {p: fsamp[p] for p in self.model.variable_params}
         self._samples['loglikelihood'] = numpy.concatenate(ols)
@@ -1046,13 +1150,17 @@ class GameSampler6(DummySampler):
         """
         results = []
 
-        def descend(group):
+        def descend(group, ll_here):
             if group.attrs['is_leaf']:
                 pts = numpy.zeros(int(group.attrs['n_points']),
                                   dtype=self.dtype)
                 for p in self.variable_params:
                     pts[p] = group[f'points_{p}'][:]
-                results.append(pts)
+                # carry the likelihood at this leaf's own representative:
+                # it was already paid for to decide the descent, and it is
+                # what makes the leaf-weighted cloud an estimate of the
+                # posterior (see _seed_proposal_from_leaves)
+                results.append((pts, ll_here))
                 return
             for c in group['children']:
                 child = group['children'][c]
@@ -1061,7 +1169,7 @@ class GameSampler6(DummySampler):
                 ll = call_likelihood(params)
                 self.tree_ncalls += 1
                 if numpy.isfinite(ll) and ll > loglr_bound:
-                    descend(child)
+                    descend(child, ll)
 
-        descend(tree_root)
+        descend(tree_root, numpy.nan)
         return results
