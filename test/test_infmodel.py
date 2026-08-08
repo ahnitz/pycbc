@@ -208,18 +208,14 @@ class TestModels(unittest.TestCase):
         self.assertAlmostEqual(self.a2, model.loglr, delta=0.002)
 
 
-    # ------------------------------------------------------------------
-    # Models that marginalize over time. These had no coverage. They locate
-    # the signal from its SNR peak, so unlike the other models they need
-    # data that actually contains a signal, hence they live here rather
-    # than with the signal-free noise used by TestWaveformErrors.
-    #
-    # Note ``a1`` is a phase-marginalized log likelihood ratio, so these are
-    # only comparable to it with phase marginalization turned on as well.
-    # ------------------------------------------------------------------
+    # Models that marginalize over time. They locate the signal from its
+    # SNR peak, so they need data that actually contains one, hence they
+    # live here rather than with the signal-free noise of
+    # TestWaveformErrors. ``a1`` is phase-marginalized, so it is only a
+    # valid reference with phase marginalization turned on as well.
 
     # half width of the tc prior, centred on the reference tc
-    tc_half_width = 0.05
+    tc_half_width = 0.02
 
     def tc_setup(self):
         """Returns variable params and a prior including tc.
@@ -237,7 +233,7 @@ class TestModels(unittest.TestCase):
             Uniform(tc=(tc - self.tc_half_width, tc + self.tc_half_width)))
         return variable, prior
 
-    def marg_time_model(self):
+    def marg_time_model(self, nsamples=512):
         variable, prior = self.tc_setup()
         static = {k: v for k, v in self.static.items() if k != 'tc'}
         return models.MarginalizedTime(
@@ -245,10 +241,10 @@ class TestModels(unittest.TestCase):
             low_frequency_cutoff=self.flow, psds=self.psds,
             static_params=static, prior=prior,
             marginalize_vector_params='tc',
-            marginalize_vector_samples=512,
+            marginalize_vector_samples=nsamples,
             marginalize_phase=True, sample_rate=4096)
 
-    def relative_time_model(self, cls):
+    def relative_time_model(self, cls, nsamples=512):
         variable, prior = self.tc_setup()
         static = {k: v for k, v in self.static.items() if k != 'tc'}
         return cls(
@@ -258,39 +254,81 @@ class TestModels(unittest.TestCase):
             fiducial_params={'mass1': 1.3756, 'tc': self.static['tc']},
             epsilon=0.1, sample_rate=4096,
             marginalize_vector_params='tc',
-            marginalize_vector_samples=512)
+            marginalize_vector_samples=nsamples)
 
-    def test_relative_time_matches_fixed_tc(self):
-        # marginalizing tc over a narrow window centred on the peak should
-        # stay close to the fixed-tc answer the other models are checked
-        # against
-        model = self.relative_time_model(models.RelativeTime)
-        model.update(**self.q1)
-        self.assertAlmostEqual(self.a1, model.loglr, delta=2.0)
+    def brute_force_marginalize_tc(self, half_width, nbins=2001):
+        """log of the mean likelihood ratio over a uniform tc prior.
+
+        Evaluated on a grid rather than by drawing samples: the likelihood
+        is sharply peaked in tc, with a width under a millisecond, so
+        random draws over a wide prior do not converge.
+        """
+        tc = self.static['tc']
+        variable, prior = self.tc_setup()
+        static = {k: v for k, v in self.static.items() if k != 'tc'}
+        model = models.Relative(
+            variable, copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=static, prior=prior,
+            fiducial_params={'mass1': 1.3756, 'tc': tc}, epsilon=0.1)
+        grid = numpy.linspace(tc - half_width, tc + half_width, nbins)
+        logls = numpy.empty(nbins)
+        for i, value in enumerate(grid):
+            params = dict(self.q1)
+            params['tc'] = value
+            model.update(**params)
+            logls[i] = model.loglr
+        return special.logsumexp(logls) - numpy.log(nbins)
+
+    def test_brute_force_tc_marginalization_is_correct(self):
+        """Checks the reference the time marginalization is measured against.
+
+        Over a prior far narrower than the peak the mean likelihood must
+        equal the value at the peak, and each doubling of the prior width
+        must cost exactly log(2), since the extra volume adds no likelihood.
+        """
+        self.assertAlmostEqual(self.a1,
+                               self.brute_force_marginalize_tc(1e-5),
+                               delta=0.02)
+        wide = self.brute_force_marginalize_tc(0.004)
+        wider = self.brute_force_marginalize_tc(0.008)
+        self.assertAlmostEqual(numpy.log(2), wide - wider, delta=0.01)
+
+    def test_time_marginalization_is_converged(self):
+        """The Monte Carlo estimate must not depend on the sample count.
+
+        The count has to be set when the model is built; it is read once
+        into ``vsamples`` and assigning to the model afterwards does
+        nothing.
+        """
+        for build in (self.marg_time_model,
+                      lambda n: self.relative_time_model(
+                          models.RelativeTime, n)):
+            values = []
+            for nsamples in (128, 2048):
+                model = build(nsamples)
+                model.update(**self.q1)
+                values.append(model.loglr)
+            self.assertAlmostEqual(values[0], values[1], delta=0.5)
 
     def test_marginalized_time_matches_relative_time_dom(self):
-        # two independent implementations of the same time marginalization,
-        # so they should agree far more closely than either does with the
-        # fixed-tc value
+        """Two implementations of the same marginalization should agree.
+
+        This is a consistency check between models, not a check that either
+        is right: both use the same convention for how the marginalization
+        is normalized, so a mistake in that convention would not show up
+        here. See test_brute_force_tc_marginalization_is_correct for what
+        the independent reference looks like.
+        """
         marg = self.marg_time_model()
         marg.update(**self.q1)
         reldom = self.relative_time_model(models.RelativeTimeDom)
         reldom.update(**self.q1)
         self.assertAlmostEqual(marg.loglr, reldom.loglr, delta=1.5)
 
-    def test_time_marginalization_is_finite(self):
-        for model in [self.marg_time_model(),
-                      self.relative_time_model(models.RelativeTime),
-                      self.relative_time_model(models.RelativeTimeDom)]:
-            model.update(**self.q1)
-            self.assertTrue(numpy.isfinite(model.loglr))
-
 
 class TestAnalyticModels(unittest.TestCase):
-    """Tests the analytic models against their closed-form answers.
-
-    These have exact answers but were not covered by any test.
-    """
+    """Tests the analytic models against their closed-form answers."""
 
     def test_normal(self):
         model = models.TestNormal(['x', 'y'])
@@ -299,8 +337,7 @@ class TestAnalyticModels(unittest.TestCase):
             mean=[0., 0.], cov=[1., 1.]).logpdf([-0.2, 0.1])
         self.assertAlmostEqual(model.loglikelihood, expected, places=12)
 
-    def test_normal_mean_and_cov(self):
-        # a non-default mean/cov, so the arguments are actually exercised
+        # a non-default mean/cov, so those arguments are exercised too
         mean, cov = [1., -2.], [4., 0.25]
         model = models.TestNormal(['x', 'y'], mean=mean, cov=cov)
         model.update(x=0.5, y=-1.5)
