@@ -437,8 +437,6 @@ class GameSampler6(DummySampler):
                  gen_seed_leaves=0,
                  gen_seed_temper=-1.0,
                  gen_seed_range=4.0,
-                 gen_seed_update=0,
-                 gen_seed_kappa=1.0,
                  **kwargs):
         super().__init__(model, *args)
 
@@ -484,8 +482,6 @@ class GameSampler6(DummySampler):
         self.gen_seed_leaves = int(gen_seed_leaves)
         self.gen_seed_temper = float(gen_seed_temper)
         self.gen_seed_range = float(gen_seed_range)
-        self.gen_seed_update = int(gen_seed_update)
-        self.gen_seed_kappa = float(gen_seed_kappa)
         self.leaf_loglr = {}
         # seeded from the legacy global RNG, which pycbc_inference --seed sets,
         # so generative draws are reproducible alongside the shuffles that the
@@ -768,27 +764,6 @@ class GameSampler6(DummySampler):
                 weight = lengths / lengths.sum()
         else:
             weight = lengths / lengths.sum()
-        # per-leaf likelihood accumulators for the shrinkage estimator.
-        # _leaf_prior holds exp((loglr_rep - max)/T), i.e. the same
-        # tempered rep estimate the round-1 weight uses, so the estimator
-        # starts exactly where seeding starts and then moves on evidence.
-        self._leaf_ref = 0.0
-        self._leaf_sum = numpy.zeros(key)
-        self._leaf_n = numpy.zeros(key)
-        self._leaf_prior = numpy.ones(key)
-        if self.gen_seed_update:
-            ll0 = numpy.array([self.leaf_loglr.get(k, numpy.nan)
-                               for k in range(key)], dtype=float)
-            good = numpy.isfinite(ll0)
-            if good.any():
-                self._leaf_ref = float(ll0[good].max())
-                sp = float(ll0[good].max() - ll0[good].min())
-                tt = (self.gen_seed_temper if self.gen_seed_temper > 0
-                      else max(1.0, sp / max(self.gen_seed_range, 1e-6)))
-                self._leaf_prior = numpy.full(key, numpy.exp(-sp / tt))
-                self._leaf_prior[good] = numpy.exp(
-                    (ll0[good] - self._leaf_ref) / tt)
-
         # per-stratum accumulators
         gen_keys = [f'gen:bw{bw:g}' for bw in self.gen_bandwidths]
         strata = {'pool': {'samp': None, 'loglr': None, 'logw': None}}
@@ -825,49 +800,18 @@ class GameSampler6(DummySampler):
                                                       ps, pl, pw)
                     after = self._ess(strata['pool']['logw'])
                     pool_gain = (after - before) / max(len(pw), 1)
-                    if self.gen_seed_update:
-                        # Shrinkage estimator of each leaf's mean
-                        # likelihood, replacing the additive update.
-                        #
-                        # A leaf's draw weight should track its INTEGRATED
-                        # likelihood, n_bin * E[L]. Everything else is an
-                        # estimator of E[L]: the seed uses L(rep), a
-                        # SINGLE sample from inside the leaf, which is a
-                        # poor estimator once the likelihood varies within
-                        # a leaf (1.8 nats at SNR 13.5 but 9 at SNR 30, 95
-                        # at SNR 98). Here the rep is demoted to a weak
-                        # prior with weight seed_kappa and overwritten by
-                        # the actual draws as they arrive, so a leaf whose
-                        # rep was unlucky is corrected after one round
-                        # instead of being drained on a bad guess.
-                        #
-                        # This subsumes tempering in principle: tempering
-                        # is a blunt "distrust L(rep) by factor T" that
-                        # cannot tell an unlucky rep from a genuinely weak
-                        # leaf, whereas this corrects per leaf on evidence.
-                        # Kept separate from the additive path so the
-                        # validated baseline is undisturbed.
-                        m = float(numpy.nanmax(pl)) if len(pl) else 0.0
-                        if m > self._leaf_ref:
-                            # rescale accumulators to the new reference so
-                            # early leaves keep a consistent normalisation
-                            shift = numpy.exp(self._leaf_ref - m)
-                            self._leaf_sum *= shift
-                            self._leaf_ref = m
-                        contrib = numpy.exp(pl - self._leaf_ref)
-                        numpy.add.at(self._leaf_sum, bid, contrib)
-                        numpy.add.at(self._leaf_n, bid, 1.0)
-                        lhat = ((self.gen_seed_kappa * self._leaf_prior
-                                 + self._leaf_sum)
-                                / (self.gen_seed_kappa + self._leaf_n))
-                        w = lengths.astype(float) * lhat
-                        if numpy.isfinite(w).all() and w.sum() > 0:
-                            weight = w / w.sum()
-                    else:
-                        # games3's adaptive leaf reweighting, unchanged
-                        wn = numpy.exp(pw - logsumexp(pw))
-                        for j, v in zip(bid, wn):
-                            weight[j] += v
+                    # games3's adaptive leaf reweighting, unchanged.
+                    # A per-leaf shrinkage estimator of E[L] was tried here
+                    # (rep as weak prior, overwritten by observed draws) on
+                    # the theory that L(rep) is a poor one-sample estimator
+                    # once the within-leaf likelihood spread grows. It
+                    # measured NEUTRAL -- tempering beat it everywhere and
+                    # it added nothing on top -- so it was removed to keep
+                    # this path simple. See commit 4915a9340 for the code
+                    # and the numbers.
+                    wn = numpy.exp(pw - logsumexp(pw))
+                    for j, v in zip(bid, wn):
+                        weight[j] += v
                 except OutOfSamples:
                     logging.info('pool exhausted at round %i; handing its '
                                  'budget to the generative proposals', rnd)
