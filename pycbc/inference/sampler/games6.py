@@ -480,6 +480,7 @@ class GameSampler6(DummySampler):
         self._rng = numpy.random.default_rng(
             numpy.random.randint(0, 2 ** 31 - 1))
         self.ncalls = 0
+        self.tree_ncalls = 0
         self.stratum_calls = {'pool': 0, 'gen': 0}
 
     # ---------------- discrete pool stratum (unchanged from games3) ---------
@@ -956,12 +957,21 @@ class GameSampler6(DummySampler):
                          k, e, c, 100.0 * e / c if c else 0.0, b)
             self.meta[f'ess_{k}'] = float(e)
             self.meta[f'ncalls_{k}'] = int(c)
-        logging.info('combined ESS=%.1f ncalls=%i (setup %i)', total_ess,
-                     self.ncalls, self.meta.get('setup_ncalls', 0))
+        logging.info('combined ESS=%.1f ncalls=%i (setup %i, tree cut %i)',
+                     total_ess, self.ncalls,
+                     self.meta.get('setup_ncalls', 0), self.tree_ncalls)
 
+        # Setup and tree-cut calls are deliberately NOT folded into ncalls:
+        # both are one-time costs paid before/while resolving which leaves
+        # are active, independent of how many posterior samples are then
+        # drawn, so they amortize away at the ESS this sampler targets.
+        # Reported separately because they are still a useful diagnostic --
+        # a tree whose root level is too coarse prunes weakly and descends
+        # a large fraction of its nodes, which shows up here.
         self.meta['ncalls'] = self.ncalls
         self.meta['ess'] = total_ess
         self.meta['setup_ncalls'] = self.meta.get('setup_ncalls', 0)
+        self.meta['tree_ncalls'] = self.tree_ncalls
 
         nout = max(int(total_ess), 1)
         outs, ols = [], []
@@ -979,6 +989,17 @@ class GameSampler6(DummySampler):
         self._samples['loglikelihood'] = numpy.concatenate(ols)
 
     def _find_active_leaves(self, tree_root, loglr_bound):
+        """ Prune the subtree, evaluating the likelihood at each child's
+        representative and descending only where it clears the bound.
+
+        Those evaluations are real likelihood calls and are counted into
+        self.tree_ncalls. They used to be counted NOWHERE, which silently
+        inflated the reported efficiency (ESS/ncalls) of every tree-based
+        run -- and by a tree-shape-dependent amount, so it also made runs
+        on differently-shaped trees non-comparable: a tree with few coarse
+        root tiles hides many nodes below each one and pays far more here
+        than a tree with many fine root tiles.
+        """
         results = []
 
         def descend(group):
@@ -994,6 +1015,7 @@ class GameSampler6(DummySampler):
                 params = {p: float(child.attrs[f'param_{p}'])
                           for p in self.variable_params}
                 ll = call_likelihood(params)
+                self.tree_ncalls += 1
                 if numpy.isfinite(ll) and ll > loglr_bound:
                     descend(child)
 
