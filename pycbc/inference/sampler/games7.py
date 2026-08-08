@@ -1,4 +1,46 @@
-""" games6 reading a SHAPE-COMPRESSED tree, with the points regenerated.
+""" ABANDONED -- kept as a documented negative result. Use games6.
+
+games6 reading a SHAPE-COMPRESSED tree, with the points regenerated.
+
+VERDICT: storage works, sampling does not. 0.2-1.1% efficiency against
+games6's 22%, and the reason is structural rather than a bug.
+
+WHY IT FAILS. Real leaves TESSELLATE the prior: each cell is a piece of a
+uniform distribution and their union reconstructs a flat box with hard
+edges at the prior boundaries. Replacing each cell with an independent
+ellipsoid of matching mean and covariance gives a SUM OF OVERLAPPING
+BUMPS -- smooth, peaked, and spilling past the prior box. Plotting the
+2-D marginals makes this obvious instantly; no scalar summary catches it,
+because matching each leaf's first two moments FORCES the correlation to
+match (measured 0.0071, below the KDE's own 0.012 reproduction noise)
+while the distribution shape is qualitatively wrong.
+
+REBUILDING THE CELLS ALSO FAILS. The natural fix -- use the ellipsoid as
+a rejection envelope and carve the cell out with a nearest-representative
+test -- does not work either, because a cell is defined by the MATCH
+METRIC G, not by the point covariance: a cell is the match ellipsoid
+intersected with the Voronoi condition and clipped by the prior, so the
+covariance of the surviving points is a property of that clipped region,
+not of G. Measured, assigning real points by nearest representative
+recovers the leaf they actually came from for 3.3% of points (0.7% using
+a global metric). Recovering G means finite-difference metric computation
+per leaf, ~97k waveform-generating computations at build time.
+
+WHAT DID WORK, and is worth keeping: the flat file layout. Per-leaf HDF5
+groups were ~96% of the original file (~126k groups at ~1.8 kB metadata
+each), so flattening the STRUCTURE gave 3.7x on its own with no
+modelling assumptions at all. Combined with quantising point offsets
+relative to their leaf centre (~3x, still the real points) that is ~10x
+with no distributional risk -- the recommended route if map size needs
+reducing.
+
+Three earlier diagnostics in this file's history were WRONG and are
+recorded so they are not repeated: a claimed 0.127 2-D structure loss, a
+0.738 covariance error, and a kernel-anisotropy effect were all artifacts
+of indexing shapes by leaf_id instead of shape_id (they differ once small
+leaves get shrunk shapes appended after the main walk -- leaf 6 maps to
+shape 94461). The stored shapes are exact to 1e-8.
+
 
 games6 is deliberately untouched: it is the known-best baseline and this
 module must not be able to perturb it.
@@ -69,12 +111,14 @@ class GameSampler7(GameSampler6):
                 ('param', 'is_leaf', 'child_start', 'child_count',
                  'child_index', 'leaf_id', 'roots')}
         sh = {k: f['shape/%s' % k][:] for k in ('mu', 'cov_tril', 'radius')}
+        sh['alpha'] = (f['shape/alpha'][:] if 'shape/alpha' in f
+                       else numpy.zeros(len(sh['mu'])))
         leaf = {'shape_id': f['leaf/shape_id'][:],
                 'n_total': f['leaf/n_total'][:]}
         f.close()
         return node, sh, leaf
 
-    def _regenerate(self, mu, cov_tril, radius, n):
+    def _regenerate(self, mu, cov_tril, radius, n, alpha=0.0):
         """ n draws uniform on the ellipsoid (mu, cov, radius). """
         d = len(self.variable_params)
         c = numpy.zeros((d, d))
@@ -106,9 +150,25 @@ class GameSampler7(GameSampler6):
         # the extent, because the real leaf is not uniform. Matching the
         # covariance is the right choice -- it fixes the bulk, which is
         # what the pool weights depend on.
+        # Radial profile p(u) ~ u^(d-1+alpha) for u = r/r_max, alpha=0
+        # being the uniform ellipsoid. Real leaves are strongly peaked:
+        # 65.4% of points inside HALF the max radius against 1.6% uniform,
+        # i.e. 41.9x, with a fitted median alpha of -4.74. Sampling
+        # uniformly while rescaling to match the covariance (the earlier
+        # sqrt(d+2) fix) reproduced every 1-D marginal to ~1% but got the
+        # 2-D correlation structure wrong by 0.127 -- same second moments,
+        # entirely different shape.
+        #
+        # r_max is DERIVED from alpha rather than stored, which makes the
+        # covariance match exact by construction: with E[u^2] =
+        # (d+a)/(d+a+2) and whitened E[r^2] = d,
+        #     r_max^2 = d (d+a+2)/(d+a)
+        dpa = max(float(d) + float(alpha), 0.2)
+        rmax = numpy.sqrt(d * (dpa + 2.0) / dpa)
         z = self._rng.normal(size=(n, d))
         z /= numpy.maximum(numpy.linalg.norm(z, axis=1)[:, None], 1e-300)
-        z *= (self._rng.random(n) ** (1.0 / d))[:, None] * numpy.sqrt(d + 2.0)
+        u = self._rng.random(n) ** (1.0 / dpa)
+        z *= (u * rmax)[:, None]
         return mu + z @ L.T
 
     def run(self):
@@ -198,7 +258,8 @@ class GameSampler7(GameSampler6):
                 cand = self._regenerate(sh['mu'][sid].astype(float),
                                         sh['cov_tril'][sid].astype(float),
                                         float(sh['radius'][sid]),
-                                        int(n * 3))
+                                        int(n * 3),
+                                        float(sh['alpha'][sid]))
                 if cand is None:
                     break
                 inb = numpy.ones(len(cand), dtype=bool)
