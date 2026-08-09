@@ -110,6 +110,23 @@ class TestDetector(unittest.TestCase):
                 self.assertAlmostEqual(fc, fc2, places=12)
                 self.assertAlmostEqual(dt, dt2, places=14)
 
+    def test_antenna_pattern_and_delay_array_times(self):
+        # a signal long enough that the earth turns during it is evaluated
+        # at an array of times, which relative binning relies on
+        for ifo in self.d:
+            for ra1, dec1, pol1, time1 in list(zip(self.ra, self.dec,
+                                                   self.pol, self.time))[:10]:
+                times = time1 + numpy.linspace(0., 100., 17)
+                fp, fc = ifo.antenna_pattern(ra1, dec1, pol1, times)
+                dt = ifo.time_delay_from_earth_center(ra1, dec1, times)
+                fp2, fc2, dt2 = ifo.antenna_pattern_and_delay(
+                    ra1, dec1, pol1, times)
+                self.assertEqual(numpy.shape(fp2), numpy.shape(times))
+                self.assertLess(abs(fp - fp2).max(), 1e-12)
+                self.assertLess(abs(fc - fc2).max(), 1e-12)
+                self.assertLess(abs(numpy.atleast_1d(dt)
+                                    - numpy.atleast_1d(dt2)).max(), 1e-12)
+
     def test_project_wave_fd(self):
         # must reproduce assembling the projection by hand, which is what
         # the frequency-domain waveform generator used to do inline

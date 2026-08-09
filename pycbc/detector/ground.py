@@ -506,19 +506,28 @@ class Detector(object):
         cosdec, sindec = cos(declination), sin(declination)
         cospsi, sinpsi = cos(polarization), sin(polarization)
 
+        # t_gps may be an array, for a signal long enough that the earth
+        # turns during it. Broadcast the terms that do not depend on it so
+        # the stacked vectors below stay rectangular.
+        bcast = np.zeros_like(gha)
+
         resp = self.response
         x = np.array([-cospsi * singha - sinpsi * cosgha * sindec,
                       -cospsi * cosgha + sinpsi * singha * sindec,
-                      sinpsi * cosdec])
+                      sinpsi * cosdec + bcast])
         y = np.array([sinpsi * singha - cospsi * cosgha * sindec,
                       sinpsi * cosgha + cospsi * singha * sindec,
-                      cospsi * cosdec])
+                      cospsi * cosdec + bcast])
         dx = resp.dot(x)
         dy = resp.dot(y)
-        fplus = (x * dx - y * dy).sum()
-        fcross = (x * dy + y * dx).sum()
+        if x.ndim > 1:
+            fplus = (x * dx - y * dy).sum(axis=0)
+            fcross = (x * dy + y * dx).sum(axis=0)
+        else:
+            fplus = (x * dx - y * dy).sum()
+            fcross = (x * dy + y * dx).sum()
 
-        ehat = np.array([cosdec * cosgha, -cosdec * singha, sindec])
+        ehat = np.array([cosdec * cosgha, -cosdec * singha, sindec + bcast])
         delta_t = (-self.location).dot(ehat) / constants.c.value
         return fplus, fcross, delta_t
 
