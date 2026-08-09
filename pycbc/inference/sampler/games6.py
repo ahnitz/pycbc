@@ -5,19 +5,10 @@ reaches ~32% efficiency at low SNR) and adds one or more *generative*
 proposals that can supply unlimited draws once the discrete pools start to run
 dry. The point is narrow: fix exhaustion without giving up games3's efficiency.
 
-Two generative proposals, both fitted to the *accumulated posterior samples*
-rather than to a tile's prior pool:
-
-  'kde'      a Gaussian mixture centred on the current posterior samples, with
-             a full sample-covariance bandwidth.
-  'stretch'  additional mixture centres placed along the segment between pairs
-             of posterior samples, x = a + u (b - a). This fills in between
-             samples along whatever direction the posterior actually
-             correlates, which is the same idea as an affine-invariant stretch
-             move. A bare line proposal has no Lebesgue density in 6-D (a
-             segment is measure zero), so the segment points are used as
-             mixture *centres* and given the same kernel as 'kde'; the density
-             is then exactly computable.
+The generative proposal is a Gaussian mixture fitted to the *accumulated
+posterior samples* rather than to a tile's prior pool, with a separate
+covariance per centre estimated from its k nearest neighbours (see
+``LocalCovarianceProposal``).
 
 This is deliberately NOT games2. games2 fit a KDE to each tile's own prior
 pool, i.e. to a thin curved sliver of the prior, and a full-rank Gaussian
@@ -51,15 +42,27 @@ Consequences worth stating:
 Validated configuration
 ------------------------
 The constructor defaults below ARE the validated settings (see
-example_bns/GAMES6_RESULTS.md): local-covariance kernel (``gen_local_k=160``,
-not the global ``GaussianMixtureProposal`` fallback), raw coordinates
-(``gen_logit=0`` -- the logit/prior-box map made things worse, kept only as a
-documented negative result), no defensive component (``gen_defensive=0``),
-reserve mode (``gen_fraction=0`` -- the pool keeps the full budget until it
-exhausts, then hands over), and weighted-without-replacement centre
-subsampling once accumulated samples exceed ``gen_max_centres``. Only two
-knobs need a per-case override away from these defaults: ``gen_max_centres``
-and ``gen_min_ess`` at the most extreme SNR (see prior_g6final_snr100.ini).
+example_bns/GAMES6_RESULTS.md): a local-covariance kernel (``gen_local_k=160``)
+in raw coordinates, the generative proposal held in reserve so the pool keeps
+the whole budget until it exhausts and only then hands over, and
+weighted-without-replacement centre subsampling once accumulated samples
+exceed ``gen_max_centres``. Only two knobs need a per-case override:
+``gen_max_centres`` and ``gen_min_ess`` at the most extreme SNR (see
+prior_g6final_snr100.ini).
+
+Five alternatives were implemented, measured, and then REMOVED once settled.
+Each is a negative result rather than an untried idea, and each is in git
+history if a future parameter space reopens the question:
+
+  global shared-covariance kernel  one covariance cannot hug a thin CURVED
+                                   manifold -- see LocalCovarianceProposal
+  stretch centres                  extra centres between pairs of samples
+  logit map onto the prior box     helped in principle at the hard prior
+                                   edges, measured worse here
+  defensive broad component        bounds pi/q from above, but costs bulk
+                                   efficiency and the tail catastrophe it
+                                   guards against never materialised
+  several bandwidths as strata     one bandwidth won every time
 """
 import os
 import logging
@@ -68,128 +71,13 @@ import h5py
 import numpy
 import numpy.random
 from scipy.special import logsumexp
+from scipy.stats import chi2
 from pycbc.io import FieldArray
 
 from pycbc.inference import models
 from pycbc.pool import choose_pool
 from .dummy import DummySampler
 from .games import call_likelihood, OutOfSamples
-
-
-class GaussianMixtureProposal:
-    """ Gaussian mixture with a shared full-covariance kernel.
-
-    Centres come from the accumulated posterior samples and, optionally, from
-    stretch points between pairs of them. The density is a plain mixture, so it
-    is exact and cheap: one logsumexp over centres per query point.
-    """
-
-    def __init__(self, centres, cov, rng, stretch_pairs=0,
-                 stretch_scale=1.0, weights=None, defensive_frac=0.0,
-                 defensive_scale=3.0):
-        self.rng = rng
-        centres = numpy.atleast_2d(centres)
-        if weights is None:
-            weights = numpy.full(len(centres), 1.0 / len(centres))
-        weights = numpy.asarray(weights, dtype=float)
-        if stretch_pairs > 0 and len(centres) > 2:
-            a = centres[rng.integers(0, len(centres), stretch_pairs)]
-            b = centres[rng.integers(0, len(centres), stretch_pairs)]
-            u = rng.uniform(0.0, stretch_scale, size=(stretch_pairs, 1))
-            # stretch centres inherit the mean component weight, so adding
-            # them reshapes the proposal without reweighting the originals
-            extra = numpy.full(stretch_pairs, weights.mean())
-            centres = numpy.vstack([centres, a + u * (b - a)])
-            weights = numpy.concatenate([weights, extra])
-        self.weights = weights / weights.sum()
-        self.logw = numpy.log(numpy.maximum(self.weights, 1e-300))
-        self.centres = centres
-        self.n, self.dim = centres.shape
-
-        # Shared kernel: sample covariance times a Scott-like factor. A full
-        # covariance matters here -- the posterior is strongly correlated
-        # (mchirp/q, and spin1z/spin2z are tightly anti-correlated), and a
-        # diagonal kernel would spray draws across those directions.
-        factor = self.n ** (-1.0 / (self.dim + 4))
-        self.cov = cov * factor ** 2
-        # jitter until positive definite; posterior samples can be degenerate
-        # in a direction the sampler has barely explored
-        eps = 1e-12 * numpy.trace(self.cov) / self.dim
-        for _ in range(8):
-            try:
-                self.chol = numpy.linalg.cholesky(self.cov)
-                break
-            except numpy.linalg.LinAlgError:
-                self.cov = self.cov + eps * numpy.eye(self.dim)
-                eps *= 10
-        else:
-            raise numpy.linalg.LinAlgError('kernel covariance not PD')
-        self.log_det = 2.0 * numpy.log(numpy.diag(self.chol)).sum()
-        self.inv = numpy.linalg.inv(self.cov)
-        self._lognorm = -0.5 * (self.dim * numpy.log(2 * numpy.pi)
-                                + self.log_det)
-
-        # Defensive component: a single broad Gaussian covering the whole
-        # sample spread, mixed in with probability defensive_frac. Efficiency
-        # here is not limited by mild over-dispersion -- a proposal 10% too
-        # wide in 6-D would still be ~91% efficient -- but by rare draws where
-        # q is small while the target is not, which produce enormous weights
-        # and collapse the ESS. Mixing in a broad component bounds the weight
-        # ratio pi/q from above everywhere the broad component has support,
-        # which is the standard defensive-mixture remedy. It costs a little
-        # efficiency in the bulk and removes the tail catastrophe.
-        self.defensive_frac = float(defensive_frac)
-        if self.defensive_frac > 0:
-            self.def_mean = numpy.average(self.centres, axis=0,
-                                          weights=self.weights)
-            spread = numpy.cov(self.centres.T, aweights=self.weights)
-            self.def_cov = spread * defensive_scale ** 2
-            eps2 = 1e-12 * numpy.trace(self.def_cov) / self.dim
-            for _ in range(8):
-                try:
-                    self.def_chol = numpy.linalg.cholesky(self.def_cov)
-                    break
-                except numpy.linalg.LinAlgError:
-                    self.def_cov = self.def_cov + eps2 * numpy.eye(self.dim)
-                    eps2 *= 10
-            else:
-                self.defensive_frac = 0.0
-        if self.defensive_frac > 0:
-            self.def_inv = numpy.linalg.inv(self.def_cov)
-            self.def_lognorm = -0.5 * (
-                self.dim * numpy.log(2 * numpy.pi)
-                + 2.0 * numpy.log(numpy.diag(self.def_chol)).sum())
-
-    def sample(self, size):
-        idx = self.rng.choice(self.n, size=size, p=self.weights)
-        z = self.rng.normal(size=(size, self.dim))
-        x = self.centres[idx] + z @ self.chol.T
-        if self.defensive_frac > 0:
-            use = self.rng.random(size) < self.defensive_frac
-            k = int(use.sum())
-            if k:
-                zb = self.rng.normal(size=(k, self.dim))
-                x[use] = self.def_mean + zb @ self.def_chol.T
-        return x
-
-    def logpdf(self, x):
-        """ log density, exact: logsumexp over centres minus log(n). """
-        out = numpy.empty(len(x))
-        # chunked to bound memory at n_centres * chunk * dim
-        chunk = max(1, int(4e7 / max(self.n, 1)))
-        for s in range(0, len(x), chunk):
-            d = x[s:s+chunk, None, :] - self.centres[None, :, :]
-            m = numpy.einsum('ijk,kl,ijl->ij', d, self.inv, d)
-            out[s:s+chunk] = (logsumexp(-0.5 * m + self.logw[None, :], axis=1)
-                              + self._lognorm)
-        if self.defensive_frac > 0:
-            zb = x - self.def_mean
-            mb = numpy.einsum('ij,jk,ik->i', zb, self.def_inv, zb)
-            logb = -0.5 * mb + self.def_lognorm
-            out = numpy.logaddexp(
-                numpy.log1p(-self.defensive_frac) + out,
-                numpy.log(self.defensive_frac) + logb)
-        return out
 
 
 class LocalCovarianceProposal:
@@ -206,7 +94,7 @@ class LocalCovarianceProposal:
     """
 
     def __init__(self, centres, rng, k=40, scale=1.0, weights=None,
-                 ridge=1e-3, defensive_frac=0.0, defensive_scale=3.0):
+                 ridge=1e-3):
         from scipy.spatial import cKDTree
         self.rng = rng
         self.centres = numpy.atleast_2d(centres)
@@ -216,7 +104,6 @@ class LocalCovarianceProposal:
         self.weights = numpy.asarray(weights, float)
         self.weights /= self.weights.sum()
         self.logw = numpy.log(numpy.maximum(self.weights, 1e-300))
-        self.defensive_frac = float(defensive_frac)
 
         # Everything is built in globally WHITENED coordinates, where every
         # parameter is O(1). Doing this in physical units is a trap: the six
@@ -254,45 +141,11 @@ class LocalCovarianceProposal:
             self.lognorm[i] = -0.5 * (self.dim * numpy.log(2 * numpy.pi)
                                       + 2.0 * numpy.log(numpy.diag(L)).sum())
 
-        # Defensive component: a single broad Gaussian in the same whitened
-        # z-space, covering the full weighted spread of centres, mixed in with
-        # probability defensive_frac. Local kernels are tight by design (each
-        # is sized to its own k-NN neighbourhood), so a centre far from where
-        # a query point lands can leave the local mixture density essentially
-        # zero there even though the true posterior is not -- the same
-        # tail-catastrophe risk the global-covariance proposal's defensive
-        # component guards against, here guarding a per-centre kernel instead
-        # of a single global one.
-        if self.defensive_frac > 0:
-            self.def_mean = numpy.average(cz, axis=0, weights=self.weights)
-            spread = numpy.cov(cz.T, aweights=self.weights)
-            def_cov = spread * defensive_scale ** 2
-            eps2 = 1e-12 * numpy.trace(def_cov) / self.dim
-            for _ in range(8):
-                try:
-                    self.def_chol = numpy.linalg.cholesky(def_cov)
-                    break
-                except numpy.linalg.LinAlgError:
-                    def_cov = def_cov + eps2 * numpy.eye(self.dim)
-                    eps2 *= 10
-            else:
-                self.defensive_frac = 0.0
-        if self.defensive_frac > 0:
-            self.def_inv = numpy.linalg.inv(def_cov)
-            self.def_lognorm = -0.5 * (
-                self.dim * numpy.log(2 * numpy.pi)
-                + 2.0 * numpy.log(numpy.diag(self.def_chol)).sum())
 
     def sample(self, size):
         idx = self.rng.choice(self.n, size=size, p=self.weights)
         z0 = self.rng.normal(size=(size, self.dim))
         z = self._cz[idx] + numpy.einsum('nij,nj->ni', self.chol[idx], z0)
-        if self.defensive_frac > 0:
-            use = self.rng.random(size) < self.defensive_frac
-            k = int(use.sum())
-            if k:
-                zb = self.rng.normal(size=(k, self.dim))
-                z[use] = self.def_mean + zb @ self.def_chol.T
         return z @ self._Winv
 
     def logpdf(self, x):
@@ -303,70 +156,8 @@ class LocalCovarianceProposal:
             m = numpy.einsum('ij,jk,ik->i', d, self.inv[i], d)
             out = numpy.logaddexp(out, -0.5 * m + self.lognorm[i]
                                   + self.logw[i])
-        if self.defensive_frac > 0:
-            zb = z - self.def_mean
-            mb = numpy.einsum('ij,jk,ik->i', zb, self.def_inv, zb)
-            logb = -0.5 * mb + self.def_lognorm
-            out = numpy.logaddexp(
-                numpy.log1p(-self.defensive_frac) + out,
-                numpy.log(self.defensive_frac) + logb)
         # change of variables from whitened z back to physical x
         return out + self._logdetW
-
-
-class BoundedProposal:
-    """ Wraps a mixture proposal in a logit map onto the prior box.
-
-    The posterior here runs hard up against its prior boundaries -- it is nearly
-    uniform in lambda2 across the full [0, 1000] range, and 20% of its mass sits
-    within 2% of some edge -- and a Gaussian kernel cannot represent a sharp
-    edge. Fitting in the raw parameters leaks 26% of draws outside the prior and,
-    worse, leaves q deficient just inside each edge (measured: weights within 2%
-    of an edge are 3x the interior), because the kernel mass that should sit
-    there fell outside instead. Uneven q means weight variance, which is ESS.
-
-    Mapping each parameter to y = logit((x - a) / (b - a)) removes both effects
-    at once: the support becomes exactly the prior box, so nothing leaks and
-    nothing is rejected, and a density that is flat against the edge in x is
-    unbounded-and-smooth in y, which is a shape a Gaussian mixture can represent.
-    """
-
-    def __init__(self, inner, lo, hi):
-        self.inner = inner
-        self.lo = numpy.asarray(lo, float)
-        self.hi = numpy.asarray(hi, float)
-        self.span = self.hi - self.lo
-
-    @staticmethod
-    def to_y(x, lo, span, eps=1e-9):
-        u = numpy.clip((x - lo) / span, eps, 1.0 - eps)
-        return numpy.log(u / (1.0 - u))
-
-    # Keep draws strictly inside the prior. sigmoid(y) underflows for large
-    # negative y, and lo + span*4e-18 rounds back to exactly lo in float64 for
-    # a tight parameter like mchirp (span 2e-3), which pycbc's Uniform treats
-    # as outside its bounds -- every such draw would then be rejected. An inset
-    # of 1e-10 of the span is far above the float64 spacing at these values and
-    # displaces a completely negligible amount of probability.
-    INSET = 1e-10
-
-    def to_x(self, y):
-        u = 1.0 / (1.0 + numpy.exp(-y))
-        u = numpy.clip(u, self.INSET, 1.0 - self.INSET)
-        return self.lo + self.span * u
-
-    def _log_jac(self, y):
-        """ log|dy/dx| = -log(span) - log u - log(1-u), with u = sigmoid(y). """
-        logu = -numpy.log1p(numpy.exp(-y))
-        log1mu = -numpy.log1p(numpy.exp(y))
-        return (-numpy.log(self.span)[None, :] - logu - log1mu).sum(axis=1)
-
-    def sample(self, size):
-        return self.to_x(self.inner.sample(size))
-
-    def logpdf(self, x):
-        y = self.to_y(x, self.lo, self.span)
-        return self.inner.logpdf(y) + self._log_jac(y)
 
 
 class GameSampler6(DummySampler):
@@ -392,12 +183,6 @@ class GameSampler6(DummySampler):
         needs enough accumulated posterior samples to fit.
     gen_min_ess : float
         Minimum accumulated ESS before fitting the generative proposal.
-    gen_fraction : float
-        Initial share of the round budget given to the generative stratum; the
-        share then adapts toward whichever stratum delivers more ESS per call.
-        Set to 0 to hold the generative proposal in reserve, so that behaviour
-        before exhaustion is identical to games3 and the generative stratum only
-        takes over once the pools run dry.
     gen_max_centres : int
         Cap on mixture centres taken from the posterior samples.
     gen_refit : int
@@ -408,33 +193,24 @@ class GameSampler6(DummySampler):
         Extra scale on the kernel covariance. Below 1 tightens the proposal,
         which raises efficiency when the posterior is much narrower than the
         sample spread suggests.
-    stretch_pairs : int
-        Number of extra stretch centres (0 disables the stretch component).
-    stretch_scale : float
-        Upper limit of u in x = a + u (b - a); >1 extrapolates past b.
+    gen_local_k : int
+        Neighbours used to estimate each centre's own kernel covariance.
     """
     name = 'games6'
 
     def __init__(self, model, *args, nprocesses=1, use_mpi=False,
                  mapfile=None, treefile=None,
-                 loglr_region=25,
+                 loglr_region=0,
+                 loglr_coverage=1e-4,
                  target_likelihood_calls=1e5,
                  rounds=1,
                  gen_start_round=1,
                  gen_min_ess=100,
-                 gen_fraction=0.0,
                  gen_max_centres=20000,
                  gen_refit=1,
                  gen_bandwidth=1.0,
-                 gen_bandwidths=None,
                  gen_local_k=160,
-                 gen_logit=0,
-                 gen_defensive=0.0,
-                 gen_defensive_scale=3.0,
-                 stretch_pairs=0,
-                 stretch_scale=1.0,
                  tree_start_level=0,
-                 coarse_fraction=0.5,
                  min_active_points=100,
                  tile_point_cap=200000,
                  gen_seed_leaves=0,
@@ -456,37 +232,33 @@ class GameSampler6(DummySampler):
         self._samples = {}
 
         self.target_likelihood_calls = int(target_likelihood_calls)
-        self.loglr_region = float(loglr_region)
+        # The cut keeps nodes within `loglr_region` of the best. That is a
+        # COVERAGE statement, not a free number: a d-dimensional posterior
+        # encloses a fraction 1-eps of its mass within a loglr drop of
+        # chi2_d(1-eps)/2, so the region follows from how much mass you are
+        # willing to miss and from how many parameters there are. In 6-D,
+        # 1e-4 gives 13.9 nats -- close to the 15 this was set to for years,
+        # which is why 15 worked; but the same 15 is over-conservative in
+        # 4-D (a BBH map), where 11.8 suffices, and over-conservative costs
+        # real money here because `loglr_region` sets the SNR below which
+        # the cut cannot prune at all (rho ~ sqrt(2*loglr_region)).
+        # Pass loglr_region explicitly to override.
+        if float(loglr_region) > 0:
+            self.loglr_region = float(loglr_region)
+        else:
+            d = len(model.variable_params)
+            self.loglr_region = float(
+                chi2.ppf(1.0 - float(loglr_coverage), d) / 2.0)
+            logging.info('loglr_region=%.1f from %i parameters and '
+                         'coverage 1-%g', self.loglr_region, d,
+                         float(loglr_coverage))
         self.gen_start_round = int(gen_start_round)
         self.gen_min_ess = float(gen_min_ess)
-        self.gen_fraction = float(gen_fraction)
         self.gen_max_centres = int(gen_max_centres)
         self.gen_refit = int(gen_refit)
         self.gen_bandwidth = float(gen_bandwidth)
-        # One generative stratum per bandwidth. Because strata are combined
-        # with beta proportional to ESS, the mixture automatically shifts
-        # toward whichever bandwidth is working, with no switching rule to
-        # tune: a bandwidth that proposes badly earns a small ESS and so a
-        # small beta. Budget is also reallocated toward the better strata.
-        if gen_bandwidths is None:
-            self.gen_bandwidths = [self.gen_bandwidth]
-        elif isinstance(gen_bandwidths, str):
-            self.gen_bandwidths = [float(v) for v in
-                                   gen_bandwidths.replace(',', ' ').split()]
-        else:
-            self.gen_bandwidths = [float(v) for v in gen_bandwidths]
         self.gen_local_k = int(gen_local_k)
-        self.gen_logit = int(gen_logit)
-        self.gen_defensive = float(gen_defensive)
-        self.gen_defensive_scale = float(gen_defensive_scale)
-        self.stretch_pairs = int(stretch_pairs)
-        self.stretch_scale = float(stretch_scale)
         self.tree_start_level = int(tree_start_level)
-        # If at least this fraction of start-level nodes clears the cut,
-        # skip the descent and use those nodes as leaves -- see the long
-        # comment at the call site. 0 restores the always-descend
-        # behaviour. Only active when tree_start_level > 0.
-        self.coarse_fraction = float(coarse_fraction)
         # Fall back to start-level tiles only if the cut leaves fewer
         # points than this IN TOTAL. Set low on purpose. An earlier value
         # of 2000 fired on P-P injection 19, which had 9 leaves holding
@@ -612,10 +384,7 @@ class GameSampler6(DummySampler):
         xall = proposal.sample(budget)
         keep = self._in_prior(xall, names)
         if keep.sum() == 0:
-            self._dump(stratum + '-rejected', x=xall,
-                       is_logit=int(isinstance(proposal, BoundedProposal)),
-                       lo=getattr(proposal, 'lo', numpy.zeros(0)),
-                       hi=getattr(proposal, 'hi', numpy.zeros(0)))
+            self._dump(stratum + '-rejected', x=xall)
             return None
         x = xall[keep]
         logq = proposal.logpdf(x)
@@ -625,19 +394,8 @@ class GameSampler6(DummySampler):
             psamp[p] = x[:, k]
         loglr = self._likelihoods(psamp, stratum=stratum)
         self._dump(stratum, x=x, loglr=loglr, logq=logq, budget=budget,
-                   nkept=int(keep.sum()),
-                   centres=getattr(proposal, 'centres',
-                                   getattr(getattr(proposal, 'inner', None),
-                                           'centres', numpy.zeros(0))),
-                   cweights=getattr(proposal, 'weights',
-                                    getattr(getattr(proposal, 'inner', None),
-                                            'weights', numpy.zeros(0))),
-                   kcov=getattr(proposal, 'cov',
-                                getattr(getattr(proposal, 'inner', None),
-                                        'cov', numpy.zeros(0))),
-                   is_logit=int(isinstance(proposal, BoundedProposal)),
-                   lo=getattr(proposal, 'lo', numpy.zeros(0)),
-                   hi=getattr(proposal, 'hi', numpy.zeros(0)))
+                   nkept=int(keep.sum()), centres=proposal.centres,
+                   cweights=proposal.weights)
         # uniform prior => its density is a constant that cancels in the
         # stratum's own self-normalisation
         return psamp, loglr, loglr - logq
@@ -725,14 +483,34 @@ class GameSampler6(DummySampler):
         passed = numpy.where((node_loglrs > bound)
                              & ~numpy.isnan(node_loglrs))[0]
 
-        # Below rho ~ sqrt(2*loglr_region) the cut cannot prune at all --
-        # a node at match m sits (1-m^2) rho^2/2 below the peak -- so the
-        # descent enumerates the whole tree AND under-covers, because
-        # rep-level noise discards leaves that hold posterior mass. When
-        # most start nodes pass, skip it and use the tiles themselves:
-        # as rho -> 0 their subtree clouds union to the prior exactly.
-        coarse = (start_nodes is not None and self.coarse_fraction > 0
-                  and len(passed) >= self.coarse_fraction * len(args))
+        # CAN THE CUT DISCRIMINATE AT ALL? The bound is
+        # max - loglr_region, so every node passes exactly when the whole
+        # SPREAD is smaller than the region:
+        #
+        #     max(node) - min(node) < loglr_region.
+        #
+        # Must be written as a spread, not as an absolute level: these
+        # values come from `call_likelihood`, which returns the LOG
+        # LIKELIHOOD (order -5e5 here), not the loglr. A threshold on the
+        # absolute value fires always. Differences are offset-free, which
+        # is why the bound itself has always been written as a difference.
+        #
+        # In loglr terms the worst node has ~0, so the spread is the best
+        # node's loglr ~ t^2 rho^2/2 for a start level of threshold t --
+        # giving rho < sqrt(2 loglr_region)/t, the floor measured from the
+        # tree_ncalls blow-up (5.9 at t=0.9, R=13.9).
+        # Below that the descent enumerates the whole tree AND
+        # under-covers, since rep-level noise then discards leaves that do
+        # hold posterior mass. Use the tiles themselves instead: as rho ->
+        # 0 their subtree clouds union to the prior exactly.
+        #
+        # This replaces a `coarse_fraction >= 0.5` heuristic that was a
+        # proxy for exactly this quantity, and a poor one -- injection 5
+        # had under half its start nodes pass, so the proxy declined to
+        # fire, and it still paid 146113 descent calls for 3.06%.
+        finite = node_loglrs[numpy.isfinite(node_loglrs)]
+        spread = (finite.max() - finite.min()) if len(finite) else 0.0
+        coarse = start_nodes is not None and spread < self.loglr_region
         if coarse:
             logging.info('%i of %i start nodes passed: cut cannot '
                          'discriminate, using tiles directly',
@@ -855,41 +633,28 @@ class GameSampler6(DummySampler):
         else:
             weight = lengths / lengths.sum()
         # per-stratum accumulators
-        gen_keys = [f'gen:bw{bw:g}' for bw in self.gen_bandwidths]
         strata = {'pool': {'samp': None, 'loglr': None, 'logw': None}}
-        for k in gen_keys:
-            strata[k] = {'samp': None, 'loglr': None, 'logw': None}
-        self.stratum_calls = {k: 0 for k in ['pool'] + gen_keys}
-        proposals = {}
-        if self.gen_seed_leaves:
-            seed = self._seed_proposal_from_leaves()
-            if seed is not None:
-                proposals = {gen_keys[0]: seed}
-        # per-stratum share of the generative budget, adapted by ESS per call
-        share = {k: 1.0 / len(gen_keys) for k in gen_keys}
+        self.stratum_calls = {'pool': 0}
+        proposal = self._seed_proposal_from_leaves() \
+            if self.gen_seed_leaves else None
         pool_dead = False
-        frac = self.gen_fraction
 
         for rnd in range(1, self.rounds + 1):
             self._round = rnd
-            gen_budget = 0
-            if proposals:
-                gen_budget = int(self.target_likelihood_calls
-                                 * (1.0 if pool_dead else frac))
+            # The generative proposal is held in RESERVE: the pool keeps the
+            # entire budget, so behaviour before exhaustion is identical to
+            # games3, and the generative stratum only runs once the pool dies
+            # and hands its budget over.
+            gen_budget = self.target_likelihood_calls if pool_dead else 0
             pool_budget = self.target_likelihood_calls - gen_budget
 
-            pool_gain = None
-            gen_gains = {}
             if pool_budget > 0 and not pool_dead:
                 try:
                     ps, pl, pw, bid = self.pool_round(
                         weight / weight.sum(), active_ids, lengths,
                         pool_budget, prior_mass=prior_mass)
-                    before = self._ess(strata['pool']['logw'])
                     strata['pool'] = self._accumulate(strata['pool'],
                                                       ps, pl, pw)
-                    after = self._ess(strata['pool']['logw'])
-                    pool_gain = (after - before) / max(len(pw), 1)
                     # games3's adaptive leaf reweighting, unchanged.
                     # A per-leaf shrinkage estimator of E[L] was tried here
                     # (rep as weak prior, overwritten by observed draws) on
@@ -904,58 +669,25 @@ class GameSampler6(DummySampler):
                         weight[j] += v
                 except OutOfSamples:
                     logging.info('pool exhausted at round %i; handing its '
-                                 'budget to the generative proposals', rnd)
+                                 'budget to the generative proposal', rnd)
                     pool_dead = True
-                    if not proposals:
-                        proposals = self._fit_proposals(strata, gen_keys)
-                    if not proposals:
+                    if proposal is None:
+                        proposal = self._fit_proposal(strata)
+                    if proposal is None:
                         logging.info('no generative proposal available; stop')
                         break
                     gen_budget = self.target_likelihood_calls
 
-            if gen_budget > 0 and proposals:
-                live = [k for k in gen_keys if k in proposals]
-                tot_share = sum(share[k] for k in live) or 1.0
-                for k in live:
-                    b = int(gen_budget * share[k] / tot_share)
-                    if b <= 0:
-                        continue
-                    got = self.gen_round(proposals[k], b, stratum=k)  # noqa
-                    if got is None:
-                        continue
+            if gen_budget > 0 and proposal is not None:
+                got = self.gen_round(proposal, gen_budget)
+                if got is not None:
                     gs, gl, gw = got
-                    # one stratum per (bandwidth, round): each round used a
-                    # different refitted proposal, so its samples are only
-                    # commensurate with themselves
-                    rk = f'{k}:r{rnd}'
+                    # one stratum PER ROUND: each round used a different
+                    # refitted proposal, so its samples are only commensurate
+                    # with themselves
+                    rk = 'gen:r%i' % rnd
                     strata[rk] = {'samp': gs, 'loglr': gl, 'logw': gw}
-                    self.stratum_calls.setdefault(rk, 0)
                     self.stratum_calls[rk] = len(gw)
-                    self.stratum_calls[k] = self.stratum_calls.get(k, 0)
-                    gen_gains[k] = self._ess(gw) / max(len(gw), 1)
-                if gen_gains:
-                    tot = sum(max(v, 0) for v in gen_gains.values())
-                    if tot > 0:
-                        for k in gen_keys:
-                            g = max(gen_gains.get(k, 0.0), 0.0) / tot
-                            share[k] = 0.5 * share[k] + 0.5 * g
-                        ssum = sum(share.values()) or 1.0
-                        for k in gen_keys:
-                            share[k] = max(share[k] / ssum, 0.02)
-
-            # shift budget toward whichever stratum yields more ESS per call.
-            # gen_fraction <= 0 means "hold the generative proposal in reserve":
-            # the pool keeps the entire budget, so behaviour before exhaustion
-            # is identical to games3, and the generative stratum only runs once
-            # the pool dies and hands over its budget.
-            best_gen = max(gen_gains.values()) if gen_gains else None
-            if self.gen_fraction > 0 and pool_gain is not None \
-                    and best_gen is not None:
-                gen_gain = best_gen
-                tot = max(pool_gain, 0) + max(gen_gain, 0)
-                if tot > 0:
-                    frac = 0.5 * frac + 0.5 * (max(gen_gain, 0) / tot)
-                    frac = min(max(frac, 0.05), 0.95)
 
             # Refit the generative proposal as posterior information
             # accumulates. This is safe because every sample already carries
@@ -967,17 +699,16 @@ class GameSampler6(DummySampler):
             # that round.
             if rnd >= self.gen_start_round and self.gen_refit > 0 and \
                     (rnd - self.gen_start_round) % self.gen_refit == 0:
-                new = self._fit_proposals(strata, gen_keys)
-                if new:
-                    proposals = new
+                new = self._fit_proposal(strata)
+                if new is not None:
+                    proposal = new
 
             ess_p = self._ess(strata['pool']['logw'])
             gkeys = [q for q in strata if q.startswith('gen')]
             gsum = sum(self._ess(strata[q]['logw']) for q in gkeys)
-            detail = f'{len(gkeys)} sub-strata'
-            logging.info('round %i: ESS pool=%.1f gen[%s] total=%.1f '
-                         'ncalls=%i', rnd, ess_p, detail, ess_p + gsum,
-                         self.ncalls)
+            logging.info('round %i: ESS pool=%.1f gen[%i rounds]=%.1f '
+                         'total=%.1f ncalls=%i', rnd, ess_p, len(gkeys),
+                         gsum, ess_p + gsum, self.ncalls)
 
         self._finalise(strata)
 
@@ -1035,43 +766,14 @@ class GameSampler6(DummySampler):
         for p in names:
             fa[p] = samp[p]
         stratum = {'samp': fa, 'loglr': logw, 'logw': logw}
-        prop = self._fit_proposal({'seed': stratum}, self.gen_bandwidth)
+        prop = self._fit_proposal({'seed': stratum})
         if prop is not None:
             logging.info('seeded generative proposal from %i active leaves '
                          '(%i points, subsampled to %i)', len(keys), total,
                          len(samp))
         return prop
 
-    def _fit_proposals(self, strata, gen_keys):
-        out = {}
-        for bw, k in zip(self.gen_bandwidths, gen_keys):
-            p = self._fit_proposal(strata, bw)
-            if p is not None:
-                out[k] = p
-        if out:
-            logging.info('fitted %i generative proposals: %s', len(out),
-                         ', '.join(sorted(out)))
-        return out
-
-    def _prior_bounds(self):
-        names = list(self.model.variable_params)
-        lo = numpy.full(len(names), -numpy.inf)
-        hi = numpy.full(len(names), numpy.inf)
-        try:
-            dists = self.model.prior_distribution.distributions
-        except AttributeError:
-            return None
-        for dist in dists:
-            b = getattr(dist, 'bounds', None) or {}
-            for k, v in b.items():
-                if k in names:
-                    i = names.index(k)
-                    lo[i], hi[i] = float(v[0]), float(v[1])
-        if not numpy.all(numpy.isfinite(lo) & numpy.isfinite(hi)):
-            return None
-        return lo, hi
-
-    def _fit_proposal(self, strata, bandwidth=None):
+    def _fit_proposal(self, strata):
         """ Fit the generative proposal to the accumulated posterior samples
         from every stratum, resampled to equal weight.
         """
@@ -1151,56 +853,16 @@ class GameSampler6(DummySampler):
             return None
         logging.debug('centres=%i centre_w_ess=%.1f (of %i drawn from %i)',
                       len(cw), cw.sum() ** 2 / (cw ** 2).sum(), n, len(x))
-        # weighted covariance over ALL samples, which uses the full posterior
-        # information rather than only the retained centres
-        mu = (w[:, None] * x).sum(0)
-        xc = x - mu
-        cov = (w[:, None] * xc).T @ xc / max(1.0 - (w ** 2).sum(), 1e-12)
-        if not numpy.all(numpy.isfinite(cov)):
-            return None
-        # Kernel choice and coordinate transform are ORTHOGONAL, and must be
-        # composed rather than raced. An earlier version returned from the logit
-        # branch before the gen_local_k test could run, and since gen_logit
-        # defaults to 1 that made the local-covariance kernel dead code -- it was
-        # then wrongly reported as "tried and ineffective". Build the kernel
-        # first, then optionally wrap it in the logit map.
-        bw = self.gen_bandwidth if bandwidth is None else bandwidth
-        bnd = self._prior_bounds() if self.gen_logit else None
-
-        fit_x, lo, hi = centres, None, None
-        if bnd is not None:
-            lo, hi = bnd
-            fit_x = BoundedProposal.to_y(centres, lo, hi - lo)
-            if not numpy.all(numpy.isfinite(fit_x)):
-                fit_x, lo, hi = centres, None, None
-
         try:
-            if self.gen_local_k > 0:
-                inner = LocalCovarianceProposal(
-                    fit_x, self._rng, k=self.gen_local_k, scale=bw,
-                    weights=cw, defensive_frac=self.gen_defensive,
-                    defensive_scale=self.gen_defensive_scale)
-            else:
-                fcov = numpy.cov(fit_x.T, aweights=cw) if lo is not None \
-                    else cov
-                if not numpy.all(numpy.isfinite(fcov)):
-                    return None
-                inner = GaussianMixtureProposal(
-                    fit_x, fcov * bw ** 2, self._rng,
-                    stretch_pairs=self.stretch_pairs,
-                    stretch_scale=self.stretch_scale, weights=cw,
-                    defensive_frac=self.gen_defensive,
-                    defensive_scale=self.gen_defensive_scale)
+            prop = LocalCovarianceProposal(
+                centres, self._rng, k=self.gen_local_k,
+                scale=self.gen_bandwidth, weights=cw)
         except numpy.linalg.LinAlgError:
             logging.info('generative proposal fit failed (singular kernel)')
             return None
-
-        prop = inner if lo is None else BoundedProposal(inner, lo, hi)
-        kern = ('local%d' % self.gen_local_k if self.gen_local_k > 0
-                else 'global')
-        logging.info('fitted proposal: kernel=%s space=%s bw=%.2f centres=%i '
-                     'accumulated ESS=%.1f', kern,
-                     'logit' if lo is not None else 'raw', bw, inner.n, ess)
+        logging.info('fitted proposal: k=%i bw=%.2f centres=%i '
+                     'accumulated ESS=%.1f', self.gen_local_k,
+                     self.gen_bandwidth, prop.n, ess)
         return prop
 
     def _finalise(self, strata):
