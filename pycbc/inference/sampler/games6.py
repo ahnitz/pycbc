@@ -745,7 +745,7 @@ class GameSampler6(DummySampler):
         else:
             logging.info('...resolving tree leaves for %i passed tiles',
                          len(passed))
-            active_lengths, key = [], 0
+            active_lengths, active_mass, key = [], [], 0
             self.leaf_loglr = {}
             with h5py.File(self.mapfile, 'r') as mapfile:
                 for tile in passed:
@@ -757,16 +757,17 @@ class GameSampler6(DummySampler):
                         leaves = self._find_active_leaves(
                             treefile['tree'][str(tile)], bound)
                     if not leaves and start_nodes is None:
-                        leaves = [(mapfile['map'][str(tile)][:],
-                                   node_loglrs[tile])]
-                    for pts, ll in (leaves or []):
+                        mp = mapfile['map'][str(tile)][:]
+                        leaves = [(mp, node_loglrs[tile], float(len(mp)))]
+                    for pts, ll, mass in (leaves or []):
                         self.dmap[key] = pts
                         self.leaf_loglr[key] = ll
                         active_lengths.append(len(pts))
+                        active_mass.append(mass)
                         key += 1
             active_ids = numpy.arange(key)
             lengths = numpy.array(active_lengths)
-            prior_mass = lengths.astype(float)
+            prior_mass = numpy.array(active_mass, dtype=float)
         # NB: the tree file must stay open until after the fallback
         # below, which reads subtrees through `start_nodes`.
         logging.info('...resolved to %i active bins (%i points)',
@@ -1351,11 +1352,17 @@ class GameSampler6(DummySampler):
                                   dtype=self.dtype)
                 for p in self.variable_params:
                     pts[p] = group[f'points_{p}'][:]
-                # carry the likelihood at this leaf's own representative:
-                # it was already paid for to decide the descent, and it is
+                # Third element is the leaf's PRIOR MASS. A refined leaf
+                # holds more points than its mass warrants, so the weight
+                # must use the builder's unbiased count or oversampling
+                # would inflate that leaf; equals the point count for
+                # unrefined maps. The loglr is the leaf's own
+                # representative, already paid for during the descent and
                 # what makes the leaf-weighted cloud an estimate of the
-                # posterior (see _seed_proposal_from_leaves)
-                results.append((pts, ll_here))
+                # posterior (see _seed_proposal_from_leaves).
+                results.append((pts, ll_here,
+                                float(group.attrs.get('prior_mass',
+                                                      len(pts)))))
                 return
             for c in group['children']:
                 child = group['children'][c]
