@@ -120,17 +120,17 @@ class LocalCovarianceProposal:
 
 
 class GameSampler6(DummySampler):
-    """games3 with inexhaustible generative proposals combined by strata.
+    """ Stratified importance sampler over a precomputed parameter map.
 
     Parameters
     ----------
     model : Model
         An instance of a model from ``pycbc.inference.models``.
     mapfile : str
-        Flat mapping file (games/games3 format).
+        Flat map file, as written by pycbc_inference_build_map.
     treefile : str, optional
         Hierarchical tree file; tiles without an entry fall back to the flat
-        pool, exactly as games3 does.
+        pool.
     loglr_region : int
         Only use regions within this loglr of the best node.
     target_likelihood_calls : int
@@ -231,7 +231,7 @@ class GameSampler6(DummySampler):
         self.tree_ncalls = 0
         self.stratum_calls = {'pool': 0, 'gen': 0}
 
-    # ---------------- discrete pool stratum (unchanged from games3) ---------
+    # ---------------- discrete pool stratum ---------------------------------
 
     def draw_samples_from_bin(self, i, size):
         if i not in self.draw:
@@ -486,10 +486,8 @@ class GameSampler6(DummySampler):
 
         for rnd in range(1, self.rounds + 1):
             self._round = rnd
-            # The generative proposal is held in RESERVE: the pool keeps the
-            # entire budget, so behaviour before exhaustion is identical to
-            # games3, and the generative stratum only runs once the pool dies
-            # and hands its budget over.
+            # The generative proposal is held in reserve: the pool keeps
+            # the entire budget until it exhausts and hands it over.
             gen_budget = self.target_likelihood_calls if pool_dead else 0
             pool_budget = self.target_likelihood_calls - gen_budget
 
