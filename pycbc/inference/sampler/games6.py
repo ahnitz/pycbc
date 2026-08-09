@@ -434,6 +434,10 @@ class GameSampler6(DummySampler):
                  stretch_pairs=0,
                  stretch_scale=1.0,
                  tree_start_level=0,
+                 coarse_fraction=0.5,
+                 min_active_points=100,
+                 tile_point_cap=200000,
+                 tree_ncall_budget=0,
                  gen_seed_leaves=0,
                  gen_seed_temper=-1.0,
                  gen_seed_range=4.0,
@@ -479,6 +483,31 @@ class GameSampler6(DummySampler):
         self.stretch_pairs = int(stretch_pairs)
         self.stretch_scale = float(stretch_scale)
         self.tree_start_level = int(tree_start_level)
+        # If at least this fraction of start-level nodes clears the cut,
+        # skip the descent and use those nodes as leaves -- see the long
+        # comment at the call site. 0 restores the always-descend
+        # behaviour. Only active when tree_start_level > 0.
+        self.coarse_fraction = float(coarse_fraction)
+        # Fall back to start-level tiles only if the cut leaves fewer
+        # points than this IN TOTAL. Set low on purpose. An earlier value
+        # of 2000 fired on P-P injection 19, which had 9 leaves holding
+        # 1484 points -- a legitimately concentrated active set at SNR
+        # 34, where a tight cut is correct -- and swapping those
+        # well-placed fine leaves for coarse tiles cost 1.31% -> 0.07%
+        # efficiency, an 18x regression. Saturation alone is survivable
+        # (the budget passes to the generative stratum); what is not
+        # survivable is a pool with nothing in it, e.g. injection 146's
+        # single point.
+        self.min_active_points = int(min_active_points)
+        # Cap on points kept per start-level tile when a coarse path is
+        # taken. Their subtrees can be the entire map; a run draws far
+        # less. The tile's TRUE population is still used for its prior
+        # mass, so capping changes only what is available to draw.
+        self.tile_point_cap = int(tile_point_cap)
+        # Hard cap on likelihood calls spent RESOLVING which leaves are
+        # active; 0 (default) disables it. DO NOT enable without reading
+        # the warning in `_find_active_leaves` -- it biases posteriors.
+        self.tree_ncall_budget = int(tree_ncall_budget)
         self.gen_seed_leaves = int(gen_seed_leaves)
         self.gen_seed_temper = float(gen_seed_temper)
         self.gen_seed_range = float(gen_seed_range)
@@ -504,10 +533,26 @@ class GameSampler6(DummySampler):
         self.draw[i] = self.draw[i][size:]
         return self.dmap[i][selected]
 
-    def pool_round(self, bin_weight, node_idx, lengths, budget):
+    def pool_round(self, bin_weight, node_idx, lengths, budget,
+                   prior_mass=None):
         """ One round of games3's discrete-pool draw. Returns
         (psamp, loglr, logw_unnormalised, bin_id) or raises OutOfSamples.
+
+        `lengths` is how many points a bin physically HOLDS -- the cap on
+        how many can be drawn. `prior_mass` is how much PRIOR MASS it
+        represents, which is what belongs in the importance weight. They
+        are the same thing whenever a bin stores every point assigned to
+        it, which is why one array served both roles originally; they
+        differ as soon as a bin stores a subsample of a larger
+        population, as the coarse-tile paths below do (a start-level tile
+        can cover millions of points -- loading them all would need GBs
+        and there is no reason to, since a run only draws tens of
+        thousands). Keeping them separate is also exactly what per-leaf
+        refinement needs: oversample a thin leaf, store the extra points,
+        and leave its prior mass at the unbiased value.
         """
+        if prior_mass is None:
+            prior_mass = lengths
         drawcount = (bin_weight * budget).astype(int)
         dorder = bin_weight.argsort()[::-1]
         remainder = 0
@@ -539,7 +584,7 @@ class GameSampler6(DummySampler):
             j += len(bdraw)
 
         loglr = self._likelihoods(psamp, stratum='pool')
-        logw = loglr + numpy.log(lengths[bin_id]) - pweight
+        logw = loglr + numpy.log(prior_mass[bin_id]) - pweight
         self._dump('pool', loglr=loglr, logw=logw, bin_id=bin_id,
                    binlen=lengths[bin_id], pweight=pweight,
                    bin_weight=bin_weight, drawcount=drawcount,
@@ -685,32 +730,159 @@ class GameSampler6(DummySampler):
         passed = numpy.where((node_loglrs > bound)
                              & ~numpy.isnan(node_loglrs))[0]
 
+        # SHORT-CIRCUIT THE DESCENT WHEN THE CUT CANNOT DISCRIMINATE.
+        #
+        # The descent evaluates the likelihood at every child of every
+        # node it enters, so when nothing prunes it enumerates the WHOLE
+        # tree: measured maxima of 445601 (BNS) and 149959 (BBH) are
+        # exactly level2+level3 of those trees, i.e. every internal node
+        # plus every leaf. That is 4-15x the sampling budget, and one
+        # such run took 3.5 h against ~10 min typical.
+        #
+        # It happens at LOW SNR, and the threshold follows from the cut
+        # itself: a node at match m sits (1-m^2) rho^2/2 nats below the
+        # peak, so pruning needs rho > sqrt(2*loglr_region/(1-m^2)) --
+        # about 12.6 for the 0.9-match nodes of level 1, and NOTHING
+        # prunes below rho ~ sqrt(2*loglr_region). Measured: corr(log
+        # tree_ncalls, SNR) = -0.81 (BNS) and -0.70 (BBH); the runs that
+        # enumerate everything have mean SNR 6.9 against 17.0 for the
+        # rest, and they are 21 of the 29 worst-efficiency runs.
+        #
+        # The cut is not misbehaving -- at rho ~ 5 the posterior really
+        # does span most of the prior, so nearly every leaf really is
+        # active. The waste is paying one likelihood call per node to
+        # rediscover it. So when the passing FRACTION is high, stop and
+        # use the start-level nodes themselves as leaves, each carrying
+        # its whole subtree's points and its own already-paid-for rep
+        # loglr. As rho -> 0 this is not even an approximation: the
+        # weights become equal and the subtree clouds union to the prior,
+        # which is exactly the target.
+        coarse = (start_nodes is not None and self.coarse_fraction > 0
+                  and len(passed) >= self.coarse_fraction * len(args))
+        if coarse:
+            logging.info('%i of %i start nodes passed (>= %.0f%%): the cut '
+                         'cannot discriminate, so using start-level tiles '
+                         'directly instead of descending. This is the '
+                         'low-SNR regime where the posterior spans most of '
+                         'the prior anyway.', len(passed), len(args),
+                         100 * self.coarse_fraction)
+
         logging.info('...resolving tree leaves for %i passed tiles',
                      len(passed))
         active_lengths, key = [], 0
         self.leaf_loglr = {}
+        tile_mass = {}
         with h5py.File(self.mapfile, 'r') as mapfile:
             for tile in passed:
                 leaves = None
-                if start_nodes is not None:
+                if coarse:
+                    pts, tot = self._subtree_points(start_nodes[tile],
+                                                    self.tile_point_cap)
+                    leaves = [(pts, node_loglrs[tile], tot)] if len(pts) else []
+                elif start_nodes is not None:
                     leaves = self._find_active_leaves(start_nodes[tile],
                                                       bound)
                 elif treefile is not None and str(tile) in treefile['tree']:
                     leaves = self._find_active_leaves(
                         treefile['tree'][str(tile)], bound)
                 if not leaves and start_nodes is None:
-                    leaves = [(mapfile['map'][str(tile)][:],
-                               node_loglrs[tile])]
-                for pts, ll in (leaves or []):
+                    mp = mapfile['map'][str(tile)][:]
+                    leaves = [(mp, node_loglrs[tile], len(mp))]
+                for item in (leaves or []):
+                    pts, ll = item[0], item[1]
                     self.dmap[key] = pts
                     self.leaf_loglr[key] = ll
                     active_lengths.append(len(pts))
+                    if len(item) > 2:
+                        tile_mass[key] = item[2]
                     key += 1
-        if treefile is not None:
-            treefile.close()
+        # NB: the tree file stays open until after the starved-set
+        # fallback below, which reads subtrees through `start_nodes`.
+        # Closing here left those as handles into a closed file and the
+        # fallback died with an h5py "invalid identifier" KeyError.
         active_ids = numpy.arange(key)
         lengths = numpy.array(active_lengths)
-        logging.info('...resolved to %i active leaves', key)
+        prior_mass = numpy.array([tile_mass.get(i, active_lengths[i])
+                                  for i in range(key)], dtype=float)
+        logging.info('...resolved to %i active leaves (%i points)',
+                     key, int(lengths.sum()) if key else 0)
+
+        # STARVED ACTIVE SET. The opposite failure to the one above: the
+        # cut prunes so hard that almost nothing survives, and the pool
+        # then saturates immediately (`pool_round` caps drawcount at leaf
+        # size), which breaks the w ~ L * n_bin / c_bin cancellation.
+        #
+        # This is not hypothetical. Over 291 wide-space P-P runs the
+        # efficiency residual at SNR > 15, after detrending the SNR
+        # dependence, correlates with log(tree_ncalls) at +0.31: the
+        # smallest-active-set quartile has median efficiency 13.3%
+        # against 31.9% for the largest, at comparable SNR. And one run
+        # (idx 146, SNR 24) resolved to a single point and reported
+        # ESS = 1 from ncalls = 1 -- a "100% efficient" run that produced
+        # one sample.
+        #
+        # Falling back to the start-level tiles keeps the run alive with
+        # a coarser but well-populated pool, which is strictly better
+        # than a pool of one. Costs no likelihood calls: the tiles and
+        # their reps were already evaluated.
+        starved = key and lengths.sum() < self.min_active_points
+        if (starved or not key) and start_nodes is not None and not coarse:
+            logging.warning('active set starved (%i leaves, %i points < %i): '
+                            'the cut pruned nearly everything, which '
+                            'saturates the pool on the first round. '
+                            'Falling back to start-level tiles.',
+                            key, int(lengths.sum()) if key else 0,
+                            self.min_active_points)
+            # Widen the cut until the pool is usable. Falling back to the
+            # start-level tiles is not enough on its own: the tile that
+            # holds the signal can itself be nearly empty. Measured on
+            # P-P injection 146 (SNR ~24) -- exactly ONE of 1104 tiles
+            # cleared the cut and its whole subtree held 8 points, so the
+            # run returned ESS 1. The tessellation is by MATCH, so a
+            # tile's population follows the local prior volume and some
+            # corners really are that thin; a signal that lands in one is
+            # the adverse case a P-P test is supposed to catch, and it
+            # did (1 run in 291).
+            #
+            # Widening costs NO likelihood calls -- every start node was
+            # already evaluated during setup, so admitting more of them
+            # is free. It cannot bias the result either: extra tiles are
+            # low-likelihood and importance weighting gives them
+            # correspondingly low weight. It trades a little efficiency
+            # for not returning a one-sample posterior.
+            region = self.loglr_region
+            for _ in range(6):
+                bound_w = numpy.nanmax(node_loglrs) - region
+                sel = numpy.where((node_loglrs > bound_w)
+                                  & ~numpy.isnan(node_loglrs))[0]
+                active_lengths, key = [], 0
+                self.dmap, self.leaf_loglr = {}, {}
+                tile_mass = {}
+                for tile in sel:
+                    pts, tot = self._subtree_points(start_nodes[tile],
+                                                    self.tile_point_cap)
+                    if not len(pts):
+                        continue
+                    self.dmap[key] = pts
+                    self.leaf_loglr[key] = node_loglrs[tile]
+                    active_lengths.append(len(pts))
+                    tile_mass[key] = tot
+                    key += 1
+                if sum(active_lengths) >= self.min_active_points:
+                    break
+                region *= 2.0
+                logging.warning('still starved (%i points from %i tiles); '
+                                'widening loglr_region to %.0f',
+                                sum(active_lengths), len(sel), region)
+            active_ids = numpy.arange(key)
+            lengths = numpy.array(active_lengths)
+            prior_mass = numpy.array([tile_mass.get(i, active_lengths[i])
+                                      for i in range(key)], dtype=float)
+            logging.info('...fallback gave %i tiles (%i points)',
+                         key, int(lengths.sum()) if key else 0)
+
+        if treefile is not None:
+            treefile.close()
 
         # Round-1 draw probability. Plain leaf size is prior VOLUME only:
         # the representative likelihood computed during the cut is used
@@ -794,7 +966,7 @@ class GameSampler6(DummySampler):
                 try:
                     ps, pl, pw, bid = self.pool_round(
                         weight / weight.sum(), active_ids, lengths,
-                        pool_budget)
+                        pool_budget, prior_mass=prior_mass)
                     before = self._ess(strata['pool']['logw'])
                     strata['pool'] = self._accumulate(strata['pool'],
                                                       ps, pl, pw)
@@ -1172,6 +1344,52 @@ class GameSampler6(DummySampler):
         self._samples = {p: fsamp[p] for p in self.model.variable_params}
         self._samples['loglikelihood'] = numpy.concatenate(ols)
 
+    def _subtree_points(self, group, cap=None):
+        """ Points under `group`, subsampled to `cap`, plus the TRUE total.
+
+        The counterpart to `_find_active_leaves` for the low-SNR case:
+        that one pays a likelihood call per node to decide what to keep,
+        this one keeps what is below a node that already passed. Pure
+        HDF5 reads, so the cost is IO rather than likelihood calls.
+
+        The cap is not optional in practice. When the cut fails to prune
+        at all, EVERY start-level tile passes, and their subtrees are the
+        whole map -- 100M points, ~2.4 GB, for a run that will draw a few
+        tens of thousands. (Found the hard way: the uncapped version put
+        one process at 4.1 GB RSS and made the runs slower than the
+        descent it was meant to replace.)
+
+        Returns (points, total) so the caller can keep prior mass and
+        physical size apart: `total` is the leaf's share of the prior,
+        `len(points)` is only how many are available to draw.
+        """
+        chunks, total = [], 0
+
+        def gather(g):
+            nonlocal total
+            if g.attrs['is_leaf']:
+                n = int(g.attrs['n_points'])
+                total += n
+                if n:
+                    pts = numpy.zeros(n, dtype=self.dtype)
+                    for p in self.variable_params:
+                        pts[p] = g[f'points_{p}'][:]
+                    chunks.append(pts)
+                return
+            for c in g['children']:
+                gather(g['children'][c])
+
+        gather(group)
+        if not chunks:
+            return numpy.zeros(0, dtype=self.dtype), 0
+        pts = numpy.concatenate(chunks)
+        if cap is not None and len(pts) > cap:
+            # uniform subsample: the stored cloud stays prior-distributed
+            # inside the tile, which is what the pool draw assumes
+            sel = numpy.random.choice(len(pts), size=cap, replace=False)
+            pts = pts[sel]
+        return pts, total
+
     def _find_active_leaves(self, tree_root, loglr_bound):
         """ Prune the subtree, evaluating the likelihood at each child's
         representative and descending only where it clears the bound.
@@ -1183,20 +1401,56 @@ class GameSampler6(DummySampler):
         on differently-shaped trees non-comparable: a tree with few coarse
         root tiles hides many nodes below each one and pays far more here
         than a tree with many fine root tiles.
+
+        BUDGET (`tree_ncall_budget`, DEFAULT OFF -- it BIASES posteriors).
+        The idea was that resolving WHERE to sample should not cost more
+        than the sampling itself, capping the descent and taking any
+        still-unresolved node wholesale. It targets a real gap:
+        `coarse_fraction` is all-or-nothing on how many START nodes pass,
+        so P-P injection 5 (SNR 8.2) had under half pass, descended, and
+        still paid 146113 calls -- five times its sampling budget -- for
+        3.06% efficiency. Capping it cut that to 40194 and lifted
+        efficiency to 3.82%.
+
+        It is nonetheless WRONG. Against a dynesty reference on that same
+        injection, the ordinary descent matches on every parameter
+        (offsets <= 0.087 posterior widths) while the budgeted run is off
+        by up to **0.81 widths** on mchirp and 0.58 on lambda1 -- a pure
+        location bias, since the widths agree to 0.90-1.10 either way.
+
+        The mechanism is the difference from `coarse_fraction`, which IS
+        verified: that path takes EVERY tile wholesale, so every bin has
+        the same resolution. A budget instead leaves a MIX of fine leaves
+        and wholesale subtrees, and a wholesale bin carries one
+        representative loglr for a region many leaves wide. Leaf-seeded
+        round-1 weighting (`gen_seed_leaves`) then treats incomparable
+        bins as comparable. **Uniform bin resolution appears to be the
+        thing that matters; mixing scales is what breaks it.**
+
+        Returns (points, loglr, prior_mass) triples. `prior_mass` differs
+        from `len(points)` only for wholesale-taken subtrees, which are
+        capped for memory -- see `_subtree_points`.
         """
         results = []
+        # OFF by default -- see the warning in the docstring above.
+        budget = self.tree_ncall_budget
 
         def descend(group, ll_here):
             if group.attrs['is_leaf']:
-                pts = numpy.zeros(int(group.attrs['n_points']),
-                                  dtype=self.dtype)
+                n = int(group.attrs['n_points'])
+                pts = numpy.zeros(n, dtype=self.dtype)
                 for p in self.variable_params:
                     pts[p] = group[f'points_{p}'][:]
                 # carry the likelihood at this leaf's own representative:
                 # it was already paid for to decide the descent, and it is
                 # what makes the leaf-weighted cloud an estimate of the
                 # posterior (see _seed_proposal_from_leaves)
-                results.append((pts, ll_here))
+                results.append((pts, ll_here, n))
+                return
+            if budget and self.tree_ncalls >= budget:
+                pts, tot = self._subtree_points(group, self.tile_point_cap)
+                if len(pts):
+                    results.append((pts, ll_here, tot))
                 return
             for c in group['children']:
                 child = group['children'][c]
