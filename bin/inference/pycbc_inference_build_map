@@ -207,8 +207,8 @@ logging.info('grown: %i draws, nodes/level %s, %i leaves, %.1f comp/draw',
 
 # ---------------- phase 2: assign ----------------
 # Points are accumulated as flat numpy blocks (int32 leaf id + float32
-# params) rather than per-leaf Python tuples: at 50M draws the tuple
-# representation needs ~10 GB, while this needs ~1.4 GB. Grouping by leaf
+# params) rather than per-leaf Python objects, which costs several times
+# less memory at the draw counts a production map needs. Grouping by leaf
 # happens once at write time via a single argsort.
 remaining = max(0, args.sample_size - grown)
 blocks_id, blocks_pt = [], []
@@ -299,11 +299,9 @@ with h5py.File(args.tree_output, 'w') as out:
             pts = all_pt[bounds[lid]:bounds[lid + 1]]
             group.attrs['is_leaf'] = True
             group.attrs['n_points'] = len(pts)
-            # What the leaf is WORTH, as against how many points it holds.
-            # The sampler weights by this and caps draws by n_points, so the
-            # two can differ -- a builder that oversamples a sparse leaf must
-            # leave prior_mass at the unbiased count or that leaf's
-            # importance weight would be inflated along with its population.
+            # What the leaf is worth, as against how many points it
+            # holds. The sampler weights by this and caps draws by
+            # n_points, so the two can differ.
             group.attrs['prior_mass'] = float(counts[lid])
             for k, p in enumerate(var):
                 group.create_dataset('points_%s' % p, data=pts[:, k].copy())

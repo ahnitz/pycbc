@@ -1,70 +1,34 @@
-""" games3 plus inexhaustible generative proposals, combined by strata.
+""" Importance sampling from a precomputed map of the parameter space,
+combined by strata with an adaptive generative proposal.
 
-This keeps games3 exactly as-is (hierarchical tree of discrete pools, which
-reaches ~32% efficiency at low SNR) and adds one or more *generative*
-proposals that can supply unlimited draws once the discrete pools start to run
-dry. The point is narrow: fix exhaustion without giving up games3's efficiency.
+Draws come from two kinds of proposal:
 
-The generative proposal is a Gaussian mixture fitted to the *accumulated
-posterior samples* rather than to a tile's prior pool, with a separate
-covariance per centre estimated from its k nearest neighbours (see
-``LocalCovarianceProposal``).
+  pool  a discrete pool of precomputed prior points, taken from the
+        leaves of the map that survive a likelihood cut. Efficient, but
+        finite -- a leaf can only supply the points it holds.
+  gen   a Gaussian mixture fitted to the accumulated posterior samples,
+        with a separate covariance per centre estimated from its k
+        nearest neighbours. Unlimited, and takes over once the pool
+        exhausts.
 
-This is deliberately NOT games2. games2 fit a KDE to each tile's own prior
-pool, i.e. to a thin curved sliver of the prior, and a full-rank Gaussian
-cannot represent that -- confirmed there and independently here (a leaf's
-covariance spectrum spans ~13 orders of magnitude and the cloud is curved).
-The posterior, by contrast, is a compact correlated blob, which is the shape a
-Gaussian mixture handles well.
+The two are not combined into a single density: the pool proposal puts
+mass on atoms and the generative one has a Lebesgue density, so the
+measures are mutually singular. Instead each proposal -- and each
+generative refit -- is its own stratum with its own self-normalised
+estimate, and the strata are combined as
 
-Combination by strata, not by a single mixture density
-------------------------------------------------------
-The discrete-pool proposal puts mass on atoms while the generative proposals
-have Lebesgue densities; the two measures are mutually singular, so there is no
-common density in which to write one mixture. Rather than paper over that (a
-good way to introduce a silent bias), each proposal is kept as its own stratum
-with its own self-normalised estimate, and the strata are combined as
-    I = sum_s beta_s I_s,      sum_s beta_s = 1,
-which is valid for any beta. Taking beta_s proportional to the stratum's ESS is
-the inverse-variance choice and makes the combined ESS the sum of the strata's,
-so a stratum that is doing badly simply contributes little. That is what
-implements "use whichever proposal is working" without any tuning.
+    I = sum_s beta_s I_s,    sum_s beta_s = 1
 
-Consequences worth stating:
-  * Each sample carries the weight of the proposal and round that produced it.
-    Weights are never recomputed against a later proposal, which would bias.
-  * Out-of-prior draws get zero weight and are dropped BEFORE the likelihood
-    call, so they cost draws but not likelihood evaluations, and dropping them
-    does not bias a self-normalised estimate.
-  * Pool exhaustion no longer ends the run: the exhausted stratum's budget is
-    handed to the generative stratum for the remaining rounds.
+with beta proportional to the stratum's ESS. That is the
+inverse-variance choice, and it makes the combined ESS the sum of the
+strata's, so a stratum that is doing badly contributes little.
 
-Validated configuration
-------------------------
-The constructor defaults below ARE the validated settings (see
-example_bns/GAMES6_RESULTS.md): a local-covariance kernel (``gen_local_k=160``)
-in raw coordinates, the generative proposal held in reserve so the pool keeps
-the whole budget until it exhausts and only then hands over, and
-weighted-without-replacement centre subsampling once accumulated samples
-exceed ``gen_max_centres``. Only two knobs need a per-case override:
-``gen_max_centres`` and ``gen_min_ess`` at the most extreme SNR (see
-prior_g6final_snr100.ini).
+Every sample keeps the weight computed against the proposal in force
+when it was drawn; weights are never recomputed against a later
+proposal. Out-of-prior draws are dropped before any likelihood call.
 
-Five alternatives were implemented, measured, and then REMOVED once settled.
-Each is a negative result rather than an untried idea, and each is in git
-history if a future parameter space reopens the question:
-
-  global shared-covariance kernel  one covariance cannot hug a thin CURVED
-                                   manifold -- see LocalCovarianceProposal
-  stretch centres                  extra centres between pairs of samples
-  logit map onto the prior box     helped in principle at the hard prior
-                                   edges, measured worse here
-  defensive broad component        bounds pi/q from above, but costs bulk
-                                   efficiency and the tail catastrophe it
-                                   guards against never materialised
-  several bandwidths as strata     one bandwidth won every time
+The map is built by ``pycbc_inference_build_map``.
 """
-import os
 import logging
 import tqdm
 import h5py
@@ -81,16 +45,15 @@ from .games import call_likelihood, OutOfSamples
 
 
 class LocalCovarianceProposal:
-    """ Mixture with a SEPARATE covariance per centre, from its k nearest
-    neighbours.
+    """ Gaussian mixture with a separate covariance per centre.
 
-    A single global covariance cannot hug a thin *curved* manifold: measured at
-    SNR 30, the bandwidth broad enough to cover the target puts 41% of draws
-    beyond the posterior's own 99th-percentile nearest-neighbour distance, while
-    the bandwidth that keeps draws on-manifold under-disperses and leaves the
-    tails empty. Estimating each kernel's covariance from its own neighbourhood
-    lets the kernel follow the sheet's local orientation and thickness, which is
-    what a global covariance averages away.
+    Each centre's kernel covariance is estimated from its `k` nearest
+    neighbours, so the kernel follows the local orientation and thickness
+    of the posterior rather than a single global shape.
+
+    Centres, kernels and draws all live in globally whitened coordinates,
+    where every parameter is O(1); `logpdf` returns the density in the
+    original coordinates.
     """
 
     def __init__(self, centres, rng, k=40, scale=1.0, weights=None,
@@ -105,11 +68,6 @@ class LocalCovarianceProposal:
         self.weights /= self.weights.sum()
         self.logw = numpy.log(numpy.maximum(self.weights, 1e-300))
 
-        # Everything is built in globally WHITENED coordinates, where every
-        # parameter is O(1). Doing this in physical units is a trap: the six
-        # parameters span ~6 orders of magnitude (mchirp variance ~1e-8 against
-        # lambda ~1e5), so any isotropic regularisation floor applied there is
-        # meaningless -- it swamps the tight parameters completely.
         g = numpy.cov(self.centres.T)
         ev, V = numpy.linalg.eigh(g)
         ev = numpy.maximum(ev, 1e-12 * max(ev.max(), 1e-300))
@@ -130,7 +88,8 @@ class LocalCovarianceProposal:
         eye = numpy.eye(self.dim)
         for i in range(self.n):
             c = numpy.cov(cz[idx[i]].T) * f ** 2
-            # floor is dimensionless here, so it regularises without distorting
+            # dimensionless in whitened coordinates, so the same floor
+            # regularises every direction equally
             c = c + ridge * f ** 2 * eye
             try:
                 L = numpy.linalg.cholesky(c)
@@ -214,7 +173,6 @@ class GameSampler6(DummySampler):
                  min_active_points=100,
                  tile_point_cap=200000,
                  gen_seed_leaves=0,
-                 gen_seed_temper=-1.0,
                  gen_seed_range=4.0,
                  **kwargs):
         super().__init__(model, *args)
@@ -232,17 +190,10 @@ class GameSampler6(DummySampler):
         self._samples = {}
 
         self.target_likelihood_calls = int(target_likelihood_calls)
-        # The cut keeps nodes within `loglr_region` of the best. That is a
-        # COVERAGE statement, not a free number: a d-dimensional posterior
-        # encloses a fraction 1-eps of its mass within a loglr drop of
-        # chi2_d(1-eps)/2, so the region follows from how much mass you are
-        # willing to miss and from how many parameters there are. In 6-D,
-        # 1e-4 gives 13.9 nats -- close to the 15 this was set to for years,
-        # which is why 15 worked; but the same 15 is over-conservative in
-        # 4-D (a BBH map), where 11.8 suffices, and over-conservative costs
-        # real money here because `loglr_region` sets the SNR below which
-        # the cut cannot prune at all (rho ~ sqrt(2*loglr_region)).
-        # Pass loglr_region explicitly to override.
+        # A d-dimensional posterior encloses 1-eps of its mass within a
+        # loglr drop of chi2_d(1-eps)/2, so the region follows from the
+        # coverage asked for and the number of parameters. Set
+        # loglr_region explicitly to override.
         if float(loglr_region) > 0:
             self.loglr_region = float(loglr_region)
         else:
@@ -260,28 +211,20 @@ class GameSampler6(DummySampler):
         self.gen_local_k = int(gen_local_k)
         self.tree_start_level = int(tree_start_level)
         # Fall back to start-level tiles only if the cut leaves fewer
-        # points than this IN TOTAL. Set low on purpose. An earlier value
-        # of 2000 fired on P-P injection 19, which had 9 leaves holding
-        # 1484 points -- a legitimately concentrated active set at SNR
-        # 34, where a tight cut is correct -- and swapping those
-        # well-placed fine leaves for coarse tiles cost 1.31% -> 0.07%
-        # efficiency, an 18x regression. Saturation alone is survivable
-        # (the budget passes to the generative stratum); what is not
-        # survivable is a pool with nothing in it, e.g. injection 146's
-        # single point.
+        # points than this in total. A pool that saturates is survivable,
+        # since its budget passes to the generative stratum; a pool with
+        # almost nothing in it is not.
         self.min_active_points = int(min_active_points)
-        # Cap on points kept per start-level tile when a coarse path is
-        # taken. Their subtrees can be the entire map; a run draws far
-        # less. The tile's TRUE population is still used for its prior
-        # mass, so capping changes only what is available to draw.
+        # Cap on points kept per start-level tile on the coarse path. A
+        # tile's subtree can hold the whole map. Its true population is
+        # still used as its prior mass, so the cap changes only what is
+        # available to draw.
         self.tile_point_cap = int(tile_point_cap)
         self.gen_seed_leaves = int(gen_seed_leaves)
-        self.gen_seed_temper = float(gen_seed_temper)
         self.gen_seed_range = float(gen_seed_range)
         self.leaf_loglr = {}
-        # seeded from the legacy global RNG, which pycbc_inference --seed sets,
-        # so generative draws are reproducible alongside the shuffles that the
-        # discrete-pool path uses
+        # seeded from the global RNG that pycbc_inference --seed sets, so
+        # generative draws are reproducible alongside the pool shuffles
         self._rng = numpy.random.default_rng(
             numpy.random.randint(0, 2 ** 31 - 1))
         self.ncalls = 0
@@ -302,21 +245,17 @@ class GameSampler6(DummySampler):
 
     def pool_round(self, bin_weight, node_idx, lengths, budget,
                    prior_mass=None):
-        """ One round of games3's discrete-pool draw. Returns
-        (psamp, loglr, logw_unnormalised, bin_id) or raises OutOfSamples.
+        """ One round of the discrete-pool draw.
 
-        `lengths` is how many points a bin physically HOLDS -- the cap on
-        how many can be drawn. `prior_mass` is how much PRIOR MASS it
-        represents, which is what belongs in the importance weight. They
-        are the same thing whenever a bin stores every point assigned to
-        it, which is why one array served both roles originally; they
-        differ as soon as a bin stores a subsample of a larger
-        population, as the coarse-tile paths below do (a start-level tile
-        can cover millions of points -- loading them all would need GBs
-        and there is no reason to, since a run only draws tens of
-        thousands). Keeping them separate is also exactly what per-leaf
-        refinement needs: oversample a thin leaf, store the extra points,
-        and leave its prior mass at the unbiased value.
+        Returns (psamp, loglr, unnormalised logw, bin_id), or raises
+        OutOfSamples when no bin can supply another point.
+
+        `lengths` is how many points a bin holds, and so caps how many
+        can be drawn from it. `prior_mass` is how much prior mass it
+        represents, which is what enters the importance weight. The two
+        are equal when a bin stores every point assigned to it, and
+        differ when it stores a subsample of a larger population, as the
+        coarse-tile path does. Defaults to `lengths`.
         """
         if prior_mass is None:
             prior_mass = lengths
@@ -352,31 +291,11 @@ class GameSampler6(DummySampler):
 
         loglr = self._likelihoods(psamp, stratum='pool')
         logw = loglr + numpy.log(prior_mass[bin_id]) - pweight
-        self._dump('pool', loglr=loglr, logw=logw, bin_id=bin_id,
-                   binlen=lengths[bin_id], pweight=pweight,
-                   bin_weight=bin_weight, drawcount=drawcount,
-                   x=numpy.column_stack([psamp[p] for p in
-                                         self.model.variable_params]))
         return psamp, loglr, logw, bin_id
-
-    # ---------------- temporary diagnostics (env-var gated) -----------------
-
-    def _dump(self, tag, **kwargs):
-        """ Write per-round weight forensics if GAMES6_DUMP is set to a path
-        prefix. Purely diagnostic: no effect on the sampler when unset.
-        """
-        prefix = os.environ.get('GAMES6_DUMP')
-        if not prefix:
-            return
-        fn = '%s_%s_r%02i.npz' % (prefix, tag.replace(':', '-'),
-                                  getattr(self, '_round', 0))
-        kwargs['names'] = numpy.array(list(self.model.variable_params))
-        numpy.savez(fn, **kwargs)
-        logging.info('dumped %s diagnostics to %s', tag, fn)
 
     # ---------------- generative stratum -----------------------------------
 
-    def gen_round(self, proposal, budget, stratum='gen'):
+    def gen_round(self, proposal, budget):
         """ One round from the generative proposal. Out-of-prior draws are
         dropped before any likelihood call.
         """
@@ -384,7 +303,6 @@ class GameSampler6(DummySampler):
         xall = proposal.sample(budget)
         keep = self._in_prior(xall, names)
         if keep.sum() == 0:
-            self._dump(stratum + '-rejected', x=xall)
             return None
         x = xall[keep]
         logq = proposal.logpdf(x)
@@ -392,10 +310,7 @@ class GameSampler6(DummySampler):
         psamp = FieldArray(len(x), dtype=self.dtype)
         for k, p in enumerate(names):
             psamp[p] = x[:, k]
-        loglr = self._likelihoods(psamp, stratum=stratum)
-        self._dump(stratum, x=x, loglr=loglr, logq=logq, budget=budget,
-                   nkept=int(keep.sum()), centres=proposal.centres,
-                   cweights=proposal.weights)
+        loglr = self._likelihoods(psamp, stratum='gen')
         # uniform prior => its density is a constant that cancels in the
         # stratum's own self-normalisation
         return psamp, loglr, loglr - logq
@@ -444,17 +359,12 @@ class GameSampler6(DummySampler):
 
         treefile = h5py.File(self.treefile, 'r') if self.treefile else None
 
-        # Where to start evaluating. The likelihood is evaluated at each
-        # start node's REPRESENTATIVE and everything more than
-        # loglr_region below the best is discarded, so the cut is only as
-        # good as that representative proxies the likelihood across its
-        # whole tile. A coarse representative is a poor proxy -- one at
-        # match m sits roughly (1 - m^2) * rho^2/2 below a perfect one,
-        # ~46 nats for m=0.7 at SNR 13.5 -- so a window tuned for a fine
-        # bank can throw away subtrees that do hold posterior mass.
-        # Coarse levels are still wanted for BUILDING the tree (they make
-        # routing a draw cheap), so this lets construction and evaluation
-        # use different depths instead of forcing one compromise.
+        # Where to start evaluating. The cut compares the likelihood at
+        # each start node's representative, so it is only as good as that
+        # representative proxies the likelihood across its whole tile. A
+        # coarser representative is a worse proxy, which is why the depth
+        # the cut starts from is separate from the depths the tree was
+        # built with.
         start_nodes = None
         if treefile is not None and self.tree_start_level > 0:
             start_nodes = []
@@ -483,31 +393,17 @@ class GameSampler6(DummySampler):
         passed = numpy.where((node_loglrs > bound)
                              & ~numpy.isnan(node_loglrs))[0]
 
-        # CAN THE CUT DISCRIMINATE AT ALL? The bound is
-        # max - loglr_region, so every node passes exactly when the whole
-        # SPREAD is smaller than the region:
+        # Can the cut discriminate at all? The bound is
+        # max - loglr_region, so every node passes exactly when
         #
-        #     max(node) - min(node) < loglr_region.
+        #     max(node) - min(node) < loglr_region
         #
-        # Must be written as a spread, not as an absolute level: these
-        # values come from `call_likelihood`, which returns the LOG
-        # LIKELIHOOD (order -5e5 here), not the loglr. A threshold on the
-        # absolute value fires always. Differences are offset-free, which
-        # is why the bound itself has always been written as a difference.
-        #
-        # In loglr terms the worst node has ~0, so the spread is the best
-        # node's loglr ~ t^2 rho^2/2 for a start level of threshold t --
-        # giving rho < sqrt(2 loglr_region)/t, the floor measured from the
-        # tree_ncalls blow-up (5.9 at t=0.9, R=13.9).
-        # Below that the descent enumerates the whole tree AND
-        # under-covers, since rep-level noise then discards leaves that do
-        # hold posterior mass. Use the tiles themselves instead: as rho ->
-        # 0 their subtree clouds union to the prior exactly.
-        #
-        # This replaces a `coarse_fraction >= 0.5` heuristic that was a
-        # proxy for exactly this quantity, and a poor one -- injection 5
-        # had under half its start nodes pass, so the proxy declined to
-        # fire, and it still paid 146113 descent calls for 3.06%.
+        # written as a spread rather than an absolute level because
+        # `call_likelihood` returns the log likelihood, not the loglr, so
+        # only differences are offset-free. When nothing can be pruned,
+        # descending would enumerate the whole tree and still discard
+        # leaves on representative-level noise, so use the tiles
+        # directly: their subtree clouds union to the prior.
         finite = node_loglrs[numpy.isfinite(node_loglrs)]
         spread = (finite.max() - finite.min()) if len(finite) else 0.0
         coarse = start_nodes is not None and spread < self.loglr_region
@@ -551,11 +447,11 @@ class GameSampler6(DummySampler):
         logging.info('...resolved to %i active bins (%i points)',
                      key, int(lengths.sum()) if key else 0)
 
-        # The cut can also starve the pool instead of failing to prune:
-        # injection 146 had ONE of 1104 tiles pass, holding 8 points, and
-        # returned ESS 1. Widen until usable -- free, since every start
-        # node was already evaluated, and unbiased, since the extra tiles
-        # are low-likelihood and weighted accordingly.
+        # The cut can also starve the pool rather than fail to prune, if
+        # very few tiles pass and they hold very few points. Widen until
+        # usable: free, since every start node was already evaluated, and
+        # unbiased, since the extra tiles are low-likelihood and weighted
+        # accordingly.
         if start_nodes is not None and not coarse \
                 and (not key or lengths.sum() < self.min_active_points):
             logging.warning('active set starved (%i leaves, %i points): '
@@ -580,58 +476,7 @@ class GameSampler6(DummySampler):
         if treefile is not None:
             treefile.close()
 
-        # Round-1 draw probability. Plain leaf size is prior VOLUME only:
-        # the representative likelihood computed during the cut is used
-        # there as a pass/fail threshold and its magnitude then thrown
-        # away, so the first round spreads draws by volume and only the
-        # adaptive update below (weight[j] += v) starts concentrating them
-        # from round 2. Seeding with exp(loglr_rep) * volume uses the
-        # information already paid for. This cannot bias the estimate --
-        # logw = loglr + log(lengths) - pweight carries log(drawcount), so
-        # the importance weights self-correct for any draw probability --
-        # it only changes their variance. The adaptive tuning is unchanged
-        # and still runs on top of this.
-        if self.gen_seed_leaves:
-            ll = numpy.array([self.leaf_loglr.get(k, numpy.nan)
-                              for k in range(key)], dtype=float)
-            ok = numpy.isfinite(ll)
-            if ok.any():
-                # TEMPERING. exp(loglr_rep) is the likelihood AT the
-                # representative, but a leaf's actual weight is the
-                # likelihood INTEGRATED over the leaf. Those agree only
-                # while the likelihood barely varies inside a leaf. The
-                # variation is (1 - m^2) * rho^2/2, so it grows as rho^2:
-                # ~1.8 nats at SNR 13.5 but ~9 at SNR 30 and ~95 at SNR
-                # 98, i.e. a round-1 weight ratio of 6:1 rising to
-                # 7750:1 and beyond. Untempered, that piles every draw
-                # into a handful of leaves and drains them immediately --
-                # measured, it cost 20.8% -> 12.7% efficiency at SNR 30,
-                # where the discrete pool is still the workhorse, while
-                # helping at SNR 50/98 where the pool is nearly dead
-                # anyway. The integral is far flatter than the point
-                # value, so temper the exponent to approximate it.
-                spread = float(ll[ok].max() - ll[ok].min())
-                if self.gen_seed_temper > 0:
-                    temper = self.gen_seed_temper
-                else:
-                    # auto: hold the effective dynamic range near
-                    # gen_seed_range nats regardless of SNR
-                    temper = max(1.0, spread / max(self.gen_seed_range,
-                                                   1e-6))
-                w = lengths.astype(float).copy()
-                w[ok] *= numpy.exp((ll[ok] - ll[ok].max()) / temper)
-                if w.sum() > 0:
-                    weight = w / w.sum()
-                    logging.info('seeded round-1 leaf weights: '
-                                 'exp((loglr_rep-max)/%.2f) * volume '
-                                 '(loglr spread %.1f nats over %i leaves)',
-                                 temper, spread, int(ok.sum()))
-                else:
-                    weight = lengths / lengths.sum()
-            else:
-                weight = lengths / lengths.sum()
-        else:
-            weight = lengths / lengths.sum()
+        weight = self._round1_weights(key, lengths)
         # per-stratum accumulators
         strata = {'pool': {'samp': None, 'loglr': None, 'logw': None}}
         self.stratum_calls = {'pool': 0}
@@ -655,15 +500,8 @@ class GameSampler6(DummySampler):
                         pool_budget, prior_mass=prior_mass)
                     strata['pool'] = self._accumulate(strata['pool'],
                                                       ps, pl, pw)
-                    # games3's adaptive leaf reweighting, unchanged.
-                    # A per-leaf shrinkage estimator of E[L] was tried here
-                    # (rep as weak prior, overwritten by observed draws) on
-                    # the theory that L(rep) is a poor one-sample estimator
-                    # once the within-leaf likelihood spread grows. It
-                    # measured NEUTRAL -- tempering beat it everywhere and
-                    # it added nothing on top -- so it was removed to keep
-                    # this path simple. See commit 4915a9340 for the code
-                    # and the numbers.
+                    # concentrate later rounds on the leaves that are
+                    # actually carrying posterior weight
                     wn = numpy.exp(pw - logsumexp(pw))
                     for j, v in zip(bid, wn):
                         weight[j] += v
@@ -689,14 +527,9 @@ class GameSampler6(DummySampler):
                     strata[rk] = {'samp': gs, 'loglr': gl, 'logw': gw}
                     self.stratum_calls[rk] = len(gw)
 
-            # Refit the generative proposal as posterior information
-            # accumulates. This is safe because every sample already carries
-            # the logw computed against the proposal that was in force when it
-            # was drawn -- weights are never recomputed against a later
-            # proposal, which would bias the estimate. Refitting is the whole
-            # point of an adaptive scheme: a proposal frozen at the first fit
-            # can only ever be as good as the posterior estimate available at
-            # that round.
+            # Refit as posterior information accumulates. Safe because
+            # each sample already carries the weight computed against the
+            # proposal in force when it was drawn.
             if rnd >= self.gen_start_round and self.gen_refit > 0 and \
                     (rnd - self.gen_start_round) % self.gen_refit == 0:
                 new = self._fit_proposal(strata)
@@ -712,6 +545,42 @@ class GameSampler6(DummySampler):
 
         self._finalise(strata)
 
+    def _round1_weights(self, key, lengths):
+        """ Draw probability for round 1, over `key` active bins.
+
+        Leaf size alone is prior volume, so round 1 would spread draws by
+        volume and start concentrating them only from round 2. Seeding
+        with exp(loglr_rep) * volume reuses the representative
+        likelihoods the cut already paid for. This changes the variance
+        of the importance weights, not their expectation: logw carries
+        log(drawcount), so they self-correct for any draw probability.
+
+        The exponent is tempered because exp(loglr_rep) is the likelihood
+        AT the representative, while a leaf's weight is the likelihood
+        integrated OVER it. The two diverge as the within-leaf likelihood
+        spread grows, and an untempered exponent piles every draw into a
+        handful of leaves and drains them at once. Tempering holds the
+        effective dynamic range near `gen_seed_range` nats.
+        """
+        volume = lengths / lengths.sum()
+        if not self.gen_seed_leaves:
+            return volume
+        ll = numpy.array([self.leaf_loglr.get(k, numpy.nan)
+                          for k in range(key)], dtype=float)
+        ok = numpy.isfinite(ll)
+        if not ok.any():
+            return volume
+        spread = float(ll[ok].max() - ll[ok].min())
+        temper = max(1.0, spread / max(self.gen_seed_range, 1e-6))
+        w = lengths.astype(float).copy()
+        w[ok] *= numpy.exp((ll[ok] - ll[ok].max()) / temper)
+        if w.sum() <= 0:
+            return volume
+        logging.info('seeded round-1 leaf weights: temper %.2f over a '
+                     'loglr spread of %.1f nats in %i leaves',
+                     temper, spread, int(ok.sum()))
+        return w / w.sum()
+
     def _accumulate(self, st, samp, loglr, logw):
         if st['samp'] is None:
             return {'samp': samp, 'loglr': loglr, 'logw': logw}
@@ -720,28 +589,18 @@ class GameSampler6(DummySampler):
                 'logw': numpy.concatenate([logw, st['logw']])}
 
     def _seed_proposal_from_leaves(self, max_points=200000):
-        """ Fit a generative proposal to the ACTIVE LEAVES, before any
+        """ Fit a generative proposal to the active leaves, before any
         posterior samples exist.
 
-        The setup cut already evaluates the likelihood at each leaf's
-        representative -- we pay for those calls to decide the descent and
-        then normally discard them. But a leaf's posterior mass is
-        approximately exp(loglr_rep) times its prior volume, and its point
-        count is proportional to that volume (the points are uniform prior
-        draws), so weighting every point in leaf i by exp(loglr_i) turns
-        the union of active leaves into an estimate of the posterior --
-        the same estimate that makes the discrete-pool stratum work at
-        all. If a KDE fitted to accumulated posterior samples is a good
-        proposal later, one fitted to this cloud should be a good proposal
-        immediately, without waiting for the pool to deliver gen_min_ess.
+        A leaf's posterior mass is approximately exp(loglr_rep) times its
+        prior volume, and its point count is proportional to that volume,
+        so weighting every point in a leaf by exp(loglr_rep) turns the
+        union of active leaves into an estimate of the posterior. The
+        representative likelihoods were already paid for by the cut.
 
-        That matters most where games6 is weakest: at high SNR the pool
-        exhausts after a single round with ESS ~10-20, so the generative
-        stratum barely engages under the accumulate-then-fit rule.
-
-        Built as a synthetic stratum and handed to the existing
-        _fit_proposal, so it goes through exactly the same weighted
-        centre-subsampling and kernel construction as every other fit.
+        Built as a synthetic stratum and handed to `_fit_proposal`, so it
+        goes through the same centre subsampling and kernel construction
+        as every other fit.
         """
         names = list(self.model.variable_params)
         keys = [k for k, v in self.leaf_loglr.items()
@@ -778,26 +637,21 @@ class GameSampler6(DummySampler):
         from every stratum, resampled to equal weight.
         """
         names = list(self.model.variable_params)
-        # Weight each stratum's contribution by its OWN ESS when pooling for
-        # the fit, unconditionally. Normalising every stratum to sum to 1 and
-        # concatenating gives each equal total mass regardless of quality, so
-        # a weak stratum drags the fit toward wherever it happens to have
-        # drawn -- the same defect as games.py's per-round self-normalisation,
-        # one function away. This matches how _finalise already combines
-        # strata (beta proportional to ESS, the inverse-variance choice).
+        # Weight each stratum's contribution by its own ESS. Normalising
+        # every stratum to sum to 1 and concatenating would give each
+        # equal total mass regardless of quality, letting a weak stratum
+        # drag the fit toward wherever it happened to draw. This is the
+        # same beta-proportional-to-ESS choice `_finalise` uses.
         xs, ws = [], []
-        _diag = []
-        for kk, st in strata.items():
+        for st in strata.values():
             if st['samp'] is None:
                 continue
-            lw = st['logw']
-            wv = numpy.exp(lw - logsumexp(lw))
-            e = 1.0 / (wv ** 2).sum()
-            _diag.append((kk, len(wv), e))
-            if e <= 0:
+            wv = numpy.exp(st['logw'] - logsumexp(st['logw']))
+            ess = self._ess(st['logw'])
+            if ess <= 0:
                 continue
             xs.append(numpy.column_stack([st['samp'][p] for p in names]))
-            ws.append(wv * e)
+            ws.append(wv * ess)
         if not xs:
             return None
         x = numpy.vstack(xs)
@@ -806,41 +660,15 @@ class GameSampler6(DummySampler):
             return None
         w = w / w.sum()
         ess = 1.0 / (w ** 2).sum()
-        logging.debug('fit blocks=%s sum_stratum_ess=%.1f pooled_ess=%.1f',
-                      ';'.join('%s:n=%i,ess=%.1f' % d for d in _diag),
-                      sum(d[2] for d in _diag), ess)
         if ess < self.gen_min_ess:
             logging.debug('accumulated ESS %.1f below gen_min_ess %.1f; '
-                          'not fitting generative proposal yet',
-                          ess, self.gen_min_ess)
+                          'not fitting yet', ess, self.gen_min_ess)
             return None
-        # A properly WEIGHTED mixture over the samples: every sample is a
-        # centre and carries its own posterior weight as its mixture weight.
-        # Three constructions were tried for which raw draws become centres
-        # when there are more than gen_max_centres of them. Resampling by
-        # weight WITH replacement duplicates a handful of points at low ESS
-        # (ESS 19 gives ~19 distinct centres), making the covariance
-        # degenerate. Taking the top-N by weight concentrates centres at the
-        # peak, which under-disperses the proposal -- fatal for importance
-        # sampling, since the target's tails then have almost no proposal
-        # density and pi/q explodes there. Uniform random selection (ignoring
-        # weight) avoids both, but is blind to information content: as the
-        # raw pool keeps growing past the cap round over round, each
-        # individual high-weight point's chance of survival keeps shrinking
-        # even as accumulated ESS climbs -- measured directly (SNR 30, fixed
-        # gen_max_centres): the fit-input accumulated ESS rose from ~2700 to
-        # ~7900 across rounds while the resulting round's own efficiency
-        # *fell* from 27.5% to 20.0%, the opposite of what more information
-        # should buy.
-        #
-        # Weighted sampling WITHOUT replacement gets both properties at once:
-        # numpy's choice(replace=False, p=w) can never pick the same point
-        # twice (so it cannot reproduce the with-replacement duplication
-        # failure), while still preferring higher-weight points, so the kept
-        # centres retain most of the pool's weight regardless of how peaked
-        # it is (measured: a synthetic pool with weight ~ U(0,1)^8, i.e. very
-        # peaked, keeps 99.6% of total weight when subsampled 40000 -> 20000,
-        # versus ~50% for the uniform selection it replaces).
+        # Centres are subsampled by weight WITHOUT replacement when there
+        # are more than gen_max_centres. That keeps most of the pool's
+        # weight while never picking the same point twice, which matters
+        # because duplicated centres make the kernel covariance
+        # degenerate at low ESS.
         n = min(self.gen_max_centres, len(x))
         if n < len(x):
             # w is already normalised to sum to 1 above
@@ -925,23 +753,19 @@ class GameSampler6(DummySampler):
         self._samples['loglikelihood'] = numpy.concatenate(ols)
 
     def _subtree_points(self, group, cap=None):
-        """ Points under `group`, subsampled to `cap`, plus the TRUE total.
+        """ Points under `group`, subsampled to `cap`, and the true total.
 
-        The counterpart to `_find_active_leaves` for the low-SNR case:
-        that one pays a likelihood call per node to decide what to keep,
-        this one keeps what is below a node that already passed. Pure
-        HDF5 reads, so the cost is IO rather than likelihood calls.
+        The counterpart to `_find_active_leaves` for the case where the
+        cut cannot prune: that one pays a likelihood call per node to
+        decide what to keep, this one keeps everything below a node that
+        already passed, so its cost is HDF5 reads rather than likelihood
+        calls.
 
-        The cap is not optional in practice. When the cut fails to prune
-        at all, EVERY start-level tile passes, and their subtrees are the
-        whole map -- 100M points, ~2.4 GB, for a run that will draw a few
-        tens of thousands. (Found the hard way: the uncapped version put
-        one process at 4.1 GB RSS and made the runs slower than the
-        descent it was meant to replace.)
-
-        Returns (points, total) so the caller can keep prior mass and
-        physical size apart: `total` is the leaf's share of the prior,
-        `len(points)` is only how many are available to draw.
+        The cap matters because a start-level tile's subtree can be the
+        whole map, which a run has no use for. Returns (points, total) so
+        the caller can keep prior mass and physical size apart: `total`
+        is the tile's share of the prior, `len(points)` is only how many
+        are available to draw.
         """
         chunks, total = [], 0
 
@@ -997,14 +821,8 @@ class GameSampler6(DummySampler):
         """ Prune the subtree, evaluating the likelihood at each child's
         representative and descending only where it clears the bound.
 
-        Those evaluations are real likelihood calls and are counted into
-        self.tree_ncalls. They used to be counted NOWHERE, which silently
-        inflated the reported efficiency (ESS/ncalls) of every tree-based
-        run -- and by a tree-shape-dependent amount, so it also made runs
-        on differently-shaped trees non-comparable: a tree with few coarse
-        root tiles hides many nodes below each one and pays far more here
-        than a tree with many fine root tiles.
-
+        These are real likelihood calls and are counted into
+        `self.tree_ncalls`, which is reported separately from `ncalls`.
         """
         results = []
 

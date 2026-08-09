@@ -1,42 +1,35 @@
-""" Build the tile hierarchy ONLINE from prior draws -- no pregenerated bank.
+""" Tile hierarchy over a parameter space, built online from prior draws.
 
-This replaces the bank.sh -> map.py -> build_tree_reorg.py chain with a
-single pass. Each level has a match threshold. A draw descends from the
-root, compared at each level ONLY against the current node's children; if
-the best child clears that level's threshold it descends, otherwise the
-draw becomes the representative of a new branch (and, applying the same
-rule down the remaining levels, of a fresh chain to a leaf). Draws
-reaching the bottom are stored as that leaf's points.
+Each level has a match threshold. A draw descends from the root, compared
+at each level only against the current node's children; if the best child
+clears that level's threshold the draw descends into it, otherwise the
+draw becomes the representative of a new branch, and of a fresh chain of
+nodes down the remaining levels. Draws reaching the bottom are stored as
+that leaf's points.
 
-Cost: with branching b over d levels a draw costs ~d*b comparisons rather
-than N against a flat bank, and every comparison set is one node's
-children -- small enough to stay cache-resident, which matters more than
-the comparison count (a flat 247 MB bank costs 2543 ns/template against
-328 ns/template for a cache-resident 400).
+With branching b over d levels a draw costs ~d*b comparisons rather than
+N against a flat bank, and each comparison set is one node's children --
+small enough to stay cache-resident.
 
-Which metric, and why it is not uniform across levels
------------------------------------------------------
-pycbc_brute_bank covers the space using MATCH, maximized over time shift
-and phase. map.py instead uses a fixed-time OVERLAP (abs() maximizes
-phase only). That was sound where map.py operates -- at minimal_match
-0.99 the waveforms are nearly identical and time-maximization buys almost
-nothing, so overlap ~= match -- but it fails badly at the coarse levels
-this hierarchy introduces. Measured on the narrow config against the real
-21-template 0.7 bank, over 300 prior draws:
+Two metrics, chosen per level
+----------------------------
+Representatives are stored PSD-whitened and unit-normalized, so
 
-    time-maximized MATCH : min 0.726, median 0.862, covers 100% at 0.7
-    fixed-time OVERLAP   : min 0.047, median 0.669, covers  42% at 0.7
+    abs(a.conj() @ b)              is the fixed-time overlap
+    max_t abs(IFFT(conj(a) * b))   is the time-maximized match
 
-Building with overlap therefore splits where a real bank would not: a
-0.7-threshold level came out at 109-123 limbs against the bank's 21, and
-ALL 109 had a sibling at match >= 0.7 (median nearest-sibling match
-0.891) -- i.e. every limb was redundant under the correct metric.
+Coarse levels must use match: a fixed-time overlap badly understates the
+similarity of two waveforms that differ mainly by a time shift, so
+building with it splits where a real bank would not. At fine thresholds
+the two agree closely and overlap is ~19x cheaper.
 
-So: MATCH at coarse levels, OVERLAP at fine levels (where it is a good
-approximation and 19x cheaper). Because overlap <= match always,
-`overlap >= threshold` is a SOUND fast path at any level -- it implies
-match >= threshold -- so the FFT is only paid when overlap says "split",
-which is exactly when it could be wrong.
+Because overlap <= match always, `overlap >= threshold` is a sound fast
+path at any level -- it implies `match >= threshold` -- so the FFT is
+only paid when overlap says "split", which is exactly when it could be
+wrong.
+
+Whitening divides by sqrt(PSD) rather than PSD, so that a PAIR of stored
+vectors carries exactly one factor of the PSD weighting.
 """
 import logging
 
@@ -44,16 +37,7 @@ import numpy
 
 
 class LevelIndex:
-    """ One node's children, with the comparison metric for its level.
-
-    Representatives are stored PSD-whitened and unit-normalized, so
-    `abs(a.conj() @ b)` is the fixed-time overlap and
-    `max_t |IFFT(conj(a) * b)|` is the time-maximized match. Whitening
-    divides by sqrt(PSD) rather than PSD so that a PAIR of stored vectors
-    carries exactly one factor of the PSD weighting (dividing by the full
-    PSD, as map.py's cached bank rows do, is correct only because the
-    other side of that product is a RAW candidate).
-    """
+    """ One node's children, with the comparison metric for its level. """
 
     def __init__(self, nfft, use_match):
         self.nfft = int(nfft)
