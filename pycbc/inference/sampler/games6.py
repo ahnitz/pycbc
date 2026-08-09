@@ -329,7 +329,8 @@ class GameSampler6(DummySampler):
                               total=len(args)))
         self.ncalls += len(args)
         if stratum is not None:
-            self.stratum_calls[stratum] += len(args)
+            self.stratum_calls[stratum] = \
+                self.stratum_calls.get(stratum, 0) + len(args)
         return numpy.array(vals)
 
     # ---------------- driver ----------------------------------------------
