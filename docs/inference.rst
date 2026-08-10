@@ -511,6 +511,15 @@ functions, depending on the sampler that was used. For more details on these
 classes, see the :py:mod:`pycbc.inference.io` module.
 
 ----------------------
+Samplers
+----------------------
+
+.. toctree::
+    :maxdepth: 1
+
+    inference/sampler_options.rst
+
+----------------------
 Examples
 ----------------------
 
