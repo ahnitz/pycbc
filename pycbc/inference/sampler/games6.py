@@ -229,7 +229,7 @@ class GameSampler6(DummySampler):
             numpy.random.randint(0, 2 ** 31 - 1))
         self.ncalls = 0
         self.tree_ncalls = 0
-        self.stratum_calls = {'pool': 0, 'gen': 0}
+        self.stratum_calls = {}
 
     # ---------------- discrete pool stratum ---------------------------------
 
@@ -353,150 +353,153 @@ class GameSampler6(DummySampler):
             out.extend(self._nodes_at_depth(group['children'][c], depth - 1))
         return out
 
-    def run(self):
-        logging.info('Retrieving params of parameter space nodes')
-        with h5py.File(self.mapfile, 'r') as mapfile:
-            self.dtype = mapfile['map']['0'].dtype
+    def _evaluate_start_nodes(self, treefile):
+        """ Likelihood at the representative of every start node.
 
-        treefile = h5py.File(self.treefile, 'r') if self.treefile else None
-
-        # Where to start evaluating. The cut compares the likelihood at
-        # each start node's representative, so it is only as good as that
-        # representative proxies the likelihood across its whole tile. A
-        # coarser representative is a worse proxy, which is why the depth
-        # the cut starts from is separate from the depths the tree was
-        # built with.
+        Returns (start_nodes, loglrs), where `start_nodes` is None if the
+        cut runs over the flat map's root tiles rather than a tree depth.
+        """
         start_nodes = None
         if treefile is not None and self.tree_start_level > 0:
             start_nodes = []
             for k in sorted(treefile['tree'], key=int):
                 start_nodes.extend(self._nodes_at_depth(
                     treefile['tree'][k], self.tree_start_level))
-            args = [{p: float(n.attrs[f'param_{p}'])
+            args = [{p: float(n.attrs['param_%s' % p])
                      for p in self.model.variable_params}
                     for n in start_nodes]
-            logging.info('starting evaluation at tree depth %i: %i nodes '
-                         '(vs %i at depth 0)', self.tree_start_level,
+            logging.info('evaluating the cut at tree depth %i: %i nodes '
+                         '(%i at depth 0)', self.tree_start_level,
                          len(start_nodes), len(treefile['tree']))
         else:
             with h5py.File(self.mapfile, 'r') as mapfile:
-                bparams = {p: mapfile['bank'][p][:]
-                           for p in self.variable_params}
-                num_nodes = len(bparams[list(bparams.keys())[0]])
-            args = [{p: bparams[p][i] for p in self.model.variable_params}
-                    for i in range(num_nodes)]
-
+                bank = {p: mapfile['bank'][p][:] for p in self.variable_params}
+            args = [{p: bank[p][i] for p in self.model.variable_params}
+                    for i in range(len(next(iter(bank.values()))))]
         logging.info('Calculating likelihood at nodes')
-        node_loglrs = numpy.array(list(tqdm.tqdm(
+        loglrs = numpy.array(list(tqdm.tqdm(
             self.pool.imap(call_likelihood, args), total=len(args))))
         self.meta['setup_ncalls'] = len(args)
-        bound = node_loglrs[~numpy.isnan(node_loglrs)].max() - self.loglr_region
-        passed = numpy.where((node_loglrs > bound)
-                             & ~numpy.isnan(node_loglrs))[0]
+        return start_nodes, loglrs
 
-        # Can the cut discriminate at all? The bound is
-        # max - loglr_region, so every node passes exactly when
-        #
-        #     max(node) - min(node) < loglr_region
-        #
-        # written as a spread rather than an absolute level because
-        # `call_likelihood` returns the log likelihood, not the loglr, so
-        # only differences are offset-free. When nothing can be pruned,
-        # descending would enumerate the whole tree and still discard
-        # leaves on representative-level noise, so use the tiles
-        # directly: their subtree clouds union to the prior.
+    def _leaves_as_bins(self, treefile, passed, start_nodes, node_loglrs,
+                        bound):
+        """ Descend into each passed tile and keep the leaves that clear
+        `bound`. Fills self.dmap and self.leaf_loglr.
+        """
+        self.dmap, self.leaf_loglr = {}, {}
+        lengths, mass, key = [], [], 0
+        with h5py.File(self.mapfile, 'r') as mapfile:
+            for tile in passed:
+                if start_nodes is not None:
+                    leaves = self._find_active_leaves(start_nodes[tile],
+                                                      bound)
+                elif str(tile) in treefile['tree']:
+                    leaves = self._find_active_leaves(
+                        treefile['tree'][str(tile)], bound)
+                else:
+                    leaves = []
+                if not leaves and start_nodes is None:
+                    # no tree entry for this tile: use the flat pool
+                    pts = mapfile['map'][str(tile)][:]
+                    leaves = [(pts, node_loglrs[tile], float(len(pts)))]
+                for pts, ll, m in leaves:
+                    self.dmap[key] = pts
+                    self.leaf_loglr[key] = ll
+                    lengths.append(len(pts))
+                    mass.append(m)
+                    key += 1
+        return (numpy.arange(key), numpy.array(lengths),
+                numpy.array(mass, dtype=float))
+
+    def _active_bins(self, treefile, start_nodes, node_loglrs):
+        """ The bins to draw from, as (ids, lengths, prior_mass).
+
+        Keeps every node within `loglr_region` of the best, then resolves
+        those to leaves. Two cases need something else:
+
+        coarse   the cut cannot discriminate, because the whole spread of
+                 node likelihoods is smaller than the region. Descending
+                 would enumerate the tree and still drop leaves on
+                 representative-level noise, so use the tiles directly --
+                 their subtree clouds union to the prior.
+        starved  so few tiles pass, holding so few points, that the pool
+                 has nothing to give. Widen the region until it does.
+                 Free, since every start node was already evaluated, and
+                 unbiased, since the extra tiles are low-likelihood and
+                 weighted accordingly.
+        """
         finite = node_loglrs[numpy.isfinite(node_loglrs)]
-        spread = (finite.max() - finite.min()) if len(finite) else 0.0
-        coarse = start_nodes is not None and spread < self.loglr_region
-        if coarse:
-            logging.info('%i of %i start nodes passed: cut cannot '
+        if not len(finite):
+            raise RuntimeError(
+                'no start node had a finite likelihood; the map does not '
+                'cover this signal, or the model is misconfigured')
+        bound = finite.max() - self.loglr_region
+        # NaN and -inf both compare False, so they are excluded here
+        passed = numpy.where(node_loglrs > bound)[0]
+
+        if start_nodes is not None \
+                and finite.max() - finite.min() < self.loglr_region:
+            logging.info('%i of %i start nodes passed: the cut cannot '
                          'discriminate, using tiles directly',
-                         len(passed), len(args))
+                         len(passed), len(node_loglrs))
+            return self._tiles_as_bins(passed, start_nodes, node_loglrs)
 
-        if coarse:
-            active_ids, lengths, prior_mass = self._tiles_as_bins(
-                passed, start_nodes, node_loglrs)
-            key = len(active_ids)
-        else:
-            logging.info('...resolving tree leaves for %i passed tiles',
-                         len(passed))
-            active_lengths, active_mass, key = [], [], 0
-            self.leaf_loglr = {}
-            with h5py.File(self.mapfile, 'r') as mapfile:
-                for tile in passed:
-                    leaves = None
-                    if start_nodes is not None:
-                        leaves = self._find_active_leaves(start_nodes[tile],
-                                                          bound)
-                    elif treefile is not None and str(tile) in treefile['tree']:
-                        leaves = self._find_active_leaves(
-                            treefile['tree'][str(tile)], bound)
-                    if not leaves and start_nodes is None:
-                        mp = mapfile['map'][str(tile)][:]
-                        leaves = [(mp, node_loglrs[tile], float(len(mp)))]
-                    for pts, ll, mass in (leaves or []):
-                        self.dmap[key] = pts
-                        self.leaf_loglr[key] = ll
-                        active_lengths.append(len(pts))
-                        active_mass.append(mass)
-                        key += 1
-            active_ids = numpy.arange(key)
-            lengths = numpy.array(active_lengths)
-            prior_mass = numpy.array(active_mass, dtype=float)
-        # NB: the tree file must stay open until after the fallback
-        # below, which reads subtrees through `start_nodes`.
+        logging.info('...resolving tree leaves for %i passed tiles',
+                     len(passed))
+        ids, lengths, mass = self._leaves_as_bins(
+            treefile, passed, start_nodes, node_loglrs, bound)
         logging.info('...resolved to %i active bins (%i points)',
-                     key, int(lengths.sum()) if key else 0)
+                     len(ids), int(lengths.sum()))
+        if start_nodes is None or lengths.sum() >= self.min_active_points:
+            return ids, lengths, mass
 
-        # The cut can also starve the pool rather than fail to prune, if
-        # very few tiles pass and they hold very few points. Widen until
-        # usable: free, since every start node was already evaluated, and
-        # unbiased, since the extra tiles are low-likelihood and weighted
-        # accordingly.
-        if start_nodes is not None and not coarse \
-                and (not key or lengths.sum() < self.min_active_points):
-            logging.warning('active set starved (%i leaves, %i points): '
-                            'falling back to start-level tiles',
-                            key, int(lengths.sum()) if key else 0)
-            region = self.loglr_region
-            for _ in range(6):
-                sel = numpy.where(
-                    (node_loglrs > numpy.nanmax(node_loglrs) - region)
-                    & ~numpy.isnan(node_loglrs))[0]
-                active_ids, lengths, prior_mass = self._tiles_as_bins(
-                    sel, start_nodes, node_loglrs)
-                key = len(active_ids)
-                if lengths.sum() >= self.min_active_points:
-                    break
-                region *= 2.0
-                logging.warning('still starved (%i points); widening '
-                                'loglr_region to %.0f', lengths.sum(), region)
-            logging.info('...fallback gave %i tiles (%i points)',
-                         key, int(lengths.sum()) if key else 0)
+        logging.warning('active set starved (%i bins, %i points): falling '
+                        'back to start-level tiles', len(ids),
+                        int(lengths.sum()))
+        region = self.loglr_region
+        for _ in range(6):
+            sel = numpy.where(node_loglrs > finite.max() - region)[0]
+            ids, lengths, mass = self._tiles_as_bins(sel, start_nodes,
+                                                     node_loglrs)
+            if lengths.sum() >= self.min_active_points:
+                break
+            region *= 2.0
+            logging.warning('still starved (%i points); widening the '
+                            'region to %.0f', int(lengths.sum()), region)
+        logging.info('...fallback gave %i tiles (%i points)', len(ids),
+                     int(lengths.sum()))
+        return ids, lengths, mass
 
-        if treefile is not None:
-            treefile.close()
+    def run(self):
+        with h5py.File(self.mapfile, 'r') as mapfile:
+            self.dtype = mapfile['map']['0'].dtype
 
-        weight = self._round1_weights(key, lengths)
+        treefile = h5py.File(self.treefile, 'r') if self.treefile else None
+        try:
+            start_nodes, node_loglrs = self._evaluate_start_nodes(treefile)
+            active_ids, lengths, prior_mass = self._active_bins(
+                treefile, start_nodes, node_loglrs)
+        finally:
+            if treefile is not None:
+                treefile.close()
+
+        weight = self._round1_weights(len(active_ids), lengths)
         # per-stratum accumulators
         strata = {'pool': {'samp': None, 'loglr': None, 'logw': None}}
-        self.stratum_calls = {'pool': 0}
+        self.stratum_calls = {}
         proposal = self._seed_proposal_from_leaves() \
             if self.gen_seed_leaves else None
         pool_dead = False
 
+        # The generative proposal is held in reserve: the pool keeps the
+        # whole budget each round until it exhausts and hands it over.
         for rnd in range(1, self.rounds + 1):
-            self._round = rnd
-            # The generative proposal is held in reserve: the pool keeps
-            # the entire budget until it exhausts and hands it over.
-            gen_budget = self.target_likelihood_calls if pool_dead else 0
-            pool_budget = self.target_likelihood_calls - gen_budget
-
-            if pool_budget > 0 and not pool_dead:
+            if not pool_dead:
                 try:
                     ps, pl, pw, bid = self.pool_round(
                         weight / weight.sum(), active_ids, lengths,
-                        pool_budget, prior_mass=prior_mass)
+                        self.target_likelihood_calls, prior_mass=prior_mass)
                     strata['pool'] = self._accumulate(strata['pool'],
                                                       ps, pl, pw)
                     # concentrate later rounds on the leaves that are
@@ -513,10 +516,10 @@ class GameSampler6(DummySampler):
                     if proposal is None:
                         logging.info('no generative proposal available; stop')
                         break
-                    gen_budget = self.target_likelihood_calls
 
-            if gen_budget > 0 and proposal is not None:
-                got = self.gen_round(proposal, gen_budget)
+            if pool_dead:
+                got = self.gen_round(proposal,
+                                     self.target_likelihood_calls)
                 if got is not None:
                     gs, gl, gw = got
                     # one stratum PER ROUND: each round used a different
