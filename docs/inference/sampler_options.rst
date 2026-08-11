@@ -95,7 +95,8 @@ Nested samplers
 dynesty
 =======
 
-See the `dynesty documentation <https://dynesty.readthedocs.io/>`_.
+See the `dynesty documentation <https://dynesty.readthedocs.io/>`_, and
+:ref:`platter_dynesty` for a working configuration.
 
 ``nlive``
     Required. The number of live points. More live points give a more finely
@@ -162,7 +163,8 @@ ultranest
 =========
 
 See the `UltraNest documentation
-<https://johannesbuchner.github.io/UltraNest/>`_.
+<https://johannesbuchner.github.io/UltraNest/>`_, and :ref:`platter_ultranest`
+for a working configuration.
 
 ``min_num_live_points``
     The number of live points.
@@ -183,7 +185,8 @@ See the `UltraNest documentation
 nessai
 ======
 
-See the `nessai documentation <https://nessai.readthedocs.io/>`_.
+See the `nessai documentation <https://nessai.readthedocs.io/>`_, and
+:ref:`platter_nessai` for a working configuration.
 
 ``nlive``
     The number of live points.
@@ -200,7 +203,9 @@ error listing them.
 snowline
 ========
 
-See the `snowline documentation <https://johannesbuchner.github.io/snowline/>`_.
+See the `snowline documentation
+<https://johannesbuchner.github.io/snowline/>`_, and :ref:`platter_snowline`
+for a working configuration.
 
 ``num_global_samples``, ``num_gauss_samples``
     How many samples are drawn globally and from the fitted Gaussian.
@@ -215,7 +220,8 @@ multinest
 =========
 
 See the `PyMultiNest documentation
-<https://johannesbuchner.github.io/PyMultiNest/>`_.
+<https://johannesbuchner.github.io/PyMultiNest/>`_, and
+:ref:`platter_multinest` for a working configuration.
 
 ``nlivepoints``
     The number of live points.
@@ -230,7 +236,8 @@ See the `PyMultiNest documentation
 cpnest
 ======
 
-See the `cpnest documentation <https://github.com/johnveitch/cpnest>`_.
+See the `cpnest documentation <https://github.com/johnveitch/cpnest>`_, and
+:ref:`platter_cpnest` for a working configuration.
 
 ``nlive``
     The number of live points.
@@ -280,7 +287,8 @@ Burn-in is configured in its own ``[sampler-burn_in]`` section:
 emcee
 =====
 
-See the `emcee documentation <https://emcee.readthedocs.io/>`_.
+See the `emcee documentation <https://emcee.readthedocs.io/>`_, and
+:ref:`platter_emcee` for a working configuration.
 
 ``nwalkers``
     Required. The number of walkers in the ensemble. It must exceed twice
@@ -292,7 +300,8 @@ See the `emcee documentation <https://emcee.readthedocs.io/>`_.
 ptemcee
 =======
 
-See the `ptemcee documentation <https://github.com/willvousden/ptemcee>`_.
+See the `ptemcee documentation <https://github.com/willvousden/ptemcee>`_,
+and :ref:`platter_ptemcee` for a working configuration.
 
 ``nwalkers``
     Required, as for ``emcee``.
@@ -315,7 +324,8 @@ See the `ptemcee documentation <https://github.com/willvousden/ptemcee>`_.
 epsie
 =====
 
-See the `epsie documentation <https://github.com/cdcapano/epsie>`_.
+See the `epsie documentation <https://github.com/cdcapano/epsie>`_, and
+:ref:`platter_epsie` for a working configuration.
 
 ``nchains``
     Required. The number of parallel chains.
