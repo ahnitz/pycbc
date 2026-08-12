@@ -303,9 +303,11 @@ class DistMarg():
         self._current_params.update(self.marginalize_vector_params)
         self.sample_idx = self.premarg['sample_idx'][choice]
 
-        # Update the importance weights for each vector sample
-        logw = self.marginalize_vector_weights + logw[choice]
-        self.marginalize_vector_weights = logw - logsumexp(logw)
+        # Update the importance weights for each vector sample. They are
+        # not renormalized to sum to one: that would make the integral over
+        # the marginalized parameter an average over it instead.
+        self.marginalize_vector_weights = \
+            self.marginalize_vector_weights + logw[choice]
         return self.marginalize_vector_params
 
     def snr_draw(self, wfs=None, snrs=None, size=None):
@@ -418,9 +420,16 @@ class DistMarg():
                                    size=vsamples)
         tc = tct + tci * snr.delta_t + float(snr.start_time) - dt
 
-        # Update the current proposed times and the marginalization values
-        # assumes uniform prior!
-        logw = - logweight[tci] + numpy.log(1.0 / len(logweight))
+        # Update the current proposed times and the marginalization values.
+        # The times are drawn from the incoherent likelihood, not from the
+        # prior, so each carries the ratio of the two: logweight is a
+        # probability per time sample, and the spacing turns it into a
+        # density the prior can be divided by. Assumes a uniform tc prior,
+        # as the draws themselves do.
+        logw = (- logweight[tci]
+                + numpy.log(snr.delta_t / (tcmax - tcmin)))
+        # times the search had to leave out carry no prior weight
+        logw[(tc < tcmin) | (tc > tcmax)] = -numpy.inf
         self.marginalize_vector_params['tc'] = tc
         self.marginalize_vector_params['logw_partial'] = logw
 
@@ -739,8 +748,17 @@ class DistMarg():
         for k in self.marginalize_vector_params:
             if k not in params:
                 params[k] = self.marginalize_vector_params[k]
-        self.marginalize_vector_weights = - numpy.log(self.vsamples)
         return params
+
+    def update(self, **params):
+        """Move to a new point, resetting the marginalization weights.
+
+        The weights start out equal and each draw adds to them. They are
+        reset here, once per point, so that reading the parameters after a
+        draw - which is what the likelihoods do - leaves them intact.
+        """
+        super().update(**params)
+        self.marginalize_vector_weights = - numpy.log(self.vsamples)
 
     def reconstruct(self, rec=None, seed=None, set_loglr=None):
         """ Reconstruct the distance or vectored marginalized parameter
