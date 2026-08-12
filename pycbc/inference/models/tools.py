@@ -845,15 +845,34 @@ def setup_distance_marg_interpolant(dist_marg,
                                                  phase=phase)
     interp = RectBivariateSpline(shr, hhr, lvals)
 
+    # warn the first time the sampler asks outside the interpolated range,
+    # rather than silently returning -inf. Beyond the range the distance
+    # marginalized likelihood is dropped to zero, which biases the result;
+    # the fix is a wider marginalize_distance_snr_range. Reported in signal
+    # to noise ratio, which is what the option is set in.
+    warned = [False]
+
+    def warn_out_of_range(over):
+        if warned[0] or not over:
+            return
+        warned[0] = True
+        logging.warning(
+            "A likelihood evaluation asked for a signal to noise ratio "
+            "outside marginalize_distance_snr_range %s; beyond it the "
+            "distance marginalized likelihood is set to zero, which biases "
+            "the result. Widen the range.", snr_range)
+
     def interp_wrapper(x, y, bounds_check=True):
         k = None
         if bounds_check:
             if isinstance(x, float):
                 if x > shr_max or x < shr_min or y > hhr_max or y < hhr_min:
+                    warn_out_of_range(True)
                     return -numpy.inf
             else:
                 k = (x > shr_max) | (x < shr_min)
                 k = k | (y > hhr_max) | (y < hhr_min)
+                warn_out_of_range(k.any())
 
         v = interp(x, y, grid=False)
         if k is not None:
