@@ -29,7 +29,7 @@ import unittest
 import copy
 from utils import simple_exit
 import numpy
-from scipy import special
+from scipy import special, stats
 from pycbc.catalog import Merger
 from pycbc.psd import interpolate, inverse_spectrum_truncation, aLIGOZeroDetHighPower
 from pycbc.noise import noise_from_psd
@@ -208,6 +208,166 @@ class TestModels(unittest.TestCase):
         self.assertAlmostEqual(self.a2, model.loglr, delta=0.002)
 
 
+    # ------------------------------------------------------------------
+    # Models that marginalize over time. These had no coverage. They locate
+    # the signal from its SNR peak, so unlike the other models they need
+    # data that actually contains a signal, hence they live here rather
+    # than with the signal-free noise used by TestWaveformErrors.
+    #
+    # Note ``a1`` is a phase-marginalized log likelihood ratio, so these are
+    # only comparable to it with phase marginalization turned on as well.
+    # ------------------------------------------------------------------
+
+    # half width of the tc prior, centred on the reference tc
+    tc_half_width = 0.02
+
+    def tc_setup(self):
+        """Returns variable params and a prior including tc.
+
+        Both are fresh each time: setting up a marginalization removes the
+        marginalized parameter from the list and prior it is handed, so
+        sharing them between models corrupts the later ones.
+        """
+        variable = self.variable + ['tc']
+        tc = self.static['tc']
+        prior = JointDistribution(
+            list(variable),
+            SinAngle(inclination=None),
+            Uniform(distance=(10, 100)),
+            Uniform(tc=(tc - self.tc_half_width, tc + self.tc_half_width)))
+        return variable, prior
+
+    def marg_time_model(self):
+        variable, prior = self.tc_setup()
+        static = {k: v for k, v in self.static.items() if k != 'tc'}
+        return models.MarginalizedTime(
+            variable, copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=static, prior=prior,
+            marginalize_vector_params='tc',
+            marginalize_vector_samples=512,
+            marginalize_phase=True, sample_rate=4096)
+
+    def relative_time_model(self, cls):
+        variable, prior = self.tc_setup()
+        static = {k: v for k, v in self.static.items() if k != 'tc'}
+        return cls(
+            variable, copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=static, prior=prior,
+            fiducial_params={'mass1': 1.3756, 'tc': self.static['tc']},
+            epsilon=0.1, sample_rate=4096,
+            marginalize_vector_params='tc',
+            marginalize_vector_samples=512)
+
+    def brute_force_marginalize_tc(self, half_width, nbins=2001):
+        """log of the mean likelihood ratio over a uniform tc prior.
+
+        Evaluated on a grid rather than by drawing samples: the likelihood
+        is sharply peaked in tc, with a width under a millisecond, so
+        random draws over a wide prior do not converge.
+        """
+        tc = self.static['tc']
+        variable, prior = self.tc_setup()
+        static = {k: v for k, v in self.static.items() if k != 'tc'}
+        model = models.Relative(
+            variable, copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=static, prior=prior,
+            fiducial_params={'mass1': 1.3756, 'tc': tc}, epsilon=0.1)
+        grid = numpy.linspace(tc - half_width, tc + half_width, nbins)
+        logls = numpy.empty(nbins)
+        for i, value in enumerate(grid):
+            params = dict(self.q1)
+            params['tc'] = value
+            model.update(**params)
+            logls[i] = model.loglr
+        return special.logsumexp(logls) - numpy.log(nbins)
+
+    def test_brute_force_tc_marginalization_is_correct(self):
+        """Checks the reference the time marginalization is measured against.
+
+        Over a prior far narrower than the peak the mean likelihood must
+        equal the value at the peak, and each doubling of the prior width
+        must cost exactly log(2), since the extra volume adds no likelihood.
+        """
+        self.assertAlmostEqual(self.a1,
+                               self.brute_force_marginalize_tc(1e-5),
+                               delta=0.02)
+        wide = self.brute_force_marginalize_tc(0.004)
+        wider = self.brute_force_marginalize_tc(0.008)
+        self.assertAlmostEqual(numpy.log(2), wide - wider, delta=0.01)
+
+    def test_time_marginalization_is_converged(self):
+        """The Monte Carlo estimate must not depend on the sample count."""
+        for build in (self.marg_time_model,
+                      lambda: self.relative_time_model(models.RelativeTime)):
+            values = []
+            for nsamples in (128, 2048):
+                model = build()
+                model.marginalize_vector_samples = nsamples
+                model.update(**self.q1)
+                values.append(model.loglr)
+                self.assertTrue(numpy.isfinite(model.loglr))
+            self.assertAlmostEqual(values[0], values[1], delta=0.5)
+
+    def test_marginalized_time_matches_relative_time_dom(self):
+        """Two implementations of the same marginalization should agree.
+
+        This is a consistency check between models, not a check that either
+        is right: both use the same convention for how the marginalization
+        is normalized, so a mistake in that convention would not show up
+        here. See test_brute_force_tc_marginalization_is_correct for what
+        the independent reference looks like.
+        """
+        marg = self.marg_time_model()
+        marg.update(**self.q1)
+        reldom = self.relative_time_model(models.RelativeTimeDom)
+        reldom.update(**self.q1)
+        self.assertAlmostEqual(marg.loglr, reldom.loglr, delta=1.5)
+
+
+class TestAnalyticModels(unittest.TestCase):
+    """Tests the analytic models against their closed-form answers.
+
+    These have exact answers but were not covered by any test.
+    """
+
+    def test_normal(self):
+        model = models.TestNormal(['x', 'y'])
+        model.update(x=-0.2, y=0.1)
+        expected = stats.multivariate_normal(
+            mean=[0., 0.], cov=[1., 1.]).logpdf([-0.2, 0.1])
+        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
+
+    def test_normal_mean_and_cov(self):
+        # a non-default mean/cov, so the arguments are actually exercised
+        mean, cov = [1., -2.], [4., 0.25]
+        model = models.TestNormal(['x', 'y'], mean=mean, cov=cov)
+        model.update(x=0.5, y=-1.5)
+        expected = stats.multivariate_normal(mean=mean, cov=cov).logpdf(
+            [0.5, -1.5])
+        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
+
+    def test_rosenbrock(self):
+        model = models.TestRosenbrock(['x', 'y'])
+        model.update(x=0.3, y=0.4)
+        expected = -((1 - 0.3) ** 2 + 100 * (0.4 - 0.3 ** 2) ** 2)
+        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
+
+    def test_eggbox(self):
+        model = models.TestEggbox(['x', 'y'])
+        model.update(x=0.3, y=0.4)
+        expected = (2 + numpy.cos(0.3 / 2.) * numpy.cos(0.4 / 2.)) ** 5
+        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
+
+    def test_prior_is_flat(self):
+        # the loglikelihood is constant, so the posterior is just the prior
+        model = models.TestPrior(['x', 'y'])
+        model.update(x=0.3, y=0.4)
+        self.assertEqual(model.loglikelihood, 0.)
+
+
 class TestWaveformErrors(unittest.TestCase):
     """Tests that models handle no waveform errors correctly."""
 
@@ -378,6 +538,23 @@ class TestWaveformErrors(unittest.TestCase):
             ignore_failed_waveforms=True)
         self._run_tests(model)
 
+    def test_gated_gaussian_margphase(self):
+        static = self.static.copy()
+        static['t_gate_start'] = static['tc'] - 0.05
+        static['t_gate_end'] = static['tc']
+        # the phase being marginalized over still has to be a parameter the
+        # waveform generator knows about, even though its value is irrelevant
+        static['coa_phase'] = 0.
+        model = models.GatedGaussianMargPhase(
+            self.variable, data=copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow,
+            psds=self.psds,
+            static_params=static,
+            prior=self.prior,
+            ref_phase='coa_phase',
+            ignore_failed_waveforms=True)
+        self._run_tests(model)
+
 
 class TestMarginalizedPolModels(unittest.TestCase):
     """Tests that marginalized polarization models return the same
@@ -495,6 +672,7 @@ class TestMarginalizedPolModels(unittest.TestCase):
 
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestModels))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestAnalyticModels))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestWaveformErrors))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMarginalizedPolModels))
 
