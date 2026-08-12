@@ -819,6 +819,13 @@ class RelativeTimeDom(RelativeTime):
         snrs = {}
         self.sh = {}
         self.hh = {}
+        # once the marginalization points are precalculated, the
+        # per-evaluation draw takes them from that pool and never looks at
+        # this signal-to-noise series, so building it every call is
+        # wasted; self.sh and self.hh are still needed for the likelihood.
+        # Before the pool exists (setup, and the non-precalculated path)
+        # the series is drawn from and must be built.
+        need_series = not hasattr(self, 'premarg')
         for ifo in wfs:
             sdat = self.sdat[ifo]
             dtc = self.tstart[ifo] - self.end_time[ifo] - self.ta[ifo]
@@ -830,12 +837,13 @@ class RelativeTimeDom(RelativeTime):
                                        self.h00_sparse[ifo],
                                        sdat['a0'], sdat['a1'],
                                        sdat['b0'], sdat['b1'])
-            snr = TimeSeries(abs(sh[2:-2]) / hh ** 0.5, delta_t=delta_t,
-                             epoch=self.tstart[ifo])
             self.sh[ifo] = TimeSeries(sh, delta_t=delta_t,
                                       epoch=self.tstart[ifo] - delta_t * 2.0)
             self.hh[ifo] = hh
-            snrs[ifo] = snr
+            if need_series:
+                snrs[ifo] = TimeSeries(abs(sh[2:-2]) / hh ** 0.5,
+                                       delta_t=delta_t,
+                                       epoch=self.tstart[ifo])
 
         return snrs
 
