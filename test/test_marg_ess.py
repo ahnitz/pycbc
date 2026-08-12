@@ -25,18 +25,44 @@ import copy
 import unittest
 
 import numpy
-from validation import FLOW, TC, get_seed, make_data
 
+from pycbc.detector import Detector
 from pycbc.distributions import JointDistribution, SinAngle, Uniform
 from pycbc.inference import models
+from pycbc.noise import noise_from_psd
+from pycbc.psd import aLIGOZeroDetHighPower
+from pycbc.waveform import get_td_waveform
+
+FLOW, SEGLEN, SRATE, TC = 25., 32, 2048, 1187008882.42840
 
 
 class TestMargESS(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.seed = get_seed(cls.__name__)
-        cls.data, cls.psds, inj = make_data(cls.seed, ifos=['H1', 'L1'])
+        # a fixed binary neutron star signal injected into simulated noise;
+        # self-contained so the test does not depend on a shared fixture
+        inj = dict(mass1=1.4, mass2=1.35, distance=60., inclination=0.5,
+                   ra=1.7, dec=-0.4, polarization=0.3, coa_phase=1.1)
+        hp, hc = get_td_waveform(
+            approximant='TaylorF2', f_lower=FLOW, delta_t=1. / SRATE,
+            **{k: inj[k] for k in ('mass1', 'mass2', 'distance',
+                                   'inclination', 'coa_phase')})
+        hp.start_time += TC
+        hc.start_time += TC
+        flen = int(SRATE * SEGLEN / 2) + 1
+        psd = aLIGOZeroDetHighPower(flen, 1. / SEGLEN, FLOW)
+        cls.data, cls.psds = {}, {}
+        seed = 3
+        for ifo in ['H1', 'L1']:
+            noise = noise_from_psd(int(SEGLEN * SRATE), 1. / SRATE, psd,
+                                   seed=seed)
+            noise._epoch = TC - SEGLEN / 2
+            seed += 101
+            signal = Detector(ifo).project_wave(
+                hp, hc, inj['ra'], inj['dec'], inj['polarization'])
+            cls.data[ifo] = noise.add_into(signal).to_frequencyseries()
+            cls.psds[ifo] = psd
         cls.flow = {ifo: FLOW for ifo in cls.data}
         cls.static = dict(mass1=inj['mass1'], mass2=inj['mass2'], f_lower=FLOW,
                           approximant='TaylorF2', ra=inj['ra'], dec=inj['dec'],
