@@ -128,6 +128,84 @@ class TestRelbinResolution(unittest.TestCase):
         self.assertGreaterEqual(value, 0.)
 
 
+    # 'auto' keeps the bins good enough while the sampler runs
+
+    def wander(self, model, n=4000, spread=0.05):
+        """Evaluate near the peak, the way a settled sampler would."""
+        for i in range(n):
+            model.update(distance=self.q['distance'] + spread * (i % 7 - 3),
+                         inclination=self.q['inclination'])
+            assert numpy.isfinite(model.loglr)
+        return model
+
+    def test_auto_leaves_a_good_setup_alone(self):
+        """Nothing should be rebuilt when nothing is wrong."""
+        model = self.wander(self.model('auto'))
+        self.assertEqual(model.rebins, 0)
+        self.assertEqual(model.epsilon, 0.5)
+
+    def test_auto_refines_when_the_bins_are_not_good_enough(self):
+        """A fiducial away from the signal should buy bins, while running.
+
+        The setup cannot know this: it depends on where the sampler goes.
+        """
+        offset = dict(self.static)
+        offset['mass1'], offset['mass2'] = 1.39, 1.36
+
+        fixed = self.model(0.5, static=offset)
+        fixed.update(**self.q)
+        auto = self.wander(self.model('auto', static=offset))
+        auto.update(**self.q)
+
+        self.assertGreater(auto.rebins, 0)
+        self.assertLess(auto.epsilon, 0.5)
+
+        fine = self.model(0.002, static=offset)
+        fine.update(**self.q)
+        self.assertLess(abs(auto.loglr - fine.loglr),
+                        abs(fixed.loglr - fine.loglr))
+
+    def test_auto_does_not_rebin_away_from_the_peak(self):
+        """Bins are only worth adding where the answer matters.
+
+        A point the sampler is passing through on its way somewhere better
+        does not need the bins to describe it, and paying for it would
+        mean paying for the worst place the sampler ever wandered.
+        """
+        offset = dict(self.static)
+        offset['mass1'], offset['mass2'] = 1.39, 1.36
+        model = self.model('auto', static=offset)
+        model.update(**self.q)
+        # as if a far better point had already been seen, so that
+        # everything from here on is out in the tails
+        model.best_loglr = model.loglr + 1000.
+
+        self.wander(model)
+        self.assertEqual(model.rebins, 0)
+        self.assertEqual(model.epsilon, 0.5)
+
+    def test_auto_settles(self):
+        """It must stop refining, not keep going for as long as it runs."""
+        offset = dict(self.static)
+        offset['mass1'], offset['mass2'] = 1.39, 1.36
+        model = self.wander(self.model('auto', static=offset))
+        after = model.rebins
+        self.wander(model)
+        self.assertEqual(model.rebins, after,
+                         "still refining after settling")
+
+    def test_auto_only_ever_refines(self):
+        """Going back and forth would never settle."""
+        offset = dict(self.static)
+        offset['mass1'], offset['mass2'] = 1.39, 1.36
+        model = self.model('auto', static=offset)
+        seen = []
+        for _ in range(12):
+            self.wander(model, n=600)
+            seen.append(model.epsilon)
+        self.assertEqual(seen, sorted(seen, reverse=True), "%s" % seen)
+
+
 suite = unittest.TestSuite()
 suite.addTest(
     unittest.TestLoader().loadTestsFromTestCase(TestRelbinResolution))

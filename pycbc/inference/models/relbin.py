@@ -36,6 +36,7 @@ from pycbc.waveform import (get_fd_waveform_sequence,
 from pycbc.detector import Detector
 from pycbc.types import Array, TimeSeries
 
+from .base import ModelStats
 from .gaussian_noise import (BaseGaussianNoise, catch_waveform_error)
 from pycbc.waveform import FailedWaveformError
 from .relbin_cpu import (likelihood_parts, likelihood_parts_v,
@@ -158,9 +159,14 @@ class Relative(DistMarg, BaseGaussianNoise):
         an intrinsic parameter compatible with the chosen approximant.
     gammas : array of floats, optional
         Frequency powerlaw indices to be used in computing frequency bins.
-    epsilon : float, optional
+    epsilon : float or 'auto', optional
         Tuning parameter used in calculating the frequency bins. Lower values
-        will result in higher resolution and more bins.
+        will result in higher resolution and more bins. If 'auto', the bins
+        are laid out again while running whenever they turn out not to be
+        good enough for where the sampler has got to.
+    accuracy : float, optional
+        How much error in the log likelihood ratio to accept when 'auto' is
+        deciding whether to lay the bins out again.
     earth_rotation: boolean, optional
         Default is False. If True, then vary the fp/fc polarization values
         as a function of frequency bin, using a predetermined PN approximation
@@ -182,6 +188,7 @@ class Relative(DistMarg, BaseGaussianNoise):
         earth_rotation=False,
         earth_rotation_mode=2,
         marginalize_phase=True,
+        accuracy=0.05,
         **kwargs
     ):
 
@@ -225,9 +232,16 @@ class Relative(DistMarg, BaseGaussianNoise):
         # from, and are kept so that can be done again.
         self.shifted, self.flimits = {}, {}
 
+        self.adapt = str(epsilon).lower() == 'auto'
+        self.epsilon = 0.5 if self.adapt else float(epsilon)
+        self.accuracy = float(accuracy)
+        self.layout = (gammas, earth_rotation, int(earth_rotation_mode))
+        self.best_loglr = -numpy.inf
+        self.since_check = 0
+        self.rebins = 0
+
         self.setup_fiducial()
-        self.setup_bin_layout(epsilon, gammas, earth_rotation,
-                              int(earth_rotation_mode))
+        self.setup_bin_layout(self.epsilon, *self.layout)
 
     def setup_fiducial(self):
         """Generate the fiducial waveform and the data to compare against it.
@@ -337,6 +351,74 @@ class Relative(DistMarg, BaseGaussianNoise):
                                         self.fedges[ifo])
         self.combine_layout()
         self.check_bin_resolution()
+
+    def update(self, **params):
+        if self.adapt:
+            self.keep_bins_good()
+        super().update(**params)
+
+    def loglr_at(self, point):
+        """The log likelihood ratio at a point, leaving the model be."""
+        saved = (self._current_params, self._current_stats)
+        try:
+            self._current_params = point
+            self._current_stats = ModelStats()
+            return float(self.loglr)
+        except Exception:
+            return numpy.nan
+        finally:
+            self._current_params, self._current_stats = saved
+
+    def keep_bins_good(self, drop=20.0, check_every=500, screen=1e-3,
+                       smallest=0.005):
+        """Lay the bins out again if they are not good enough for where
+        the sampler has got to.
+
+        The resolution the bins need depends on where the likelihood is
+        being asked about, which is not known until it is being asked.
+        This looks at the point just evaluated: if it is within ``drop`` of
+        the best seen, so somewhere the answer matters, the resolution is
+        checked and the bins are refined if that costs more than the
+        accuracy wanted.
+
+        The check costs about thirty evaluations, so it is not done on
+        every one; laying the bins out again costs a few hundred, against
+        the millions in a run. Refining only ever adds bins, so this
+        settles rather than going back and forth.
+        """
+        previous = getattr(self._current_stats, 'loglr', None)
+        if previous is None or not numpy.isfinite(previous):
+            return
+        previous = float(previous)
+        self.best_loglr = max(self.best_loglr, previous)
+
+        self.since_check += 1
+        if (previous < self.best_loglr - drop
+                or self.since_check < check_every
+                or self.epsilon <= smallest):
+            return
+        self.since_check = 0
+
+        # the cheap screen: how far the ratio departs from what the bins
+        # assume of it, which costs no new bin layout
+        if self.interpolation_error_from_reference() < screen:
+            return
+
+        # it looks bad, so find out what it is worth in the likelihood
+        point = dict(self._current_params)
+        self.setup_bin_layout(self.epsilon / 2., *self.layout)
+        finer = self.loglr_at(point)
+        if numpy.isfinite(finer) and abs(finer - previous) < self.accuracy:
+            # the coarser bins were good enough after all
+            self.setup_bin_layout(self.epsilon, *self.layout)
+            return
+
+        self.epsilon /= 2.
+        self.rebins += 1
+        logging.info("Refined epsilon to %.4g, %s bins: the likelihood "
+                     "moved by %.3g against an accuracy of %.3g",
+                     self.epsilon, len(self.fedges[list(self.data)[0]]),
+                     abs(finer - previous), self.accuracy)
 
     def init_from_frequencies(self, data, h00, fbin_ind, ifo):
         bins = numpy.array(
