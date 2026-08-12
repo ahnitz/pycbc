@@ -238,6 +238,13 @@ class Relative(DistMarg, BaseGaussianNoise):
         self.layout = (gammas, earth_rotation, int(earth_rotation_mode))
         self.best_loglr = -numpy.inf
         self.since_check = 0
+        # how many evaluations between resolution checks. It doubles each
+        # time a check finds nothing to do and resets when one refines, so
+        # a run whose bins are already good enough stops paying to keep
+        # asking. Without it a nested sampler, whose best likelihood only
+        # ever rises so every point looks close to the peak, checks
+        # forever for no gain.
+        self.interval = 500
         self.rebins = 0
 
         self.setup_fiducial()
@@ -394,7 +401,7 @@ class Relative(DistMarg, BaseGaussianNoise):
 
         self.since_check += 1
         if (previous < self.best_loglr - drop
-                or self.since_check < check_every
+                or self.since_check < self.interval
                 or self.epsilon <= smallest):
             return
         self.since_check = 0
@@ -402,6 +409,7 @@ class Relative(DistMarg, BaseGaussianNoise):
         # the cheap screen: how far the ratio departs from what the bins
         # assume of it, which costs no new bin layout
         if self.interpolation_error_from_reference() < screen:
+            self.interval = min(self.interval * 2, 32000)
             return
 
         # it looks bad, so find out what it is worth in the likelihood
@@ -411,9 +419,11 @@ class Relative(DistMarg, BaseGaussianNoise):
         if numpy.isfinite(finer) and abs(finer - previous) < self.accuracy:
             # the coarser bins were good enough after all
             self.setup_bin_layout(self.epsilon, *self.layout)
+            self.interval = min(self.interval * 2, 32000)
             return
 
         self.epsilon /= 2.
+        self.interval = check_every
         self.rebins += 1
         logging.info("Refined epsilon to %.4g, %s bins: the likelihood "
                      "moved by %.3g against an accuracy of %.3g",
