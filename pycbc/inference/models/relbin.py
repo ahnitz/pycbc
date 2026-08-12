@@ -842,9 +842,82 @@ class RelativeTime(Relative):
                  sample_rate=4096,
                  **kwargs):
         super(RelativeTime, self).__init__(*args, **kwargs)
-        self.sample_rate = float(sample_rate)
-        self.setup_peak_lock(sample_rate=self.sample_rate, **kwargs)
+        auto = str(sample_rate).lower() == 'auto'
+        if auto:
+            # start from the data, which is as coarse as it can sensibly be
+            sample_rate = self.data[tuple(self.data)[0]].sample_rate
+        self.set_sample_rate(sample_rate, **kwargs)
+        if auto:
+            self.choose_sample_rate(**kwargs)
         self.draw_ifos(self.ref_snr, **kwargs)
+
+    def set_sample_rate(self, rate, **kwargs):
+        """Set the time resolution and redo what was built for the old one.
+        """
+        self.sample_rate = float(rate)
+        if hasattr(self, '_ref_snr'):
+            del self._ref_snr
+        self.setup_peak_lock(sample_rate=self.sample_rate, **kwargs)
+
+    def resolved_samples(self, snrs):
+        """How many time samples share the weight of the SNR peak.
+
+        The times are drawn in proportion to the likelihood along these
+        series, so this is the number of samples that drawing actually has
+        to choose between. One sample means the peak falls between grid
+        points as often as not, and the answer depends on which.
+        """
+        worst = numpy.inf
+        for ifo in snrs:
+            logw = snrs[ifo].squared_norm().numpy() / 2.0
+            weight = numpy.exp(logw - logw.max())
+            worst = min(worst, weight.sum() ** 2 / (weight ** 2).sum())
+        return worst
+
+    def choose_sample_rate(self, target=2.5, most=65536.0, **kwargs):
+        """Pick a time resolution that resolves the peak of the likelihood.
+
+        The peak is narrow, and how narrow depends on the signal, so a
+        fixed rate is either wasteful or wrong. Where the series already
+        resolves the peak its width can be measured, and the rate that
+        follows from it reached in one step. Where it does not there is
+        nothing to measure, and the rate is doubled until there is.
+
+        The rate is worth no more than it buys: the signal to noise series
+        is rebuilt at every likelihood evaluation, so its length is a
+        running cost rather than a setup one.
+
+        Parameters
+        ----------
+        target : float, optional
+            How many samples the peak should be spread over. Measured on a
+            binary neutron star injection: at one sample the answer is as
+            likely to be off by 0.17 as to be right, while from two
+            samples upwards it was within 0.007 of direct integration at
+            every rate tried.
+        most : float, optional
+            Never go above this rate.
+        """
+        resolved = self.resolved_samples(self.ref_snr)
+        while resolved < target and self.sample_rate < most:
+            if resolved >= 2.0:
+                # resolved well enough to say how much more is needed
+                steps = max(1, int(numpy.ceil(numpy.log2(target / resolved))))
+            else:
+                steps = 1
+            self.set_sample_rate(min(self.sample_rate * 2 ** steps, most),
+                                 **kwargs)
+            resolved = self.resolved_samples(self.ref_snr)
+
+        rate = self.sample_rate
+        if resolved < target:
+            logging.warning("Could not resolve the peak of the likelihood in "
+                            "time: %.1f samples across it at %s Hz, against "
+                            "the %s wanted", resolved, rate, target)
+        else:
+            logging.info("Chose a sample rate of %s Hz, spreading the peak "
+                         "over %.1f samples", rate, resolved)
+        return rate
 
     @property
     def ref_snr(self):
