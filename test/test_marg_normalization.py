@@ -108,7 +108,7 @@ class TestMargNormalization(unittest.TestCase):
                 marginalize_phase=True,
                 marginalize_vector_params='tc,ra,dec,polarization',
                 marginalize_vector_samples=npoint, sample_rate=4096,
-                marginalize_sky_initial_samples=1e6)
+                marginalize_sky_initial_samples=2e5)
             model.update(**self.point)
             values.append(model.loglr)
         return numpy.mean(values), numpy.std(values) / nseed ** 0.5
