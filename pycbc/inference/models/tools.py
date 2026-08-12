@@ -123,6 +123,15 @@ class DistMarg():
         self.marginalized_vector_priors = {}
         self.vsamples = int(marginalize_vector_samples)
 
+        # a generator kept for the one draw that is hot enough to matter,
+        # seeded from the global stream so a run seeded with
+        # numpy.random.seed still repeats. Choosing a subset without
+        # replacement through numpy.random.choice permutes the whole
+        # precomputed set to take a slice of it; the generator does it by
+        # Floyd's algorithm, the same draw without the permutation.
+        self._choice_rng = numpy.random.default_rng(
+            numpy.random.randint(0, 2 ** 63))
+
         self.marginalize_sky_initial_samples = \
             int(float(marginalize_sky_initial_samples))
 
@@ -294,8 +303,8 @@ class DistMarg():
         if self.vsamples == len(logw):
             choice = slice(None, None)
         else:
-            choice = numpy.random.choice(len(logw), size=self.vsamples,
-                                         replace=False)
+            choice = self._choice_rng.choice(len(logw), size=self.vsamples,
+                                             replace=False)
 
         for k in self.snr_params:
             self.marginalize_vector_params[k] = self.premarg[k][choice]
