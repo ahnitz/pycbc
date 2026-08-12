@@ -19,16 +19,23 @@ effective sample size is how many of them the answer really rests on, and
 the error of the answer is about one over its square root. This checks
 that the reported number means that: that it rises with the points drawn,
 and that one over its root really is the spread of the answer.
+
+It also pins down the arithmetic that produces the number, which is done
+in linear space for speed rather than through logsumexp: the value has to
+agree with the log-space route, has to survive log weights far outside the
+range of exp, and has to give the obvious answers in the obvious cases.
 """
 
 import copy
 import unittest
 
 import numpy
+from scipy.special import logsumexp
 
 from pycbc.detector import Detector
 from pycbc.distributions import JointDistribution, SinAngle, Uniform
 from pycbc.inference import models
+from pycbc.inference.models.tools import marginalize_likelihood
 from pycbc.noise import noise_from_psd
 from pycbc.psd import aLIGOZeroDetHighPower
 from pycbc.waveform import get_td_waveform
@@ -132,8 +139,124 @@ class TestMargESS(unittest.TestCase):
                             "%d points" % (predicted, spread, npoint))
 
 
+def reported_ess(vloglr, logw):
+    """The effective sample size marginalize_likelihood reports for a
+    prescribed vector of log likelihood ratios.
+
+    Feeding the wanted vector in as sh with hh zero makes the internal
+    loglr exactly that vector, so the test drives the real code path
+    instead of a copy of it.
+    """
+    vloglr = numpy.asarray(vloglr, dtype=float)
+    _, ess = marginalize_likelihood(vloglr, numpy.zeros(len(vloglr)),
+                                    logw=logw, return_ess=True)
+    return ess
+
+
+def logspace_ess(vloglr, logw):
+    """The same quantity via logsumexp, kept as the reference.
+
+    This is how the effective sample size used to be computed, and it is
+    the thing the faster linear-space form has to reproduce.
+    """
+    lw = numpy.asarray(vloglr, dtype=float) + logw
+    return float(numpy.exp(2.0 * logsumexp(lw) - logsumexp(2.0 * lw)))
+
+
+class TestESSArithmetic(unittest.TestCase):
+    """The effective sample size is now formed in linear space.
+
+    The weights are exponentiated once, after their largest log is
+    subtracted, and the ratio (sum w)^2 / sum w^2 is taken directly. That
+    is much cheaper than two more logsumexp calls on an array already in
+    hand, but it is not bit-identical to them: rounding differs at the
+    last couple of digits. These tests fix how far it is allowed to drift
+    and check the cases where a naive exponential would break.
+    """
+
+    def test_matches_the_log_space_form(self):
+        """Agreement with logsumexp, over weights of every character.
+
+        The offsets push the log weights far above and far below the range
+        where exp is representable, which is the whole reason the maximum
+        is subtracted first. The spread controls how peaked the weights
+        are, from nearly uniform to dominated by a few points.
+        """
+        rng = numpy.random.RandomState(9)
+        for n in (2, 17, 512, 4096):
+            for spread in (1e-3, 1.0, 5.0, 40.0):
+                for offset in (-900.0, 0.0, 700.0):
+                    v = rng.normal(size=n) * spread + offset
+                    logw = -numpy.log(n)
+                    fast, ref = reported_ess(v, logw), logspace_ess(v, logw)
+                    self.assertLess(
+                        abs(fast / ref - 1.0), 1e-10,
+                        "n=%d spread=%g offset=%g: %.17g vs %.17g"
+                        % (n, spread, offset, fast, ref))
+
+    def test_matches_with_uneven_weights(self):
+        """The log weights need not be a single number per point.
+
+        The marginalization passes a whole array of importance weights
+        once the draws stop being uniform, so the two routes have to agree
+        when both terms vary point to point.
+        """
+        rng = numpy.random.RandomState(11)
+        n = 1000
+        v = rng.normal(size=n) * 8.0 + 300.0
+        logw = rng.normal(size=n) * 4.0
+        logw -= logsumexp(logw)
+        self.assertLess(abs(reported_ess(v, logw)
+                            / logspace_ess(v, logw) - 1.0), 1e-10)
+
+    def test_equal_weights_give_the_sample_count(self):
+        """Nothing is wasted when every point counts the same, so the
+        effective sample size is the number of points, on the nose."""
+        for n in (1, 2, 37, 1024):
+            ess = reported_ess(numpy.full(n, 12.5), -numpy.log(n))
+            self.assertLess(abs(ess / n - 1.0), 1e-12)
+
+    def test_one_dominant_weight_gives_one(self):
+        """The opposite extreme: if a single point carries the integral
+        the answer rests on one sample and the diagnostic must say so."""
+        v = numpy.full(64, -400.0)
+        v[13] = 0.0
+        self.assertLess(abs(reported_ess(v, -numpy.log(64)) - 1.0), 1e-12)
+
+    def test_bounded_by_the_sample_count(self):
+        """The count is the ceiling, whatever the weights look like."""
+        rng = numpy.random.RandomState(5)
+        for n in (3, 64, 2048):
+            for spread in (0.1, 10.0, 100.0):
+                ess = reported_ess(rng.normal(size=n) * spread, -numpy.log(n))
+                self.assertGreaterEqual(ess, 1.0 - 1e-12)
+                self.assertLessEqual(ess, n + 1e-9)
+
+    def test_minus_infinities_drop_out(self):
+        """A point of zero weight is not a point.
+
+        Excluded draws arrive as -inf log weights. They must contribute
+        nothing at all, so the answer has to be the answer for the finite
+        points alone, and not a nan.
+        """
+        rng = numpy.random.RandomState(21)
+        v = rng.normal(size=40) * 3.0
+        keep = numpy.zeros(40, dtype=bool)
+        keep[:9] = True
+        logw = numpy.where(keep, -numpy.log(9), -numpy.inf)
+        self.assertLess(abs(reported_ess(v, logw)
+                            - logspace_ess(v[keep], -numpy.log(9))), 1e-9)
+
+    def test_no_finite_weight_is_not_a_number(self):
+        """With every weight zero there is nothing to count, and the
+        diagnostic should report that rather than invent a value."""
+        self.assertTrue(numpy.isnan(
+            reported_ess(numpy.full(8, -numpy.inf), -numpy.log(8))))
+
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMargESS))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestESSArithmetic))
 
 if __name__ == '__main__':
     from astropy.utils import iers

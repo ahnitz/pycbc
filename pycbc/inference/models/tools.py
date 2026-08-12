@@ -982,9 +982,29 @@ def marginalize_likelihood(sh, hh,
             # answer: (sum w)^2 / sum w^2 with w the combined weights.
             # Low against the number drawn means the marginal rests on a
             # handful of them and its error is correspondingly large.
+            #
+            # Exponentiate once and form the ratio directly rather than
+            # asking logsumexp twice for the same array. Subtracting the
+            # largest log weight first is what keeps exp in range, exactly
+            # as logsumexp does it internally, and the ratio is scale free
+            # so that shift cancels. Doing the sums in linear space instead
+            # of log space moves the answer against the logsumexp route by
+            # of order 1e-14 relative, a few times 1e-13 at worst. That is
+            # accepted deliberately: the effective sample size is a
+            # monitoring number, it enters neither the posterior nor the
+            # evidence, and chasing bit-identity would mean copying
+            # scipy's internals and tracking their changes.
             lw = vloglr + logw
-            ess = float(numpy.exp(2.0 * logsumexp(lw)
-                                  - logsumexp(2.0 * lw)))
+            lwmax = lw.max()
+            if numpy.isfinite(lwmax):
+                # the largest weight is exactly one after the shift, so the
+                # denominator is at least one and the sums cannot overflow
+                w = numpy.exp(lw - lwmax)
+                ess = float(w.sum() ** 2.0 / numpy.vdot(w, w))
+            else:
+                # every weight vanished, or one is infinite; there is
+                # nothing meaningful to count
+                ess = numpy.nan
         vloglr = float(logsumexp(vloglr, b=numpy.exp(logw)))
 
     if return_peak:
