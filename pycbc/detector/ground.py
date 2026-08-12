@@ -507,6 +507,114 @@ class Detector(object):
                                              declination,
                                              t_gps)
     
+    def antenna_pattern_and_delay(self, right_ascension, declination,
+                                  polarization, t_gps):
+        """Return the antenna pattern and the delay from the earth center.
+
+        This answers, for one source direction, everything a likelihood
+        needs in order to project the two polarizations onto this detector:
+        how much of each polarization it sees, and when the signal reaches
+        it. Both follow from the same source direction, so computing them
+        together avoids repeating that geometry, and it gives a detector
+        with a different response a single place to override.
+
+        Parameters
+        ----------
+        right_ascension: float
+            The right ascension of the source.
+        declination: float
+            The declination of the source.
+        polarization: float
+            The polarization angle of the source.
+        t_gps: float
+            The GPS time of the signal.
+
+        Returns
+        -------
+        fplus: float
+            The plus polarization factor.
+        fcross: float
+            The cross polarization factor.
+        delta_t: float
+            The delay from the earth center to this detector.
+        """
+        gha = self.gmst_estimate(t_gps) - right_ascension
+        cosgha, singha = cos(gha), sin(gha)
+        cosdec, sindec = cos(declination), sin(declination)
+        cospsi, sinpsi = cos(polarization), sin(polarization)
+
+        # t_gps may be an array, for a signal long enough that the earth
+        # turns during it. Broadcast the terms that do not depend on it so
+        # the stacked vectors below stay rectangular.
+        bcast = np.zeros_like(gha)
+
+        resp = self.response
+        x = np.array([-cospsi * singha - sinpsi * cosgha * sindec,
+                      -cospsi * cosgha + sinpsi * singha * sindec,
+                      sinpsi * cosdec + bcast])
+        y = np.array([sinpsi * singha - cospsi * cosgha * sindec,
+                      sinpsi * cosgha + cospsi * singha * sindec,
+                      cospsi * cosdec + bcast])
+        dx = resp.dot(x)
+        dy = resp.dot(y)
+        if x.ndim > 1:
+            fplus = (x * dx - y * dy).sum(axis=0)
+            fcross = (x * dy + y * dx).sum(axis=0)
+        else:
+            fplus = (x * dx - y * dy).sum()
+            fcross = (x * dy + y * dx).sum()
+
+        ehat = np.array([cosdec * cosgha, -cosdec * singha, sindec + bcast])
+        delta_t = (-self.location).dot(ehat) / constants.c.value
+        return fplus, fcross, delta_t
+
+    def project_wave_fd(self, hp, hc, ra, dec, polarization, ref_tc,
+                        ref_frame='geocentric', extra_time_shift=0.):
+        """Return the strain this detector measures, in the frequency domain.
+
+        This is the frequency-domain counterpart of ``project_wave``: it
+        applies the antenna patterns to the two polarizations and shifts to
+        the arrival time in this detector.
+
+        It is separated out because it is the whole of what a likelihood
+        needs from a detector once it has the polarizations, so a detector
+        whose response is not two frequency-independent numbers and a time
+        shift has a single place to say so, rather than the caller having to
+        know how a response is assembled.
+
+        Parameters
+        ----------
+        hp: pycbc.types.FrequencySeries
+            Plus polarization of the GW.
+        hc: pycbc.types.FrequencySeries
+            Cross polarization of the GW.
+        ra: float
+            Right ascension of the source.
+        dec: float
+            Declination of the source.
+        polarization: float
+            Polarization angle of the source.
+        ref_tc: float
+            The coalescence time, defined in ``ref_frame``.
+        ref_frame: str, optional
+            The frame ``ref_tc`` is defined in. Default is 'geocentric'.
+        extra_time_shift: float, optional
+            An additional shift applied along with the arrival time, used
+            for time-domain waveforms whose peak is not at the end of the
+            series.
+
+        Returns
+        -------
+        pycbc.types.FrequencySeries
+            The strain measured by this detector.
+        """
+        from pycbc.waveform.utils import apply_fd_time_shift
+
+        tc = self.arrival_time(ref_tc, ra, dec, ref_frame)
+        fp, fc = self.antenna_pattern(ra, dec, polarization, tc)
+        return apply_fd_time_shift(fp * hp + fc * hc, tc + extra_time_shift,
+                                   copy=False)
+
     def arrival_time(self, ref_tc, ra, dec, ref_frame='geocentric'):
         """Compute the arrival time in this detector.
         

@@ -96,6 +96,61 @@ class TestDetector(unittest.TestCase):
 
             self.assertLess(diff.max(), tolerance)
 
+    def test_antenna_pattern_and_delay(self):
+        # must agree with calling the two methods it replaces, since the
+        # only difference is that the shared geometry is computed once
+        for ifo in self.d:
+            for ra1, dec1, pol1, time1 in list(zip(self.ra, self.dec,
+                                                   self.pol, self.time))[:50]:
+                fp, fc = ifo.antenna_pattern(ra1, dec1, pol1, time1)
+                dt = ifo.time_delay_from_earth_center(ra1, dec1, time1)
+                fp2, fc2, dt2 = ifo.antenna_pattern_and_delay(
+                    ra1, dec1, pol1, time1)
+                self.assertAlmostEqual(fp, fp2, places=12)
+                self.assertAlmostEqual(fc, fc2, places=12)
+                self.assertAlmostEqual(dt, dt2, places=14)
+
+    def test_antenna_pattern_and_delay_array_times(self):
+        # a signal long enough that the earth turns during it is evaluated
+        # at an array of times, which relative binning relies on
+        for ifo in self.d:
+            for ra1, dec1, pol1, time1 in list(zip(self.ra, self.dec,
+                                                   self.pol, self.time))[:10]:
+                times = time1 + numpy.linspace(0., 100., 17)
+                fp, fc = ifo.antenna_pattern(ra1, dec1, pol1, times)
+                dt = ifo.time_delay_from_earth_center(ra1, dec1, times)
+                fp2, fc2, dt2 = ifo.antenna_pattern_and_delay(
+                    ra1, dec1, pol1, times)
+                self.assertEqual(numpy.shape(fp2), numpy.shape(times))
+                self.assertLess(abs(fp - fp2).max(), 1e-12)
+                self.assertLess(abs(fc - fc2).max(), 1e-12)
+                self.assertLess(abs(numpy.atleast_1d(dt)
+                                    - numpy.atleast_1d(dt2)).max(), 1e-12)
+
+    def test_project_wave_fd(self):
+        # must reproduce assembling the projection by hand, which is what
+        # the frequency-domain waveform generator used to do inline
+        from pycbc.types import FrequencySeries
+        from pycbc.waveform.utils import apply_fd_time_shift
+        numpy.random.seed(0)
+        n = 128
+        hp = FrequencySeries(numpy.random.normal(size=n)
+                             + 1j * numpy.random.normal(size=n),
+                             delta_f=1.0, epoch=0)
+        hc = FrequencySeries(numpy.random.normal(size=n)
+                             + 1j * numpy.random.normal(size=n),
+                             delta_f=1.0, epoch=0)
+        ref_tc = 1187008882.4
+        for ifo in self.d:
+            for ra1, dec1, pol1 in list(zip(self.ra, self.dec, self.pol))[:5]:
+                tc = ifo.arrival_time(ref_tc, ra1, dec1)
+                fp, fc = ifo.antenna_pattern(ra1, dec1, pol1, tc)
+                expected = apply_fd_time_shift(fp * hp + fc * hc, tc,
+                                               copy=True)
+                got = ifo.project_wave_fd(hp, hc, ra1, dec1, pol1, ref_tc)
+                self.assertLess(abs(numpy.array(got) - numpy.array(expected)
+                                    ).max(), 1e-12)
+
     def test_delay_from_detector(self):
         ra, dec, time = self.ra[0:10], self.dec[0:10], self.time[0:10]
         for d1 in self.d:
