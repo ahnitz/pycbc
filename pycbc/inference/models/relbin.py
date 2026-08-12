@@ -30,6 +30,7 @@ import logging
 import numpy
 import itertools
 from scipy.interpolate import interp1d
+from scipy.optimize import minimize
 
 from pycbc.waveform import (get_fd_waveform_sequence,
                             get_fd_det_waveform_sequence, fd_det_sequence)
@@ -125,6 +126,22 @@ def setup_bins(f_full, f_lo, f_hi, chi=1.0,
     return fbin_ind
 
 
+def is_rescaled(base, other, tolerance=1e-6):
+    """Whether two waveforms differ only by an overall constant.
+
+    That is what tells a parameter which merely scales the waveform from
+    one which changes how it varies with frequency.
+    """
+    keep = base != 0
+    if not keep.any():
+        return True
+    ratio = other[keep] / base[keep]
+    scale = numpy.median(abs(ratio))
+    if scale == 0:
+        return not numpy.any(other)
+    return bool(abs(ratio - numpy.mean(ratio)).max() <= tolerance * scale)
+
+
 class Relative(DistMarg, BaseGaussianNoise):
     r"""Model that assumes the likelihood in a region around the peak
     is slowly varying such that a linear approximation can be made, and
@@ -165,6 +182,11 @@ class Relative(DistMarg, BaseGaussianNoise):
         Default is False. If True, then vary the fp/fc polarization values
         as a function of frequency bin, using a predetermined PN approximation
         for the time offsets.
+    optimize_fiducial: boolean, optional
+        Default is False. If True, treat the fiducial parameters given as a
+        rough starting point, maximize from there, and build the fiducial
+        waveform again at what that finds. Saves having to know where the
+        peak is beforehand.
     \**kwargs :
         All other keyword arguments are passed to
         :py:class:`BaseGaussianNoise`.
@@ -182,6 +204,7 @@ class Relative(DistMarg, BaseGaussianNoise):
         earth_rotation=False,
         earth_rotation_mode=2,
         marginalize_phase=True,
+        optimize_fiducial=False,
         **kwargs
     ):
 
@@ -225,9 +248,30 @@ class Relative(DistMarg, BaseGaussianNoise):
         # from, and are kept so that can be done again.
         self.shifted, self.flimits = {}, {}
 
+        layout = (epsilon, gammas, earth_rotation, int(earth_rotation_mode))
         self.setup_fiducial()
-        self.setup_bin_layout(epsilon, gammas, earth_rotation,
-                              int(earth_rotation_mode))
+        self.setup_bin_layout(*layout)
+
+        if optimize_fiducial:
+            # what is maximized is built from the current fiducial
+            # waveform, so it is only trustworthy near it; move there and
+            # look again, until it stops moving
+            for _ in range(5):
+                found = self.optimize_fiducial_params()
+                if not found:
+                    break
+                moved = max((abs(v - self.fid_params[p]) / max(abs(v), 1e-8)
+                             for p, v in found.items()
+                             if p in self.fid_params), default=numpy.inf)
+                self.fid_params.update(found)
+                self.setup_fiducial()
+                self.setup_bin_layout(*layout)
+                if moved < 1e-3:
+                    break
+            else:
+                logging.warning("The fiducial waveform was still moving "
+                                "after 5 rounds of maximizing; it may not "
+                                "be near the peak")
 
     def setup_fiducial(self):
         """Generate the fiducial waveform and the data to compare against it.
@@ -337,6 +381,149 @@ class Relative(DistMarg, BaseGaussianNoise):
                                         self.fedges[ifo])
         self.combine_layout()
         self.check_bin_resolution()
+
+    def optimize_fiducial_params(self, ndraw=200, seed=0):
+        """Look for fiducial parameters near the peak of the likelihood.
+
+        Relative binning is accurate where the waveform stays close in
+        shape to the fiducial one, so the fiducial wants to sit near the
+        posterior. This starts from a rough set of parameters drawn from
+        the prior and maximizes from there, which reuses the waveform
+        machinery already set up rather than adding any.
+
+        What is maximized is the signal to noise ratio rather than the
+        likelihood. It is normalized by the amplitude of the waveform, so
+        parameters that only scale the waveform, such as the distance, do
+        not enter it. Maximizing the likelihood instead walks along the
+        degeneracy between those parameters and stops at whatever bound it
+        reaches, which says nothing about the shape the bins are placed
+        for. Parameters that leave the normalized waveform alone are then
+        left where they started rather than searched over.
+
+        The model used is the one built from the current fiducial
+        waveform, so it is only a guide; the caller rebuilds with the
+        result, and the answer improves rather than degrades because the
+        new fiducial is closer to the signal than the one it came from.
+
+        Parameters
+        ----------
+        ndraw : int, optional
+            How many prior draws to start the maximization from.
+        seed : int, optional
+            Seed for the draws, so the choice is reproducible.
+
+        Returns
+        -------
+        dict
+            The parameters to use for the fiducial waveform.
+        """
+        if self.prior_distribution is None:
+            return {}
+        params = [p for p in self.variable_params
+                  if p in self.prior_distribution.variable_args]
+        if not params:
+            return {}
+
+        state = numpy.random.get_state()
+        numpy.random.seed(seed)
+        try:
+            draws = self.prior_distribution.rvs(size=int(ndraw))
+        finally:
+            numpy.random.set_state(state)
+
+        saved = (self._current_params, self._current_stats,
+                 self.return_sh_hh)
+        self.return_sh_hh = True
+        try:
+            def snr(point):
+                """Minus the network signal to noise ratio squared."""
+                if self.prior_distribution(**point) == -numpy.inf:
+                    return numpy.inf
+                try:
+                    self.update(**point)
+                    sh, hh = self.loglr
+                    return -abs(sh) ** 2 / hh
+                except Exception:  # a point we cannot evaluate is no peak
+                    return numpy.inf
+
+            start = min(({p: draw[p] for p in params} for draw in draws),
+                        key=snr)
+            shape = self.shape_params(params, draws)
+            if not shape:
+                logging.warning("No parameter changes the shape of the "
+                                "waveform, keeping the fiducial given")
+                return {}
+
+            def objective(values):
+                return snr(dict(start, **dict(zip(shape, values))))
+
+            result = minimize(objective, [start[p] for p in shape],
+                              method='Nelder-Mead')
+        finally:
+            (self._current_params, self._current_stats,
+             self.return_sh_hh) = saved
+
+        if not numpy.isfinite(result.fun):
+            logging.warning("Could not find a fiducial waveform by "
+                            "maximizing the signal to noise ratio, keeping "
+                            "the one given")
+            return {}
+
+        found = dict(start, **dict(zip(shape, result.x)))
+        logging.info("Chose a fiducial waveform with a signal to noise "
+                     "ratio of %.4g at %s", (-result.fun) ** 0.5,
+                     ", ".join("%s=%.4g" % kv for kv in found.items()))
+        return found
+
+    def shape_params(self, params, draws):
+        """Which of these parameters change how the waveform varies with
+        frequency.
+
+        Bins are placed to follow that variation, so it is all the fiducial
+        waveform has to get right. A parameter that only multiplies the
+        waveform by a constant, such as the distance, leaves it alone
+        whatever value it takes, and searching over one only walks along a
+        degeneracy until it reaches a bound.
+
+        Found by moving one parameter at a time between prior draws and
+        comparing the waveforms, so nothing here needs to know which
+        parameters a given approximant treats as an overall scale.
+        """
+        shape = []
+        # a handful of pairs is plenty; two draws agreeing by chance is
+        # what the rest are there to catch
+        for a, b in zip(draws[:5], draws[1:6], strict=False):
+            point = {p: a[p] for p in params}
+            base = self.waveform_profile(point)
+            if base is None:
+                continue
+            for p in params:
+                if p in shape:
+                    continue
+                other = self.waveform_profile(dict(point, **{p: b[p]}))
+                if other is None or any(
+                        not is_rescaled(x, y)
+                        for x, y in zip(base, other, strict=False)):
+                    shape.append(p)
+            if len(shape) == len(params):
+                break
+        return shape
+
+    def waveform_profile(self, point):
+        """The waveform at the bin edges, or None if it cannot be made."""
+        try:
+            self.update(**point)
+            wfs = self.get_waveforms(self.current_params)
+        except Exception:
+            return None
+        profile = []
+        for ifo in sorted(wfs):
+            value = wfs[ifo]
+            # with the detector response applied there is one array per
+            # detector, without it a polarization pair
+            for part in (value if isinstance(value, tuple) else (value,)):
+                profile.append(numpy.asarray(part))
+        return profile
 
     def init_from_frequencies(self, data, h00, fbin_ind, ifo):
         bins = numpy.array(
