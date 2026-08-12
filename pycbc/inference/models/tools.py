@@ -995,7 +995,9 @@ def marginalize_likelihood(sh, hh,
             # evidence, and chasing bit-identity would mean copying
             # scipy's internals and tracking their changes.
             lw = vloglr + logw
-            lwmax = lw.max()
+            # an empty draw has no maximum to take, and no sample size to
+            # report, so it joins the degenerate cases rather than raising
+            lwmax = lw.max() if lw.size else numpy.nan
             if numpy.isfinite(lwmax):
                 # the largest weight is exactly one after the shift, so the
                 # denominator is at least one and the sums cannot overflow
