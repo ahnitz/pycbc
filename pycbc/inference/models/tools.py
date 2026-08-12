@@ -586,10 +586,23 @@ class DistMarg():
 
         tc = tct + iref[ti] * snr.delta_t + float(sref.start_time) - dtc[ifos[0]]
 
-        # Update the current proposed times and the marginalization values
-        # There's an overall normalization here which may introduce a constant
-        # factor at the moment.
-        logw_sky = -mcweight[ti] + numpy.log(wi) - numpy.log(resize_factor)
+        # Update the current proposed times and the marginalization values.
+        # The points were drawn from the incoherent likelihood rather than
+        # from the prior, so each carries the ratio of the two. One tuple
+        # of time samples gives one (tc, ra, dec): the reference detector
+        # fixes tc and the delays between the detectors fix the sky bin.
+        # So mcweight is a probability per time sample per sky bin, and
+        # the sample spacing and the bin's share of the sky prior turn it
+        # into a density that the tc prior can be divided by. Assumes a
+        # uniform prior on tc, as the draws themselves do. Filling back up
+        # to vsamples above makes what follows an average over the draws
+        # that landed in a populated bin rather than a sum over all of
+        # them, so resize_factor puts back the ones left out.
+        logw_sky = (-mcweight[ti] + numpy.log(wi)
+                    + numpy.log(sref.delta_t / (tcmax - tcmin))
+                    + numpy.log(resize_factor))
+        # times the search had to leave out carry no prior weight
+        logw_sky[(tc < tcmin) | (tc > tcmax)] = -numpy.inf
 
         self.marginalize_vector_params['tc'] = tc
         self.marginalize_vector_params['ra'] = ra
