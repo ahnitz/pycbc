@@ -450,12 +450,21 @@ class Relative(DistMarg, BaseGaussianNoise):
         likelihood
         """
         # Check if this model *can* be included in a multi-signal model.
-        # All marginalizations must currently be disabled to work!
+        # All marginalizations must currently be disabled to work: the
+        # marginalized likelihood is not the sum of the components', so
+        # combining the two gives a wrong answer rather than a slow one.
+        # This used to only log the fact and report support anyway, which
+        # left the wrong answer reachable without any sign of it.
         if (self.marginalize_vector_params or
-            self.marginalize_distance or
-            self.marginalize_phase):
-            logging.info("Cannot use single template model inside of"
-                         "multi_signal if marginalizations are enabled")
+                self.marginalize_distance or
+                self.marginalize_phase):
+            raise ValueError(
+                "Cannot use %s inside of multi_signal while any "
+                "marginalization is enabled; the combination silently gives "
+                "a wrong likelihood. Disable marginalize_phase, "
+                "marginalize_distance and marginalize_vector_params, or use "
+                "the joint_primary_marginalized model instead."
+                % type(self).__name__)
         return [type(self)]
 
     def calculate_hihjs(self, models):
