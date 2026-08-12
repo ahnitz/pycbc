@@ -462,6 +462,8 @@ class Relative(DistMarg, BaseGaussianNoise):
             for ifo in self.data:
                 wfs.update(get_fd_det_waveform_sequence(
                         ifos=ifo, sample_points=self.fedges[ifo], **params))
+                if self.recalibration:
+                    wfs[ifo] = wfs[ifo] * self.calibration_factor(ifo, params)
             return wfs
 
         wfs = []
@@ -472,8 +474,27 @@ class Relative(DistMarg, BaseGaussianNoise):
             wfs.append((hp, hc))
         wf_ret = {ifo: wfs[self.ifo_map[ifo]] for ifo in self.data}
 
+        if self.recalibration:
+            # the correction differs by detector, so it cannot be shared
+            # between detectors the way the waveform itself is
+            wf_ret = {ifo: tuple(h * self.calibration_factor(ifo, params)
+                                 for h in pols)
+                      for ifo, pols in wf_ret.items()}
+
         self.wf_ret = wf_ret
         return wf_ret
+
+    def calibration_factor(self, ifo, params):
+        """The calibration correction, at this detector's bin edges only.
+
+        The correction is a smooth function of frequency, so it is as well
+        described across a bin as the waveform ratio is, and evaluating it
+        at the edges costs one spline per bin rather than one per frequency
+        sample of the data.
+        """
+        recalib = self.recalibration[ifo]
+        recalib.set_params(**params)
+        return recalib.calibration_factor(self.fedges[ifo])
 
     @property
     def multi_signal_support(self):
