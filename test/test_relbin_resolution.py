@@ -24,10 +24,12 @@ import unittest
 import numpy
 from utils import simple_exit
 
+from pycbc.detector import Detector
 from pycbc.distributions import JointDistribution, SinAngle, Uniform
 from pycbc.inference import models
 from pycbc.noise import noise_from_psd
 from pycbc.psd import aLIGOZeroDetHighPower
+from pycbc.waveform import get_td_waveform
 
 
 class TestRelbinResolution(unittest.TestCase):
@@ -40,15 +42,6 @@ class TestRelbinResolution(unittest.TestCase):
         delta_f = 1. / seglen
         flen = int(srate * seglen / 2) + 1
         psd = aLIGOZeroDetHighPower(flen, delta_f, flow)
-        cls.psds, cls.data = {}, {}
-        seed = 7
-        for ifo in ['H1', 'L1']:
-            ts = noise_from_psd(int(seglen * srate), 1. / srate, psd,
-                                seed=seed)
-            ts._epoch = tc - seglen / 2
-            seed += 11
-            cls.data[ifo] = ts.to_frequencyseries()
-            cls.psds[ifo] = psd
         cls.flow = {'H1': flow, 'L1': flow}
         cls.static = {'mass1': 1.3757, 'mass2': 1.3757, 'f_lower': flow,
                       'approximant': 'TaylorF2', 'polarization': 0.,
@@ -58,12 +51,37 @@ class TestRelbinResolution(unittest.TestCase):
                                       Uniform(distance=(10, 100)))
         cls.q = {'distance': 42.0, 'inclination': 2.5}
 
-    def model(self, epsilon, static=None):
+        # a signal at the test point, injected loud enough that the
+        # resolution matters: the check that refines only where the answer
+        # matters can only be exercised where there is a signal to get
+        # wrong. Pure noise would leave the likelihood flat and nothing to
+        # resolve.
+        hp, hc = get_td_waveform(
+            approximant='TaylorF2', f_lower=flow, delta_t=1. / srate,
+            mass1=cls.static['mass1'], mass2=cls.static['mass2'],
+            distance=cls.q['distance'], inclination=cls.q['inclination'],
+            coa_phase=0.)
+        hp.start_time += tc
+        hc.start_time += tc
+        cls.psds, cls.data = {}, {}
+        seed = 7
+        for ifo in ['H1', 'L1']:
+            ts = noise_from_psd(int(seglen * srate), 1. / srate, psd,
+                                seed=seed)
+            ts._epoch = tc - seglen / 2
+            seed += 11
+            signal = Detector(ifo).project_wave(
+                hp, hc, cls.static['ra'], cls.static['dec'],
+                cls.static['polarization'])
+            cls.data[ifo] = ts.add_into(signal).to_frequencyseries()
+            cls.psds[ifo] = psd
+
+    def model(self, epsilon, static=None, fiducial=None):
         return models.Relative(
             list(self.variable), {k: v.copy() for k, v in self.data.items()},
             low_frequency_cutoff=self.flow, psds=self.psds,
             static_params=static or self.static, prior=self.prior,
-            fiducial_params={'mass1': 1.3756}, epsilon=epsilon)
+            fiducial_params=fiducial or {'mass1': 1.3756}, epsilon=epsilon)
 
     def test_error_falls_with_resolution(self):
         """Adding bins must resolve the ratio better, and at second order.
@@ -126,6 +144,112 @@ class TestRelbinResolution(unittest.TestCase):
         value = model.check_bin_resolution(ndraw=3)
         self.assertTrue(numpy.isfinite(value))
         self.assertGreaterEqual(value, 0.)
+
+
+    # 'auto' keeps the bins good enough while the sampler runs
+
+    def wander(self, model, n=4000, spread=0.05):
+        """Evaluate near the peak, the way a settled sampler would."""
+        for i in range(n):
+            model.update(distance=self.q['distance'] + spread * (i % 7 - 3),
+                         inclination=self.q['inclination'])
+            assert numpy.isfinite(model.loglr)
+        return model
+
+    def test_auto_leaves_a_good_setup_alone(self):
+        """Nothing should be rebuilt when nothing is wrong."""
+        model = self.wander(self.model('auto'))
+        self.assertEqual(model.rebins, 0)
+        self.assertEqual(model.epsilon, 0.5)
+
+    # a fiducial off enough from the template that the coarse bins cost
+    # real accuracy (interpolation error 0.3, worth 5 in the log
+    # likelihood at this signal's strength), while the template still
+    # matches the injected signal so the likelihood stays loud there.
+    # Offsetting the template instead would mismatch the data and leave
+    # nothing to resolve; a much larger offset would break the relative
+    # binning outright and drive the likelihood negative.
+    BAD_FIDUCIAL = {'mass1': 1.37}
+
+    def test_auto_refines_when_the_bins_are_not_good_enough(self):
+        """A fiducial away from the signal should buy bins, while running.
+
+        The setup cannot know this: it depends on where the sampler goes.
+        """
+        fixed = self.model(0.5, fiducial=self.BAD_FIDUCIAL)
+        fixed.update(**self.q)
+        auto = self.wander(self.model('auto', fiducial=self.BAD_FIDUCIAL))
+        auto.update(**self.q)
+
+        self.assertGreater(auto.rebins, 0)
+        self.assertLess(auto.epsilon, 0.5)
+
+        fine = self.model(0.002, fiducial=self.BAD_FIDUCIAL)
+        fine.update(**self.q)
+        self.assertLess(abs(auto.loglr - fine.loglr),
+                        abs(fixed.loglr - fine.loglr))
+
+    def test_auto_does_not_rebin_away_from_the_peak(self):
+        """Bins are only worth adding where the answer matters.
+
+        A point the sampler is passing through on its way somewhere better
+        does not need the bins to describe it, and paying for it would
+        mean paying for the worst place the sampler ever wandered.
+        """
+        model = self.model('auto', fiducial=self.BAD_FIDUCIAL)
+        model.update(**self.q)
+        # as if a far better point had already been seen, so that
+        # everything from here on is out in the tails
+        model.best_loglr = model.loglr + 1000.
+
+        self.wander(model)
+        self.assertEqual(model.rebins, 0)
+        self.assertEqual(model.epsilon, 0.5)
+
+    def test_auto_settles(self):
+        """It must stop refining, not keep going for as long as it runs."""
+        model = self.wander(self.model('auto', fiducial=self.BAD_FIDUCIAL))
+        after = model.rebins
+        self.wander(model)
+        self.assertEqual(model.rebins, after,
+                         "still refining after settling")
+
+    def test_auto_only_ever_refines(self):
+        """Going back and forth would never settle."""
+        model = self.model('auto', fiducial=self.BAD_FIDUCIAL)
+        seen = []
+        for _ in range(12):
+            self.wander(model, n=600)
+            seen.append(model.epsilon)
+        self.assertEqual(seen, sorted(seen, reverse=True), "%s" % seen)
+
+    def test_screen_closes_the_high_snr_gap(self):
+        """The gap the fixed threshold left: a departure too small to trip
+        a threshold on the ratio, but not too small to matter at a loud
+        signal.
+
+        The screen weighs the ratio error by the signal to noise ratio,
+        because that is what turns it into an error in the log likelihood.
+        A well-matched fiducial with coarse bins leaves a ratio error near
+        6e-4, under the old fixed threshold of 1e-3, so the old screen
+        skipped it however loud the signal. At this fixture's own strength
+        that skip is correct; at a loud signal it is not, and the new
+        screen refines. Checked on the screen's quantities so it does not
+        need an injection louder than the fixture can hold.
+        """
+        model = self.model(0.5, fiducial={'mass1': 1.3756})
+        model.update(**self.q)
+        model.get_waveforms(model.current_params)
+        error = model.interpolation_error_from_reference()
+
+        # under the old fixed threshold, so it was skipped regardless
+        self.assertLess(error, 1e-3)
+        # correct to skip at this signal's own strength
+        here_snr = (2.0 * max(model.loglr, 0.0)) ** 0.5
+        self.assertLess(here_snr * error, model.accuracy)
+        # wrong to skip at a loud signal: the same bins now cost more than
+        # the accuracy, which the new screen sees and the old could not
+        self.assertGreater(100.0 * error, model.accuracy)
 
 
 suite = unittest.TestSuite()
