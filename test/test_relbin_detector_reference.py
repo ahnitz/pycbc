@@ -26,6 +26,8 @@ default was both wrong and inconsistent with them.
 
 import unittest
 
+import numpy
+
 from pycbc.detector import Detector
 from pycbc.distributions import JointDistribution, SinAngle, Uniform
 from pycbc.inference import models
@@ -115,6 +117,40 @@ class TestRelbinDetectorReference(unittest.TestCase):
             scale = max(abs(rfp), abs(rfc))
             self.assertLess(max(abs(fp - rfp), abs(fc - rfc)) / scale, 1e-9,
                             "%s antenna response is off" % ifo)
+
+    def test_marginalized_model_detectors_are_referenced_too(self):
+        """The same drift was in the marginalized models.
+
+        They build their detectors lazily, on the first evaluation, and
+        cache them. The reference is therefore the coalescence time of
+        whichever sample came first, which is right: the time varies only
+        over the prior, a fraction of a second, while the drift being fixed
+        here is measured over years.
+        """
+        variable = ['distance', 'inclination', 'tc']
+        model = models.MarginalizedTime(
+            list(variable), {k: v.copy() for k, v in self.data.items()},
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=dict(mass1=1.4, mass2=1.35, f_lower=FLOW,
+                               approximant='TaylorF2', ra=1.7, dec=-0.4,
+                               polarization=0.3),
+            prior=JointDistribution(list(variable),
+                                    SinAngle(inclination=None),
+                                    Uniform(distance=(10, 200)),
+                                    Uniform(tc=(TC - 0.1, TC + 0.1))),
+            marginalize_phase=True, marginalize_vector_params='tc',
+            sample_rate=4096, marginalize_vector_samples=64)
+        numpy.random.seed(3)
+        model.update(distance=60., inclination=0.5)
+        self.assertTrue(numpy.isfinite(model.loglr))
+
+        self.assertTrue(model.dets, "no detectors were built")
+        exact = gmst_accurate(TC)
+        for det_name, det in model.dets.items():
+            self.assertNotEqual(det.reference_time, DEFAULT_REFERENCE)
+            self.assertLess(abs(det.gmst_estimate(TC) - exact), 1e-9,
+                            "%s sidereal time is off at the event"
+                            % det_name)
 
 
 suite = unittest.TestSuite()

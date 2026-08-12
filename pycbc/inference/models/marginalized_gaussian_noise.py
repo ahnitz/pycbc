@@ -335,7 +335,14 @@ class MarginalizedTime(DistMarg, BaseGaussianNoise):
         ref_tc = params['tc']
         for det in wfs:
             if det not in self.dets:
-                self.dets[det] = Detector(det)
+                # Referenced at the time being analyzed; the default is the
+                # time of GW150914, and the sidereal time estimate drifts
+                # away from wherever it is referenced. The time is a vector
+                # when it is being marginalized over, so take its average,
+                # as the sky draws in tools.py do: the spread is the width
+                # of the prior, far too small to matter to the estimate.
+                self.dets[det] = Detector(
+                    det, reference_time=float(numpy.mean(ref_tc)))
             tc = self.dets[det].arrival_time(ref_tc, ra, dec, refframe)
             if self.precalc_antenna_factors:
                 fp, fc, dt = self.get_precalc_antenna_factors(det)
@@ -467,7 +474,14 @@ class MarginalizedPolarization(DistMarg, BaseGaussianNoise):
         ref_tc = params['tc']
         for det, (hp, hc) in wfs.items():
             if det not in self.dets:
-                self.dets[det] = Detector(det)
+                # Referenced at the time being analyzed; the default is the
+                # time of GW150914, and the sidereal time estimate drifts
+                # away from wherever it is referenced. The time is a vector
+                # when it is being marginalized over, so take its average,
+                # as the sky draws in tools.py do: the spread is the width
+                # of the prior, far too small to matter to the estimate.
+                self.dets[det] = Detector(
+                    det, reference_time=float(numpy.mean(ref_tc)))
             tc = self.dets[det].arrival_time(ref_tc, ra, dec, refframe)
             fp, fc = self.dets[det].antenna_pattern(ra, dec,
                                     params['polarization'], tc)
@@ -669,7 +683,14 @@ class MarginalizedHMPolPhase(BaseGaussianNoise):
         ref_tc = params['tc']
         for det, modes in wfs.items():
             if det not in self.dets:
-                self.dets[det] = Detector(det)
+                # Referenced at the time being analyzed; the default is the
+                # time of GW150914, and the sidereal time estimate drifts
+                # away from wherever it is referenced. The time is a vector
+                # when it is being marginalized over, so take its average,
+                # as the sky draws in tools.py do: the spread is the width
+                # of the prior, far too small to matter to the estimate.
+                self.dets[det] = Detector(
+                    det, reference_time=float(numpy.mean(ref_tc)))
             tc = self.dets[det].arrival_time(ref_tc, ra, dec, refframe)
             fp, fc = self.dets[det].antenna_pattern(ra, dec, self.pol, tc)
 
