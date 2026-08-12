@@ -1018,6 +1018,15 @@ def setup_distance_marg_interpolant(dist_marg,
         v = interp(x, y, grid=False)
         if k is not None:
             v[k] = -numpy.inf
+        # a scalar query is a single point with nothing to marginalize over;
+        # the spline returns it as a length-one array, which the caller then
+        # mistakes for a vector and folds through the vector-marginalization
+        # weight, subtracting log(marginalize_vector_samples) from the
+        # distance-marginalized likelihood. Hand back a scalar so it does
+        # not. Only bites distance marginalization without an accompanying
+        # time or sky marginalization; with one, x is a genuine vector.
+        if numpy.ndim(x) == 0:
+            return float(v)
         return v
     return interp_wrapper
 

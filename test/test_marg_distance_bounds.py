@@ -56,6 +56,23 @@ class TestDistanceBoundsWarning(unittest.TestCase):
         self.assertIn('snr_range', caught.records[0].getMessage().lower()
                       .replace('signal to noise ratio', 'snr_range'))
 
+    def test_scalar_query_returns_a_scalar(self):
+        """A single point has nothing to marginalize over.
+
+        The spline returns a scalar query as a length-one array, which the
+        caller folds through the vector-marginalization weight, subtracting
+        log(marginalize_vector_samples) from a distance-only marginalized
+        likelihood. The wrapper must hand a scalar back for a scalar query,
+        and an array only for an array query.
+        """
+        interp = self.interpolant()
+        one = interp(200.0, 100.0)
+        self.assertEqual(numpy.ndim(one), 0)
+        many = interp(numpy.array([200.0, 150.0]),
+                      numpy.array([100.0, 80.0]))
+        self.assertEqual(numpy.ndim(many), 1)
+        self.assertEqual(len(many), 2)
+
     def test_out_of_range_still_returns_minus_inf(self):
         """The warning must not change the value: still -inf out of range."""
         interp = self.interpolant()
