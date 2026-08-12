@@ -376,8 +376,7 @@ class Relative(DistMarg, BaseGaussianNoise):
         finally:
             self._current_params, self._current_stats = saved
 
-    def keep_bins_good(self, drop=20.0, check_every=500, screen=1e-3,
-                       smallest=0.005):
+    def keep_bins_good(self, drop=20.0, check_every=500, smallest=0.005):
         """Lay the bins out again if they are not good enough for where
         the sampler has got to.
 
@@ -406,9 +405,18 @@ class Relative(DistMarg, BaseGaussianNoise):
             return
         self.since_check = 0
 
-        # the cheap screen: how far the ratio departs from what the bins
-        # assume of it, which costs no new bin layout
-        if self.interpolation_error_from_reference() < screen:
+        # the cheap screen: predict what the interpolation error is worth
+        # in the likelihood, which costs no new bin layout. The error in
+        # the log likelihood ratio is about the error in the waveform
+        # ratio times the signal to noise ratio, and that ratio is about
+        # the square root of twice the log likelihood ratio, so a small
+        # departure at a loud signal is not small in the likelihood. A
+        # fixed threshold on the ratio alone would pass a loud signal that
+        # is badly under resolved, and waste checks on a quiet one where
+        # the cost is genuinely small. Skipping only when the predicted
+        # cost is below the accuracy wanted handles both.
+        snr = (2.0 * max(previous, 0.0)) ** 0.5
+        if snr * self.interpolation_error_from_reference() < self.accuracy:
             self.interval = min(self.interval * 2, 32000)
             return
 
