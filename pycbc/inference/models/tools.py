@@ -464,6 +464,54 @@ class DistMarg():
 
         return self.marginalize_vector_params
 
+    @staticmethod
+    def _build_sky_lookup(dmap, most_cells=5_000_000):
+        """Flatten dmap into arrays the per-evaluation draw can index.
+
+        dmap maps a tuple of rounded inter-detector delays to the list of
+        sky-sample indices with those delays. Per evaluation the draw has
+        to, for each drawn delay tuple, find that list and pick one of its
+        members. Done as a python loop over the samples that is the bulk
+        of the sky marginalization's cost.
+
+        This encodes each delay tuple as one integer and lays the lists
+        end to end, so the loop becomes array indexing: ``offset[code]``
+        and ``count[code]`` give where a bin's members start and how many
+        there are in ``flat``, in the order dmap stored them, so a draw
+        reproduces ``dmap[t][int(r * len(dmap[t]))]`` exactly. Returns
+        None, leaving the loop to run, when there are no delays to key on
+        or the integer code would range over more cells than it is worth
+        allocating for.
+        """
+        keys = [k for k in dmap if len(k) > 0]
+        if not keys:
+            return None
+        key_arr = numpy.array(keys, dtype=numpy.int64)
+        lo = key_arr.min(axis=0)
+        dims = (key_arr.max(axis=0) - lo + 1).astype(numpy.int64)
+        strides = numpy.concatenate(
+            [[1], numpy.cumprod(dims[:-1])]).astype(numpy.int64)
+        ncell = int(dims.prod())
+        if ncell > most_cells or ncell <= 0:
+            return None
+
+        offset = numpy.full(ncell, -1, dtype=numpy.int64)
+        count = numpy.zeros(ncell, dtype=numpy.int64)
+        flat = []
+        pos = 0
+        for t, members in dmap.items():
+            if len(t) == 0:
+                continue
+            code = int(((numpy.array(t, dtype=numpy.int64) - lo)
+                        * strides).sum())
+            offset[code] = pos
+            count[code] = len(members)
+            flat.extend(members)
+            pos += len(members)
+        return {'lo': lo, 'strides': strides, 'dims': dims,
+                'offset': offset, 'count': count,
+                'flat': numpy.array(flat, dtype=numpy.int64)}
+
     def draw_sky_times(self, snrs, size=None):
         """ Draw ra, dec, and tc together using SNR timeseries to determine
         monte-carlo weights.
@@ -518,7 +566,12 @@ class DistMarg():
             # Sky prior by bin
             bin_prior = {t: len(dmap[t]) / size for t in dmap}
 
-            return dmap, tcmin, tcmax, fp, fc, ra, dec, dtc, bin_prior
+            # a flat form of dmap that the per-evaluation draw can index
+            # without a python loop over the samples; see _build_sky_lookup
+            lookup = self._build_sky_lookup(dmap)
+
+            return (dmap, tcmin, tcmax, fp, fc, ra, dec, dtc, bin_prior,
+                    lookup)
 
         if not hasattr(self, 'tinfo'):
             self.tinfo = {}
@@ -527,7 +580,8 @@ class DistMarg():
             logging.info('pregenerating sky pointings')
             self.tinfo[ikey] = make_init()
 
-        dmap, tcmin, tcmax, fp, fc, ra, dec, dtc, bin_prior = self.tinfo[ikey]
+        (dmap, tcmin, tcmax, fp, fc, ra, dec, dtc, bin_prior,
+         lookup) = self.tinfo[ikey]
 
         # draw times from each snr time series
         # Is it worth doing this if some detector has low SNR?
@@ -570,17 +624,41 @@ class DistMarg():
             idx.append(i)
 
         # check if delay is in dict, if not, throw out
-        ti = []
-        ix = []
-        wi = []
         rand = numpy.random.uniform(0, 1, size=vsamples)
-        for i in range(vsamples):
-            t = tuple(x[i] for x in dx)
-            if t in dmap:
-                randi = int(rand[i] * (len(dmap[t])))
-                ix.append(dmap[t][randi])
-                wi.append(bin_prior[t])
-                ti.append(i)
+        if lookup is not None and len(dx) > 0:
+            # the loop below, without the python: encode every drawn delay
+            # tuple as one integer, keep those whose bin is populated, and
+            # index the flattened bins. Bit-identical to the loop, which
+            # is checked in test/test_marg_sky_vectorized.py.
+            lo, strides, dims = lookup['lo'], lookup['strides'], lookup['dims']
+            shifted = numpy.stack(dx, axis=1) - lo
+            inside = numpy.all((shifted >= 0) & (shifted < dims), axis=1)
+            codes = numpy.where(
+                inside, (shifted * strides).sum(axis=1), 0).astype(numpy.int64)
+            present = inside & (lookup['offset'][codes] >= 0)
+            ti = numpy.nonzero(present)[0]
+            codes_k = codes[ti]
+            counts_k = lookup['count'][codes_k]
+            ix = lookup['flat'][lookup['offset'][codes_k]
+                                + (rand[ti] * counts_k).astype(numpy.int64)]
+            # bin_prior[t] is len(dmap[t]) / marginalize_sky_initial_samples;
+            # count is that length, so divide by the same denominator, not
+            # by the vsamples that the local ``size`` refers to here
+            wi = counts_k / self.marginalize_sky_initial_samples
+            ti = list(ti)
+            ix = list(ix)
+            wi = list(wi)
+        else:
+            ti = []
+            ix = []
+            wi = []
+            for i in range(vsamples):
+                t = tuple(x[i] for x in dx)
+                if t in dmap:
+                    randi = int(rand[i] * (len(dmap[t])))
+                    ix.append(dmap[t][randi])
+                    wi.append(bin_prior[t])
+                    ti.append(i)
 
         # If we had really poor efficiency at finding a point, we should
         # give up and just use the original random draws
