@@ -453,8 +453,6 @@ class Relative(DistMarg, BaseGaussianNoise):
         # All marginalizations must currently be disabled to work: the
         # marginalized likelihood is not the sum of the components', so
         # combining the two gives a wrong answer rather than a slow one.
-        # This used to only log the fact and report support anyway, which
-        # left the wrong answer reachable without any sign of it.
         if (self.marginalize_vector_params or
                 self.marginalize_distance or
                 self.marginalize_phase):
