@@ -812,20 +812,71 @@ class Relative(DistMarg, BaseGaussianNoise):
                 h1 = m1.h00[ifo]
                 h2 = m2.h00[ifo]
 
-                # Combine the grids
-                edge = numpy.unique([m1.edges[ifo], m2.edges[ifo]])
+                # Combine the grids. The two models may have been set up
+                # with different numbers of bins, so these have to be
+                # concatenated rather than stacked.
+                edge = numpy.unique(numpy.concatenate([m1.edges[ifo],
+                                                       m2.edges[ifo]]))
 
-                # Remove any points where either reference is zero
-                keep = numpy.where((h1[edge] != 0) | (h2[edge] != 0))[0]
+                # Only the band both models analyze can contribute, and
+                # neither reference waveform may be zero, as the ratio of
+                # signal to reference is what is interpolated.
+                edge = edge[(edge >= max(m1.edges[ifo][0], m2.edges[ifo][0]))
+                            & (edge <= min(m1.edges[ifo][-1],
+                                           m2.edges[ifo][-1]))]
+                keep = numpy.where((h1[edge] != 0) & (h2[edge] != 0))[0]
                 edge = edge[keep]
                 fedge = m1.f[ifo][edge]
+
+                # Each model stores its reference waveform without the time
+                # shift it applies to its own copy of the data instead, so
+                # the shifts have to be put back before the two references
+                # are combined; only the difference between them survives.
+                # The kernels below pair this summary data with r1 conj(r2),
+                # the ratios of each signal to its own reference, so what is
+                # summed here is <h2|h1> rather than <h1|h2>: the references
+                # go in the opposite order. Only the real part is used, and
+                # the two agree there.
+                s1 = numpy.exp(-2.0j * numpy.pi * m1.f[ifo] * m1.ta[ifo])
+                s2 = numpy.exp(-2.0j * numpy.pi * m2.f[ifo] * m2.ta[ifo])
 
                 bins = numpy.array([
                         (edge[i], edge[i + 1])
                         for i in range(len(edge) - 1)
                     ])
-                a0, a1 = self.summary_product(h1, h2, bins, ifo)
+                a0, a1 = self.summary_product(h2 * s2, h1 * s1, bins, ifo)
                 self.hihj[(m1, m2)][ifo] = a0, a1, fedge
+
+    def project_wf_parts(self, parts, ifo, fedge):
+        """ Re-express the current waveform pieces on other frequencies
+
+        The waveform itself oscillates far too quickly to be interpolated,
+        but its ratio to the reference waveform does not; that smoothness is
+        the assumption relative binning is built on. So it is the ratio that
+        is moved onto the requested frequencies here, and the reference
+        waveform is replaced by ones. The likelihood kernels divide by the
+        reference waveform, so they recover the same ratio either way.
+        """
+        freqs = self.fedges[ifo]
+        if numpy.array_equal(freqs, fedge):
+            return parts
+
+        def onto(x):
+            if numpy.ndim(x) == 0:
+                return x
+            if numpy.iscomplexobj(x):
+                return (numpy.interp(fedge, freqs, numpy.real(x))
+                        + 1.0j * numpy.interp(fedge, freqs, numpy.imag(x)))
+            return numpy.interp(fedge, freqs, x)
+
+        ones = numpy.ones(len(fedge), dtype=numpy.complex128)
+        if self.still_needs_det_response:
+            dtc, channel, h00 = parts
+            return onto(dtc), onto(channel / h00), ones
+
+        fp, fc, dtc, hp, hc, h00 = parts
+        return (onto(fp), onto(fc), onto(dtc),
+                onto(hp / h00), onto(hc / h00), ones)
 
     def multi_loglikelihood(self, models):
         """ Calculate a multi-model (signal) likelihood
@@ -844,8 +895,10 @@ class Relative(DistMarg, BaseGaussianNoise):
                 for det in self.data:
                     a0, a1, fedge = self.hihj[(m1, m2)][det]
 
-                    dtc, channel, h00 = m1._current_wf_parts[det]
-                    dtc2, channel2, h002 = m2._current_wf_parts[det]
+                    dtc, channel, h00 = m1.project_wf_parts(
+                        m1._current_wf_parts[det], det, fedge)
+                    dtc2, channel2, h002 = m2.project_wf_parts(
+                        m2._current_wf_parts[det], det, fedge)
 
                     c1c2 = self.mlik(fedge,
                                      dtc, channel, h00,
@@ -858,8 +911,10 @@ class Relative(DistMarg, BaseGaussianNoise):
                 for det in self.data:
                     a0, a1, fedge = self.hihj[(m1, m2)][det]
 
-                    fp, fc, dtc, hp, hc, h00 = m1._current_wf_parts[det]
-                    fp2, fc2, dtc2, hp2, hc2, h002 = m2._current_wf_parts[det]
+                    fp, fc, dtc, hp, hc, h00 = m1.project_wf_parts(
+                        m1._current_wf_parts[det], det, fedge)
+                    fp2, fc2, dtc2, hp2, hc2, h002 = m2.project_wf_parts(
+                        m2._current_wf_parts[det], det, fedge)
 
                     h1h2 = self.mlik(fedge,
                                      fp, fc, dtc, hp, hc, h00,
