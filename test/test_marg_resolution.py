@@ -15,81 +15,217 @@
 """Tests choosing the time resolution of the marginalization automatically.
 
 sample_rate sets the spacing of the signal to noise series the times are
-drawn from. What it has to be depends on how wide the peak of that series
-is, which depends on the signal, so no fixed value suits every analysis.
-These check that the peak width is measured and the rate follows from it,
-against direct integration of the unmarginalized model.
+drawn from, and what it costs is the scatter of the marginalized
+likelihood between one evaluation of a point and the next. The rate is
+chosen by asking for that scatter to be no larger than an accuracy, so
+what these check is the accuracy: that the chosen rate delivers the
+scatter it promised, that asking for less scatter buys a finer rate, and
+that a coarser rate would not have done.
+
+The signal here is deliberately not the one the rule was measured on --
+it is a neutron star black hole binary in a different noise realisation,
+where the peak of the likelihood has a different width -- so passing
+means the rule carried over rather than that a number was fitted.
 """
 
 import copy
 import unittest
 
-from test_marg_normalization import TC, TestMargNormalization
+import numpy
+from scipy.special import logsumexp
 from utils import simple_exit
 
+from pycbc.detector import Detector
+from pycbc.distributions import JointDistribution, SinAngle, Uniform
 from pycbc.inference import models
+from pycbc.noise import noise_from_psd
+from pycbc.psd import aLIGOZeroDetHighPower
+from pycbc.waveform import get_td_waveform
 
-TARGET = 2.5
+TC = 1187008882.42840
+FLOW, SEGLEN, SRATE = 30., 16, 2048
+HALFWIDTH = 0.004
+INJ = dict(mass1=3.0, mass2=1.4, distance=130., inclination=0.9,
+           ra=0.3, dec=1.1, polarization=2.2, coa_phase=0.4)
 
 
-class TestMargResolution(TestMargNormalization):
-    """Reuses the injection and the direct integration from its base."""
+class TestMargResolution(unittest.TestCase):
 
-    def relative_time(self, sample_rate, halfwidth=0.004):
-        variable, prior = self.prior(halfwidth)
-        return models.RelativeTime(
+    @classmethod
+    def setUpClass(cls):
+        flen = int(SRATE * SEGLEN / 2) + 1
+        psd = aLIGOZeroDetHighPower(flen, 1. / SEGLEN, FLOW)
+        hp, hc = get_td_waveform(
+            approximant='IMRPhenomD', f_lower=FLOW, delta_t=1. / SRATE,
+            **{k: INJ[k] for k in ('mass1', 'mass2', 'distance',
+                                   'inclination', 'coa_phase')})
+        # the generator puts coalescence at t=0, so this puts it at tc
+        hp.start_time += TC
+        hc.start_time += TC
+        cls.data, cls.psds = {}, {}
+        seed = 91
+        for ifo in ['H1', 'L1']:
+            ts = noise_from_psd(int(SEGLEN * SRATE), 1. / SRATE, psd,
+                                seed=seed)
+            seed += 53
+            ts._epoch = TC - SEGLEN / 2
+            signal = Detector(ifo).project_wave(
+                hp, hc, INJ['ra'], INJ['dec'], INJ['polarization'])
+            cls.data[ifo] = ts.add_into(signal).to_frequencyseries()
+            cls.psds[ifo] = psd
+
+        cls.flow = {ifo: FLOW for ifo in cls.data}
+        cls.static = dict(mass1=INJ['mass1'], mass2=INJ['mass2'],
+                          f_lower=FLOW, approximant='IMRPhenomD',
+                          ra=INJ['ra'], dec=INJ['dec'],
+                          polarization=INJ['polarization'])
+        cls.point = {'distance': INJ['distance'],
+                     'inclination': INJ['inclination']}
+
+    def model(self, sample_rate='auto', accuracy=0.005, vsamples=2000):
+        variable = ['distance', 'inclination', 'tc']
+        prior = JointDistribution(
+            list(variable), SinAngle(inclination=None),
+            Uniform(distance=(10, 300)),
+            Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH)))
+        return models.RelativeTimeDom(
             list(variable), copy.deepcopy(self.data),
             low_frequency_cutoff=self.flow, psds=self.psds,
             static_params=self.static, prior=prior,
-            fiducial_params={'mass1': self.static['mass1'], 'tc': TC},
+            fiducial_params={'mass1': INJ['mass1'], 'mass2': INJ['mass2'],
+                             'tc': TC},
             epsilon=0.1, marginalize_vector_params='tc',
-            sample_rate=sample_rate, marginalize_vector_samples=2000)
+            sample_rate=sample_rate, marginalization_accuracy=accuracy,
+            marginalize_vector_samples=vsamples)
 
-    def test_auto_resolves_the_peak(self):
-        model = self.relative_time('auto')
-        self.assertGreaterEqual(
-            model.resolved_samples(model.ref_snr), TARGET,
-            "chose %s Hz" % model.sample_rate)
+    def scatter(self, model, ndraw=64):
+        """How far apart the same point lands on repeated evaluation."""
+        state = numpy.random.get_state()
+        try:
+            numpy.random.seed(4)
+            values = []
+            for _ in range(ndraw):
+                model.update(**self.point)
+                values.append(float(model.loglr))
+        finally:
+            numpy.random.set_state(state)
+        return numpy.std(values, ddof=1)
 
-    def test_auto_does_not_pay_for_more_than_it_needs(self):
-        """Half the chosen rate must not already have been enough.
+    def integrated(self, npoint=2001):
+        """The marginal computed by summing the likelihood over the prior,
+        which needs no marginalization machinery to be correct."""
+        variable = ['distance', 'inclination', 'tc']
+        prior = JointDistribution(
+            list(variable), SinAngle(inclination=None),
+            Uniform(distance=(10, 300)),
+            Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH)))
+        model = models.Relative(
+            list(variable), copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=self.static, prior=prior,
+            fiducial_params={'mass1': INJ['mass1'], 'mass2': INJ['mass2'],
+                             'tc': TC}, epsilon=0.1)
+        values = []
+        for tc in numpy.linspace(TC - HALFWIDTH, TC + HALFWIDTH, npoint):
+            model.update(tc=tc, **self.point)
+            values.append(model.loglr)
+        # a uniform prior makes the integral the mean over the window
+        return logsumexp(values) - numpy.log(npoint)
 
-        The series is rebuilt at every likelihood evaluation, so a rate
-        higher than the peak calls for is a running cost.
+    def test_the_chosen_rate_gets_the_right_answer(self):
+        """Being quiet is not the same as being right.
+
+        The scatter the rate is chosen from says how far apart two
+        evaluations land, not where they land, so the answer is also
+        checked against direct integration of the unmarginalized model.
         """
-        model = self.relative_time('auto')
-        coarser = self.relative_time(model.sample_rate / 2)
-        self.assertLess(coarser.resolved_samples(coarser.ref_snr), TARGET,
-                        "%s Hz would have done" % coarser.sample_rate)
-
-    def test_auto_matches_direct_integration(self):
-        mean, error = self.marginalized(0.004, sample_rate='auto')
-        self.assertAlmostEqual(mean, self.integrated(0.004),
+        model = self.model()
+        state = numpy.random.get_state()
+        try:
+            numpy.random.seed(11)
+            values = []
+            for _ in range(16):
+                model.update(**self.point)
+                values.append(float(model.loglr))
+        finally:
+            numpy.random.set_state(state)
+        error = numpy.std(values, ddof=1) / len(values) ** 0.5
+        self.assertAlmostEqual(numpy.mean(values), self.integrated(),
                                delta=max(0.02, 4 * error))
 
-    def test_an_unresolved_peak_is_what_goes_wrong(self):
-        """The measurement has to be measuring the thing that matters.
+    def test_the_chosen_rate_delivers_the_accuracy(self):
+        """The whole point: the rate is chosen from a promise about the
+        scatter, so the scatter has to be the promised size.
 
-        A rate that leaves the peak on about one sample is unreliable: the
-        answer depends on where the peak falls between samples. This checks
-        that such a rate exists below the chosen one and really is worse,
-        so the criterion is not just a number that happens to pass.
+        The tolerance is loose by half because the rule is a fit good to
+        about 20%, and 64 draws pin a standard deviation to about 10%.
         """
-        chosen = self.relative_time('auto').sample_rate
-        reference = self.integrated(0.004)
+        accuracy = 0.005
+        model = self.model(accuracy=accuracy)
+        self.assertLess(self.scatter(model), 1.5 * accuracy,
+                        "chose %s Hz" % model.sample_rate)
 
-        errors = []
-        rate = chosen / 2
-        while rate >= 2048:
-            model = self.relative_time(rate)
-            if model.resolved_samples(model.ref_snr) < 1.5:
-                mean, _ = self.marginalized(0.004, sample_rate=rate)
-                errors.append(abs(mean - reference))
-            rate /= 2
+    def test_a_tighter_accuracy_buys_a_finer_rate(self):
+        """The knob has to be a knob, and it has to point the right way."""
+        rates = [self.model(accuracy=a).sample_rate
+                 for a in (0.02, 0.005, 0.002)]
+        self.assertTrue(rates[0] < rates[1] < rates[2], "%s" % rates)
 
-        self.assertTrue(errors, "no unresolved rate to compare against")
-        self.assertGreater(max(errors), 0.05,
-                           "an unresolved peak should hurt: %s" % errors)
+    def test_more_samples_buy_the_same_accuracy_at_a_coarser_rate(self):
+        """Resolution and the number of draws buy the same thing.
+
+        The scatter goes as one over the root of their product, so asking
+        for the same accuracy with four times the draws should cost a
+        coarser series rather than the same one.
+        """
+        few = self.model(vsamples=1000).sample_rate
+        many = self.model(vsamples=4000).sample_rate
+        self.assertLess(many, few, "%s against %s" % (many, few))
+
+    def test_it_does_not_pay_for_more_resolution_than_it_needs(self):
+        """The series is rebuilt at every likelihood evaluation, so a rate
+        beyond what the accuracy calls for is a running cost.
+
+        Checked on the prediction rather than on a measurement, which is
+        the same statement one step earlier and costs no likelihood calls.
+        """
+        accuracy = 0.005
+        model = self.model(accuracy=accuracy)
+        coarser = self.model(sample_rate=model.sample_rate / 2)
+        predicted = coarser.marginalization_error(
+            coarser.resolved_samples(coarser.ref_snr))
+        self.assertGreater(predicted, accuracy,
+                           "%s Hz would have done" % coarser.sample_rate)
+
+    def test_a_coarser_rate_really_is_noisier(self):
+        """The prediction has to track the thing it stands for.
+
+        Cutting the rate by eight cuts the samples across the peak by
+        eight, so the rule says the scatter grows by getting on for three.
+        This checks it grows, on a signal the rule was not measured on,
+        rather than trusting that it does. It is checked loosely because
+        the scatter it is compared against is near the floor that no rate
+        removes, which makes the ratio smaller than the rule alone says.
+        """
+        fine = self.model()
+        coarse = self.model(sample_rate=fine.sample_rate / 8)
+        self.assertGreater(self.scatter(coarse), 1.5 * self.scatter(fine))
+
+    def test_an_explicit_rate_is_left_alone(self):
+        """Asking for a rate must still get exactly that rate."""
+        self.assertEqual(self.model(sample_rate=8192).sample_rate, 8192.0)
+
+    def test_an_unresolved_peak_is_doubled_up_to(self):
+        """With nothing to measure there is nothing to solve for.
+
+        A series that leaves the peak on about one sample cannot say how
+        much finer it needs to be, so the rate doubles until it can. Asked
+        for an accuracy so loose that only the two sample floor binds, the
+        rate must still climb off the rate of the data to reach it.
+        """
+        model = self.model(accuracy=1.0)
+        self.assertGreaterEqual(model.resolved_samples(model.ref_snr), 2.0)
+        self.assertGreater(model.sample_rate, SRATE)
 
 
 suite = unittest.TestSuite()
