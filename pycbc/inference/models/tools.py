@@ -118,6 +118,10 @@ class DistMarg():
         self.reconstruct_vector = False
         self.precalc_antenna_factors = False
 
+        # the effective sample size of the most recent vector
+        # marginalization, filled in by marginalize_loglr; nan until then
+        self.vector_ess = numpy.nan
+
         # Handle any requested parameter vector / brute force marginalizations
         self.marginalize_vector_params = {}
         self.marginalized_vector_priors = {}
@@ -277,14 +281,24 @@ class DistMarg():
             skip_vector = True
             return_complex = True
 
-        return marginalize_likelihood(sh_total, hh_total,
-                                      logw=self.marginalize_vector_weights,
-                                      phase=self.marginalize_phase,
-                                      interpolator=interpolator,
-                                      distance=distance,
-                                      skip_vector=skip_vector,
-                                      return_complex=return_complex,
-                                      return_peak=return_peak)
+        # ask for the effective sample size when doing the ordinary
+        # vector marginalization, so a run can see whether it drew enough
+        # points; the reconstruction and peak paths do not marginalize a
+        # vector here, so there is nothing to measure
+        want_ess = not (return_peak or return_complex or skip_vector)
+        result = marginalize_likelihood(sh_total, hh_total,
+                                        logw=self.marginalize_vector_weights,
+                                        phase=self.marginalize_phase,
+                                        interpolator=interpolator,
+                                        distance=distance,
+                                        skip_vector=skip_vector,
+                                        return_complex=return_complex,
+                                        return_peak=return_peak,
+                                        return_ess=want_ess)
+        if want_ess:
+            loglr, self.vector_ess = result
+            return loglr
+        return result
 
     def premarg_draw(self):
         """ Choose random samples from prechosen set"""
@@ -891,6 +905,7 @@ def marginalize_likelihood(sh, hh,
                            interpolator=None,
                            return_peak=False,
                            return_complex=False,
+                           return_ess=False,
                            ):
     """ Return the marginalized likelihood.
 
@@ -954,7 +969,7 @@ def marginalize_likelihood(sh, hh,
         vloglr = interpolator(sh, hh)
 
         if skip_vector:
-            return vloglr
+            return (vloglr, None) if return_ess else vloglr
     else:
         # explicit calculation
         if distance:
@@ -979,11 +994,44 @@ def marginalize_likelihood(sh, hh,
         maxl = vloglr[maxv]
 
     # Do brute-force marginalization if loglr is a vector
+    ess = None
     if isinstance(vloglr, float):
         vloglr = float(vloglr)
     elif not skip_vector:
+        if return_ess:
+            # the effective number of the drawn points that carry the
+            # answer: (sum w)^2 / sum w^2 with w the combined weights.
+            # Low against the number drawn means the marginal rests on a
+            # handful of them and its error is correspondingly large.
+            #
+            # Exponentiate once and form the ratio directly rather than
+            # asking logsumexp twice for the same array. Subtracting the
+            # largest log weight first is what keeps exp in range, exactly
+            # as logsumexp does it internally, and the ratio is scale free
+            # so that shift cancels. Doing the sums in linear space instead
+            # of log space moves the answer against the logsumexp route by
+            # of order 1e-14 relative, a few times 1e-13 at worst. That is
+            # accepted deliberately: the effective sample size is a
+            # monitoring number, it enters neither the posterior nor the
+            # evidence, and chasing bit-identity would mean copying
+            # scipy's internals and tracking their changes.
+            lw = vloglr + logw
+            # an empty draw has no maximum to take, and no sample size to
+            # report, so it joins the degenerate cases rather than raising
+            lwmax = lw.max() if lw.size else numpy.nan
+            if numpy.isfinite(lwmax):
+                # the largest weight is exactly one after the shift, so the
+                # denominator is at least one and the sums cannot overflow
+                w = numpy.exp(lw - lwmax)
+                ess = float(w.sum() ** 2.0 / numpy.vdot(w, w))
+            else:
+                # every weight vanished, or one is infinite; there is
+                # nothing meaningful to count
+                ess = numpy.nan
         vloglr = float(logsumexp(vloglr, b=numpy.exp(logw)))
 
     if return_peak:
         return vloglr, maxv, maxl
+    if return_ess:
+        return vloglr, ess
     return vloglr
