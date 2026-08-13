@@ -51,6 +51,15 @@ from .relbin_cpu import (likelihood_parts, likelihood_parts_v,
 from .tools import DistMarg
 
 
+# Beyond about this many samples across the peak the scatter of the time
+# marginalization stops falling with the sample rate: it levels off at a
+# floor set by how many times are drawn rather than by how finely the grid
+# resolves them. Measured across binary neutron star, neutron star black
+# hole and binary black hole signals; the level of that floor varied by a
+# factor of fifty and so is not predicted here, only warned about.
+FLOOR_RESOLVED = 20.0
+
+
 def setup_bins(f_full, f_lo, f_hi, chi=1.0,
                eps=0.1, gammas=None,
                ):
@@ -837,6 +846,22 @@ class RelativeTime(Relative):
                             "%.3g asked for. More marginalization samples "
                             "would buy the same accuracy more cheaply",
                             resolved, rate, error, accuracy)
+        elif resolved > FLOOR_RESOLVED:
+            # Past this the measured law stops holding: the scatter levels
+            # off at a floor set by the draws rather than by the grid, so
+            # the rate asked for here was bought without buying the
+            # accuracy it was meant to. The floor's size varied by a factor
+            # of fifty across signals, too much to predict and quote, so
+            # say that the estimate is optimistic rather than pretend to a
+            # number for it.
+            logging.warning("Needed %.1f samples across the peak to reach a "
+                            "marginalization scatter of %.3g, which is past "
+                            "the %s where the scatter stops falling with the "
+                            "rate. The %s Hz chosen is real cost and the "
+                            "accuracy reached will be worse than asked. Raise "
+                            "marginalize_vector_samples instead, which buys "
+                            "the same accuracy far more cheaply",
+                            resolved, accuracy, FLOOR_RESOLVED, rate)
         else:
             logging.info("Chose a sample rate of %s Hz, spreading the peak "
                          "over %.1f samples, for a marginalization scatter "
