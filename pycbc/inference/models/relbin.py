@@ -321,8 +321,18 @@ class Relative(DistMarg, BaseGaussianNoise):
                 fid_hp, fid_hc = get_fd_waveform_sequence(sample_points=fpoints,
                                                           **self.fid_params)
                 # Apply detector response if not handled by
-                # the waveform generator
-                self.det[ifo] = Detector(ifo)
+                # the waveform generator. Reference the detector at the
+                # time being analyzed: Detector estimates sidereal time by
+                # advancing it at a constant rate from its reference, which
+                # defaults to the time of GW150914, so a detector left at
+                # that default drifts further from the truth the further the
+                # data sits from 2015. The sky draws already reference the
+                # event time, so leaving this at the default also made the
+                # two disagree.
+                self.det[ifo] = Detector(
+                    ifo, reference_time=self.fid_params["tc"])
+                # the combined call, from detector-response-split, gets the
+                # pattern and the delay from one sidereal time calculation
                 fp, fc, dt = self.det[ifo].antenna_pattern_and_delay(
                     self.fid_params["ra"], self.fid_params["dec"],
                     self.fid_params["polarization"], self.fid_params["tc"])
