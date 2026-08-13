@@ -135,9 +135,22 @@ class DistMarg():
             str(marginalize_vector_samples).lower() == 'auto'
         if self.adapt_vsamples:
             marginalize_vector_samples = 1e3
-            logging.info('Number of marginalization samples to be chosen '
-                         'from the accuracy asked of the marginalization, '
-                         'starting from %s', int(marginalize_vector_samples))
+            if hasattr(self, 'keep_samples_good'):
+                logging.info('Number of marginalization samples to be chosen '
+                             'from the accuracy asked of the marginalization, '
+                             'starting from %s',
+                             int(marginalize_vector_samples))
+            else:
+                # asked for and not delivered, which is worth saying out
+                # loud rather than leaving to be inferred from the absence
+                # of the message above
+                logging.warning('%s cannot choose its own number of '
+                                'marginalization samples, so the %s asked '
+                                'for will be used unchanged. Only the models '
+                                'that draw their times from a signal to '
+                                'noise series know what an accuracy costs',
+                                type(self).__name__,
+                                int(marginalize_vector_samples))
         self.vsamples = int(marginalize_vector_samples)
 
         self.marginalize_sky_initial_samples = \
