@@ -33,6 +33,7 @@ over rather than that a threshold was fitted to a fixture.
 """
 
 import copy
+import time
 import unittest
 
 import numpy
@@ -307,22 +308,14 @@ class TestMargVSamples(unittest.TestCase):
         self.assertLess(float(model.loglr), model.marg_best_loglr - 20.)
         self.assertEqual(model.vsamples, settled)
 
-    def test_both_knobs_on_auto_reach_the_accuracy_together(self):
-        """The configuration someone would actually write.
-
-        The resolution is chosen once at setup, from the number of samples
-        it starts with; the number of samples is then chosen for the
-        resolution that was settled on, and followed from there. The two
-        buy the same accuracy at very different prices, so what matters is
-        that between them they deliver it.
-        """
-        accuracy = 0.03
+    def auto_rate_model(self, vsamples='auto', accuracy=0.01):
+        """The same model with the rate left to the model as well."""
         variable = ['distance', 'inclination', 'tc']
         prior = JointDistribution(
             list(variable), SinAngle(inclination=None),
             Uniform(distance=(10, 300)),
             Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH)))
-        model = models.RelativeTimeDom(
+        return models.RelativeTimeDom(
             list(variable), copy.deepcopy(self.data),
             low_frequency_cutoff=self.flow, psds=self.psds,
             static_params=self.static, prior=prior,
@@ -330,12 +323,90 @@ class TestMargVSamples(unittest.TestCase):
                              'tc': TC},
             epsilon=0.1, marginalize_vector_params='tc', sample_rate='auto',
             marginalization_accuracy=accuracy,
-            marginalize_vector_samples='auto')
+            marginalize_vector_samples=vsamples)
+
+    def cost(self, model, ncall=40):
+        """Seconds a likelihood evaluation takes."""
+        numpy.random.seed(31)
+        start = time.time()
+        for _ in range(ncall):
+            model.update(**self.point)
+            model.loglr
+        return (time.time() - start) / ncall
+
+    def test_asking_for_both_does_not_buy_the_expensive_one(self):
+        """The accuracy depends only on the product of resolution and
+        draws, and the two are not the same price: the signal to noise
+        series is rebuilt every call, so the rate is close to linear in
+        cost, while quadrupling the draws costs tens of a percent. Asking
+        for both must therefore not cost more than choosing a low rate by
+        hand and asking only for the draws -- which is what happens if the
+        rate is allowed to spend the whole budget before the draws are
+        sized. A factor of two is allowed on a timing taken in one process
+        on one signal; the point is that it is not the fourfold or more
+        that leaning on the rate costs.
+        """
+        both = self.auto_rate_model()
+        byhand = self.model(accuracy=0.01)
+        self.drive(both, 200)
+        self.drive(byhand, 200)
+        together, apart = self.cost(both), self.cost(byhand)
+        self.assertLess(together, 2.0 * apart,
+                        "%s Hz and %s samples took %.2f ms against %.2f for "
+                        "%s Hz and %s samples"
+                        % (both.sample_rate, both.vsamples, together * 1e3,
+                           apart * 1e3, byhand.sample_rate, byhand.vsamples))
+
+    def test_asking_for_both_still_reaches_the_accuracy(self):
+        """Spending less on the rate is only worth having if the accuracy
+        still arrives, so the scatter is measured rather than predicted.
+
+        This is also the configuration someone would actually write: the
+        rate settled once at setup, the draws sized for it and then
+        followed, and the two together delivering what was asked.
+        """
+        accuracy = 0.01
+        model = self.auto_rate_model(accuracy=accuracy)
         trail = self.drive(model, 400)
         self.assertEqual(trail[-100:], [trail[-1]] * 100)
         self.assertLess(self.scatter(model), 1.5 * accuracy,
                         "%s Hz and %s samples"
                         % (model.sample_rate, model.vsamples))
+
+    def test_an_explicit_count_leaves_the_rate_choice_alone(self):
+        """A number of draws given explicitly is a number the model may not
+        change, so the rate is the only thing left to buy the accuracy with
+        and it has to buy all of it, exactly as before this option existed.
+        Asking for the draws as well must then cost strictly less rate.
+        """
+        accuracy = 0.01
+        explicit = self.auto_rate_model(vsamples=1000, accuracy=accuracy)
+        # the rate alone, against the resolution the accuracy law asks of it
+        self.assertGreaterEqual(
+            explicit.resolved_samples(explicit.ref_snr),
+            1.0 / (1000 * accuracy ** 2))
+        chosen = self.auto_rate_model(accuracy=accuracy)
+        self.assertLess(chosen.sample_rate, explicit.sample_rate)
+
+    def test_the_rate_climbs_only_when_the_draws_run_out_of_room(self):
+        """The rate is the lever of last resort.
+
+        While there is room for the draws the resolution asked for is the
+        least that can be trusted; when the budget needs more draws than
+        there can be, the rate is the only thing left and it climbs. Which
+        way round it went is visible in the draws: they are up against their
+        ceiling in the second case and nowhere near it in the first.
+        """
+        from pycbc.inference.models.relbin import (MOST_VSAMPLES,
+                                                   SANE_RESOLVED)
+        loose = self.auto_rate_model(accuracy=0.01)
+        self.assertLess(loose.resolved, 2.0 * SANE_RESOLVED)
+        self.assertLess(loose.vsamples, MOST_VSAMPLES / 2)
+
+        tight = self.auto_rate_model(accuracy=0.002)
+        self.assertGreater(tight.resolved, SANE_RESOLVED)
+        self.assertGreater(tight.sample_rate, loose.sample_rate)
+        self.assertGreater(tight.vsamples, MOST_VSAMPLES / 2)
 
     def test_an_explicit_number_is_left_alone(self):
         """Asking for a number of samples must still get exactly that."""
