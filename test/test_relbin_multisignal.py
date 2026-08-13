@@ -80,7 +80,10 @@ def project(params, ifo, freqs, end_time):
     """The detector frame waveform on the given frequencies."""
     hp, hc = get_fd_waveform_sequence(sample_points=freqs,
                                       **dict(params, **FIXED))
-    det = Detector(ifo)
+    # referenced at the time being analyzed, as the model's own detectors
+    # are; leaving this at the default would compare the model against a
+    # reference using a different sidereal time and disagree by ~0.4 nats
+    det = Detector(ifo, reference_time=params['tc'])
     fp, fc = det.antenna_pattern(params['ra'], params['dec'],
                                  params['polarization'], params['tc'])
     dt = det.time_delay_from_earth_center(params['ra'], params['dec'],

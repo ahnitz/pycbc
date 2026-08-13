@@ -434,7 +434,10 @@ class Relative(DistMarg, BaseGaussianNoise):
         dict
             The parameters to use for the fiducial waveform.
         """
-        if self.prior_distribution is None:
+        if (self.prior_distribution is None
+                or not hasattr(self.prior_distribution, 'rvs')):
+            # a model built without a prior gets a stand-in object rather
+            # than None, and that stand-in cannot be drawn from
             return {}
         params = [p for p in self.variable_params
                   if p in self.prior_distribution.variable_args]
@@ -1098,8 +1101,13 @@ class Relative(DistMarg, BaseGaussianNoise):
         float
             The largest error found, or 0 if it could not be checked.
         """
-        if self.prior_distribution is None or self.still_needs_det_response:
-            # nothing to draw from, or the ratio is not formed here
+        if (self.prior_distribution is None
+                or not hasattr(self.prior_distribution, 'rvs')
+                or self.still_needs_det_response):
+            # nothing to draw from, or the ratio is not formed here. A model
+            # built without a prior gets a stand-in object rather than None,
+            # and that stand-in cannot be drawn from, so ask whether it can
+            # rather than whether it is there.
             return 0.
         state = numpy.random.get_state()
         numpy.random.seed(seed)
