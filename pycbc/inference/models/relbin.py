@@ -72,13 +72,35 @@ MOST_VSAMPLES = 32768
 # The least resolution to ask the sample rate for when the number of draws
 # is being chosen too. The accuracy depends only on the product of the two,
 # so the rate is wanted no finer than the point where that product law can
-# be relied on. Measured, it cannot be relied on at the hard floor of two
-# samples across the peak: with the draws sized by the law, two samples
-# deliver a scatter half again the size asked for and one sample nearly
-# three times it, while four samples deliver what they promise, at two
-# accuracy budgets a factor of four apart. Four is also where the total
-# cost of a call bottoms out, the draws needed rising as the rate falls, so
-# nothing is given up by stopping there.
+# be relied on. Measured with the draws sized by the law and the scatter
+# taken over 48 to 200 evaluations, across eight configurations -- binary
+# neutron star, neutron star black hole and binary black hole, TaylorF2 and
+# IMRPhenomD, sixteen to sixty-four second segments, H1L1 and H1L1V1,
+# network signal to noise 14 to 36, eight noise realisations including two
+# pairs that differ in nothing but the noise -- at two accuracy budgets a
+# factor of four apart:
+#
+#   samples across the peak      1          2           4
+#   scatter, in budgets       1.0-11     0.8-1.3    0.56-0.89
+#   error of the answer      0.2-2.9   0.003-0.15  0.000-0.018 nats
+#
+# Two samples is where the answer stops being badly wrong, not where it
+# stops being wrong: the scatter is over budget in fourteen of the sixteen
+# cells there, and the coarse grid still misplaces the marginal itself by
+# more than the default accuracy on five of the six signals. Four samples
+# delivers the scatter asked for on every configuration, with the law
+# conservative rather than optimistic, and leaves about a tenth of the
+# error two leaves. Nothing measured wanted more than four.
+#
+# Cost does not pin this down and is not asked to. At the default accuracy
+# the draws are many and the total per call is flat between about two and
+# eight samples across the peak: four is within a third of each signal's own
+# cheapest point in every case, and where that cheapest point sits moves
+# with the signal -- and even with how many threads the draws get -- over
+# that whole range. At loose accuracies the draws are few and cheap and the
+# cheapest rate is always the coarsest one, where holding to four costs 40%
+# to 200% more; but the coarse rates there are the ones that do not deliver,
+# so what four gives up is cost on rates that were never an option.
 SANE_RESOLVED = 4.0
 
 

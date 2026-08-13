@@ -37,6 +37,7 @@ import time
 import unittest
 
 import numpy
+from scipy.special import logsumexp
 from utils import simple_exit
 
 from pycbc.detector import Detector
@@ -407,6 +408,83 @@ class TestMargVSamples(unittest.TestCase):
         self.assertGreater(tight.resolved, SANE_RESOLVED)
         self.assertGreater(tight.sample_rate, loose.sample_rate)
         self.assertGreater(tight.vsamples, MOST_VSAMPLES / 2)
+
+    def integrated(self, npoint=4001):
+        """The marginal over time computed by summing the likelihood over
+        the prior, which needs no marginalization machinery to be correct.
+        The grid is fine enough to place the peak to a small fraction of a
+        sample of the finest series used here."""
+        variable = ['distance', 'inclination', 'tc']
+        prior = JointDistribution(
+            list(variable), SinAngle(inclination=None),
+            Uniform(distance=(10, 300)),
+            Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH)))
+        model = models.Relative(
+            list(variable), copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=self.static, prior=prior,
+            fiducial_params={'mass1': INJ['mass1'], 'mass2': INJ['mass2'],
+                             'tc': TC}, epsilon=0.1)
+        values = []
+        for tc in numpy.linspace(TC - HALFWIDTH, TC + HALFWIDTH, npoint):
+            model.update(tc=tc, **self.point)
+            values.append(model.loglr)
+        # a uniform prior makes the integral the mean over the window
+        return logsumexp(values) - numpy.log(npoint)
+
+    def average(self, model, ndraw=32):
+        """Where repeated evaluation of the same point lands on average."""
+        state = numpy.random.get_state()
+        try:
+            numpy.random.seed(5)
+            values = []
+            for _ in range(ndraw):
+                model.update(**self.point)
+                values.append(float(model.loglr))
+        finally:
+            numpy.random.set_state(state)
+        return numpy.mean(values)
+
+    def test_the_resolution_asked_for_gets_the_answer(self):
+        """What the floor on the resolution is really for.
+
+        Where the draws are buying the accuracy, the rate is asked only for
+        SANE_RESOLVED samples across the peak, and the case for that number
+        is not about the scatter: more draws can always quiet the scatter,
+        but no number of draws taken from too coarse a grid recovers the
+        integral the grid has misplaced. So this checks the answer rather
+        than its spread, against direct integration of the unmarginalized
+        model, and checks that half the resolution would not have done.
+
+        Measured across binary neutron star, neutron star black hole and
+        binary black hole signals, the error of the answer falls by about a
+        factor of ten between two samples across the peak and four; here a
+        factor of five is asserted, well inside that, on a mean of 32 draws
+        good to a fifth of the budget.
+        """
+        from pycbc.inference.models.relbin import SANE_RESOLVED
+        accuracy = 0.01
+        truth = self.integrated()
+
+        model = self.auto_rate_model(accuracy=accuracy)
+        self.assertGreaterEqual(model.resolved, SANE_RESOLVED)
+        asked = abs(self.average(model) - truth)
+        self.assertLess(asked, 3 * accuracy,
+                        "%.1f samples across the peak at %s Hz is %.4f from "
+                        "the integral" % (model.resolved, model.sample_rate,
+                                          asked))
+
+        # the same draws on a series half as fine, so that what changes is
+        # the resolution and nothing else
+        coarse = self.auto_rate_model(accuracy=accuracy)
+        coarse.set_sample_rate(model.sample_rate / 2)
+        coarse.set_vsamples(model.vsamples)
+        below = abs(self.average(coarse) - truth)
+        self.assertGreater(below, 5 * asked,
+                           "%.1f samples across the peak was %.4f from the "
+                           "integral against %.4f at %.1f"
+                           % (coarse.resolved_samples(coarse.ref_snr), below,
+                              asked, model.resolved))
 
     def test_an_explicit_number_is_left_alone(self):
         """Asking for a number of samples must still get exactly that."""
