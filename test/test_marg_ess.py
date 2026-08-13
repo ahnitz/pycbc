@@ -154,11 +154,7 @@ def reported_ess(vloglr, logw):
 
 
 def logspace_ess(vloglr, logw):
-    """The same quantity via logsumexp, kept as the reference.
-
-    This is how the effective sample size used to be computed, and it is
-    the thing the faster linear-space form has to reproduce.
-    """
+    """The same quantity via logsumexp, kept as the reference."""
     lw = numpy.asarray(vloglr, dtype=float) + logw
     return float(numpy.exp(2.0 * logsumexp(lw) - logsumexp(2.0 * lw)))
 
@@ -209,22 +205,19 @@ class TestESSArithmetic(unittest.TestCase):
         self.assertLess(abs(reported_ess(v, logw)
                             / logspace_ess(v, logw) - 1.0), 1e-10)
 
-    def test_equal_weights_give_the_sample_count(self):
-        """Nothing is wasted when every point counts the same, so the
-        effective sample size is the number of points, on the nose."""
+    def test_known_cases_come_out_right(self):
+        """The two extremes and the ceiling between them."""
+        # every point counting the same: the answer is the count itself
         for n in (1, 2, 37, 1024):
             ess = reported_ess(numpy.full(n, 12.5), -numpy.log(n))
             self.assertLess(abs(ess / n - 1.0), 1e-12)
 
-    def test_one_dominant_weight_gives_one(self):
-        """The opposite extreme: if a single point carries the integral
-        the answer rests on one sample and the diagnostic must say so."""
+        # one point carrying the integral: the answer rests on one sample
         v = numpy.full(64, -400.0)
         v[13] = 0.0
         self.assertLess(abs(reported_ess(v, -numpy.log(64)) - 1.0), 1e-12)
 
-    def test_bounded_by_the_sample_count(self):
-        """The count is the ceiling, whatever the weights look like."""
+        # and between them the count is the ceiling, whatever the weights
         rng = numpy.random.RandomState(5)
         for n in (3, 64, 2048):
             for spread in (0.1, 10.0, 100.0):
@@ -232,13 +225,8 @@ class TestESSArithmetic(unittest.TestCase):
                 self.assertGreaterEqual(ess, 1.0 - 1e-12)
                 self.assertLessEqual(ess, n + 1e-9)
 
-    def test_minus_infinities_drop_out(self):
-        """A point of zero weight is not a point.
-
-        Excluded draws arrive as -inf log weights. They must contribute
-        nothing at all, so the answer has to be the answer for the finite
-        points alone, and not a nan.
-        """
+    def test_weightless_points_are_not_points(self):
+        """Excluded draws arrive as -inf and must contribute nothing."""
         rng = numpy.random.RandomState(21)
         v = rng.normal(size=40) * 3.0
         keep = numpy.zeros(40, dtype=bool)
@@ -247,9 +235,7 @@ class TestESSArithmetic(unittest.TestCase):
         self.assertLess(abs(reported_ess(v, logw)
                             - logspace_ess(v[keep], -numpy.log(9))), 1e-9)
 
-    def test_no_finite_weight_is_not_a_number(self):
-        """With every weight zero there is nothing to count, and the
-        diagnostic should report that rather than invent a value."""
+        # with none of them finite there is nothing to count
         self.assertTrue(numpy.isnan(
             reported_ess(numpy.full(8, -numpy.inf), -numpy.log(8))))
 
