@@ -416,7 +416,10 @@ class Relative(DistMarg, BaseGaussianNoise):
         dict
             The parameters to use for the fiducial waveform.
         """
-        if self.prior_distribution is None:
+        if (self.prior_distribution is None
+                or not hasattr(self.prior_distribution, 'rvs')):
+            # a model built without a prior gets a stand-in rather than
+            # None, so ask whether it can be drawn from
             return {}
         params = [p for p in self.variable_params
                   if p in self.prior_distribution.variable_args]

@@ -168,6 +168,17 @@ class TestAutoFiducial(unittest.TestCase):
         self.assertEqual(model.current_params['mass1'], self.point['mass1'])
 
 
+    def test_optimizing_without_a_prior_is_skipped(self):
+        """There is nothing to draw a starting point from."""
+        model = models.Relative(
+            list(self.variable), {k: v.copy() for k, v in self.data.items()},
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=self.static, fiducial_params={'mass1': 1.3756},
+            epsilon=0.5, optimize_fiducial=True)
+        model.update(**self.point)
+        self.assertTrue(numpy.isfinite(model.loglr))
+
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestAutoFiducial))
 
