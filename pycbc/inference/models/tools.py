@@ -125,6 +125,32 @@ class DistMarg():
         # Handle any requested parameter vector / brute force marginalizations
         self.marginalize_vector_params = {}
         self.marginalized_vector_priors = {}
+
+        # 'auto' hands the number of points over to the model, to be chosen
+        # from the accuracy asked of the marginalization and kept good while
+        # the run goes on. Only the models that draw their times from a
+        # signal to noise series know what the accuracy costs, so until one
+        # of them takes it over the number is the one an unset value gets.
+        self.adapt_vsamples = \
+            str(marginalize_vector_samples).lower() == 'auto'
+        if self.adapt_vsamples:
+            marginalize_vector_samples = 1e3
+            if hasattr(self, 'keep_samples_good'):
+                logging.info('Number of marginalization samples to be chosen '
+                             'from the accuracy asked of the marginalization, '
+                             'starting from %s',
+                             int(marginalize_vector_samples))
+            else:
+                # asked for and not delivered, which is worth saying out
+                # loud rather than leaving to be inferred from the absence
+                # of the message above
+                logging.warning('%s cannot choose its own number of '
+                                'marginalization samples, so the %s asked '
+                                'for will be used unchanged. Only the models '
+                                'that draw their times from a signal to '
+                                'noise series know what an accuracy costs',
+                                type(self).__name__,
+                                int(marginalize_vector_samples))
         self.vsamples = int(marginalize_vector_samples)
 
         # a generator kept for the one draw that is hot enough to matter,
@@ -258,6 +284,32 @@ class DistMarg():
             vprior = self.marginalized_vector_priors[param]
             values = vprior.rvs(self.vsamples)[param]
             self.marginalize_vector_params[param] = values
+
+    def set_vsamples(self, nsamples):
+        """Change how many points the vector marginalization draws.
+
+        The number is not just a count. The parameters drawn from their
+        priors are vectors that long, and the weight each drawn point
+        starts with is one over it, so both have to be redone alongside
+        it. Where the points come from a precalculated pool they are drawn
+        from it without replacement, which makes the pool a ceiling: a
+        larger draw is only a larger subset of what was already computed,
+        and asking for more points than exist would mean building the pool
+        again and pairing it up with the stored antenna factors from the
+        old one.
+
+        Safe to call between one evaluation and the next, which is where
+        the samples and the weights and the sample indices are all replaced
+        together; not part way through one.
+
+        Returns the number actually set, which is what the pool allowed.
+        """
+        if hasattr(self, 'premarg'):
+            nsamples = min(nsamples, len(self.premarg['logw_partial']))
+        self.vsamples = max(int(nsamples), 1)
+        self.reset_vector_params()
+        self.marginalize_vector_weights = - numpy.log(self.vsamples)
+        return self.vsamples
 
     def marginalize_loglr(self, sh_total, hh_total,
                           skip_vector=False, return_peak=False):

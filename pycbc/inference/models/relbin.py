@@ -61,6 +61,28 @@ from .tools import DistMarg
 # factor of fifty and so is not predicted here, only warned about.
 FLOOR_RESOLVED = 20.0
 
+# Bounds on the number of marginalization samples when it is being chosen.
+# The floor is there because the marginal is an average whose logarithm is
+# biased low by about one over twice the effective sample size: at a few
+# tens of samples that bias is larger than any accuracy anyone asks for, so
+# no scatter budget makes going below it a saving. The ceiling is a bound on
+# cost rather than on accuracy; where the points come from a precalculated
+# pool that pool is the real ceiling.
+FEWEST_VSAMPLES = 32
+MOST_VSAMPLES = 32768
+
+# The least resolution to ask the sample rate for when the number of draws
+# is being chosen too. The accuracy depends only on the product of the two,
+# so the rate is wanted no finer than the point where that product law can
+# be relied on. Measured, it cannot be relied on at the hard floor of two
+# samples across the peak: with the draws sized by the law, two samples
+# deliver a scatter half again the size asked for and one sample nearly
+# three times it, while four samples deliver what they promise, at two
+# accuracy budgets a factor of four apart. Four is also where the total
+# cost of a call bottoms out, the draws needed rising as the rate falls, so
+# nothing is given up by stopping there.
+SANE_RESOLVED = 4.0
+
 
 def setup_bins(f_full, f_lo, f_hi, chi=1.0,
                eps=0.1, gammas=None,
@@ -1223,12 +1245,18 @@ class RelativeTime(Relative):
         The spacing of the signal to noise series the marginalized times are
         drawn from. If 'auto', it is chosen from the signal so that the
         marginalization is as accurate as ``marginalization_accuracy`` asks.
+    marginalize_vector_samples : int or 'auto', optional
+        How many points the vector marginalization draws. If 'auto', the
+        number is chosen from ``marginalization_accuracy`` and then kept
+        good while the run goes on, since how many points the accuracy
+        needs depends on where the sampler is.
     marginalization_accuracy : float, optional
         How much random error in the marginalized log likelihood ratio to
-        accept, in nats, when 'auto' is choosing the sample rate. This is
-        noise that differs between one evaluation of the same point and the
-        next, so unlike a systematic error it does not cancel between two
-        points a sampler is comparing.
+        accept, in nats, when 'auto' is choosing the sample rate or the
+        number of marginalization samples. This is noise that differs
+        between one evaluation of the same point and the next, so unlike a
+        systematic error it does not cancel between two points a sampler is
+        comparing.
     """
     name = "relative_time"
 
@@ -1244,8 +1272,29 @@ class RelativeTime(Relative):
             sample_rate = self.data[tuple(self.data)[0]].sample_rate
         self.set_sample_rate(sample_rate, **kwargs)
         if auto:
+            # the rate is chosen for the number of samples in hand, and the
+            # number of samples then for the rate. Where both are 'auto'
+            # the rate is settled first, from the default number, so that
+            # what the cheap knob is asked to make up is what the expensive
+            # one could not buy rather than the other way round.
             self.choose_sample_rate(**kwargs)
         self.draw_ifos(self.ref_snr, **kwargs)
+
+        if self.adapt_vsamples:
+            # how far the peak spreads on the series that was settled on.
+            # The rate does not change after this, so neither does this,
+            # and what remains to set the accuracy is the number of draws.
+            self.resolved = self.resolved_samples(self.ref_snr)
+            self.measured_ess = []
+            self.vinterval = 50
+            self.marg_best_loglr = -numpy.inf
+            self.set_vsamples(min(max(self.wanted_ess(), FEWEST_VSAMPLES),
+                                  MOST_VSAMPLES))
+            logging.info("Starting from %s marginalization samples, which is "
+                         "what a scatter of %.3g nats asks for at %.1f "
+                         "samples across the peak",
+                         self.vsamples, self.marginalization_accuracy,
+                         self.resolved)
 
     def set_sample_rate(self, rate, **kwargs):
         """Set the time resolution and redo what was built for the old one.
@@ -1318,6 +1367,19 @@ class RelativeTime(Relative):
         neutron star, and above a few kHz the series is already most of
         what the model does.
 
+        Where the number of marginalization draws is being chosen as well,
+        the two are allocated together, because the accuracy depends only
+        on their product and they are not the same price. Four times the
+        rate costs about four times as much, while four times the draws
+        cost tens of a percent, so the cheapest way to a given product is
+        as much of it as possible from the draws. The rate is then asked
+        for no more than ``SANE_RESOLVED``, the resolution below which the
+        product law stops delivering what it promises, and the draws are
+        sized to the rest of the budget. Only if there is not room for
+        enough draws does the rate climb further, which it does until
+        either the budget is met or the resolution stops being what limits
+        the answer.
+
         Parameters
         ----------
         accuracy : float, optional
@@ -1335,24 +1397,74 @@ class RelativeTime(Relative):
         if accuracy is None:
             accuracy = self.marginalization_accuracy
 
-        # invert marginalization_error for the resolution wanted. Two
-        # samples is a floor rather than an accuracy: below it the peak
-        # falls between grid points and the answer is biased, not merely
-        # noisy, so no scatter budget makes that acceptable.
-        target = max(2.0, 1.0 / (self.vsamples * accuracy ** 2))
+        if self.adapt_vsamples:
+            # the draws will buy the accuracy, so ask the rate only for a
+            # resolution the product law can be trusted at
+            ceiling = self.samples_ceiling(**kwargs)
+            target = SANE_RESOLVED
+        else:
+            # invert marginalization_error for the resolution wanted. Two
+            # samples is a floor rather than an accuracy: below it the peak
+            # falls between grid points and the answer is biased, not merely
+            # noisy, so no scatter budget makes that acceptable.
+            ceiling = None
+            target = max(2.0, 1.0 / (self.vsamples * accuracy ** 2))
 
-        resolved = self.resolved_samples(self.ref_snr)
-        while resolved < target and self.sample_rate < most:
-            if resolved >= 2.0:
-                # resolved well enough to say how much more is needed
-                steps = max(1, int(numpy.ceil(numpy.log2(target / resolved))))
-            else:
-                steps = 1
-            self.set_sample_rate(min(self.sample_rate * 2 ** steps, most),
-                                 **kwargs)
+        while True:
             resolved = self.resolved_samples(self.ref_snr)
+            while resolved < target and self.sample_rate < most:
+                if resolved >= 2.0:
+                    # resolved well enough to say how much more is needed
+                    steps = max(1,
+                                int(numpy.ceil(numpy.log2(target / resolved))))
+                else:
+                    steps = 1
+                self.set_sample_rate(min(self.sample_rate * 2 ** steps, most),
+                                     **kwargs)
+                resolved = self.resolved_samples(self.ref_snr)
+
+            if ceiling is None:
+                break
+
+            # what the draws would have to be to meet the budget here. If
+            # there is no room for that many the rate has to make up the
+            # difference after all: ask it for the resolution the most draws
+            # available would need, and no more than the resolution past
+            # which the rate buys nothing whatever it is asked. The new
+            # target is reached or it is not, and either way the one after
+            # it would be the same number, so this goes round at most twice.
+            wanted = 1.0 / (accuracy ** 2 * min(resolved, FLOOR_RESOLVED))
+            if wanted <= ceiling:
+                break
+            harder = min(1.0 / (accuracy ** 2 * ceiling), FLOOR_RESOLVED)
+            if harder <= target:
+                break
+            target = harder
 
         rate = self.sample_rate
+        if ceiling is not None:
+            if wanted > ceiling:
+                logging.warning("Could not reach the accuracy asked of the "
+                                "marginalization: %.1f samples across the "
+                                "peak at %s Hz would need %.3g draws for a "
+                                "scatter of %.3g and there is room for %s, "
+                                "which leaves about %.3g. A larger "
+                                "precalculate_marginalization_points, or a "
+                                "looser marginalization_accuracy, is the way "
+                                "out; a higher rate is not",
+                                resolved, rate, wanted, accuracy, ceiling,
+                                1.0 / (ceiling
+                                       * min(resolved,
+                                             FLOOR_RESOLVED)) ** 0.5)
+            else:
+                logging.info("Chose a sample rate of %s Hz, spreading the "
+                             "peak over %.1f samples: enough resolution for "
+                             "the draws to be trusted, and the %.3g asked "
+                             "for is bought with the draws from there, which "
+                             "is much the cheaper of the two",
+                             rate, resolved, accuracy)
+            return rate
+
         error = self.marginalization_error(resolved)
         if resolved < target:
             logging.warning("Could not resolve the peak of the likelihood in "
@@ -1383,6 +1495,168 @@ class RelativeTime(Relative):
                          "of %.3g against the %.3g asked for",
                          rate, resolved, error, accuracy)
         return rate
+
+    def samples_ceiling(self, precalculate_marginalization_points=False,
+                        **kwargs):
+        """The most marginalization draws that could be asked for.
+
+        Taken from the model's keywords rather than from what has been built
+        so far, because the rate is chosen before the pool of points exists
+        and how many draws there is room for is what decides whether the
+        rate has to climb.
+        """
+        if precalculate_marginalization_points:
+            return min(MOST_VSAMPLES,
+                       int(float(precalculate_marginalization_points)))
+        return MOST_VSAMPLES
+
+    def wanted_ess(self, accuracy=None):
+        """How many effective marginalization samples the accuracy asks for.
+
+        A budget in nats is a budget in samples: the scatter goes as one
+        over the root of the effective number of samples behind the answer,
+        so the number wanted is one over the square of the scatter allowed.
+
+        The samples are drawn from a grid of times, and a peak spread over
+        several grid points makes each draw worth several of them, which is
+        the ``resolved`` factor of the same measured law. That factor stops
+        being earned past ``FLOOR_RESOLVED``, where the scatter levels off
+        whatever the rate says, so it is not counted beyond there. Counting
+        it would credit the run with accuracy the rate did not deliver,
+        which is exactly how a run ends up quietly less accurate than it
+        asked to be.
+
+        Parameters
+        ----------
+        accuracy : float, optional
+            The scatter allowed in the marginalized log likelihood ratio,
+            in nats. Defaults to the model's ``marginalization_accuracy``.
+        """
+        if accuracy is None:
+            accuracy = self.marginalization_accuracy
+        return 1.0 / (accuracy ** 2.0 * min(self.resolved, FLOOR_RESOLVED))
+
+    def update(self, **params):
+        if self.adapt_vsamples:
+            self.keep_samples_good()
+        super().update(**params)
+
+    def keep_samples_good(self, drop=20.0, check_every=50, margin=4.0,
+                          fastest=4.0, slowest=0.5,
+                          fewest=FEWEST_VSAMPLES, most=MOST_VSAMPLES):
+        """Draw more marginalization samples, or fewer, than the last point
+        needed.
+
+        How many points the marginalization needs depends on where the
+        sampler is: the same number that is plenty in the tails leaves the
+        answer noisy at the peak, and a number chosen once at setup is
+        therefore wrong somewhere. This looks at the effective sample size
+        the marginalization actually reported, which is the measurement the
+        accuracy is a budget on, and moves the number of points towards
+        what that measurement says the budget needs.
+
+        The number may go down as well as up, which the resolution and the
+        bin layout may not: those are structural and expensive to change,
+        while this is only how large a subset of the same drawing is taken,
+        so a region that needs less is worth taking less in. Going both ways
+        is what makes oscillation possible, and what stops it here is that
+        the two decisions are separated by a margin: points are added when
+        the measured size is short of the budget, but taken away only when
+        it is ``margin`` times past it. A halving from just past the margin
+        lands a factor of ``margin * slowest`` above the threshold to add,
+        so no decrease can bring on an increase, and with the margin at four
+        that guard is a factor of two against a measurement good to some
+        tens of a percent.
+
+        Adding is quick and taking away is slow, because the two errors are
+        not the same error: too few points is noise in the likelihood the
+        sampler cannot tell from structure, while too many only costs time.
+
+        The check itself is free -- the effective sample size is already
+        computed by the marginalization -- so what the interval buys is not
+        the cost of asking but a decision made on many points rather than
+        one. The measurements are collected over ``check_every`` points near
+        the best seen and acted on by their median, so one degenerate draw
+        does not move the run. As in the bin layout the interval doubles
+        whenever a check finds nothing to do, so a run whose number of
+        points is settled stops reconsidering it.
+
+        Parameters
+        ----------
+        drop : float, optional
+            Only look at points within this much of the best log likelihood
+            ratio seen. What the marginalization needs in the tails says
+            nothing about what it needs where the posterior is.
+        check_every : float, optional
+            How many measurements to collect before deciding.
+        margin : float, optional
+            How far past the budget the effective sample size has to be
+            before points are taken away.
+        fastest, slowest : float, optional
+            The most the number of points may be multiplied by, and the
+            factor it is divided by when it comes down.
+        fewest, most : float, optional
+            Bounds on the number of points, as described where they are
+            defined. Where the points come from a precalculated pool that
+            pool is the real ceiling, applied by
+            :py:meth:`DistMarg.set_vsamples`.
+        """
+        previous = getattr(self._current_stats, 'loglr', None)
+        if previous is None or not numpy.isfinite(previous):
+            return
+        previous = float(previous)
+        self.marg_best_loglr = max(self.marg_best_loglr, previous)
+
+        ess = self.vector_ess
+        if (previous < self.marg_best_loglr - drop
+                or ess is None or not numpy.isfinite(ess)):
+            return
+
+        self.measured_ess.append(ess)
+        if len(self.measured_ess) < self.vinterval:
+            return
+        measured = float(numpy.median(self.measured_ess))
+        self.measured_ess = []
+
+        wanted = self.wanted_ess()
+        if measured < wanted:
+            # go to what the shortfall asks for, with a tenth over so that
+            # the next measurement is not sitting back on the threshold,
+            # and no more than fourfold at once: four times the points cost
+            # of order a third more per evaluation, which is a price worth
+            # paying in one step, and a bound on how far a single unlucky
+            # measurement can take the run.
+            factor = min(fastest, 1.1 * wanted / measured)
+        elif measured > margin * wanted:
+            factor = slowest
+        else:
+            factor = 1.0
+
+        if factor != 1.0:
+            was = self.vsamples
+            now = self.set_vsamples(min(max(self.vsamples * factor, fewest),
+                                        most))
+            if now != was:
+                self.vinterval = check_every
+                logging.info("Marginalizing with %s samples rather than %s: "
+                             "the effective sample size was %.3g against the "
+                             "%.3g a scatter of %.3g nats asks for",
+                             now, was, measured, wanted,
+                             self.marginalization_accuracy)
+                return
+            if measured < wanted:
+                logging.warning("Marginalizing with %s samples leaves an "
+                                "effective sample size of %.3g against the "
+                                "%.3g a scatter of %.3g nats asks for, and "
+                                "no more samples are available. The accuracy "
+                                "reached will be about %.3g nats",
+                                was, measured, wanted,
+                                self.marginalization_accuracy,
+                                1.0 / (measured
+                                       * min(self.resolved,
+                                             FLOOR_RESOLVED)) ** 0.5)
+        # nothing to do, or nothing that could be done: ask less often
+        self.vinterval = min(self.vinterval * 2, 32000)
 
     @property
     def ref_snr(self):
