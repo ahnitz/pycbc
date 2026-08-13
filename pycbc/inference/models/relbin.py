@@ -53,6 +53,15 @@ from .relbin_cpu import (likelihood_parts, likelihood_parts_v,
 from .tools import DistMarg
 
 
+# Beyond about this many samples across the peak the scatter of the time
+# marginalization stops falling with the sample rate: it levels off at a
+# floor set by how many times are drawn rather than by how finely the grid
+# resolves them. Measured across binary neutron star, neutron star black
+# hole and binary black hole signals; the level of that floor varied by a
+# factor of fifty and so is not predicted here, only warned about.
+FLOOR_RESOLVED = 20.0
+
+
 def setup_bins(f_full, f_lo, f_hi, chi=1.0,
                eps=0.1, gammas=None,
                ):
@@ -1207,13 +1216,28 @@ class RelativeTime(Relative):
     """ Heterodyne likelihood optimized for time marginalization. In addition
     it supports phase (dominant-mode), sky location, and polarization
     marginalization.
+
+    Parameters
+    ----------
+    sample_rate : float or 'auto', optional
+        The spacing of the signal to noise series the marginalized times are
+        drawn from. If 'auto', it is chosen from the signal so that the
+        marginalization is as accurate as ``marginalization_accuracy`` asks.
+    marginalization_accuracy : float, optional
+        How much random error in the marginalized log likelihood ratio to
+        accept, in nats, when 'auto' is choosing the sample rate. This is
+        noise that differs between one evaluation of the same point and the
+        next, so unlike a systematic error it does not cancel between two
+        points a sampler is comparing.
     """
     name = "relative_time"
 
     def __init__(self, *args,
                  sample_rate=4096,
+                 marginalization_accuracy=0.005,
                  **kwargs):
         super(RelativeTime, self).__init__(*args, **kwargs)
+        self.marginalization_accuracy = float(marginalization_accuracy)
         auto = str(sample_rate).lower() == 'auto'
         if auto:
             # start from the data, which is as coarse as it can sensibly be
@@ -1246,30 +1270,77 @@ class RelativeTime(Relative):
             worst = min(worst, weight.sum() ** 2 / (weight ** 2).sum())
         return worst
 
-    def choose_sample_rate(self, target=2.5, most=65536.0, **kwargs):
-        """Pick a time resolution that resolves the peak of the likelihood.
+    def marginalization_error(self, resolved):
+        """The scatter of the marginalized log likelihood ratio, in nats.
 
-        The peak is narrow, and how narrow depends on the signal, so a
-        fixed rate is either wasteful or wrong. Where the series already
-        resolves the peak its width can be measured, and the rate that
-        follows from it reached in one step. Where it does not there is
-        nothing to measure, and the rate is doubled until there is.
+        The same point evaluated twice does not give the same answer: the
+        times are drawn afresh each call. How far apart the two answers
+        land is what a sampler sees as noise, and it is set by how many
+        draws there effectively are. The draws come from a grid, so a peak
+        spread over only a few grid points tells the drawing little more
+        than those few points do, and the two counts multiply: measured
+        across binary neutron star, neutron star black hole and binary
+        black hole signals, at network signal to noise 10 to 40, in two
+        networks and two prior widths, the scatter is
+        ``1 / sqrt(vsamples * resolved)`` to within a factor of 1.2.
+
+        This is what the resolution is costing, so it is what choosing the
+        resolution can act on. It is not the whole scatter: the draws are
+        a Monte Carlo whatever the grid, and once the grid is fine enough
+        the scatter settles onto that floor and no rate lowers it further.
+        Measured, the floor comes out about the size of this estimate at
+        the rate the default accuracy asks for, which is to say the rule
+        stops paying for resolution at about the point resolution stops
+        being what limits the answer. Where the marginalization has few
+        samples the floor is the larger of the two and no rate reaches the
+        accuracy; only more samples do.
+        """
+        return 1.0 / (self.vsamples * resolved) ** 0.5
+
+    def choose_sample_rate(self, accuracy=None, most=262144.0, **kwargs):
+        """Pick a time resolution that meets the accuracy asked of the
+        marginalization.
+
+        The peak of the signal to noise series is narrow, and how narrow
+        depends on the signal, so a fixed rate is either wasteful or wrong.
+        What the rate buys is a smaller scatter in the marginalized
+        likelihood, ``marginalization_error``, so the rate to ask for is
+        the one that brings that scatter down to the accuracy wanted.
+        Where the series already resolves the peak its width can be
+        measured, and the rate that follows from it reached in one step.
+        Where it does not there is nothing to measure, and the rate is
+        doubled until there is.
 
         The rate is worth no more than it buys: the signal to noise series
         is rebuilt at every likelihood evaluation, so its length is a
-        running cost rather than a setup one.
+        running cost rather than a setup one. The cost is linear in the
+        rate, about a tenth of a millisecond per kHz per call for a binary
+        neutron star, and above a few kHz the series is already most of
+        what the model does.
 
         Parameters
         ----------
-        target : float, optional
-            How many samples the peak should be spread over. Measured on a
-            binary neutron star injection: at one sample the answer is as
-            likely to be off by 0.17 as to be right, while from two
-            samples upwards it was within 0.007 of direct integration at
-            every rate tried.
+        accuracy : float, optional
+            How much scatter in the marginalized log likelihood ratio to
+            accept, in nats. Defaults to the model's
+            ``marginalization_accuracy``.
         most : float, optional
-            Never go above this rate.
+            Never go above this rate. This is a bound on cost rather than
+            on accuracy: the default costs about 26 ms a call, some thirty
+            times everything else the model does, and past it the same
+            accuracy is far cheaper bought with more marginalization
+            samples, which cost about a sixth as much again for each
+            quadrupling against three times as much for the rate.
         """
+        if accuracy is None:
+            accuracy = self.marginalization_accuracy
+
+        # invert marginalization_error for the resolution wanted. Two
+        # samples is a floor rather than an accuracy: below it the peak
+        # falls between grid points and the answer is biased, not merely
+        # noisy, so no scatter budget makes that acceptable.
+        target = max(2.0, 1.0 / (self.vsamples * accuracy ** 2))
+
         resolved = self.resolved_samples(self.ref_snr)
         while resolved < target and self.sample_rate < most:
             if resolved >= 2.0:
@@ -1282,13 +1353,35 @@ class RelativeTime(Relative):
             resolved = self.resolved_samples(self.ref_snr)
 
         rate = self.sample_rate
+        error = self.marginalization_error(resolved)
         if resolved < target:
             logging.warning("Could not resolve the peak of the likelihood in "
-                            "time: %.1f samples across it at %s Hz, against "
-                            "the %s wanted", resolved, rate, target)
+                            "time: %.1f samples across it at %s Hz leaves the "
+                            "marginalization scattering by %.3g, against the "
+                            "%.3g asked for. More marginalization samples "
+                            "would buy the same accuracy more cheaply",
+                            resolved, rate, error, accuracy)
+        elif resolved > FLOOR_RESOLVED:
+            # Past this the measured law stops holding: the scatter levels
+            # off at a floor set by the draws rather than by the grid, so
+            # the rate asked for here was bought without buying the
+            # accuracy it was meant to. The floor's size varied by a factor
+            # of fifty across signals, too much to predict and quote, so
+            # say that the estimate is optimistic rather than pretend to a
+            # number for it.
+            logging.warning("Needed %.1f samples across the peak to reach a "
+                            "marginalization scatter of %.3g, which is past "
+                            "the %s where the scatter stops falling with the "
+                            "rate. The %s Hz chosen is real cost and the "
+                            "accuracy reached will be worse than asked. Raise "
+                            "marginalize_vector_samples instead, which buys "
+                            "the same accuracy far more cheaply",
+                            resolved, accuracy, FLOOR_RESOLVED, rate)
         else:
             logging.info("Chose a sample rate of %s Hz, spreading the peak "
-                         "over %.1f samples", rate, resolved)
+                         "over %.1f samples, for a marginalization scatter "
+                         "of %.3g against the %.3g asked for",
+                         rate, resolved, error, accuracy)
         return rate
 
     @property
