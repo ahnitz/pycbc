@@ -136,6 +136,70 @@ class TestMargNormalization(unittest.TestCase):
         self.assertLess(fine, coarse,
                         "error on the mean went %.4f to %.4f" % (coarse, fine))
 
+    def test_sky_marginalization_matches_direct_integration(self):
+        """The sky and time answer must be the integral it claims to be.
+
+        The count tests above pin down that the answer does not grow with
+        the number of points; this pins down that it lands on the right
+        value. Over a small patch of time and sky the marginalized answer
+        is compared to a direct grid sum of the same model. The patch and
+        grid are kept small so it runs in a few seconds; the wide-window
+        version is in the larger validation suite.
+        """
+        ht, hs = 0.002, 0.02
+        variable = ['distance', 'inclination', 'tc', 'ra', 'dec']
+        static = {k: v for k, v in self.static.items()
+                  if k not in ('ra', 'dec')}
+        bounds = dict(tc=(TC - ht, TC + ht),
+                      ra=(INJ['ra'] - hs, INJ['ra'] + hs),
+                      dec=(INJ['dec'] - hs, INJ['dec'] + hs))
+        dists = [SinAngle(inclination=None), Uniform(distance=(10, 200)),
+                 Uniform(tc=bounds['tc']), Uniform(ra=bounds['ra']),
+                 Uniform(dec=bounds['dec'])]
+        prior = JointDistribution(list(variable), *dists)
+
+        values = []
+        for s in range(6):
+            numpy.random.seed(800 + s)
+            model = models.MarginalizedTime(
+                list(variable), copy.deepcopy(self.data),
+                low_frequency_cutoff=self.flow, psds=self.psds,
+                static_params=static, prior=prior, marginalize_phase=True,
+                marginalize_vector_params='tc,ra,dec', sample_rate=8192,
+                marginalize_vector_samples=2000,
+                marginalize_sky_initial_samples=3e4)
+            model.update(**self.point)
+            values.append(model.loglr)
+        mean = numpy.mean(values)
+        error = numpy.std(values) / len(values) ** 0.5
+
+        # a midpoint-rule grid sum of the same model over the same patch;
+        # a uniform prior makes the integral the mean over the window
+        ref = models.Relative(
+            list(variable), copy.deepcopy(self.data),
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=static, prior=prior, marginalize_phase=True,
+            fiducial_params={'mass1': INJ['mass1'], 'tc': TC,
+                             'ra': INJ['ra'], 'dec': INJ['dec']},
+            epsilon=0.1)
+
+        def grid(lo, hi, n):
+            return lo + (numpy.arange(n) + 0.5) * (hi - lo) / n
+        tc = grid(*bounds['tc'], 61)
+        ra = grid(*bounds['ra'], 15)
+        dec = grid(*bounds['dec'], 15)
+        gt, gr, gd = numpy.meshgrid(tc, ra, dec, indexing='ij')
+        lr = []
+        for t, r, d in zip(gt.ravel(), gr.ravel(), gd.ravel()):
+            ref.update(tc=t, ra=r, dec=d, **self.point)
+            lr.append(ref.loglr)
+        integral = logsumexp(lr) - numpy.log(len(lr))
+
+        self.assertAlmostEqual(
+            mean, integral, delta=max(0.1, 4 * error),
+            msg="sky+time %.3f+-%.3f vs integral %.3f"
+                % (mean, error, integral))
+
     def integrated(self, halfwidth, npoint=4001):
         """The marginal computed by summing the likelihood over the prior."""
         variable, prior = self.prior(halfwidth)
