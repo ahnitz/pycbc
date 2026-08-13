@@ -1,0 +1,354 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2026 Alexander Harvey Nitz
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+"""Build the precomputed parameter-space map the `games` samplers draw from.
+
+The map is a hierarchy of tiles covering the prior, built ONLINE from prior
+draws in a single pass -- there is no pregenerated template bank. Each level
+has a match threshold; a draw descends from the root, compared at each level
+only against the current node's children, and becomes the representative of a
+new branch wherever no child is close enough. See
+`pycbc.inference.games_map` for the algorithm and for why the coarse levels
+must use time-maximized match rather than a fixed-time overlap.
+
+Two artifacts are written, both read directly by the samplers:
+
+  --map-output   flat map: bank/<param> for the root-level tiles, and map/<i>
+                 holding every point under tile i.
+  --tree-output  the hierarchy: tree/<i> per root tile, with is_leaf /
+                 n_points / prior_mass / param_<p> / children/<c> / points_<p>.
+
+Two phases, because the tree mutates while it grows but not afterwards:
+
+  1. GROW (serial) -- insert draws, creating branches as needed, until the
+     rate of new-leaf creation falls below --saturation, i.e. the tree has
+     stopped discovering new regions.
+  2. ASSIGN (parallel) -- freeze the structure and route the remaining draws
+     read-only, so workers can fork and share it copy-on-write.
+
+The configuration file is an ordinary pycbc inference config: the prior is
+read from its [variable_params], [static_params], [prior-*] and
+[waveform_transforms] sections, exactly as `pycbc_inference` reads it, so the
+same file can describe the map and the run. The PSD comes from the standard
+PSD command line (--psd-model, --psd-file, ...).
+
+Example:
+
+    pycbc_inference_build_map \\
+        --config-file prior.ini \\
+        --map-output map.hdf --tree-output tree.hdf \\
+        --sample-size 100000000 \\
+        --thresholds 0.7 0.9 0.95 0.98 0.99 0.995 \\
+        --psd-model aLIGOZeroDetHighPower \\
+        --nprocesses 16 --verbose
+"""
+import os
+
+# Each worker routes one draw at a time through small, cache-resident
+# arrays; threaded BLAS on top of process-level parallelism only contends.
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+
+import argparse
+import logging
+import time
+
+import h5py
+import numpy
+
+import pycbc
+from pycbc.waveform import get_fd_waveform
+from pycbc.psd import from_cli, insert_psd_option_group
+from pycbc.pool import choose_pool
+from pycbc.types.config import InterpolatingConfigParser
+from pycbc.distributions import (draw_samples_from_config,
+                                 read_params_from_config)
+from pycbc.inference.games_map import OnlineTree, whiten_padded
+
+_G = {}       # worker-visible globals, populated before the pool forks
+
+
+def make_rep(params):
+    """ Whitened, unit-norm, zero-padded representative for one draw.
+
+    `params` must carry EVERY field draw_samples_from_config produced, not
+    just the variable_params we store: the config's waveform_transforms
+    derive mass1/mass2 from mchirp/q, and get_fd_waveform requires those.
+    """
+    p = dict(params)
+    p.update(_G['stat'])
+    hp, hc = get_fd_waveform(delta_f=_G['delta_f'], **p)
+    hp.resize(_G['kmax'])
+    rp = whiten_padded(hp.numpy()[_G['kmin']:_G['kmax']], _G['psd'],
+                       _G['kmin'], _G['kmax'], _G['nfft'])
+    if not _G.get('two_pol'):
+        return rp
+    # Precessing map: represent the template by BOTH polarizations and let
+    # the tree score tiles by the MIN of the per-polarization matches. The
+    # two polarizations of a precessing waveform carry independent
+    # information, so a single-polarization representative mis-measures
+    # template distance; the min is the conservative (over-splitting) proxy.
+    hc.resize(_G['kmax'])
+    rc = whiten_padded(hc.numpy()[_G['kmin']:_G['kmax']], _G['psd'],
+                       _G['kmin'], _G['kmax'], _G['nfft'])
+    return numpy.stack([rp, rc])
+
+
+def assign_one(params):
+    """ Pool worker: route one draw through the frozen tree. Returns the
+    leaf's integer id, or -1 if the tree could not accept it.
+    """
+    leaf = _G['tree'].assign(make_rep(params))
+    return _G['leaf_id'].get(id(leaf), -1) if leaf is not None else -1
+
+
+def all_fields(samples, i):
+    """ Every drawn field (including transform-derived mass1/mass2). """
+    return {k: float(samples[k][i]) for k in samples.dtype.names}
+
+
+parser = argparse.ArgumentParser(
+    description=__doc__,
+    formatter_class=argparse.RawDescriptionHelpFormatter)
+pycbc.add_common_pycbc_options(parser)
+parser.add_argument('--config-file', required=True,
+                    help='pycbc inference config file; the prior is read '
+                         'from its [variable_params], [static_params], '
+                         '[prior-*] and [waveform_transforms] sections')
+parser.add_argument('--map-output', required=True,
+                    help='flat map file to write')
+parser.add_argument('--tree-output', required=True,
+                    help='hierarchical tree file to write')
+parser.add_argument('--sample-size', type=int, required=True,
+                    help='total prior draws to place in the map')
+parser.add_argument('--thresholds', type=float, nargs='+',
+                    default=[0.7, 0.9, 0.99],
+                    help='match threshold per level, coarsest first. Node '
+                         'count grows as mismatch^(-d_eff/2), so halving '
+                         'the mismatch at each step gives a constant '
+                         'branching factor')
+parser.add_argument('--match-below', type=float, default=0.98,
+                    help='levels at or below this threshold use '
+                         'time-maximized match; above it the cheaper '
+                         'fixed-time overlap, which is a good '
+                         'approximation only at high match')
+parser.add_argument('--grow-draws', type=int, default=200000,
+                    help='max draws for the serial growth phase')
+parser.add_argument('--saturation', type=float, default=0.02,
+                    help='end growth once new leaves per draw falls below '
+                         'this over a monitoring block')
+parser.add_argument('--block', type=int, default=20000,
+                    help='draws per growth-phase monitoring block')
+parser.add_argument('--low-frequency-cutoff', type=float, default=20.0,
+                    help='start frequency of the representative waveforms')
+parser.add_argument('--high-frequency-cutoff', type=float, default=1000.0,
+                    help='end frequency of the representative waveforms')
+parser.add_argument('--delta-f', type=float, default=2.0,
+                    help='frequency resolution of the representatives. The '
+                         'time-maximization IFFT is padded to 2*kmax, which '
+                         'at the default gives 0.5 ms resolution and '
+                         'reproduces pycbc.filter.match to ~4e-4')
+parser.add_argument('--nprocesses', type=int, default=1,
+                    help='processes for the parallel assign phase')
+parser.add_argument('--seed', type=int, default=0)
+parser.add_argument('--two-polarization', action='store_true',
+                    help='represent each template by both + and x '
+                         'polarizations and score tiles by the MIN of the '
+                         'two per-polarization matches. Needed for '
+                         'precessing waveforms, where the polarizations '
+                         'carry independent information; a single-'
+                         'polarization representative under-resolves them.')
+insert_psd_option_group(parser, include_data_options=False)
+args = parser.parse_args()
+
+pycbc.init_logging(args.verbose)
+
+delta_f = args.delta_f
+kmin = int(args.low_frequency_cutoff / delta_f)
+kmax = int(args.high_frequency_cutoff / delta_f)
+nfft = 2 * kmax
+
+cp = InterpolatingConfigParser([args.config_file])
+var, stat = read_params_from_config(cp, vargs_section='variable_params',
+                                    sargs_section='static_params')
+psd = from_cli(args, kmax + 1, delta_f,
+               args.low_frequency_cutoff - 5)[kmin:kmax].numpy()
+_G.update(stat=stat, psd=psd, nfft=nfft, kmin=kmin, kmax=kmax,
+          delta_f=delta_f, two_pol=args.two_polarization)
+
+tree = OnlineTree(args.thresholds, kmin, kmax, nfft=nfft,
+                  match_below=args.match_below)
+logging.info('thresholds=%s (time-maximized match at %s)', args.thresholds,
+             [t for t, m in zip(args.thresholds, tree.use_match) if m])
+
+# ---------------- phase 1: grow ----------------
+numpy.random.seed(args.seed)
+grown = 0
+t0 = time.perf_counter()
+while grown < args.grow_draws:
+    n = min(args.block, args.grow_draws - grown)
+    s = draw_samples_from_config(args.config_file, n, seed=args.seed + grown)
+    before = tree.counts[-1]
+    for i in range(n):
+        full = all_fields(s, i)
+        tree.insert(make_rep(full), tuple(full[p] for p in var))
+    grown += n
+    rate = (tree.counts[-1] - before) / n
+    logging.info('grow: %i draws | nodes/level %s | new leaves/draw %.4f | '
+                 '%.0f draws/s', grown, tree.counts, rate,
+                 grown / (time.perf_counter() - t0))
+    if rate < args.saturation:
+        logging.info('saturated (new-leaf rate %.4f < %.4f); freezing',
+                     rate, args.saturation)
+        break
+
+leaves = tree.leaves()
+leaf_id = {id(lf): k for k, lf in enumerate(leaves)}
+tree.frozen = True
+_G.update(tree=tree, leaf_id=leaf_id)
+logging.info('grown: %i draws, nodes/level %s, %i leaves, %.1f comp/draw',
+             grown, tree.counts, len(leaves), tree.ncomp / max(grown, 1))
+
+# ---------------- phase 2: assign ----------------
+# Points are accumulated as flat numpy blocks (int32 leaf id + float32
+# params) rather than per-leaf Python objects, which costs several times
+# less memory at the draw counts a production map needs. Grouping by leaf
+# happens once at write time via a single argsort.
+remaining = max(0, args.sample_size - grown)
+blocks_id, blocks_pt = [], []
+grown_pts = [(leaf_id[id(lf)], p) for lf in leaves for p in (lf.points or [])]
+if grown_pts:
+    blocks_id.append(numpy.array([g[0] for g in grown_pts],
+                                 dtype=numpy.int32))
+    blocks_pt.append(numpy.array([g[1] for g in grown_pts],
+                                 dtype=numpy.float32))
+if remaining:
+    pool = choose_pool(processes=args.nprocesses)
+    logging.info('assigning %i remaining draws on %i processes',
+                 remaining, args.nprocesses)
+    done = 0
+    t0 = time.perf_counter()
+    while done < remaining:
+        n = min(500000, remaining - done)
+        s = draw_samples_from_config(args.config_file, n,
+                                     seed=args.seed + grown + done)
+        work = [all_fields(s, i) for i in range(n)]
+        cs = max(1, n // (args.nprocesses * 20))
+        ids = numpy.fromiter(pool.imap(assign_one, work, chunksize=cs),
+                             dtype=numpy.int32, count=n)
+        keep = ids >= 0
+        blocks_id.append(ids[keep])
+        blocks_pt.append(numpy.column_stack(
+            [s[p][:n] for p in var]).astype(numpy.float32)[keep])
+        done += n
+        logging.info('assign: %i/%i (%.0f draws/s)', done, remaining,
+                     done / (time.perf_counter() - t0))
+
+all_id = numpy.concatenate(blocks_id) if blocks_id else numpy.zeros(
+    0, dtype=numpy.int32)
+all_pt = numpy.concatenate(blocks_pt) if blocks_pt else numpy.zeros(
+    (0, len(var)), dtype=numpy.float32)
+del blocks_id, blocks_pt
+order = numpy.argsort(all_id, kind='stable')
+all_id, all_pt = all_id[order], all_pt[order]
+bounds = numpy.searchsorted(all_id, numpy.arange(len(leaves) + 1))
+counts = numpy.diff(bounds)
+logging.info('points per leaf: min=%i median=%i max=%i total=%i',
+             counts.min(), int(numpy.median(counts)), counts.max(),
+             counts.sum())
+
+# ---------------- write ----------------
+dtype = [(p, numpy.float32) for p in var]
+roots = tree.root.children[1] if tree.root.children else []
+
+
+def subtree_leaves(node, acc):
+    if node.children is None:
+        acc.append(node)
+        return
+    for c in node.children[1]:
+        subtree_leaves(c, acc)
+
+
+# The map records the configuration it was built from, so a run can
+# reconstruct the prior its points were drawn from. Two things need that:
+# the evidence, whose normalisation is the TOTAL number of prior draws;
+# and running against a DIFFERENT prior from the one the map was built
+# with, where each point's weight picks up pi_model/pi_map.
+config_text = open(args.config_file).read()
+meta = {'config': config_text,
+        'sample_size': int(len(all_id)),
+        'requested_sample_size': int(args.sample_size),
+        'thresholds': ','.join('%g' % t for t in args.thresholds),
+        'low_frequency_cutoff': float(args.low_frequency_cutoff),
+        'high_frequency_cutoff': float(args.high_frequency_cutoff),
+        'delta_f': float(args.delta_f),
+        'seed': int(args.seed)}
+
+logging.info('writing %s', args.map_output)
+with h5py.File(args.map_output, 'w') as out:
+    for k_, v_ in meta.items():
+        out.attrs[k_] = v_
+    for k, p in enumerate(var):
+        out['bank/%s' % p] = numpy.array(
+            [r.params[k] for r in roots], dtype=numpy.float64)
+    for i, r in enumerate(roots):
+        acc = []
+        subtree_leaves(r, acc)
+        ids = [leaf_id[id(lf)] for lf in acc]
+        blocks = [all_pt[bounds[j]:bounds[j + 1]] for j in ids]
+        pts = (numpy.concatenate(blocks) if blocks
+               else numpy.zeros((0, len(var)), dtype=numpy.float32))
+        arr = numpy.zeros(len(pts), dtype=dtype)
+        for k, p in enumerate(var):
+            arr[p] = pts[:, k]
+        out.create_dataset('map/%i' % i, data=arr, compression='gzip',
+                           shuffle=True, compression_opts=9)
+
+logging.info('writing %s', args.tree_output)
+with h5py.File(args.tree_output, 'w') as out:
+    for k_, v_ in meta.items():
+        out.attrs[k_] = v_
+    for k, p in enumerate(var):
+        out['bank/%s' % p] = numpy.array(
+            [r.params[k] for r in roots], dtype=numpy.float64)
+    tg = out.create_group('tree')
+
+    def write(node, group):
+        for k, p in enumerate(var):
+            group.attrs['param_%s' % p] = float(node.params[k])
+        if node.children is None:
+            lid = leaf_id[id(node)]
+            pts = all_pt[bounds[lid]:bounds[lid + 1]]
+            group.attrs['is_leaf'] = True
+            group.attrs['n_points'] = len(pts)
+            # What the leaf is worth, as against how many points it
+            # holds. The sampler weights by this and caps draws by
+            # n_points, so the two can differ.
+            group.attrs['prior_mass'] = float(counts[lid])
+            for k, p in enumerate(var):
+                group.create_dataset('points_%s' % p, data=pts[:, k].copy())
+            return
+        group.attrs['is_leaf'] = False
+        cg = group.create_group('children')
+        for c, kid in enumerate(node.children[1]):
+            write(kid, cg.create_group(str(c)))
+
+    for i, r in enumerate(roots):
+        write(r, tg.create_group(str(i)))
+
+logging.info('done: %i root tiles, %i leaves', len(roots), len(leaves))

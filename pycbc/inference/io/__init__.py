@@ -41,8 +41,10 @@ from .snowline import SnowlineFile
 from .nessai import NessaiFile
 from .posterior import PosteriorFile
 from .txt import InferenceTXTFile
+from .games import GamesFile
 
 filetypes = {
+    GamesFile.name: GamesFile,
     EmceeFile.name: EmceeFile,
     EmceePTFile.name: EmceePTFile,
     PTEmceeFile.name: PTEmceeFile,
