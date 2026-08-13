@@ -1275,9 +1275,21 @@ class RelativeTime(Relative):
 
             hp, hc = wfs[ifo]
             det = self.det[ifo]
-            fp, fc = det.antenna_pattern(p["ra"], p["dec"],
-                                         0, times)
-            times = det.time_delay_from_earth_center(p["ra"], p["dec"], times)
+            if self.precalc_antenna_factors and not self.earth_rotation:
+                # The sky draw already evaluated the response and the delay
+                # at every one of its pointings, so re-evaluating them here
+                # for the sampled subset is pure repeated work. Only usable
+                # when a sky draw actually happened (the factors are False
+                # before the first one and None whenever the marginalization
+                # was skipped) and when the response is a single number per
+                # detector; with earth rotation on it is a function of
+                # frequency and the stored single-time values do not apply.
+                fp, fc, times = self.get_precalc_antenna_factors(ifo)
+            else:
+                fp, fc = det.antenna_pattern(p["ra"], p["dec"],
+                                             0, times)
+                times = det.time_delay_from_earth_center(p["ra"], p["dec"],
+                                                         times)
             dtc = p["tc"] - end_time - self.ta[ifo]
 
             if self.lformat == 'earth_time_pol':
