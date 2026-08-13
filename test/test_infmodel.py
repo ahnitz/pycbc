@@ -119,8 +119,12 @@ class TestModels(unittest.TestCase):
         cls.a2 = 542.581
         cls.pol_samples = 200
 
-        # answer with gate applied, no normalization
-        cls.a3 = -1246.1948739646468
+        # answer with gate applied, no normalization. This moved by 0.27
+        # when the detectors stopped being left at the default sidereal
+        # time reference, which for this data sits two years away; the
+        # gated models take their antenna pattern from the generator, so
+        # they follow it. See test_relbin_detector_reference.
+        cls.a3 = -1245.9281576844514
 
     def test_base_phase_marg(self):
         model = models.MarginalizedPhaseGaussianNoise(

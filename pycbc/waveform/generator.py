@@ -41,6 +41,7 @@ from pycbc.waveform.utils import apply_fseries_time_shift, \
 from pycbc.detector import Detector
 from pycbc.pool import use_mpi
 from pycbc import strain
+import numpy
 from numpy import pi
 
 
@@ -530,6 +531,9 @@ class BaseFDomainDetFrameGenerator(metaclass=ABCMeta):
         # location variables are specified
         if detectors is not None:
             self.detectors = {det: Detector(det) for det in detectors}
+            # these are rebuilt against the time being analyzed on the first
+            # call to generate; see reference_detectors
+            self._detectors_referenced = False
             missing_args = [arg for arg in self.location_args if not
                 (arg in self.current_params or arg in self.variable_args)]
             if any(missing_args):
@@ -539,8 +543,37 @@ class BaseFDomainDetFrameGenerator(metaclass=ABCMeta):
                     "variable args.")
         else:
             self.detectors = {'RF': None}
+            self._detectors_referenced = True
         self.detector_names = sorted(self.detectors.keys())
         self.gates = gates
+
+    def reference_detectors(self, ref_tc):
+        """Reference the detectors at the time being analyzed.
+
+        Detector estimates sidereal time by advancing it at a constant rate
+        from a reference time, so it is exact at that reference and drifts
+        away from it. The reference defaults to the time of GW150914, which
+        leaves a detector built here progressively wronger the further the
+        data sits from 2015; the arrival time it is then asked for, and the
+        antenna pattern in the subclasses that apply one, carry that error
+        into the waveform. The detectors cannot be referenced when they are
+        built, because the coalescence time is generally a variable
+        parameter and so is not known until a waveform is asked for.
+
+        Only the first call does anything: the referenced detectors are kept
+        and reused, so the reference is the coalescence time of whichever
+        waveform was generated first. That is enough, because the time moves
+        only over its prior, a fraction of a second, while the drift being
+        corrected is measured over years. Where the time is being
+        marginalized over it arrives as a vector, so take its average, as
+        the models and the sky draws in tools.py do.
+        """
+        if self._detectors_referenced:
+            return
+        reference_time = float(numpy.mean(ref_tc))
+        self.detectors = {det: Detector(det, reference_time=reference_time)
+                          for det in self.detectors}
+        self._detectors_referenced = True
 
     def set_epoch(self, epoch):
         """Sets the epoch; epoch should be a float or a LIGOTimeGPS."""
@@ -685,6 +718,7 @@ class FDomainDetFrameGenerator(BaseFDomainDetFrameGenerator):
             ref_tc = self.current_params['tc']
             pol = self.current_params['polarization']
             refframe = self.current_params.get('tc_ref_frame', 'geocentric')
+            self.reference_detectors(ref_tc)
             for detname, det in self.detectors.items():
                 tc = det.arrival_time(ref_tc, ra, dec, refframe)
                 # apply response function
@@ -818,6 +852,7 @@ class FDomainDetFrameTwoPolGenerator(BaseFDomainDetFrameGenerator):
         hp._epoch = hc._epoch = self._epoch
         h = {}
         if self.detector_names != ['RF']:
+            self.reference_detectors(self.current_params['tc'])
             for detname, det in self.detectors.items():
                 refframe = self.current_params.get('tc_ref_frame', 'geocentric')
                 ra = self.current_params['ra']
@@ -1092,6 +1127,7 @@ class FDomainDetFrameTwoPhaseGenerator(BaseFDomainDetFrameGenerator):
             ref_tc = self.current_params['tc']
             pol = self.current_params['polarization']
             refframe = self.current_params.get('tc_ref_frame', 'geocentric')
+            self.reference_detectors(ref_tc)
             for detname, det in self.detectors.items():
                 tc = det.arrival_time(ref_tc, ra, dec, refframe)
                 # apply response function
@@ -1240,6 +1276,7 @@ class FDomainDetFrameModesGenerator(BaseFDomainDetFrameGenerator):
                 tshift = 0.
             ulm._epoch = vlm._epoch = self._epoch
             if self.detector_names != ['RF']:
+                self.reference_detectors(self.current_params['tc'])
                 for detname, det in self.detectors.items():
                     refframe = self.current_params.get('tc_ref_frame', 'geocentric')
                     ra = self.current_params['ra']

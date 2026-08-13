@@ -488,7 +488,11 @@ class BaseGatedGaussian(BaseGaussianNoise):
         """
         gatetimes = {}
         for det in self._invpsds:
-            thisdet = Detector(det)
+            # Referenced at the time being analyzed, which here is the gate
+            # itself; the default is the time of GW150914, and the sidereal
+            # time estimate drifts away from wherever it is referenced.
+            thisdet = Detector(
+                det, reference_time=float(numpy.mean(gatestart)))
             # account for the time delay between the waveforms of the
             # different detectors
             refdet = self.current_params.get('tc_ref_frame', 'geocentric')
@@ -1011,7 +1015,14 @@ class GatedGaussianMargPol(BaseGatedGaussian):
         for det, (hp, hc) in wfs.items():
             # get the antenna patterns
             if det not in self.dets:
-                self.dets[det] = Detector(det)
+                # Referenced at the time being analyzed; the default is the
+                # time of GW150914, and the sidereal time estimate drifts
+                # away from wherever it is referenced. The time is a vector
+                # when it is being marginalized over, so take its average,
+                # as the sky draws in tools.py do: the spread is the width
+                # of the prior, far too small to matter to the estimate.
+                self.dets[det] = Detector(
+                    det, reference_time=float(numpy.mean(ref_tc)))
             # calculate tc in frame
             tc = self.dets[det].arrival_time(ref_tc, ra, dec, refframe)
             # evaluate antenna pattern

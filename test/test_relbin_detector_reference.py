@@ -35,6 +35,9 @@ from pycbc.noise import noise_from_psd
 from pycbc.psd import aLIGOZeroDetHighPower
 from pycbc.time import gmst_accurate
 from pycbc.waveform import get_td_waveform
+from pycbc.waveform.generator import (FDomainCBCGenerator,
+                                      FDomainDetFrameGenerator,
+                                      FDomainDetFrameTwoPolGenerator)
 
 # well after the default reference, which is what makes the drift visible
 TC = 1187008882.42840
@@ -153,9 +156,117 @@ class TestRelbinDetectorReference(unittest.TestCase):
                             % det_name)
 
 
+class TestGeneratorDetectorReference(unittest.TestCase):
+    """The waveform generator builds detectors of its own, and used them
+    at the default reference.
+
+    Fixing the models was not enough. The detector-frame generators keep
+    their own detectors and ask them for the arrival time that sets the
+    time shift applied to the waveform, so a generator left at the default
+    put the signal in the wrong place no matter what the model did with its
+    own detectors. That shift is what these tests pin down: it has to agree
+    with the accurate sidereal time at the time actually being analyzed.
+
+    These are deliberately cheap. The generator is the whole subject here,
+    so there is no data, no PSD and no model to build; a single waveform is
+    generated per case at a coarse delta_f.
+    """
+
+    generator_classes = [FDomainDetFrameGenerator,
+                         FDomainDetFrameTwoPolGenerator]
+
+    def generator(self, cls):
+        return cls(FDomainCBCGenerator, epoch=TC - SEGLEN / 2.,
+                   detectors=['H1', 'L1'],
+                   variable_args=['tc', 'ra', 'dec', 'polarization'],
+                   delta_f=1. / SEGLEN, f_lower=FLOW,
+                   approximant='TaylorF2', mass1=1.4, mass2=1.35)
+
+    def test_detectors_are_referenced_at_the_analyzed_time(self):
+        """Not left at the default, which is the time of GW150914.
+
+        The reference cannot be set when the detectors are built, because
+        tc is generally a variable parameter, so it is set on the first
+        call to generate and kept from then on.
+        """
+        for cls in self.generator_classes:
+            gen = self.generator(cls)
+            gen.generate(tc=TC, ra=1.7, dec=-0.4, polarization=0.3)
+            for ifo, det in gen.detectors.items():
+                self.assertAlmostEqual(
+                    det.reference_time, TC, places=3,
+                    msg="%s %s referenced at %r" % (
+                        cls.__name__, ifo, det.reference_time))
+                self.assertNotEqual(det.reference_time, DEFAULT_REFERENCE)
+
+    def test_arrival_time_matches_the_accurate_calculation(self):
+        """The shift the generator applies must be the accurate one.
+
+        ``generate`` shifts each detector's waveform by the arrival time its
+        own detector reports, so that number is where the drift enters. Here
+        it is checked against a detector that takes no shortcut and computes
+        the sidereal time exactly at every call.
+        """
+        ra, dec = 1.7, -0.4
+        for cls in self.generator_classes:
+            gen = self.generator(cls)
+            gen.generate(tc=TC, ra=ra, dec=dec, polarization=0.3)
+            for ifo, det in gen.detectors.items():
+                exact = Detector(ifo, reference_time=None).arrival_time(
+                    TC, ra, dec, 'geocentric')
+                self.assertLess(
+                    abs(det.arrival_time(TC, ra, dec, 'geocentric') - exact),
+                    1e-9, "%s %s arrival time is off" % (cls.__name__, ifo))
+
+                # and the default really would have been wrong, so the check
+                # above is not passing for free
+                stale = Detector(ifo).arrival_time(TC, ra, dec, 'geocentric')
+                self.assertGreater(abs(stale - exact), 1e-7)
+
+    def test_a_marginalized_time_is_averaged(self):
+        """tc arrives as a vector when it is being marginalized over.
+
+        The reference has to be a single number, so it is the average, which
+        is what the models and the sky draws already do. The spread is the
+        width of the prior, far too small to matter to an estimate whose
+        error is measured over years. This goes through the referencing
+        directly rather than through ``generate``, because not every
+        detector-frame generator accepts a vector time in the first place.
+        """
+        tc = TC + numpy.linspace(-0.1, 0.1, 16)
+        for cls in self.generator_classes:
+            gen = self.generator(cls)
+            gen.reference_detectors(tc)
+            for ifo, det in gen.detectors.items():
+                self.assertAlmostEqual(
+                    det.reference_time, tc.mean(), places=6,
+                    msg="%s %s referenced at %r" % (
+                        cls.__name__, ifo, det.reference_time))
+
+    def test_the_reference_is_kept_once_it_is_set(self):
+        """The detectors are built once and reused.
+
+        The reference is therefore the time of whichever waveform was asked
+        for first, and a later call does not move it. That is what makes the
+        cost a single construction rather than one per likelihood
+        evaluation, and it is accurate enough because the time only ever
+        moves over its prior.
+        """
+        for cls in self.generator_classes:
+            gen = self.generator(cls)
+            gen.generate(tc=TC, ra=1.7, dec=-0.4, polarization=0.3)
+            first = {ifo: det for ifo, det in gen.detectors.items()}
+            gen.generate(tc=TC + 0.05, ra=1.2, dec=0.3, polarization=1.1)
+            for ifo, det in gen.detectors.items():
+                self.assertIs(det, first[ifo])
+                self.assertAlmostEqual(det.reference_time, TC, places=3)
+
+
 suite = unittest.TestSuite()
 suite.addTest(
     unittest.TestLoader().loadTestsFromTestCase(TestRelbinDetectorReference))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(
+    TestGeneratorDetectorReference))
 
 if __name__ == '__main__':
     from astropy.utils import iers
