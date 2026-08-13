@@ -69,6 +69,18 @@ FLOOR_RESOLVED = 20.0
 FEWEST_VSAMPLES = 32
 MOST_VSAMPLES = 32768
 
+# The least resolution to ask the sample rate for when the number of draws
+# is being chosen too. The accuracy depends only on the product of the two,
+# so the rate is wanted no finer than the point where that product law can
+# be relied on. Measured, it cannot be relied on at the hard floor of two
+# samples across the peak: with the draws sized by the law, two samples
+# deliver a scatter half again the size asked for and one sample nearly
+# three times it, while four samples deliver what they promise, at two
+# accuracy budgets a factor of four apart. Four is also where the total
+# cost of a call bottoms out, the draws needed rising as the rate falls, so
+# nothing is given up by stopping there.
+SANE_RESOLVED = 4.0
+
 
 def setup_bins(f_full, f_lo, f_hi, chi=1.0,
                eps=0.1, gammas=None,
@@ -840,6 +852,19 @@ class RelativeTime(Relative):
         neutron star, and above a few kHz the series is already most of
         what the model does.
 
+        Where the number of marginalization draws is being chosen as well,
+        the two are allocated together, because the accuracy depends only
+        on their product and they are not the same price. Four times the
+        rate costs about four times as much, while four times the draws
+        cost tens of a percent, so the cheapest way to a given product is
+        as much of it as possible from the draws. The rate is then asked
+        for no more than ``SANE_RESOLVED``, the resolution below which the
+        product law stops delivering what it promises, and the draws are
+        sized to the rest of the budget. Only if there is not room for
+        enough draws does the rate climb further, which it does until
+        either the budget is met or the resolution stops being what limits
+        the answer.
+
         Parameters
         ----------
         accuracy : float, optional
@@ -857,24 +882,74 @@ class RelativeTime(Relative):
         if accuracy is None:
             accuracy = self.marginalization_accuracy
 
-        # invert marginalization_error for the resolution wanted. Two
-        # samples is a floor rather than an accuracy: below it the peak
-        # falls between grid points and the answer is biased, not merely
-        # noisy, so no scatter budget makes that acceptable.
-        target = max(2.0, 1.0 / (self.vsamples * accuracy ** 2))
+        if self.adapt_vsamples:
+            # the draws will buy the accuracy, so ask the rate only for a
+            # resolution the product law can be trusted at
+            ceiling = self.samples_ceiling(**kwargs)
+            target = SANE_RESOLVED
+        else:
+            # invert marginalization_error for the resolution wanted. Two
+            # samples is a floor rather than an accuracy: below it the peak
+            # falls between grid points and the answer is biased, not merely
+            # noisy, so no scatter budget makes that acceptable.
+            ceiling = None
+            target = max(2.0, 1.0 / (self.vsamples * accuracy ** 2))
 
-        resolved = self.resolved_samples(self.ref_snr)
-        while resolved < target and self.sample_rate < most:
-            if resolved >= 2.0:
-                # resolved well enough to say how much more is needed
-                steps = max(1, int(numpy.ceil(numpy.log2(target / resolved))))
-            else:
-                steps = 1
-            self.set_sample_rate(min(self.sample_rate * 2 ** steps, most),
-                                 **kwargs)
+        while True:
             resolved = self.resolved_samples(self.ref_snr)
+            while resolved < target and self.sample_rate < most:
+                if resolved >= 2.0:
+                    # resolved well enough to say how much more is needed
+                    steps = max(1,
+                                int(numpy.ceil(numpy.log2(target / resolved))))
+                else:
+                    steps = 1
+                self.set_sample_rate(min(self.sample_rate * 2 ** steps, most),
+                                     **kwargs)
+                resolved = self.resolved_samples(self.ref_snr)
+
+            if ceiling is None:
+                break
+
+            # what the draws would have to be to meet the budget here. If
+            # there is no room for that many the rate has to make up the
+            # difference after all: ask it for the resolution the most draws
+            # available would need, and no more than the resolution past
+            # which the rate buys nothing whatever it is asked. The new
+            # target is reached or it is not, and either way the one after
+            # it would be the same number, so this goes round at most twice.
+            wanted = 1.0 / (accuracy ** 2 * min(resolved, FLOOR_RESOLVED))
+            if wanted <= ceiling:
+                break
+            harder = min(1.0 / (accuracy ** 2 * ceiling), FLOOR_RESOLVED)
+            if harder <= target:
+                break
+            target = harder
 
         rate = self.sample_rate
+        if ceiling is not None:
+            if wanted > ceiling:
+                logging.warning("Could not reach the accuracy asked of the "
+                                "marginalization: %.1f samples across the "
+                                "peak at %s Hz would need %.3g draws for a "
+                                "scatter of %.3g and there is room for %s, "
+                                "which leaves about %.3g. A larger "
+                                "precalculate_marginalization_points, or a "
+                                "looser marginalization_accuracy, is the way "
+                                "out; a higher rate is not",
+                                resolved, rate, wanted, accuracy, ceiling,
+                                1.0 / (ceiling
+                                       * min(resolved,
+                                             FLOOR_RESOLVED)) ** 0.5)
+            else:
+                logging.info("Chose a sample rate of %s Hz, spreading the "
+                             "peak over %.1f samples: enough resolution for "
+                             "the draws to be trusted, and the %.3g asked "
+                             "for is bought with the draws from there, which "
+                             "is much the cheaper of the two",
+                             rate, resolved, accuracy)
+            return rate
+
         error = self.marginalization_error(resolved)
         if resolved < target:
             logging.warning("Could not resolve the peak of the likelihood in "
@@ -905,6 +980,20 @@ class RelativeTime(Relative):
                          "of %.3g against the %.3g asked for",
                          rate, resolved, error, accuracy)
         return rate
+
+    def samples_ceiling(self, precalculate_marginalization_points=False,
+                        **kwargs):
+        """The most marginalization draws that could be asked for.
+
+        Taken from the model's keywords rather than from what has been built
+        so far, because the rate is chosen before the pool of points exists
+        and how many draws there is room for is what decides whether the
+        rate has to climb.
+        """
+        if precalculate_marginalization_points:
+            return min(MOST_VSAMPLES,
+                       int(float(precalculate_marginalization_points)))
+        return MOST_VSAMPLES
 
     def wanted_ess(self, accuracy=None):
         """How many effective marginalization samples the accuracy asks for.
