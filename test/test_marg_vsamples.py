@@ -92,64 +92,65 @@ class TestMargVSamples(unittest.TestCase):
         cls.point = {'distance': INJ['distance'],
                      'inclination': INJ['inclination']}
 
-    def model(self, vsamples='auto', accuracy=0.05):
-        variable = ['distance', 'inclination', 'tc']
-        prior = JointDistribution(
-            list(variable), SinAngle(inclination=None),
-            Uniform(distance=(10, 300)),
-            Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH)))
-        return models.RelativeTimeDom(
-            list(variable), copy.deepcopy(self.data),
-            low_frequency_cutoff=self.flow, psds=self.psds,
-            static_params=self.static, prior=prior,
-            fiducial_params={'mass1': INJ['mass1'], 'mass2': INJ['mass2'],
-                             'tc': TC},
-            epsilon=0.1, marginalize_vector_params='tc', sample_rate=RATE,
-            marginalization_accuracy=accuracy,
-            marginalize_vector_samples=vsamples)
+    VARIABLE = ['distance', 'inclination', 'tc']
 
-    def sky_model(self, pool, vsamples='auto', accuracy=0.005):
-        """A model that draws its points from a precalculated pool.
+    def prior(self, sky=False):
+        """The variable parameters and their prior, with the sky added when
+        the sky is being marginalized over too."""
+        variable = list(self.VARIABLE)
+        dists = [SinAngle(inclination=None), Uniform(distance=(10, 300)),
+                 Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH))]
+        if sky:
+            variable += ['ra', 'dec']
+            dists += [Uniform(ra=(0, 2 * numpy.pi)), CosAngle(dec=None)]
+        return variable, JointDistribution(list(variable), *dists)
 
-        The pool is what makes changing the number of points cheap -- it is
-        the same drawing, subsetted -- and it is also the ceiling, since the
-        subset is taken without replacement and the antenna factors stored
-        alongside it belong to those points and no others.
+    def model(self, vsamples='auto', accuracy=0.05, sample_rate=RATE,
+              pool=None):
+        """The model under test. With ``pool`` the points come from a
+        precalculated pool, over the sky as well as time: the pool is what
+        makes changing the number of points cheap -- it is the same drawing,
+        subsetted -- and it is also the ceiling, since the subset is taken
+        without replacement and the antenna factors stored alongside it
+        belong to those points and no others.
         """
-        variable = ['distance', 'inclination', 'tc', 'ra', 'dec']
-        prior = JointDistribution(
-            list(variable), SinAngle(inclination=None),
-            Uniform(distance=(10, 300)), Uniform(ra=(0, 2 * numpy.pi)),
-            CosAngle(dec=None),
-            Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH)))
+        variable, prior = self.prior(sky=pool is not None)
         static = {k: v for k, v in self.static.items()
-                  if k not in ('ra', 'dec')}
+                  if pool is None or k not in ('ra', 'dec')}
+        fiducial = {'mass1': INJ['mass1'], 'mass2': INJ['mass2'], 'tc': TC}
+        extra = {}
+        if pool is not None:
+            fiducial.update(ra=INJ['ra'], dec=INJ['dec'])
+            extra = dict(marginalize_sky_initial_samples=2e4,
+                         precalculate_marginalization_points=pool)
         return models.RelativeTimeDom(
-            list(variable), copy.deepcopy(self.data),
+            variable, copy.deepcopy(self.data),
             low_frequency_cutoff=self.flow, psds=self.psds,
-            static_params=static, prior=prior,
-            fiducial_params={'mass1': INJ['mass1'], 'mass2': INJ['mass2'],
-                             'tc': TC, 'ra': INJ['ra'], 'dec': INJ['dec']},
-            epsilon=0.1, marginalize_vector_params='tc, ra, dec',
-            sample_rate=RATE, marginalization_accuracy=accuracy,
-            marginalize_vector_samples=vsamples,
-            marginalize_sky_initial_samples=2e4,
-            precalculate_marginalization_points=pool)
+            static_params=static, prior=prior, fiducial_params=fiducial,
+            epsilon=0.1, sample_rate=sample_rate,
+            marginalize_vector_params='tc, ra, dec' if pool else 'tc',
+            marginalization_accuracy=accuracy,
+            marginalize_vector_samples=vsamples, **extra)
 
-    def drive(self, model, npoint, point=None, seed=13):
+    def evaluate(self, model, npoint, point=None, seed=13):
         """Evaluate the same point over and over, as a sampler sitting on
-        the peak would, and record what the number of samples does."""
+        the peak would, and record the likelihood it gives and the number of
+        samples it drew each time."""
         state = numpy.random.get_state()
         try:
             numpy.random.seed(seed)
-            trail = []
+            values, trail = [], []
             for _ in range(npoint):
                 model.update(**(point if point else self.point))
-                model.loglr
+                values.append(float(model.loglr))
                 trail.append(model.vsamples)
         finally:
             numpy.random.set_state(state)
-        return trail
+        return values, trail
+
+    def drive(self, model, npoint, **kwargs):
+        """What the number of samples does over a run of evaluations."""
+        return self.evaluate(model, npoint, **kwargs)[1]
 
     def changes(self, trail):
         """Where the number of samples moved, and which way."""
@@ -158,24 +159,19 @@ class TestMargVSamples(unittest.TestCase):
 
     def scatter(self, model, ndraw=64):
         """How far apart the same point lands on repeated evaluation."""
-        state = numpy.random.get_state()
-        try:
-            numpy.random.seed(29)
-            values = []
-            for _ in range(ndraw):
-                model.update(**self.point)
-                values.append(float(model.loglr))
-        finally:
-            numpy.random.set_state(state)
-        return numpy.std(values, ddof=1)
+        return numpy.std(self.evaluate(model, ndraw, seed=29)[0], ddof=1)
 
-    def test_it_draws_more_when_the_measured_size_is_short(self):
-        """The direction that matters.
+    def test_it_follows_the_measurement_both_ways(self):
+        """Up is the direction that matters, down is the one the resolution
+        and the bin layout are not allowed.
 
         Too few points is noise in the likelihood that the sampler cannot
         tell from structure, so a run started well below what the accuracy
         needs has to climb, and to climb until the size it measures is the
-        size that was asked for.
+        size that was asked for. Coming back down is a real saving, since
+        the points are only a subset of one drawing and nothing has to be
+        rebuilt to take fewer, and what must not happen is going below what
+        the accuracy asks for.
         """
         model = self.model()
         model.set_vsamples(32)
@@ -183,35 +179,35 @@ class TestMargVSamples(unittest.TestCase):
         self.assertGreater(model.vsamples, 32)
         self.assertGreater(model.vector_ess, model.wanted_ess())
 
-    def test_it_draws_fewer_when_the_measured_size_is_past_the_margin(self):
-        """The direction the resolution and the bins are not allowed.
-
-        Points are only a subset of one drawing, so taking fewer in an easy
-        region is a real saving and nothing has to be rebuilt to have it.
-        What must not happen is going below what the accuracy asks for, so
-        that is checked alongside.
-        """
-        model = self.model()
-        settled = self.drive(model, 300)[-1]
+        settled = model.vsamples
         model.set_vsamples(settled * 20)
         trail = self.drive(model, 900)
         self.assertLess(trail[-1], settled * 20)
         self.assertGreater(model.vector_ess, model.wanted_ess())
 
-    def test_it_settles_and_stays_settled(self):
-        """The risk the design takes on by allowing decreases.
+    def test_it_settles_where_the_signal_says_and_not_where_it_started(self):
+        """The risk the design takes on by allowing decreases, and the price
+        of what holds it off.
 
         A controller that can move both ways can sit on the boundary and
         cross it back and forth for a whole run. What stops that here is
-        that the two decisions are separated by a margin, so this asserts
-        what the margin is for: over a long run the number of samples stops
-        changing, it gets there in a handful of steps, and it never turns
-        around more than once on the way.
+        that the two decisions are separated by a margin, so from either
+        side the number of samples must stop changing, get there in a
+        handful of steps, and never turn around more than once on the way.
+
+        The margin has a price: coming down stops as soon as the measured
+        size is inside it rather than on the budget itself, so starting far
+        above settles higher than starting below. That gap must be no wider
+        than the margin that produced it, or the number of samples is a
+        memory of the starting guess rather than a property of the signal.
+        Coming up stops a tenth past the budget and coming down within the
+        margin of four of it, so the width to expect is a little under four.
         """
-        for start in ('auto', 32):
+        settled = {}
+        for start in ('below', 'above'):
             model = self.model()
-            if start != 'auto':
-                model.set_vsamples(start)
+            model.set_vsamples(32 if start == 'below'
+                               else settled['below'] * 20)
             trail = self.drive(model, 1200)
             changes = self.changes(trail)
             turns = sum(1 for i in range(1, len(changes))
@@ -222,29 +218,12 @@ class TestMargVSamples(unittest.TestCase):
             self.assertEqual(trail[-500:], [trail[-1]] * 500,
                              "from %s: still moving at the end, %s"
                              % (start, changes))
+            settled[start] = trail[-1]
 
-    def test_where_it_settles_hardly_depends_on_where_it_started(self):
-        """The margin costs something and it should be only that.
-
-        Coming down stops as soon as the measured size is inside the margin
-        rather than on the budget itself, so starting far above settles
-        higher than starting below. That gap is the hysteresis, and it must
-        be no wider than the margin that produced it -- otherwise the number
-        of samples is a memory of the starting guess rather than a property
-        of the signal. Coming up stops a tenth past the budget and coming
-        down within the margin of four of it, so the width to expect is
-        four over that tenth, a little under four.
-        """
-        below = self.model()
-        below.set_vsamples(32)
-        low = self.drive(below, 1200)[-1]
-
-        above = self.model()
-        above.set_vsamples(low * 20)
-        high = self.drive(above, 1200)[-1]
-
-        self.assertGreaterEqual(high, low * 0.9)
-        self.assertLessEqual(high, low * 4.0, "%s against %s" % (high, low))
+        self.assertGreaterEqual(settled['above'], settled['below'] * 0.9)
+        self.assertLessEqual(settled['above'], settled['below'] * 4.0,
+                             "%s against %s" % (settled['above'],
+                                                settled['below']))
 
     def test_the_settled_number_delivers_the_accuracy(self):
         """Settling is not the point; settling in the right place is.
@@ -285,7 +264,7 @@ class TestMargVSamples(unittest.TestCase):
         accuracy that asks for more than the pool holds therefore gets the
         pool, and is told so rather than being quietly under-served."""
         pool = 400
-        model = self.sky_model(pool, accuracy=0.002)
+        model = self.model(accuracy=0.002, pool=pool)
         self.assertLessEqual(model.vsamples, pool)
         with self.assertLogs(level='WARNING') as logs:
             trail = self.drive(model, 300)
@@ -311,20 +290,8 @@ class TestMargVSamples(unittest.TestCase):
 
     def auto_rate_model(self, vsamples='auto', accuracy=0.01):
         """The same model with the rate left to the model as well."""
-        variable = ['distance', 'inclination', 'tc']
-        prior = JointDistribution(
-            list(variable), SinAngle(inclination=None),
-            Uniform(distance=(10, 300)),
-            Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH)))
-        return models.RelativeTimeDom(
-            list(variable), copy.deepcopy(self.data),
-            low_frequency_cutoff=self.flow, psds=self.psds,
-            static_params=self.static, prior=prior,
-            fiducial_params={'mass1': INJ['mass1'], 'mass2': INJ['mass2'],
-                             'tc': TC},
-            epsilon=0.1, marginalize_vector_params='tc', sample_rate='auto',
-            marginalization_accuracy=accuracy,
-            marginalize_vector_samples=vsamples)
+        return self.model(vsamples=vsamples, accuracy=accuracy,
+                          sample_rate='auto')
 
     def cost(self, model, ncall=40):
         """Seconds a likelihood evaluation takes."""
@@ -374,15 +341,20 @@ class TestMargVSamples(unittest.TestCase):
                         "%s Hz and %s samples"
                         % (model.sample_rate, model.vsamples))
 
-    def test_an_explicit_count_leaves_the_rate_choice_alone(self):
-        """A number of draws given explicitly is a number the model may not
-        change, so the rate is the only thing left to buy the accuracy with
-        and it has to buy all of it, exactly as before this option existed.
-        Asking for the draws as well must then cost strictly less rate.
+    def test_an_explicit_number_is_left_alone(self):
+        """Asking for a number of draws must get exactly that number, over
+        the whole run, and leave the rate to buy the accuracy on its own.
+
+        The rate is then the only lever there is, so it has to reach the
+        resolution the accuracy law asks of it by itself, and asking for the
+        draws as well must cost strictly less rate.
         """
+        model = self.model(vsamples=777)
+        self.assertFalse(model.adapt_vsamples)
+        self.assertEqual(set(self.drive(model, 300)), {777})
+
         accuracy = 0.01
         explicit = self.auto_rate_model(vsamples=1000, accuracy=accuracy)
-        # the rate alone, against the resolution the accuracy law asks of it
         self.assertGreaterEqual(
             explicit.resolved_samples(explicit.ref_snr),
             1.0 / (1000 * accuracy ** 2))
@@ -414,13 +386,9 @@ class TestMargVSamples(unittest.TestCase):
         the prior, which needs no marginalization machinery to be correct.
         The grid is fine enough to place the peak to a small fraction of a
         sample of the finest series used here."""
-        variable = ['distance', 'inclination', 'tc']
-        prior = JointDistribution(
-            list(variable), SinAngle(inclination=None),
-            Uniform(distance=(10, 300)),
-            Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH)))
+        variable, prior = self.prior()
         model = models.Relative(
-            list(variable), copy.deepcopy(self.data),
+            variable, copy.deepcopy(self.data),
             low_frequency_cutoff=self.flow, psds=self.psds,
             static_params=self.static, prior=prior,
             fiducial_params={'mass1': INJ['mass1'], 'mass2': INJ['mass2'],
@@ -434,16 +402,7 @@ class TestMargVSamples(unittest.TestCase):
 
     def average(self, model, ndraw=32):
         """Where repeated evaluation of the same point lands on average."""
-        state = numpy.random.get_state()
-        try:
-            numpy.random.seed(5)
-            values = []
-            for _ in range(ndraw):
-                model.update(**self.point)
-                values.append(float(model.loglr))
-        finally:
-            numpy.random.set_state(state)
-        return numpy.mean(values)
+        return numpy.mean(self.evaluate(model, ndraw, seed=5)[0])
 
     def test_the_resolution_asked_for_gets_the_answer(self):
         """What the floor on the resolution is really for.
@@ -485,12 +444,6 @@ class TestMargVSamples(unittest.TestCase):
                            "integral against %.4f at %.1f"
                            % (coarse.resolved_samples(coarse.ref_snr), below,
                               asked, model.resolved))
-
-    def test_an_explicit_number_is_left_alone(self):
-        """Asking for a number of samples must still get exactly that."""
-        model = self.model(vsamples=777)
-        self.assertFalse(model.adapt_vsamples)
-        self.assertEqual(set(self.drive(model, 300)), {777})
 
 
 suite = unittest.TestSuite()
