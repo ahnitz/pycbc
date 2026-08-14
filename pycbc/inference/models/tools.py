@@ -525,6 +525,10 @@ class DistMarg():
 
             w = snr.squared_norm().numpy() / 2.0
             i = draw_sample(w, size=vsamples)
+            # the times are drawn from this detector's series in
+            # proportion to its likelihood, so normalizing over that
+            # series gives the probability they were drawn with
+            w -= logsumexp(w)
 
             if sref is not None:
                 mcweight += w[i]
@@ -537,7 +541,6 @@ class DistMarg():
                 mcweight = w[i]
 
             idx.append(i)
-        mcweight -= logsumexp(mcweight)
 
         # check if delay is in dict, if not, throw out
         ti = []

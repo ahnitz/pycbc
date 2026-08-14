@@ -29,7 +29,13 @@ from scipy.special import logsumexp
 from utils import simple_exit
 
 from pycbc.detector import Detector
-from pycbc.distributions import JointDistribution, SinAngle, Uniform
+from pycbc.distributions import (
+    CosAngle,
+    JointDistribution,
+    SinAngle,
+    Uniform,
+    UniformAngle,
+)
 from pycbc.inference import models
 from pycbc.noise import noise_from_psd
 from pycbc.psd import aLIGOZeroDetHighPower
@@ -80,6 +86,51 @@ class TestMargNormalization(unittest.TestCase):
             list(variable), SinAngle(inclination=None),
             Uniform(distance=(10, 200)),
             Uniform(tc=(TC - halfwidth, TC + halfwidth)))
+
+    def sky_marginalized(self, npoint, nseed=6):
+        """Mean and spread of the sky and time marginalized likelihood."""
+        variable = ['distance', 'inclination', 'tc', 'polarization',
+                    'ra', 'dec']
+        static = {k: v for k, v in self.static.items()
+                  if k not in ('ra', 'dec', 'polarization')}
+        dists = [SinAngle(inclination=None), Uniform(distance=(10, 200)),
+                 Uniform(tc=(TC - 0.1, TC + 0.1)),
+                 UniformAngle(polarization=None), UniformAngle(ra=None),
+                 CosAngle(dec=None)]
+        values = []
+        for s in range(nseed):
+            numpy.random.seed(700 + s)
+            model = models.MarginalizedTime(
+                list(variable), copy.deepcopy(self.data),
+                low_frequency_cutoff=self.flow, psds=self.psds,
+                static_params=static,
+                prior=JointDistribution(list(variable), *dists),
+                marginalize_phase=True,
+                marginalize_vector_params='tc,ra,dec,polarization',
+                marginalize_vector_samples=npoint, sample_rate=4096,
+                marginalize_sky_initial_samples=2e5)
+            model.update(**self.point)
+            values.append(model.loglr)
+        return numpy.mean(values), numpy.std(values) / nseed ** 0.5
+
+    def test_sky_marginalization_does_not_depend_on_the_point_count(self):
+        """The number of points must buy precision, not a bigger answer.
+
+        The times are drawn from each detector's signal to noise series,
+        so what they carry is their probability under that series. Taken
+        over the drawn times rather than over the series it is one in
+        however many were drawn, and the answer climbs with the log of
+        the count. Sixteen times the points must leave the answer where
+        it was, and only tighten the error on it.
+        """
+        seen = [(n,) + self.sky_marginalized(n) for n in (128, 2048)]
+        (_, coarse, coarse_err), (_, fine, fine_err) = seen
+        self.assertLess(abs(coarse - fine),
+                        4 * (coarse_err ** 2 + fine_err ** 2) ** 0.5,
+                        "%s" % seen)
+        self.assertLess(fine_err, coarse_err,
+                        "error on the mean went %.4f to %.4f"
+                        % (coarse_err, fine_err))
 
     def integrated(self, halfwidth, npoint=4001):
         """The marginal computed by summing the likelihood over the prior."""
