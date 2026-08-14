@@ -21,6 +21,22 @@ def call_likelihood(params):
     return models._global_instance.loglikelihood
 
 
+def call_tile_likelihood(params):
+    """ Likelihood used ONLY for tile weighting / the descent cut.
+
+    Diagnostic: lets the tile weights come from a different model than the
+    one whose weights enter the estimator, so that "the tile weight is
+    computed from a noisy or point-varying marginalised value" can be tested
+    separately from "the per-atom importance weights carry that variation".
+    Falls back to the sampling model when no tile model is configured.
+    """
+    inst = getattr(models, '_tile_instance', None)
+    if inst is None:
+        return call_likelihood(params)
+    inst.update(**params)
+    return inst.loglikelihood
+
+
 class OutOfSamples(Exception):
     """Exception if we ran out of samples"""
 

@@ -648,6 +648,23 @@ class DistMarg():
             codes = numpy.where(
                 inside, (shifted * strides).sum(axis=1), 0).astype(numpy.int64)
             present = inside & (lookup['offset'][codes] >= 0)
+            import os as _os
+            if _os.environ.get('MARG_DIAG'):
+                _dxs = numpy.stack(dx, axis=1)
+                _u, _c = numpy.unique(_dxs, axis=0, return_counts=True)
+                _mode = _u[_c.argmax()]
+                _msh = _mode - lo
+                _min = bool(numpy.all((_msh >= 0) & (_msh < dims)))
+                _mcode = int((_msh * strides).sum()) if _min else -1
+                _mpres = bool(_min and lookup['offset'][_mcode] >= 0)
+                logging.info('MARGDIAG draws=%d uniq_delay_tuples=%d '
+                             'modal_tuple=%s modal_frac=%.3f modal_inside=%s '
+                             'modal_present=%s | inside=%.4f present=%.4f '
+                             'n_present=%d dims=%s',
+                             vsamples, len(_u), _mode.tolist(),
+                             _c.max()/vsamples, _min, _mpres,
+                             inside.mean(), present.mean(), int(present.sum()),
+                             list(dims))
             ti = numpy.nonzero(present)[0]
             codes_k = codes[ti]
             counts_k = lookup['count'][codes_k]
@@ -1016,20 +1033,36 @@ def setup_distance_marg_interpolant(dist_marg,
             "distance marginalized likelihood is set to zero, which biases "
             "the result. Widen the range.", snr_range)
 
+    # EXPERIMENT (env MARG_CLAMP=1): clamp out-of-range queries to the table
+    # edge instead of setting them to -inf. Zeroing the likelihood makes such
+    # samples unrecoverable, and when a large fraction of the extrinsic draws
+    # fall below the SNR floor the estimate is left resting on a handful of
+    # survivors. The edge value OVERSTATES a genuinely sub-floor point, but it
+    # is negligible against in-range samples (exp(edge) << exp(peak)), so the
+    # sum is unchanged while the estimate stays defined.
+    import os as _os
+    _clamp = bool(_os.environ.get('MARG_CLAMP'))
+
     def interp_wrapper(x, y, bounds_check=True):
         k = None
         if bounds_check:
             if isinstance(x, float):
                 if x > shr_max or x < shr_min or y > hhr_max or y < hhr_min:
                     warn_out_of_range(True)
-                    return -numpy.inf
+                    if not _clamp:
+                        return -numpy.inf
             else:
                 k = (x > shr_max) | (x < shr_min)
                 k = k | (y > hhr_max) | (y < hhr_min)
                 warn_out_of_range(k.any())
 
-        v = interp(x, y, grid=False)
-        if k is not None:
+        if _clamp:
+            xq = numpy.clip(x, shr_min, shr_max)
+            yq = numpy.clip(y, hhr_min, hhr_max)
+        else:
+            xq, yq = x, y
+        v = interp(xq, yq, grid=False)
+        if k is not None and not _clamp:
             v[k] = -numpy.inf
         # a scalar query is a single point with nothing to marginalize over;
         # the spline returns it as a length-one array, which the caller then

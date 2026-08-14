@@ -41,7 +41,7 @@ from pycbc.io import FieldArray
 from pycbc.inference import models
 from pycbc.pool import choose_pool
 from .dummy import DummySampler
-from .games import call_likelihood, OutOfSamples
+from .games import call_likelihood, call_tile_likelihood, OutOfSamples
 
 
 def _pareto_k(logw):
@@ -373,6 +373,8 @@ class GameSampler6(DummySampler):
                  tile_point_cap=200000,
                  gen_seed_leaves=0,
                  gen_seed_range=4.0,
+                 leaf_weight_samples=0,
+                 pool_adapt_mean=0,
                  **kwargs):
         super().__init__(model, *args)
 
@@ -385,6 +387,16 @@ class GameSampler6(DummySampler):
 
         models._global_instance = model
         self.model = model
+        # Diagnostic: a separate model for TILE WEIGHTS only (env-gated).
+        # Must be built before the pool forks so workers inherit it.
+        import os as _os
+        _tini = _os.environ.get('GAMES6_TILE_INI')
+        if _tini:
+            from pycbc.workflow import WorkflowConfigParser as _WCP
+            from pycbc.inference import models as _models
+            logging.info('DIAG building a separate TILE-WEIGHT model from %s '
+                         '(sampling weights still use the main model)', _tini)
+            _models._tile_instance = _models.read_from_config(_WCP([_tini]))
         self.pool = choose_pool(mpi=use_mpi, processes=nprocesses)
         self._samples = {}
 
@@ -428,6 +440,8 @@ class GameSampler6(DummySampler):
         # available to draw.
         self.tile_point_cap = int(tile_point_cap)
         self.gen_seed_leaves = int(gen_seed_leaves)
+        self.leaf_weight_samples = int(leaf_weight_samples)
+        self.pool_adapt_mean = int(pool_adapt_mean)
         self.gen_seed_range = float(gen_seed_range)
         self.leaf_loglr = {}
         self.extra_params = []
@@ -446,6 +460,18 @@ class GameSampler6(DummySampler):
         if i not in self.draw:
             self.draw[i] = numpy.arange(0, len(self.dmap[i]))
         if size > len(self.draw[i]):
+            import os as _os
+            if _os.environ.get('GAMES6_DIAG'):
+                remaining = sum(len(self.draw.get(k, self.dmap[k]))
+                                for k in self.dmap)
+                logging.info('DIAG OutOfSamples: bin %i wanted %i has %i left; '
+                             'TOTAL atoms left across all bins=%i of %i; '
+                             'bins fully drained=%i of %i', i, size,
+                             len(self.draw[i]), remaining,
+                             sum(len(self.dmap[k]) for k in self.dmap),
+                             sum(1 for k in self.dmap
+                                 if len(self.draw.get(k, self.dmap[k])) == 0),
+                             len(self.dmap))
             raise OutOfSamples
         numpy.random.shuffle(self.draw[i])
         selected = self.draw[i][:size]
@@ -485,6 +511,23 @@ class GameSampler6(DummySampler):
         total = drawcount.sum()
         if total <= 0:
             raise OutOfSamples
+        import os as _os
+        if _os.environ.get('GAMES6_DIAG'):
+            nz = drawcount > 0
+            top = drawcount.argsort()[::-1][:5]
+            rem = numpy.array([len(self.draw.get(node_idx[i],
+                              self.dmap[node_idx[i]])) for i in top])
+            _finite = [v for v in self.leaf_loglr.values()
+                       if numpy.isfinite(v)]
+            mx = max(_finite) if _finite else float('nan')
+            logging.info('DIAG pool_round: %i/%i bins drawn; max_rep=%.1f; '
+                         'top5 drawcount=%s binlen=%s remaining=%s reps=%s '
+                         'maxposw_bin_drawcount=%s',
+                         int(nz.sum()), len(drawcount), mx,
+                         list(drawcount[top]), list(lengths[top]), list(rem),
+                         ['%.1f' % self.leaf_loglr.get(int(i), numpy.nan)
+                          for i in top],
+                         int(drawcount[int(numpy.argmax(bin_weight))]))
 
         psamp = FieldArray(total, dtype=self.samp_dtype)
         pweight = numpy.zeros(total)
@@ -626,7 +669,7 @@ class GameSampler6(DummySampler):
                     for i in range(len(next(iter(bank.values()))))]
         logging.info('Calculating likelihood at nodes')
         loglrs = numpy.array(list(tqdm.tqdm(
-            self.pool.imap(call_likelihood, args), total=len(args))))
+            self.pool.imap(call_tile_likelihood, args), total=len(args))))
         self.meta['setup_ncalls'] = len(args)
         return start_nodes, loglrs
 
@@ -640,11 +683,13 @@ class GameSampler6(DummySampler):
         with h5py.File(self.mapfile, 'r') as mapfile:
             for tile in passed:
                 if start_nodes is not None:
-                    leaves = self._find_active_leaves(start_nodes[tile],
-                                                      bound)
+                    leaves = self._find_active_leaves(
+                        start_nodes[tile], bound,
+                        root_loglr=node_loglrs[tile])
                 elif str(tile) in treefile['tree']:
                     leaves = self._find_active_leaves(
-                        treefile['tree'][str(tile)], bound)
+                        treefile['tree'][str(tile)], bound,
+                        root_loglr=node_loglrs[tile])
                 else:
                     leaves = []
                 if not leaves and start_nodes is None:
@@ -734,6 +779,8 @@ class GameSampler6(DummySampler):
             if treefile is not None:
                 treefile.close()
 
+        if self.leaf_weight_samples > 1:
+            self._refine_leaf_weights(active_ids, self.leaf_weight_samples)
         weight = self._round1_weights(len(active_ids), lengths)
         # per-stratum accumulators
         strata = {'pool': {'samp': None, 'loglr': None, 'logw': None}}
@@ -742,6 +789,8 @@ class GameSampler6(DummySampler):
         proposal = self._seed_proposal_from_leaves() \
             if self.gen_seed_leaves else None
         pool_dead = False
+        self._diag_binid = None
+        self._leaf_acc = {}
 
         # The generative proposal is held in reserve: the pool keeps the
         # whole budget each round until it exhausts and hands it over.
@@ -753,11 +802,31 @@ class GameSampler6(DummySampler):
                         self.target_likelihood_calls, prior_mass=prior_mass)
                     strata['pool'] = self._accumulate(strata['pool'],
                                                       ps, pl, pw)
+                    # _accumulate PREPENDS the new round, so match that order
+                    self._diag_binid = bid if self._diag_binid is None else \
+                        numpy.concatenate([bid, self._diag_binid])
                     # concentrate later rounds on the leaves that are
                     # actually carrying posterior weight
-                    wn = numpy.exp(pw - logsumexp(pw))
-                    for j, v in zip(bid, wn):
-                        weight[j] += v
+                    if self.pool_adapt_mean:
+                        # Re-weight leaves by their running MEAN likelihood
+                        # rather than by the posterior weight they happened
+                        # to realise. softmax(logw) is top-heavy: measured,
+                        # it moved 100% of the weight mass in one round with
+                        # 64% of it landing in the single leaf holding the
+                        # single highest-weight atom, so the update chased
+                        # per-atom noise, drained that leaf, and killed the
+                        # pool by round 3. The mean over a leaf's drawn
+                        # atoms estimates the same quantity the weight is
+                        # meant to track, at a fraction of the variance.
+                        self._update_leaf_means(bid, pl)
+                        upd = self._temper_leaf_weights(
+                            self._leaf_mean_ll(len(active_ids)), lengths)
+                        if upd is not None:
+                            weight = upd
+                    else:
+                        wn = numpy.exp(pw - logsumexp(pw))
+                        for j, v in zip(bid, wn):
+                            weight[j] += v
                 except OutOfSamples:
                     logging.info('pool exhausted at round %i; handing its '
                                  'budget to the generative proposal', rnd)
@@ -806,7 +875,76 @@ class GameSampler6(DummySampler):
                          'total=%.1f ncalls=%i', rnd, ess_p, len(gkeys),
                          gsum, ess_p + gsum, self.ncalls)
 
+        import os as _os
+        if _os.environ.get('GAMES6_DIAG') and \
+                strata.get('pool', {}).get('logw') is not None:
+            p = strata['pool']
+            path = _os.environ.get('GAMES6_DIAG_DUMP', '/tmp/pooldump.npz')
+            nb = len(self._diag_binid) if self._diag_binid is not None else 0
+            reps = numpy.array([self.leaf_loglr.get(int(b), numpy.nan)
+                                for b in (self._diag_binid
+                                          if nb else [])], dtype=float)
+            numpy.savez(path, logw=p['logw'], loglr=p['loglr'],
+                        bin_id=(self._diag_binid if nb else
+                                numpy.array([])), leaf_rep=reps,
+                        **{q: p['samp'][q] for q in p['samp'].dtype.names})
+            logging.info('DIAG dumped pool stratum (%i samples, %i binids) '
+                         'to %s', len(p['logw']), nb, path)
+
         self._finalise(strata)
+
+    def _refine_leaf_weights(self, active_ids, k):
+        """ Re-estimate each active leaf's representative loglr as the MEAN
+        likelihood over `k` of its own atoms.
+
+        A leaf's weight should be proportional to the likelihood INTEGRATED
+        over it, i.e. E[LR] * volume, but `leaf_loglr` holds the likelihood
+        AT one representative. Those differ by however much loglr varies
+        inside the leaf, and the extrinsic marginalization makes that
+        variation larger than the tiling's match threshold bounds: measured
+        on a hard injection, one representative sits 2.8 nats (std) from its
+        own leaf's mean, so exp() of it misallocates the round-1 draws by
+        factors of e^3 between leaves that deserve equal weight.
+
+        Averaging k atoms cuts that noise as sqrt(k) and costs k calls per
+        ACTIVE leaf only (~100s of calls), not per cut node (~40k). This
+        changes only the draw probability, never the estimator: the
+        importance weight carries log(drawcount) and self-corrects, so this
+        is a pure variance choice.
+        """
+        args, owners = [], []
+        for key in active_ids:
+            pts = self.dmap[int(key)]
+            n = len(pts)
+            if not n:
+                continue
+            take = min(int(k), n)
+            sel = self._rng.choice(n, size=take, replace=False)
+            for i in sel:
+                args.append(dict(self.extra_reference,
+                                 **{p: float(pts[p][i])
+                                    for p in self.dtype.names}))
+                owners.append(int(key))
+        if not args:
+            return
+        lls = list(self.pool.imap(call_tile_likelihood, args))
+        self.tree_ncalls += len(args)
+        got = {}
+        for key, ll in zip(owners, lls):
+            if numpy.isfinite(ll):
+                got.setdefault(key, []).append(ll)
+        moved = []
+        for key, v in got.items():
+            new = logsumexp(v) - numpy.log(len(v))
+            old = self.leaf_loglr.get(key, numpy.nan)
+            if numpy.isfinite(old):
+                moved.append(new - old)
+            self.leaf_loglr[key] = new
+        logging.info('refined %i leaf weights with %i calls (%i atoms each): '
+                     'mean loglr moved %.2f nats (std %.2f) from the single '
+                     'representative', len(got), len(args), int(k),
+                     float(numpy.mean(moved)) if moved else 0.0,
+                     float(numpy.std(moved)) if moved else 0.0)
 
     def _round1_weights(self, key, lengths):
         """ Draw probability for round 1, over `key` active bins.
@@ -830,19 +968,79 @@ class GameSampler6(DummySampler):
             return volume
         ll = numpy.array([self.leaf_loglr.get(k, numpy.nan)
                           for k in range(key)], dtype=float)
+        w = self._temper_leaf_weights(ll, lengths)
+        if w is None:
+            return volume
+        return w
+
+    def _temper_leaf_weights(self, ll, lengths):
+        """ Draw probability from per-leaf loglr estimates `ll`.
+
+        exp(loglr) * volume, with the exponent tempered to hold the
+        effective dynamic range near `gen_seed_range` nats. Returns None if
+        no leaf has a usable estimate. Shared by the round-1 seed and the
+        between-round update so both weight leaves on the same scale.
+        """
         ok = numpy.isfinite(ll)
         if not ok.any():
-            return volume
+            return None
         spread = float(ll[ok].max() - ll[ok].min())
         temper = max(1.0, spread / max(self.gen_seed_range, 1e-6))
         w = lengths.astype(float).copy()
         w[ok] *= numpy.exp((ll[ok] - ll[ok].max()) / temper)
+        w[~ok] = 0.0 if ok.all() else w[~ok]
         if w.sum() <= 0:
-            return volume
-        logging.info('seeded round-1 leaf weights: temper %.2f over a '
-                     'loglr spread of %.1f nats in %i leaves',
-                     temper, spread, int(ok.sum()))
+            return None
+        logging.info('leaf weights: temper %.2f over a loglr spread of %.1f '
+                     'nats in %i leaves', temper, spread, int(ok.sum()))
         return w / w.sum()
+
+    def _update_leaf_means(self, bid, loglr):
+        """ Accumulate a running mean likelihood per leaf from drawn atoms.
+
+        The leaf's weight should track the likelihood INTEGRATED over it,
+        which the atoms drawn from it estimate directly:
+        logsumexp(loglr) - log(n) is an unbiased estimate of log E[LR].
+        Accumulated across rounds, so a leaf's estimate keeps sharpening
+        with every atom it has ever given up.
+        """
+        for j in numpy.unique(bid):
+            sel = loglr[bid == j]
+            sel = sel[numpy.isfinite(sel)]
+            if not len(sel):
+                continue
+            ls, n = self._leaf_acc.get(int(j), (-numpy.inf, 0))
+            # pool_adapt_mean == 2 accumulates the mean of loglr (geometric
+            # mean likelihood) instead of the log of the mean likelihood.
+            # log E[LR] is the quantity the weight should track, but its
+            # estimator logsumexp(loglr) - log(n) is dominated by the single
+            # largest atom, so it keeps most of the per-atom variance we are
+            # trying to average out: measured, it GREW the between-leaf
+            # spread from 15 to 36 nats. The arithmetic mean of loglr is
+            # biased low but every atom contributes equally, and for a DRAW
+            # probability the bias is free -- the importance weight carries
+            # log(drawcount) and self-corrects.
+            if self.pool_adapt_mean == 2:
+                add = float(numpy.sum(sel))
+                self._leaf_acc[int(j)] = ((add if n == 0 else ls + add),
+                                          n + len(sel))
+            else:
+                self._leaf_acc[int(j)] = (numpy.logaddexp(ls, logsumexp(sel)),
+                                          n + len(sel))
+
+    def _leaf_mean_ll(self, nleaves):
+        """ Per-leaf log-mean-likelihood, falling back to the leaf's own
+        representative where no atom has been drawn yet. """
+        out = numpy.full(nleaves, numpy.nan)
+        for k in range(nleaves):
+            if k in self._leaf_acc and self._leaf_acc[k][1] > 0:
+                ls, n = self._leaf_acc[k]
+                # mode 2 stores sum(loglr); mode 1 stores logsumexp(LR)
+                out[k] = ls / n if self.pool_adapt_mean == 2 \
+                    else ls - numpy.log(n)
+            else:
+                out[k] = self.leaf_loglr.get(k, numpy.nan)
+        return out
 
     def _setup_extra_params(self):
         """ Parameters the model samples but the map does not carry.
@@ -1069,6 +1267,21 @@ class GameSampler6(DummySampler):
             lw.append(numpy.full(len(pts), float(self.leaf_loglr[k])))
         samp = numpy.concatenate(xs)
         logw = numpy.concatenate(lw)
+        # Temper the seed weights so the KDE receives a non-degenerate
+        # spread of centres. Untempered, exp(loglr_rep) collapses onto the
+        # single best leaf in the high-SNR limit -- the fit then subsamples
+        # centres by weight without replacement and gets almost no support,
+        # so a sharp posterior with a thin seed cannot bootstrap. Holding
+        # the effective range near gen_seed_range nats (the same recipe as
+        # _round1_weights) balloons the seed shape just enough to continue;
+        # later rounds refit against real posterior samples, which carry
+        # their own weights and let the proposal shrink back to shape.
+        spread = float(logw.max() - logw.min())
+        temper = max(1.0, spread / max(self.gen_seed_range, 1e-6))
+        if temper > 1.0:
+            logging.info('tempered seed proposal: temper %.2f over a loglr '
+                         'spread of %.1f nats', temper, spread)
+        logw = logw / temper
         fa = self._as_samples(samp)
         stratum = {'samp': fa, 'loglr': logw, 'logw': logw}
         prop = self._fit_proposal({'seed': stratum})
@@ -1818,12 +2031,18 @@ class GameSampler6(DummySampler):
         return (numpy.arange(key), numpy.array(lengths),
                 numpy.array(mass, dtype=float))
 
-    def _find_active_leaves(self, tree_root, loglr_bound):
+    def _find_active_leaves(self, tree_root, loglr_bound, root_loglr=numpy.nan):
         """ Prune the subtree, evaluating the likelihood at each child's
         representative and descending only where it clears the bound.
 
         These are real likelihood calls and are counted into
         `self.tree_ncalls`, which is reported separately from `ncalls`.
+
+        `root_loglr` is the loglr already measured at `tree_root` by the
+        cut. It seeds the leaf representative when `tree_root` is itself a
+        leaf (a tree exactly `tree_start_level` deep), which would
+        otherwise store nan and silently disable the loglr-weighted
+        round-1 seed and the leaf-seeded generative proposal.
         """
         results = []
 
@@ -1879,8 +2098,8 @@ class GameSampler6(DummySampler):
                                     for q in self.dtype.names}))
             if not kids:
                 return
-            lls = (list(self.pool.imap(call_likelihood, args))
-                   if len(args) > 1 else [call_likelihood(args[0])])
+            lls = (list(self.pool.imap(call_tile_likelihood, args))
+                   if len(args) > 1 else [call_tile_likelihood(args[0])])
             self.tree_ncalls += len(args)
             ok = [numpy.isfinite(v) and v > loglr_bound for v in lls]
 
@@ -1944,7 +2163,7 @@ class GameSampler6(DummySampler):
                 if good:
                     descend(child, ll)
 
-        descend(tree_root, numpy.nan)
+        descend(tree_root, root_loglr)
         if self.tree_shortcut:
             logging.info('descent: accepted %i subtrees whole where the cut '
                          'passed at least %.0f%% of children',
