@@ -686,12 +686,10 @@ class FDomainDetFrameGenerator(BaseFDomainDetFrameGenerator):
             pol = self.current_params['polarization']
             refframe = self.current_params.get('tc_ref_frame', 'geocentric')
             for detname, det in self.detectors.items():
-                tc = det.arrival_time(ref_tc, ra, dec, refframe)
-                # apply response function
-                fp, fc = det.antenna_pattern(ra, dec, pol, tc)
-                thish = fp*hp + fc*hc
-                # apply time shift
-                h[detname] = apply_fd_time_shift(thish, tc+tshift, copy=False)
+                # the detector knows how its own response is applied
+                h[detname] = det.project_wave_fd(
+                    hp, hc, ra, dec, pol, ref_tc, ref_frame=refframe,
+                    extra_time_shift=tshift)
                 if self.recalib:
                     # recalibrate with given calibration model
                     h[detname] = \

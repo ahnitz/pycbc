@@ -110,6 +110,29 @@ class TestDetector(unittest.TestCase):
                 self.assertAlmostEqual(fc, fc2, places=12)
                 self.assertAlmostEqual(dt, dt2, places=14)
 
+    def test_project_wave_fd(self):
+        # must reproduce assembling the projection by hand: the antenna
+        # pattern applied to the two polarizations, shifted to the arrival
+        # time in this detector
+        from pycbc.types import FrequencySeries
+        from pycbc.waveform.utils import apply_fd_time_shift
+        n = 128
+        hp = FrequencySeries(numpy.random.normal(size=n)
+                             + 1j * numpy.random.normal(size=n),
+                             delta_f=1.0, epoch=0)
+        hc = FrequencySeries(numpy.random.normal(size=n)
+                             + 1j * numpy.random.normal(size=n),
+                             delta_f=1.0, epoch=0)
+        ref_tc = 1187008882.4
+        for ifo in self.d:
+            for ra1, dec1, pol1 in list(zip(self.ra, self.dec, self.pol))[:5]:
+                tc = ifo.arrival_time(ref_tc, ra1, dec1)
+                fp, fc = ifo.antenna_pattern(ra1, dec1, pol1, tc)
+                expected = apply_fd_time_shift(fp * hp + fc * hc, tc,
+                                               copy=True)
+                got = ifo.project_wave_fd(hp, hc, ra1, dec1, pol1, ref_tc)
+                self.assertLess(abs(got.data - expected.data).max(), 1e-12)
+
     def test_delay_from_detector(self):
         ra, dec, time = self.ra[0:10], self.dec[0:10], self.time[0:10]
         for d1 in self.d:
