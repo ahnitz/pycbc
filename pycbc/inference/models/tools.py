@@ -537,6 +537,16 @@ class DistMarg():
 
         vsamples = size if size is not None else self.vsamples
 
+        # EXPERIMENT B2 (env MARG_B2=<factor>, default 1 = current behaviour):
+        # oversample the time draws so that enough of them survive the
+        # physical-delay lookup. The draws themselves are cheap integer ops on
+        # an already-computed SNR series, and `resize_factor` below is exactly
+        # the acceptance fraction, so the estimator normalisation is unchanged.
+        import os as _os
+        _b2 = max(1, int(_os.environ.get('MARG_B2', '1')))
+        _b1 = int(_os.environ.get('MARG_B1', '0'))   # snap radius, 0 = off
+        ndraw = vsamples * _b2
+
         # No good SNR peaks, go with prior draw
         if len(ifos) == 0:
             self.marginalize_vector_params['logw_partial'] = numpy.zeros(vsamples)
@@ -614,7 +624,7 @@ class DistMarg():
             snr = snr.time_slice(start, end, mode='nearest')
 
             w = snr.squared_norm().numpy() / 2.0
-            i = draw_sample(w, size=vsamples)
+            i = draw_sample(w, size=ndraw)
             # the times were drawn from this detector's series in
             # proportion to its likelihood, so normalizing over that
             # series is what turns it into the probability they were
@@ -636,7 +646,7 @@ class DistMarg():
             idx.append(i)
 
         # check if delay is in dict, if not, throw out
-        rand = numpy.random.uniform(0, 1, size=vsamples)
+        rand = numpy.random.uniform(0, 1, size=ndraw)
         if lookup is not None and len(dx) > 0:
             # the loop below, without the python: encode every drawn delay
             # tuple as one integer, keep those whose bin is populated, and
@@ -648,6 +658,34 @@ class DistMarg():
             codes = numpy.where(
                 inside, (shifted * strides).sum(axis=1), 0).astype(numpy.int64)
             present = inside & (lookup['offset'][codes] >= 0)
+            if _b1 > 0:
+                # EXPERIMENT B1: instead of discarding a tuple whose cell is
+                # empty, snap it to the nearest populated cell within +/-_b1
+                # in each delay coordinate. Cheap (one gather per offset), but
+                # the proposal probability belongs to the ORIGINAL cell, so
+                # this is only approximately correct -- watch a healthy atom's
+                # value for bias.
+                miss = numpy.nonzero(~present)[0]
+                if len(miss):
+                    sh_m = shifted[miss]
+                    best = numpy.full(len(miss), -1, dtype=numpy.int64)
+                    for r in range(1, _b1 + 1):
+                        offs = [o for o in numpy.ndindex(*([2 * r + 1] * sh_m.shape[1]))]
+                        for o in offs:
+                            if best.min() >= 0:
+                                break
+                            delta = numpy.array(o) - r
+                            if numpy.abs(delta).max() != r:
+                                continue
+                            cand = sh_m + delta
+                            ok = numpy.all((cand >= 0) & (cand < dims), axis=1)
+                            cc = numpy.where(ok, (cand * strides).sum(axis=1),
+                                             0).astype(numpy.int64)
+                            good = ok & (lookup['offset'][cc] >= 0) & (best < 0)
+                            best = numpy.where(good, cc, best)
+                    hit = best >= 0
+                    codes[miss[hit]] = best[hit]
+                    present[miss[hit]] = True
             import os as _os
             if _os.environ.get('MARG_DIAG'):
                 _dxs = numpy.stack(dx, axis=1)
@@ -700,7 +738,7 @@ class DistMarg():
         ix = numpy.resize(numpy.array(ix, dtype=int), vsamples)
         self.sample_idx = ix
         self.precalc_antenna_factors = fp, fc, dtc
-        resize_factor = len(ti) / vsamples
+        resize_factor = len(ti) / ndraw
 
         ra = ra[ix]
         dec = dec[ix]
