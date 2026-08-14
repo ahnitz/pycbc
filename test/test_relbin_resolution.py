@@ -260,8 +260,7 @@ class TestRelbinResolution(unittest.TestCase):
         marginalized parameter is held as the vector of samples drawn for
         it, and some samplers hand a batch of points in together. The
         diagnostic generates a waveform of its own, and the generators take
-        one point at a time, so it has to reduce them first. It used to
-        pass the vector straight through and raise a TypeError instead.
+        one point at a time, so it has to reduce them first.
         """
         model = self.model(0.5)
         model.update(**self.q)
@@ -281,6 +280,18 @@ class TestRelbinResolution(unittest.TestCase):
         # the parameters made vectors here either scale the ratio, which
         # cancels in a relative error, or never reach the generator
         self.assertAlmostEqual(value, expected, places=10)
+
+
+    def test_a_model_without_a_prior_can_be_built(self):
+        """The check runs at construction and must not need a prior."""
+        model = models.Relative(
+            list(self.variable), {k: v.copy() for k, v in self.data.items()},
+            low_frequency_cutoff=self.flow, psds=self.psds,
+            static_params=self.static, fiducial_params={'mass1': 1.3756},
+            epsilon=0.5)
+        model.update(**self.q)
+        self.assertTrue(numpy.isfinite(model.loglr))
+        self.assertEqual(model.check_bin_resolution(), 0.)
 
 
 suite = unittest.TestSuite()
