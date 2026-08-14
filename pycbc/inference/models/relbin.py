@@ -251,15 +251,10 @@ class Relative(DistMarg, BaseGaussianNoise):
                 # Apply detector response if not handled by
                 # the waveform generator
                 self.det[ifo] = Detector(ifo)
-                dt = self.det[ifo].time_delay_from_earth_center(
-                    self.fid_params["ra"],
-                    self.fid_params["dec"],
-                    self.fid_params["tc"],
-                )
-                self.ta[ifo] = self.fid_params["tc"] + dt
-                fp, fc = self.det[ifo].antenna_pattern(
+                fp, fc, dt = self.det[ifo].antenna_pattern_and_delay(
                     self.fid_params["ra"], self.fid_params["dec"],
                     self.fid_params["polarization"], self.fid_params["tc"])
+                self.ta[ifo] = self.fid_params["tc"] + dt
                 curr_wav = (fid_hp * fp + fid_hc * fc)
 
             # check for zeros at low and high frequencies
@@ -575,9 +570,8 @@ class Relative(DistMarg, BaseGaussianNoise):
             else:
                 hp, hc = wfs[ifo]
                 det = self.det[ifo]
-                fp, fc = det.antenna_pattern(p["ra"], p["dec"],
-                                             0.0, times)
-                dt = det.time_delay_from_earth_center(p["ra"], p["dec"], times)
+                fp, fc, dt = det.antenna_pattern_and_delay(
+                    p["ra"], p["dec"], 0.0, times)
                 dtc = p["tc"] + dt - end_time - self.ta[ifo]
 
                 if self.lformat == 'earth_pol':

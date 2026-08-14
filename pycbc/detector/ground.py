@@ -470,6 +470,58 @@ class Detector(object):
                                              declination,
                                              t_gps)
     
+    def antenna_pattern_and_delay(self, right_ascension, declination,
+                                  polarization, t_gps):
+        """Return the antenna pattern and the delay from the earth center.
+
+        This answers, for one source direction, everything a likelihood
+        needs in order to project the two polarizations onto this detector:
+        how much of each polarization it sees, and when the signal reaches
+        it. Both follow from the same source direction, so computing them
+        together avoids repeating that geometry, and it gives a detector
+        with a different response a single place to override.
+
+        Parameters
+        ----------
+        right_ascension: float
+            The right ascension of the source.
+        declination: float
+            The declination of the source.
+        polarization: float
+            The polarization angle of the source.
+        t_gps: float
+            The GPS time of the signal.
+
+        Returns
+        -------
+        fplus: float
+            The plus polarization factor.
+        fcross: float
+            The cross polarization factor.
+        delta_t: float
+            The delay from the earth center to this detector.
+        """
+        gha = self.gmst_estimate(t_gps) - right_ascension
+        cosgha, singha = cos(gha), sin(gha)
+        cosdec, sindec = cos(declination), sin(declination)
+        cospsi, sinpsi = cos(polarization), sin(polarization)
+
+        resp = self.response
+        x = np.array([-cospsi * singha - sinpsi * cosgha * sindec,
+                      -cospsi * cosgha + sinpsi * singha * sindec,
+                      sinpsi * cosdec])
+        y = np.array([sinpsi * singha - cospsi * cosgha * sindec,
+                      sinpsi * cosgha + cospsi * singha * sindec,
+                      cospsi * cosdec])
+        dx = resp.dot(x)
+        dy = resp.dot(y)
+        fplus = (x * dx - y * dy).sum()
+        fcross = (x * dy + y * dx).sum()
+
+        ehat = np.array([cosdec * cosgha, -cosdec * singha, sindec])
+        delta_t = (-self.location).dot(ehat) / constants.c.value
+        return fplus, fcross, delta_t
+
     def arrival_time(self, ref_tc, ra, dec, ref_frame='geocentric'):
         """Compute the arrival time in this detector.
         

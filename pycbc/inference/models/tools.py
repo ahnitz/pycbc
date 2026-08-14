@@ -470,8 +470,8 @@ class DistMarg():
 
             fp, fc, dtc = {}, {}, {}
             for ifo in self.data:
-                fp[ifo], fc[ifo] = d[ifo].antenna_pattern(ra, dec, 0.0, tcave)
-                dtc[ifo] = d[ifo].time_delay_from_earth_center(ra, dec, tcave)
+                fp[ifo], fc[ifo], dtc[ifo] = \
+                    d[ifo].antenna_pattern_and_delay(ra, dec, 0.0, tcave)
 
             dmap = {}
             for i, t in enumerate(tqdm.tqdm(zip(*dts))):

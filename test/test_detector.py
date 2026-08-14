@@ -96,6 +96,20 @@ class TestDetector(unittest.TestCase):
 
             self.assertLess(diff.max(), tolerance)
 
+    def test_antenna_pattern_and_delay(self):
+        # the combined call must agree with asking for the antenna pattern
+        # and for the delay separately
+        for ifo in self.d:
+            for ra1, dec1, pol1, time1 in list(zip(self.ra, self.dec,
+                                                   self.pol, self.time))[:10]:
+                fp, fc = ifo.antenna_pattern(ra1, dec1, pol1, time1)
+                dt = ifo.time_delay_from_earth_center(ra1, dec1, time1)
+                fp2, fc2, dt2 = ifo.antenna_pattern_and_delay(
+                    ra1, dec1, pol1, time1)
+                self.assertAlmostEqual(fp, fp2, places=12)
+                self.assertAlmostEqual(fc, fc2, places=12)
+                self.assertAlmostEqual(dt, dt2, places=14)
+
     def test_delay_from_detector(self):
         ra, dec, time = self.ra[0:10], self.dec[0:10], self.time[0:10]
         for d1 in self.d:
