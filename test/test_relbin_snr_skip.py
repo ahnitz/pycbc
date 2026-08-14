@@ -44,8 +44,11 @@ class TestRelbinSNRSkip(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # a fixed binary neutron star signal in simulated noise; the test
-        # is self-contained and does not depend on a shared fixture
+        # A fixed binary neutron star signal in simulated noise. The
+        # assertions only count what get_snr built, but the signal is not
+        # decoration: draw_ifos drops detectors whose reference signal to
+        # noise ratio is negligible, and with none left the precalculated
+        # pool cannot be built and construction raises.
         hp, hc = get_td_waveform(
             approximant='TaylorF2', f_lower=FLOW, delta_t=1. / SRATE,
             **{k: INJ[k] for k in ('mass1', 'mass2', 'distance',
