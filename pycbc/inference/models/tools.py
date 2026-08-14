@@ -303,6 +303,14 @@ class DistMarg():
         self._current_params.update(self.marginalize_vector_params)
         self.sample_idx = self.premarg['sample_idx'][choice]
 
+        # The precalculated points were themselves drawn from the sky grid,
+        # so the stored antenna factors describe this draw as well and go
+        # back with the indices that select it. They have to be restored
+        # here and not merely left alone: snr_draw discards them whenever a
+        # scalar coalescence time comes through, as it does during
+        # reconstruction, and this is the only place that puts them back.
+        self.precalc_antenna_factors = self.premarg['antenna_factors']
+
         # Update the importance weights for each vector sample
         logw = self.marginalize_vector_weights + logw[choice]
         self.marginalize_vector_weights = logw - logsumexp(logw)
@@ -334,8 +342,12 @@ class DistMarg():
                 return self.draw_sky_times(snrs, size=size)
         else:
             # OK, we couldn't do anything with the requested monte-carlo
-            # marginalizations.
+            # marginalizations. The stored factors and the indices that
+            # select from them describe a draw that no longer applies, and
+            # they are invalidated together so that neither can be used
+            # without the other.
             self.precalc_antenna_factors = None
+            self.sample_idx = None
             return None
 
     def draw_times(self, snrs, size=None):
@@ -724,6 +736,7 @@ class DistMarg():
             num_points = int(float(precalculate_marginalization_points))
             self.premarg = self.snr_draw(size=num_points, snrs=snrs).copy()
             self.premarg['sample_idx'] = self.sample_idx
+            self.premarg['antenna_factors'] = self.precalc_antenna_factors
 
         return keep_ifos
 
