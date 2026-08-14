@@ -146,7 +146,6 @@ class TestRelbinResolution(unittest.TestCase):
         self.assertTrue(numpy.isfinite(value))
         self.assertGreaterEqual(value, 0.)
 
-
     # 'auto' keeps the bins good enough while the sampler runs
 
     def wander(self, model, n=4000, spread=0.05):
@@ -207,16 +206,9 @@ class TestRelbinResolution(unittest.TestCase):
         self.assertEqual(model.rebins, 0)
         self.assertEqual(model.epsilon, 0.5)
 
-    def test_auto_settles(self):
-        """It must stop refining, not keep going for as long as it runs."""
-        model = self.wander(self.model('auto', fiducial=self.BAD_FIDUCIAL))
-        after = model.rebins
-        self.wander(model)
-        self.assertEqual(model.rebins, after,
-                         "still refining after settling")
-
-    def test_auto_only_ever_refines(self):
-        """Going back and forth would never settle."""
+    def test_auto_settles_and_only_ever_refines(self):
+        """It must stop refining rather than keep going for as long as it
+        runs, and never go back and forth, which would never settle."""
         model = self.model('auto', fiducial=self.BAD_FIDUCIAL)
         seen = []
         for _ in range(12):
@@ -224,34 +216,35 @@ class TestRelbinResolution(unittest.TestCase):
             seen.append(model.epsilon)
         self.assertEqual(seen, sorted(seen, reverse=True), "%s" % seen)
 
-    def test_screen_closes_the_high_snr_gap(self):
-        """The gap the fixed threshold left: a departure too small to trip
-        a threshold on the ratio, but not too small to matter at a loud
-        signal.
+        after = model.rebins
+        self.wander(model)
+        self.assertEqual(model.rebins, after,
+                         "still refining after settling")
 
-        The screen weighs the ratio error by the signal to noise ratio,
-        because that is what turns it into an error in the log likelihood.
-        A well-matched fiducial with coarse bins leaves a ratio error near
-        6e-4, under the old fixed threshold of 1e-3, so the old screen
-        skipped it however loud the signal. At this fixture's own strength
-        that skip is correct; at a loud signal it is not, and the new
-        screen refines. Checked on the screen's quantities so it does not
-        need an injection louder than the fixture can hold.
+    def test_the_screen_weighs_the_error_by_the_signal(self):
+        """A ratio error small on its own is not small at a loud signal.
+
+        The screen weighs the interpolation error by the signal to noise
+        ratio, because that is what turns it into an error in the log
+        likelihood. A well-matched fiducial with coarse bins leaves a ratio
+        error near 6e-4: worth less than the accuracy at this fixture's own
+        strength, and worth more than it at a loud one, so the ratio alone
+        cannot decide. Checked on the screen's own quantities, so it does
+        not need an injection louder than the fixture can hold.
         """
         model = self.model(0.5, fiducial={'mass1': 1.3756})
         model.update(**self.q)
         model.get_waveforms(model.current_params)
         error = model.interpolation_error_from_reference()
 
-        # under the old fixed threshold, so it was skipped regardless
+        # small as a ratio error
         self.assertLess(error, 1e-3)
-        # correct to skip at this signal's own strength
+        # worth skipping at this signal's own strength
         here_snr = (2.0 * max(model.loglr, 0.0)) ** 0.5
         self.assertLess(here_snr * error, model.accuracy)
-        # wrong to skip at a loud signal: the same bins now cost more than
-        # the accuracy, which the new screen sees and the old could not
+        # not worth skipping at a loud one: the same bins cost more than
+        # the accuracy asked for
         self.assertGreater(100.0 * error, model.accuracy)
-
 
     def test_diagnostic_survives_vector_valued_parameters(self):
         """A marginalized or batched parameter is a vector, not a number.

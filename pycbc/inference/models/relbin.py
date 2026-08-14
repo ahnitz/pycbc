@@ -410,11 +410,7 @@ class Relative(DistMarg, BaseGaussianNoise):
         # the log likelihood ratio is about the error in the waveform
         # ratio times the signal to noise ratio, and that ratio is about
         # the square root of twice the log likelihood ratio, so a small
-        # departure at a loud signal is not small in the likelihood. A
-        # fixed threshold on the ratio alone would pass a loud signal that
-        # is badly under resolved, and waste checks on a quiet one where
-        # the cost is genuinely small. Skipping only when the predicted
-        # cost is below the accuracy wanted handles both.
+        # departure at a loud signal is not small in the likelihood.
         snr = (2.0 * max(previous, 0.0)) ** 0.5
         if snr * self.interpolation_error_from_reference() < self.accuracy:
             self.interval = min(self.interval * 2, 32000)
