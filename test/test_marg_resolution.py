@@ -82,47 +82,49 @@ class TestMargResolution(unittest.TestCase):
         cls.point = {'distance': INJ['distance'],
                      'inclination': INJ['inclination']}
 
-    def model(self, sample_rate='auto', accuracy=0.005, vsamples=2000):
-        variable = ['distance', 'inclination', 'tc']
-        prior = JointDistribution(
-            list(variable), SinAngle(inclination=None),
+    VARIABLE = ['distance', 'inclination', 'tc']
+
+    def prior(self):
+        return JointDistribution(
+            list(self.VARIABLE), SinAngle(inclination=None),
             Uniform(distance=(10, 300)),
             Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH)))
+
+    def model(self, sample_rate='auto', accuracy=0.005, vsamples=2000):
         return models.RelativeTimeDom(
-            list(variable), copy.deepcopy(self.data),
+            list(self.VARIABLE), copy.deepcopy(self.data),
             low_frequency_cutoff=self.flow, psds=self.psds,
-            static_params=self.static, prior=prior,
+            static_params=self.static, prior=self.prior(),
             fiducial_params={'mass1': INJ['mass1'], 'mass2': INJ['mass2'],
                              'tc': TC},
             epsilon=0.1, marginalize_vector_params='tc',
             sample_rate=sample_rate, marginalization_accuracy=accuracy,
             marginalize_vector_samples=vsamples)
 
-    def scatter(self, model, ndraw=64):
-        """How far apart the same point lands on repeated evaluation."""
+    def repeated(self, model, ndraw=64, seed=4):
+        """The same point evaluated over and over, which is what the times
+        being drawn afresh each call makes scatter."""
         state = numpy.random.get_state()
         try:
-            numpy.random.seed(4)
+            numpy.random.seed(seed)
             values = []
             for _ in range(ndraw):
                 model.update(**self.point)
                 values.append(float(model.loglr))
         finally:
             numpy.random.set_state(state)
-        return numpy.std(values, ddof=1)
+        return values
+
+    def scatter(self, model, **kwargs):
+        return numpy.std(self.repeated(model, **kwargs), ddof=1)
 
     def integrated(self, npoint=2001):
         """The marginal computed by summing the likelihood over the prior,
         which needs no marginalization machinery to be correct."""
-        variable = ['distance', 'inclination', 'tc']
-        prior = JointDistribution(
-            list(variable), SinAngle(inclination=None),
-            Uniform(distance=(10, 300)),
-            Uniform(tc=(TC - HALFWIDTH, TC + HALFWIDTH)))
         model = models.Relative(
-            list(variable), copy.deepcopy(self.data),
+            list(self.VARIABLE), copy.deepcopy(self.data),
             low_frequency_cutoff=self.flow, psds=self.psds,
-            static_params=self.static, prior=prior,
+            static_params=self.static, prior=self.prior(),
             fiducial_params={'mass1': INJ['mass1'], 'mass2': INJ['mass2'],
                              'tc': TC}, epsilon=0.1)
         values = []
@@ -139,16 +141,7 @@ class TestMargResolution(unittest.TestCase):
         evaluations land, not where they land, so the answer is also
         checked against direct integration of the unmarginalized model.
         """
-        model = self.model()
-        state = numpy.random.get_state()
-        try:
-            numpy.random.seed(11)
-            values = []
-            for _ in range(16):
-                model.update(**self.point)
-                values.append(float(model.loglr))
-        finally:
-            numpy.random.set_state(state)
+        values = self.repeated(self.model(), ndraw=16, seed=11)
         error = numpy.std(values, ddof=1) / len(values) ** 0.5
         self.assertAlmostEqual(numpy.mean(values), self.integrated(),
                                delta=max(0.02, 4 * error))
@@ -165,29 +158,35 @@ class TestMargResolution(unittest.TestCase):
         self.assertLess(self.scatter(model), 1.5 * accuracy,
                         "chose %s Hz" % model.sample_rate)
 
-    def test_a_tighter_accuracy_buys_a_finer_rate(self):
-        """The knob has to be a knob, and it has to point the right way."""
+    def test_the_knobs_point_the_right_way(self):
+        """Resolution and the number of draws buy the same thing.
+
+        The scatter goes as one over the root of their product, so asking
+        for less of it must buy a finer rate, and asking for the same with
+        four times the draws must cost a coarser series rather than the
+        same one.
+        """
         rates = [self.model(accuracy=a).sample_rate
                  for a in (0.02, 0.005, 0.002)]
         self.assertTrue(rates[0] < rates[1] < rates[2], "%s" % rates)
 
-    def test_more_samples_buy_the_same_accuracy_at_a_coarser_rate(self):
-        """Resolution and the number of draws buy the same thing.
-
-        The scatter goes as one over the root of their product, so asking
-        for the same accuracy with four times the draws should cost a
-        coarser series rather than the same one.
-        """
         few = self.model(vsamples=1000).sample_rate
         many = self.model(vsamples=4000).sample_rate
         self.assertLess(many, few, "%s against %s" % (many, few))
 
-    def test_it_does_not_pay_for_more_resolution_than_it_needs(self):
+    def test_a_coarser_rate_would_not_have_done(self):
         """The series is rebuilt at every likelihood evaluation, so a rate
-        beyond what the accuracy calls for is a running cost.
+        beyond what the accuracy calls for is a running cost, and one below
+        it really is noisier.
 
-        Checked on the prediction rather than on a measurement, which is
-        the same statement one step earlier and costs no likelihood calls.
+        The first check is on the prediction, which is the same statement
+        one step earlier and costs no likelihood calls; the second measures
+        the scatter itself, on a signal the rule was not measured on,
+        rather than trusting that it tracks. Cutting the rate by eight cuts
+        the samples across the peak by eight, so the rule says the scatter
+        grows by getting on for three. It is compared loosely because the
+        finer scatter is near the floor that no rate removes, which makes
+        the ratio smaller than the rule alone says.
         """
         accuracy = 0.005
         model = self.model(accuracy=accuracy)
@@ -197,19 +196,8 @@ class TestMargResolution(unittest.TestCase):
         self.assertGreater(predicted, accuracy,
                            "%s Hz would have done" % coarser.sample_rate)
 
-    def test_a_coarser_rate_really_is_noisier(self):
-        """The prediction has to track the thing it stands for.
-
-        Cutting the rate by eight cuts the samples across the peak by
-        eight, so the rule says the scatter grows by getting on for three.
-        This checks it grows, on a signal the rule was not measured on,
-        rather than trusting that it does. It is checked loosely because
-        the scatter it is compared against is near the floor that no rate
-        removes, which makes the ratio smaller than the rule alone says.
-        """
-        fine = self.model()
-        coarse = self.model(sample_rate=fine.sample_rate / 8)
-        self.assertGreater(self.scatter(coarse), 1.5 * self.scatter(fine))
+        coarse = self.model(sample_rate=model.sample_rate / 8)
+        self.assertGreater(self.scatter(coarse), 1.5 * self.scatter(model))
 
     def test_an_explicit_rate_is_left_alone(self):
         """Asking for a rate must still get exactly that rate."""
