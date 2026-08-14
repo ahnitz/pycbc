@@ -17,11 +17,12 @@
 Detector estimates sidereal time by advancing it at a constant rate from a
 reference time, so it is exact at that reference and drifts away from it.
 The default reference is the time of GW150914, which is right for data from
-2015 and progressively wrong for everything since: at the time of GW170817,
-about two years later, the antenna pattern is off by around one part in ten
-thousand and the arrival time by most of a microsecond. The sky draws
-already reference the time being analyzed, so a detector left at the
-default was both wrong and inconsistent with them.
+2015 and progressively wrong for everything since. At the time of GW170817,
+about two years later, the antenna pattern is off by up to 1.1e-4 on
+factors of order one and the arrival time by up to 1.2 microseconds, both
+taken over the whole sky; at the position used below it is 0.5 to 0.7
+microseconds. The sky draws already reference the time being analyzed, so a
+detector left at the default was both wrong and inconsistent with them.
 """
 
 import unittest
