@@ -489,16 +489,17 @@ class Detector(object):
             The declination of the source.
         polarization: float
             The polarization angle of the source.
-        t_gps: float
-            The GPS time of the signal.
+        t_gps: float or numpy.ndarray
+            The GPS time of the signal. An array of times gives the
+            response at each of them.
 
         Returns
         -------
-        fplus: float
+        fplus: float or numpy.ndarray
             The plus polarization factor.
-        fcross: float
+        fcross: float or numpy.ndarray
             The cross polarization factor.
-        delta_t: float
+        delta_t: float or numpy.ndarray
             The delay from the earth center to this detector.
         """
         gha = self.gmst_estimate(t_gps) - right_ascension
@@ -506,19 +507,23 @@ class Detector(object):
         cosdec, sindec = cos(declination), sin(declination)
         cospsi, sinpsi = cos(polarization), sin(polarization)
 
+        # t_gps may be an array; broadcast the terms that do not depend on
+        # it so the stacked vectors below stay rectangular.
+        bcast = np.zeros_like(gha)
+
         resp = self.response
         x = np.array([-cospsi * singha - sinpsi * cosgha * sindec,
                       -cospsi * cosgha + sinpsi * singha * sindec,
-                      sinpsi * cosdec])
+                      sinpsi * cosdec + bcast])
         y = np.array([sinpsi * singha - cospsi * cosgha * sindec,
                       sinpsi * cosgha + cospsi * singha * sindec,
-                      cospsi * cosdec])
+                      cospsi * cosdec + bcast])
         dx = resp.dot(x)
         dy = resp.dot(y)
-        fplus = (x * dx - y * dy).sum()
-        fcross = (x * dy + y * dx).sum()
+        fplus = (x * dx - y * dy).sum(axis=0)
+        fcross = (x * dy + y * dx).sum(axis=0)
 
-        ehat = np.array([cosdec * cosgha, -cosdec * singha, sindec])
+        ehat = np.array([cosdec * cosgha, -cosdec * singha, sindec + bcast])
         delta_t = (-self.location).dot(ehat) / constants.c.value
         return fplus, fcross, delta_t
 
