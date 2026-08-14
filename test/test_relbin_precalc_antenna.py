@@ -21,9 +21,8 @@ Working them out again from the sky coordinates on every evaluation is the
 same answer computed twice, and for a thousand pointings in three detectors
 it is a few milliseconds of every likelihood call. These tests check that
 the stored values are the ones actually used, that they still line up
-sample for sample with the draw they belong to, and that the two situations
-in which they do not apply -- no sky draw ever happened, and a response that
-varies across the frequency bins -- still fall back to computing them.
+sample for sample with the draw they belong to, and that the situations in
+which they do not apply still fall back to computing them.
 """
 
 import unittest
@@ -39,12 +38,10 @@ from pycbc.psd import aLIGOZeroDetHighPower
 from pycbc.waveform import get_td_waveform
 
 TC = 1187008882.42840
-# The coalescence time prior is deliberately not centred on the fiducial
-# time, as it is not in the shipped configurations. The stored factors are
-# evaluated in the middle of that prior and the recomputed ones at the
-# fiducial time, so this offset is the whole of the difference between the
-# two paths; centring the prior would make them agree bit for bit and the
-# comparison below would prove nothing.
+# The coalescence time prior is deliberately off-centre from the fiducial
+# time: the stored factors are evaluated in the middle of the prior and the
+# recomputed ones at the fiducial time, so centring it would make the two
+# paths agree bit for bit and the comparison below would prove nothing.
 TCMIN, TCMAX = TC - 0.02, TC + 0.08
 FLOW, SEGLEN, SRATE = 25., 16, 2048
 RA, DEC, POL = 1.7, -0.4, 0.3
@@ -124,31 +121,15 @@ class TestRelbinPrecalcAntenna(unittest.TestCase):
             marginalize_sky_initial_samples=SKY_SAMPLES,
             sample_rate=4096, **extra)
 
-    def test_stored_factors_are_used_when_the_sky_is_drawn(self):
-        """The whole point: with a sky draw in hand, nothing is recomputed."""
-        model = self.model()
-        used = watch_precalc_use(model)
-        model.update(distance=45., inclination=0.6)
-        self.assertTrue(numpy.isfinite(model.loglr))
-        self.assertTrue(model.precalc_antenna_factors,
-                        "the sky draw stored no antenna factors")
-        self.assertEqual(sorted(used), sorted(model.data),
-                         "the stored factors were not used for every "
-                         "detector (used: %s)" % used)
-
-    def test_stored_factors_belong_to_the_samples_that_were_drawn(self):
-        """The lookup has to be aligned with the draw, sample for sample.
+    def assert_factors_match_the_draw(self, model):
+        """The stored factors must line up with the draw, sample for sample.
 
         get_precalc_antenna_factors indexes the full pointing grid with the
         indices the draw kept, so element i must describe the same patch of
-        sky as element i of the drawn ra and dec. If that alignment were off
-        the values would not be slightly different from the recomputed ones,
-        they would be unrelated to them, and the likelihood would quietly be
-        using another sky position's response.
+        sky as element i of the drawn ra and dec. A misalignment would not
+        leave the values slightly off, it would leave them unrelated, and
+        the likelihood would quietly use another sky position's response.
         """
-        model = self.model()
-        model.update(distance=45., inclination=0.6)
-        model.loglr
         p = model.current_params
         for ifo in model.data:
             fp, fc, dt = model.get_precalc_antenna_factors(ifo)
@@ -159,33 +140,40 @@ class TestRelbinPrecalcAntenna(unittest.TestCase):
                                                               p['dec'], atime)
             self.assertLess(max(abs(fp - rfp).max(), abs(fc - rfc).max()),
                             1e-4, "%s response does not match its draw" % ifo)
-            self.assertLess(abs(dt - rdt).max(), 1e-6,
+            # the earth turns 9.2e-7 s of delay per second, and the two
+            # evaluations are about a second apart, so this is a bound on
+            # the offset rather than on the alignment; the roll below is
+            # what holds the alignment down
+            self.assertLess(abs(dt - rdt).max(), 1e-5,
                             "%s delay does not match its draw" % ifo)
 
-            # and a misalignment really would show up here, so the
-            # tolerances above are not passing for free: sliding the draw
-            # by a single sample moves the response by order unity
+            # the tolerances above are not passing for free: sliding the
+            # draw by one sample moves the response by order unity
             self.assertGreater(abs(numpy.roll(fp, 1) - rfp).max(), 0.1)
 
-    def test_loglr_agrees_with_recomputing_the_factors(self):
-        """The stored and recomputed factors are close but not identical.
+    def test_stored_factors_are_used_and_give_the_same_loglr(self):
+        """The whole point: with a sky draw in hand, nothing is recomputed.
 
-        Both are the response of a detector that is referenced at the time
-        being analysed, but they are evaluated at slightly different times:
-        the stored ones in the middle of the coalescence time prior, where
-        the pointing grid was built, the recomputed ones at the fiducial
-        time. Over the tenth of a second that separates them the earth turns
-        far too little to matter: the response differs by a part in a
-        million and the log likelihood ratio by about as much, comfortably
-        inside the tolerance asserted here and far under any scale a
-        sampler can see. Reaching for the wrong samples, by contrast,
-        would move it by tens.
+        The stored and the recomputed factors are close but not identical,
+        as they are evaluated at slightly different times: the stored ones
+        in the middle of the coalescence time prior, where the pointing grid
+        was built, the recomputed ones at the fiducial time. Over the second
+        or so between them the earth turns far too little to matter, so the
+        log likelihood ratio moves by a part in a million, far under any
+        scale a sampler can see. Reaching for the wrong samples, by
+        contrast, would move it by tens.
         """
         model = self.model()
         used = watch_precalc_use(model)
         model.update(distance=45., inclination=0.6)
         with_stored = model.loglr
-        self.assertEqual(len(used), len(model.data))
+        self.assertTrue(numpy.isfinite(with_stored))
+        self.assertTrue(model.precalc_antenna_factors,
+                        "the sky draw stored no antenna factors")
+        self.assertEqual(sorted(used), sorted(model.data),
+                         "the stored factors were not used for every "
+                         "detector (used: %s)" % used)
+        self.assert_factors_match_the_draw(model)
 
         # Re-evaluate the very same draw with the factors worked out again.
         # The draw is frozen so the sample set cannot move underneath the
@@ -200,49 +188,26 @@ class TestRelbinPrecalcAntenna(unittest.TestCase):
         model.precalc_antenna_factors = None
         recomputed = model._loglr()
         self.assertEqual(used, [], "the fallback still used stored factors")
-
         self.assertLess(abs(with_stored - recomputed) / abs(recomputed), 1e-4,
                         "stored %r vs recomputed %r" % (with_stored,
                                                         recomputed))
-
-    def test_scalar_time_falls_back(self):
-        """Reconstruction asks for one definite sky position and time.
-
-        The vector marginalization is switched off for that call and the
-        stored factors, which describe a thousand other pointings, are
-        discarded. Anything indexing them would be reading a leftover draw.
-        """
-        model = self.model()
-        used = watch_precalc_use(model)
-        model.update(distance=45., inclination=0.6)
-        model.loglr
-        self.assertTrue(model.precalc_antenna_factors)
-
-        del used[:]
-        model.update(distance=45., inclination=0.6, tc=TC, ra=RA, dec=DEC)
-        self.assertTrue(numpy.isfinite(model.loglr))
-        self.assertIsNone(model.precalc_antenna_factors)
-        self.assertEqual(used, [], "stored factors used for a scalar time")
 
     def test_precalculated_points_keep_the_factors_after_a_scalar_time(self):
         """The fast path has to survive a reconstruction, not just precede it.
 
         With precalculate_marginalization_points set -- the configuration
-        the shipped examples use and the one the saving was measured in --
-        every draw comes from premarg_draw, which selects a subset of the
-        points chosen once at setup. A scalar coalescence time discards the
-        stored factors, and premarg_draw is then the only thing that can put
-        them back; if it does not, the very first reconstruction turns the
-        reuse off for the rest of the run and the optimization silently
-        stops optimizing while every test above still passes.
+        the shipped examples use -- every draw comes from premarg_draw,
+        which selects a subset of the points chosen once at setup. A scalar
+        coalescence time discards the stored factors, and premarg_draw is
+        the only thing that can put them back; if it does not, the first
+        reconstruction turns the reuse off for the rest of the run.
         """
         model = self.model(premarg=True)
         self.assertTrue(hasattr(model, 'premarg'),
                         "the precalculated points were not built")
         used = watch_precalc_use(model)
         model.update(distance=45., inclination=0.6)
-        before = model.loglr
-        self.assertTrue(numpy.isfinite(before))
+        self.assertTrue(numpy.isfinite(model.loglr))
         self.assertEqual(sorted(used), sorted(model.data))
 
         # A reconstruction-style call: one definite sky position and time.
@@ -265,27 +230,33 @@ class TestRelbinPrecalcAntenna(unittest.TestCase):
                              "(draw %d, used: %s)" % (step, used))
 
         # Restoring them is only right if they still describe the draw that
-        # was made; handing back a leftover set would pass every assertion
-        # above and quietly use another sky position's response.
-        p = model.current_params
-        for ifo in model.data:
-            fp, fc, dt = model.get_precalc_antenna_factors(ifo)
-            atime = model.antenna_time[ifo]
-            rfp, rfc = model.det[ifo].antenna_pattern(p['ra'], p['dec'],
-                                                      0, atime)
-            rdt = model.det[ifo].time_delay_from_earth_center(p['ra'],
-                                                              p['dec'], atime)
-            self.assertLess(max(abs(fp - rfp).max(), abs(fc - rfc).max()),
-                            1e-4, "%s response does not match its draw" % ifo)
-            self.assertLess(abs(dt - rdt).max(), 1e-6,
-                            "%s delay does not match its draw" % ifo)
+        # was made; a leftover set would pass every assertion above.
+        self.assert_factors_match_the_draw(model)
 
-    def test_no_sky_marginalization_falls_back(self):
-        """With only the time marginalized no pointings are ever drawn.
+    def test_falls_back_where_the_stored_factors_do_not_apply(self):
+        """Three configurations with nothing applicable to index.
 
-        The factors are then still their initial value and there is nothing
-        to index, so the response has to be computed as before.
+        Reconstruction asks for one definite sky position and time, so the
+        pointings the draw held no longer describe it. With only the time
+        marginalized none are ever drawn. With earth rotation the response
+        is a vector over the bins, evaluated at the time the signal was at
+        each frequency, and no single stored number can stand in for it --
+        using one would throw away the frequency dependence that is the
+        whole reason the option exists. Each has to compute the response.
         """
+        # a scalar coalescence time, as reconstruction uses
+        model = self.model()
+        used = watch_precalc_use(model)
+        model.update(distance=45., inclination=0.6)
+        model.loglr
+        self.assertTrue(model.precalc_antenna_factors)
+        del used[:]
+        model.update(distance=45., inclination=0.6, tc=TC, ra=RA, dec=DEC)
+        self.assertTrue(numpy.isfinite(model.loglr))
+        self.assertIsNone(model.precalc_antenna_factors)
+        self.assertEqual(used, [], "stored factors used for a scalar time")
+
+        # no sky marginalization, so no pointings were ever drawn
         model = self.model(sky=False)
         used = watch_precalc_use(model)
         model.update(distance=45., inclination=0.6)
@@ -293,25 +264,16 @@ class TestRelbinPrecalcAntenna(unittest.TestCase):
         self.assertFalse(model.precalc_antenna_factors)
         self.assertEqual(used, [], "stored factors used without a sky draw")
 
-    def test_earth_rotation_falls_back(self):
-        """With earth rotation on the response is a function of frequency.
-
-        Each bin is evaluated at the time the signal was at that frequency,
-        so the response is a vector over the bins, while what the sky draw
-        stored is a single number per pointing. The stored values cannot
-        stand in for it, and using them would silently throw the frequency
-        dependence away, which is the entire reason the option exists.
-        """
+        # earth rotation, so the response varies across the bins
         model = self.model(earth_rotation=True)
         used = watch_precalc_use(model)
         model.update(distance=45., inclination=0.6)
         try:
             model.loglr
         except Exception:
-            # A marginalized sky and earth rotation is not a combination
-            # the model supports, and this is where it has always come
-            # apart. Failing is fine; quietly answering with the wrong
-            # factors would not be.
+            # A marginalized sky with earth rotation is not a combination
+            # the model supports, and this is where it comes apart.
+            # Failing is fine; answering with the wrong factors is not.
             pass
         self.assertTrue(model.precalc_antenna_factors,
                         "the sky draw stored no antenna factors")
@@ -319,10 +281,10 @@ class TestRelbinPrecalcAntenna(unittest.TestCase):
 
         # and the response really does depend on frequency here, so there
         # is genuinely no single number that could have been substituted
-        times = model.antenna_time[list(model.data)[0]]
+        ifo = list(model.data)[0]
+        times = model.antenna_time[ifo]
         self.assertGreater(len(times), 1)
-        fp, _ = model.det[list(model.data)[0]].antenna_pattern(RA, DEC, 0,
-                                                               times)
+        fp, _ = model.det[ifo].antenna_pattern(RA, DEC, 0, times)
         self.assertGreater(abs(fp.max() - fp.min()), 1e-4)
 
 
