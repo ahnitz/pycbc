@@ -12,13 +12,13 @@
 # You should have received a copy of the GNU General Public License along
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
-"""Tests the warning when the distance interpolator range is exceeded.
+"""Tests of the wrapper around the distance marginalization interpolant.
 
-The distance-marginalized likelihood is interpolated over a fixed range
-of signal to noise ratio; outside it the value is dropped to zero, which
-biases the result. That used to happen silently. This checks that the
-first time it happens the run says so, once, and that staying inside the
-range says nothing.
+The distance-marginalized likelihood is interpolated over a fixed range of
+signal to noise ratio; outside it the value is dropped to zero, which
+biases the result, so the run has to say so. And what the wrapper returns
+for a single point has to be recognizable to its caller as a single point,
+or the answer is marginalized a second time over nothing.
 """
 
 import logging
@@ -27,10 +27,13 @@ import unittest
 import numpy
 from utils import simple_exit
 
-from pycbc.inference.models.tools import setup_distance_marg_interpolant
+from pycbc.inference.models.tools import (marginalize_likelihood,
+                                          setup_distance_marg_interpolant)
+
+VSAMPLES = 1000
 
 
-class TestDistanceBoundsWarning(unittest.TestCase):
+class TestDistanceInterpolantWrapper(unittest.TestCase):
 
     def interpolant(self, snr_range=(5, 40)):
         dist_rescale = numpy.linspace(0.5, 2.0, 60)
@@ -38,15 +41,13 @@ class TestDistanceBoundsWarning(unittest.TestCase):
         return setup_distance_marg_interpolant(
             (dist_rescale, weights), snr_range=snr_range, density=(60, 60))
 
-    def test_in_range_is_silent(self):
+    def test_warns_once_and_only_outside_the_range(self):
         interp = self.interpolant()
         with self.assertNoLogs(level='WARNING'):
             # a signal to noise ratio of about 20, well inside (5, 40)
             interp(200.0, 100.0)
             interp(numpy.array([150.0, 300.0]), numpy.array([80.0, 120.0]))
 
-    def test_out_of_range_warns_once(self):
-        interp = self.interpolant()
         with self.assertLogs(level='WARNING') as caught:
             interp(1e9, 1e12)
             interp(1e9, 1e12)
@@ -55,23 +56,6 @@ class TestDistanceBoundsWarning(unittest.TestCase):
         self.assertEqual(len(caught.records), 1)
         self.assertIn('snr_range', caught.records[0].getMessage().lower()
                       .replace('signal to noise ratio', 'snr_range'))
-
-    def test_scalar_query_returns_a_scalar(self):
-        """A single point has nothing to marginalize over.
-
-        The spline returns a scalar query as a length-one array, which the
-        caller folds through the vector-marginalization weight, subtracting
-        log(marginalize_vector_samples) from a distance-only marginalized
-        likelihood. The wrapper must hand a scalar back for a scalar query,
-        and an array only for an array query.
-        """
-        interp = self.interpolant()
-        one = interp(200.0, 100.0)
-        self.assertEqual(numpy.ndim(one), 0)
-        many = interp(numpy.array([200.0, 150.0]),
-                      numpy.array([100.0, 80.0]))
-        self.assertEqual(numpy.ndim(many), 1)
-        self.assertEqual(len(many), 2)
 
     def test_out_of_range_still_returns_minus_inf(self):
         """The warning must not change the value: still -inf out of range."""
@@ -85,10 +69,35 @@ class TestDistanceBoundsWarning(unittest.TestCase):
         self.assertTrue(numpy.isfinite(v[0]))
         self.assertEqual(v[1], -numpy.inf)
 
+    def test_a_scalar_query_is_not_marginalized_a_second_time(self):
+        """A single point has nothing to marginalize over.
+
+        marginalize_likelihood decides whether its input is a vector of
+        drawn points by asking whether it is a float, and a
+        zero-dimensional array is not one. Handed that, it folds the value
+        through the vector-marginalization weight and the likelihood comes
+        out low by exactly log(marginalize_vector_samples) -- 6.9 nats at
+        the default. So the wrapper has to return a float for a scalar
+        query, and an array only for an array query.
+        """
+        interp = self.interpolant()
+        one = interp(200.0, 100.0)
+        self.assertIsInstance(one, float)
+        self.assertEqual(
+            marginalize_likelihood(200.0, 100.0, logw=-numpy.log(VSAMPLES),
+                                   interpolator=interp, distance=True,
+                                   phase=True),
+            one)
+
+        many = interp(numpy.array([200.0, 150.0]),
+                      numpy.array([100.0, 80.0]))
+        self.assertEqual(numpy.ndim(many), 1)
+        self.assertEqual(len(many), 2)
+
 
 suite = unittest.TestSuite()
-suite.addTest(
-    unittest.TestLoader().loadTestsFromTestCase(TestDistanceBoundsWarning))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(
+    TestDistanceInterpolantWrapper))
 
 if __name__ == '__main__':
     results = unittest.TextTestRunner(verbosity=2).run(suite)

@@ -845,11 +845,10 @@ def setup_distance_marg_interpolant(dist_marg,
                                                  phase=phase)
     interp = RectBivariateSpline(shr, hhr, lvals)
 
-    # warn the first time the sampler asks outside the interpolated range,
-    # rather than silently returning -inf. Beyond the range the distance
-    # marginalized likelihood is dropped to zero, which biases the result;
-    # the fix is a wider marginalize_distance_snr_range. Reported in signal
-    # to noise ratio, which is what the option is set in.
+    # warn once when the sampler asks outside the interpolated range, where
+    # the distance marginalized likelihood is dropped to zero and the
+    # result is biased. Reported in signal to noise ratio, which is what
+    # marginalize_distance_snr_range is set in.
     warned = [False]
 
     def warn_out_of_range(over):
@@ -877,13 +876,11 @@ def setup_distance_marg_interpolant(dist_marg,
         v = interp(x, y, grid=False)
         if k is not None:
             v[k] = -numpy.inf
-        # a scalar query is a single point with nothing to marginalize over;
-        # the spline returns it as a length-one array, which the caller then
-        # mistakes for a vector and folds through the vector-marginalization
-        # weight, subtracting log(marginalize_vector_samples) from the
-        # distance-marginalized likelihood. Hand back a scalar so it does
-        # not. Only bites distance marginalization without an accompanying
-        # time or sky marginalization; with one, x is a genuine vector.
+        # a scalar query is a single point with nothing to marginalize
+        # over, but the spline hands it back as a zero-dimensional array,
+        # which marginalize_likelihood does not recognize as a scalar and
+        # so folds through the vector-marginalization weight. Return a
+        # float so it does not.
         if numpy.ndim(x) == 0:
             return float(v)
         return v
