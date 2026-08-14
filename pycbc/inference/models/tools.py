@@ -612,6 +612,7 @@ class DistMarg():
         idx = []
         dx = []
         mcweight = None
+        _saved = {}
         for ifo in ifos:
             snr = snrs[ifo]
             tmin, tmax = tcmin - EARTH_RADIUS, tcmax + EARTH_RADIUS
@@ -624,6 +625,7 @@ class DistMarg():
             snr = snr.time_slice(start, end, mode='nearest')
 
             w = snr.squared_norm().numpy() / 2.0
+            _saved[ifo] = (snr, w.copy())
             i = draw_sample(w, size=ndraw)
             # the times were drawn from this detector's series in
             # proportion to its likelihood, so normalizing over that
@@ -644,6 +646,27 @@ class DistMarg():
                 mcweight = w[i]
 
             idx.append(i)
+
+        # ADAPTIVE B2: only the atoms that actually miss pay for oversampling.
+        # A first pass at `vsamples` is the current cost; if too few draws land
+        # in a populated cell we redraw once with a count estimated from the
+        # observed acceptance fraction. Healthy atoms therefore stay at 1x.
+        def _draw_delays(n):
+            _sref = _iref = None
+            _idx, _dx, _mcw = [], [], None
+            for _ifo in ifos:
+                _snr, _w = _saved[_ifo]
+                _i = draw_sample(_w, size=n)
+                _wn = _w - logsumexp(_w)
+                if _sref is not None:
+                    _mcw = _mcw + _wn[_i]
+                    _delt = float(_snr.start_time - _sref.start_time)
+                    _i = _i + round(_delt / _sref.delta_t)
+                    _dx.append(_iref - _i)
+                else:
+                    _sref, _iref, _mcw = _snr, _i, _wn[_i]
+                _idx.append(_i)
+            return _sref, _iref, _dx, _mcw
 
         # check if delay is in dict, if not, throw out
         rand = numpy.random.uniform(0, 1, size=ndraw)
