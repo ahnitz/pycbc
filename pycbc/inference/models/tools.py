@@ -2,6 +2,7 @@
 """
 
 import logging
+import os as _os
 import warnings
 from distutils.util import strtobool
 
@@ -340,6 +341,13 @@ class DistMarg():
         # size of the prior would cancel out of the answer.
         self.marginalize_vector_weights = \
             self.marginalize_vector_weights + logw[choice]
+
+        if _os.environ.get('MARG_ORIENT'):
+            corr = self._draw_orientation()
+            if corr is not None:
+                self.marginalize_vector_weights = \
+                    self.marginalize_vector_weights + corr
+                self._current_params.update(self.marginalize_vector_params)
         return self.marginalize_vector_params
 
     def snr_draw(self, wfs=None, snrs=None, size=None):
@@ -738,6 +746,86 @@ class DistMarg():
             ti = list(ti)
             ix = list(ix)
             wi = list(wi)
+
+            # STEP 2 (env MARG_COH=1): bias WHICH POINT we take from each
+            # delay bin, using amplitude/phase consistency.
+            #
+            # The delay match fixes the bin; within it the members differ in
+            # sub-sample delay and antenna response, and the relative
+            # amplitudes/phases across detectors say which is right - the only
+            # sky information the delay draw never uses. For a member the model
+            # in detector i is (a+ F+_i + ax Fx_i) h+, so with
+            #   y_k = sum_i F_ki sh_i ,  G_kl = sum_i F_ki F_li hh_i
+            # the consistency is coh = y^dag G^-1 y / 2, already maximised over
+            # distance, phase, inclination and polarization.
+            #
+            # Selecting member j with probability p_j instead of 1/count means
+            # the prior/proposal contribution becomes 1/(N_initial p_j) rather
+            # than count/N_initial, so the estimator is unchanged.
+            if _os.environ.get('MARG_COH') and len(ti) and hasattr(self, 'hh'):
+                _ti = numpy.array(ti, dtype=int)
+                _ck = numpy.array(codes_k, dtype=int)
+                _cn = numpy.array(counts_k, dtype=int)
+                _wi = numpy.array(wi, dtype=float)
+                _ix = numpy.array(ix, dtype=int)
+                _multi = numpy.nonzero(_cn > 1)[0]
+                if len(_multi):
+                    _off = lookup['offset'][_ck[_multi]]
+                    _cnt = _cn[_multi]
+                    _grp = numpy.repeat(numpy.arange(len(_multi)), _cnt)
+                    _mem = numpy.concatenate([lookup['flat'][o:o + c]
+                                              for o, c in zip(_off, _cnt)])
+                    _base = (iref[_ti[_multi]] * sref.delta_t
+                             + float(sref.start_time))
+                    _b = numpy.repeat(_base, _cnt)
+                    _y = numpy.zeros((2, len(_mem)), dtype=complex)
+                    _G = numpy.zeros((2, 2, len(_mem)))
+                    _d0 = dtc[ifos[0]][_mem]
+                    for _ifo in ifos:
+                        _t = _b + (dtc[_ifo][_mem] - _d0)
+                        _shv = self.sh[_ifo].at_time(_t, interpolate='quadratic',
+                                                     extrapolate=0.0j)
+                        _F = numpy.stack([fp[_ifo][_mem], fc[_ifo][_mem]])
+                        _hh = float(self.hh[_ifo])
+                        _y += _F * numpy.asarray(_shv)
+                        for _p in range(2):
+                            for _q in range(2):
+                                _G[_p, _q] += _F[_p] * _F[_q] * _hh
+                    _dd = _G[0, 0] * _G[1, 1] - _G[0, 1] * _G[1, 0]
+                    _dd = numpy.where(numpy.abs(_dd) < 1e-30, 1e-30, _dd)
+                    _coh = 0.5 * (numpy.abs(_y[0]) ** 2 * _G[1, 1]
+                                  + numpy.abs(_y[1]) ** 2 * _G[0, 0]
+                                  - 2.0 * (_y[0].conj() * _y[1]).real * _G[0, 1]) / _dd
+                    _coh = numpy.where(numpy.isfinite(_coh), _coh, -numpy.inf)
+                    # softmax within each group, then one draw per group
+                    _mx = numpy.full(len(_multi), -numpy.inf)
+                    numpy.maximum.at(_mx, _grp, _coh)
+                    _T = float(_os.environ.get('MARG_COH_T', '1'))
+                    _e = numpy.exp((_coh - _mx[_grp]) / _T)
+                    _sum = numpy.zeros(len(_multi))
+                    numpy.add.at(_sum, _grp, _e)
+                    _pm = _e / _sum[_grp]
+                    _u = numpy.random.uniform(0, 1, len(_multi))
+                    _cum = numpy.zeros(len(_mem))
+                    _acc = numpy.zeros(len(_multi))
+                    for _j in range(len(_mem)):        # small groups; fine
+                        _acc[_grp[_j]] += _pm[_j]
+                        _cum[_j] = _acc[_grp[_j]]
+                    _hit = _cum >= _u[_grp]
+                    _first = numpy.zeros(len(_multi), dtype=int)
+                    _seen = numpy.zeros(len(_multi), dtype=bool)
+                    for _j in range(len(_mem)):
+                        _g = _grp[_j]
+                        if _hit[_j] and not _seen[_g]:
+                            _first[_g] = _j; _seen[_g] = True
+                    _sel = _first[_seen]
+                    _gs = numpy.nonzero(_seen)[0]
+                    _ix[_multi[_gs]] = _mem[_sel]
+                    _wi[_multi[_gs]] = 1.0 / (self.marginalize_sky_initial_samples
+                                              * _pm[_sel])
+                    ix = list(_ix); wi = list(_wi)
+                    logging.debug('MARG_COH: within-bin selection on %d of %d '
+                                  'candidates', len(_multi), len(_ti))
         else:
             ti = []
             ix = []
@@ -798,6 +886,12 @@ class DistMarg():
         self.marginalize_vector_params['tc'] = tc
         self.marginalize_vector_params['ra'] = ra
         self.marginalize_vector_params['dec'] = dec
+
+        if _os.environ.get('MARG_ORIENT'):
+            corr = self._draw_orientation()
+            if corr is not None:
+                logw_sky = logw_sky + corr
+
         self.marginalize_vector_params['logw_partial'] = logw_sky
 
         if self._current_params is not None:
@@ -806,6 +900,137 @@ class DistMarg():
             self.marginalize_vector_weights += logw_sky
 
         return self.marginalize_vector_params
+
+    def _orientation_grid(self):
+        """Cell centres and coefficients for the (iota,psi) proposal grid.
+
+        These depend only on the grid, so they are built once and reused.
+        """
+        nc = int(_os.environ.get('MARG_ORIENT_NC', '24'))
+        npsi = int(_os.environ.get('MARG_ORIENT_NP', '12'))
+        key = (nc, npsi)
+        if getattr(self, '_orient_grid_key', None) == key:
+            return self._orient_grid
+        ce = numpy.linspace(-1.0, 1.0, nc + 1)
+        pe = numpy.linspace(0.0, 2.0 * numpy.pi, npsi + 1)
+        cm = 0.5 * (ce[:-1] + ce[1:])
+        pm = 0.5 * (pe[:-1] + pe[1:])
+        CM, PM = numpy.meshgrid(cm, pm, indexing='ij')
+        CM = CM.ravel()
+        PM = PM.ravel()
+        ip = 0.5 * (1.0 + CM ** 2)
+        c2 = numpy.cos(2.0 * PM)
+        s2 = numpy.sin(2.0 * PM)
+        k1 = ip ** 2 * c2 ** 2 + CM ** 2 * s2 ** 2
+        k2 = ip ** 2 * s2 ** 2 + CM ** 2 * c2 ** 2
+        k3 = 2.0 * c2 * s2 * (ip ** 2 - CM ** 2)
+        k4 = -2.0 * ip * CM
+        self._orient_grid = (nc, npsi, ce, pe,
+                             numpy.stack([k1, k2, k3, k4]),
+                             numpy.stack([k1, k2, k3]))
+        self._orient_grid_key = key
+        return self._orient_grid
+
+    def _draw_orientation(self):
+        """Draw (inclination, polarization) conditional on each sky sample.
+
+        At a fixed sky location the whole orientation dependence of the
+        likelihood is carried by five numbers,
+            Y_p = sum_i sh_i fp_i,  Y_c = sum_i sh_i fc_i     (complex)
+            G_pp = sum_i hh_i fp_i^2, G_pc, G_cc              (real)
+        because with f_i = (fp_i + i fc_i) exp(-2i psi),
+            sh_total = ip (c2 Y_p + s2 Y_c) + i cos(iota) (-s2 Y_p + c2 Y_c)
+        and Im(A* B) turns out to be Im(Y_p* Y_c), independent of psi. So
+        |sh|^2 and hh_total are bilinear: the sky sample supplies seven real
+        numbers and the grid cell supplies four coefficients, which makes the
+        whole grid two small matrix products and no SNR gathers beyond the
+        one already needed per detector.
+
+        The grid only defines a piecewise-constant proposal. The draw is
+        uniform WITHIN the chosen cell and every cell keeps a defensive floor,
+        so the support is the full continuous (iota, psi) space. The returned
+        log(prior/proposal) makes the estimator identical to drawing from the
+        prior.
+        """
+        vp = self.marginalize_vector_params
+        if ('inclination' not in vp or 'polarization' not in vp
+                or 'tc' not in vp):
+            return None
+        if not hasattr(self, 'sh') or not hasattr(self, 'hh'):
+            return None
+        tc = numpy.asarray(vp['tc'], dtype=float)
+        if tc.ndim == 0 or tc.size < 2:
+            return None
+        try:
+            ifos = list(self.sh.keys())
+            n = tc.size
+            Yp = numpy.zeros(n, dtype=complex)
+            Yc = numpy.zeros(n, dtype=complex)
+            Gpp = numpy.zeros(n)
+            Gpc = numpy.zeros(n)
+            Gcc = numpy.zeros(n)
+            for ifo in ifos:
+                fp, fc, dt = self.get_precalc_antenna_factors(ifo)
+                sh = numpy.asarray(self.sh[ifo].at_time(
+                    tc + dt, interpolate='quadratic', extrapolate=0.0j))
+                hh = float(self.hh[ifo])
+                Yp += sh * fp
+                Yc += sh * fc
+                Gpp += hh * fp * fp
+                Gpc += hh * fp * fc
+                Gcc += hh * fc * fc
+        except Exception as e:
+            logging.debug('orientation draw unavailable: %s', e)
+            return None
+
+        nc, npsi, ce, pe, Wsh, Whh = self._orientation_grid()
+        ncell = nc * npsi
+        eps = float(_os.environ.get('MARG_ORIENT_EPS', '0.02'))
+        YY = Yp.conj() * Yc
+        Xsh = numpy.stack([Yp.real ** 2 + Yp.imag ** 2,
+                           Yc.real ** 2 + Yc.imag ** 2,
+                           YY.real, YY.imag], axis=1)
+        Xhh = numpy.stack([Gpp, Gcc, Gpc], axis=1)
+        sh2 = (Xsh @ Wsh).T.astype(numpy.float32)
+        hh2 = (Xhh @ Whh).T.astype(numpy.float32)
+        numpy.maximum(sh2, 1e-30, out=sh2)
+        numpy.maximum(hh2, 1e-30, out=hh2)
+        # Laplace value of int u^-4 exp(|sh| u - hh u^2 / 2) du with u = 1/d:
+        # the prior VOLUME containment under a uniform-in-volume distance
+        # prior, which is what the proposal should track. It is only the
+        # proposal, so the approximation costs efficiency and not accuracy.
+        ll = sh2 / (2.0 * hh2) + 2.0 * (numpy.log(hh2) - numpy.log(sh2))
+        ll[~numpy.isfinite(ll)] = -numpy.inf
+
+        mx = ll.max(axis=0)
+        E = numpy.exp(ll - mx[None, :], out=ll)
+        Z = E.sum(axis=0)
+        bad = ~numpy.isfinite(Z) | (Z <= 0)
+        if bad.any():
+            E[:, bad] = 1.0
+            Z = numpy.where(bad, float(ncell), Z)
+        cum = numpy.cumsum(E, axis=0)
+        u = numpy.random.random(n).astype(numpy.float32) * Z
+        pick = numpy.argmax(cum >= u[None, :], axis=0)
+        floor = numpy.random.random(n) < eps
+        if floor.any():
+            pick = numpy.where(floor, numpy.random.randint(0, ncell, n), pick)
+        pk = E[pick, numpy.arange(n)] / Z
+        p_pick = (1.0 - eps) * pk + eps / ncell
+
+        ic = pick // npsi
+        ip_ = pick % npsi
+        ci = ce[ic] + numpy.random.uniform(0, 1, n) * (ce[ic + 1] - ce[ic])
+        ps = pe[ip_] + numpy.random.uniform(0, 1, n) * (pe[ip_ + 1] - pe[ip_])
+        cell_area = (2.0 / nc) * (2.0 * numpy.pi / npsi)
+
+        vp['inclination'] = numpy.arccos(numpy.clip(ci, -1.0, 1.0))
+        vp['polarization'] = ps
+        logprior = -numpy.log(2.0) - numpy.log(2.0 * numpy.pi)
+        logq = numpy.log(p_pick) - numpy.log(cell_area)
+        corr = logprior - logq
+        corr[~numpy.isfinite(corr)] = -numpy.inf
+        return corr
 
     def get_precalc_antenna_factors(self, ifo):
         """ Get the antenna factors for marginalized samples if they exist """

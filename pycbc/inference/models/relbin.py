@@ -1569,12 +1569,19 @@ class RelativeTimeDom(RelativeTime):
         wfs = self.get_waveforms(p2)
 
         sh_total = hh_total = 0
-        ic = numpy.cos(p['inclination'])
-        ip = 0.5 * (1.0 + ic * ic)
-        pol_phase = numpy.exp(-2.0j * p['polarization'])
 
         snrs = self.get_snr(wfs)
         self.snr_draw(snrs=snrs)
+
+        # after the draw, not before: the draw may propose the orientation
+        # itself (conditional on each sky sample) rather than leaving the
+        # prior values in place, and the likelihood has to be evaluated at
+        # whatever it produced. With the orientation left alone this is the
+        # same values as before.
+        p = self.current_params
+        ic = numpy.cos(p['inclination'])
+        ip = 0.5 * (1.0 + ic * ic)
+        pol_phase = numpy.exp(-2.0j * p['polarization'])
 
         for ifo in self.sh:
             if self.precalc_antenna_factors:
