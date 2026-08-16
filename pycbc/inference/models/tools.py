@@ -551,9 +551,7 @@ class DistMarg():
         # an already-computed SNR series, and `resize_factor` below is exactly
         # the acceptance fraction, so the estimator normalisation is unchanged.
         import os as _os
-        _b2 = max(1, int(_os.environ.get('MARG_B2', '1')))
-        _b1 = int(_os.environ.get('MARG_B1', '0'))   # snap radius, 0 = off
-        ndraw = vsamples * _b2
+        ndraw = vsamples
 
         # No good SNR peaks, go with prior draw
         if len(ifos) == 0:
@@ -689,51 +687,7 @@ class DistMarg():
             codes = numpy.where(
                 inside, (shifted * strides).sum(axis=1), 0).astype(numpy.int64)
             present = inside & (lookup['offset'][codes] >= 0)
-            if _b1 > 0:
-                # EXPERIMENT B1: instead of discarding a tuple whose cell is
-                # empty, snap it to the nearest populated cell within +/-_b1
-                # in each delay coordinate. Cheap (one gather per offset), but
-                # the proposal probability belongs to the ORIGINAL cell, so
-                # this is only approximately correct -- watch a healthy atom's
-                # value for bias.
-                miss = numpy.nonzero(~present)[0]
-                if len(miss):
-                    sh_m = shifted[miss]
-                    best = numpy.full(len(miss), -1, dtype=numpy.int64)
-                    for r in range(1, _b1 + 1):
-                        offs = [o for o in numpy.ndindex(*([2 * r + 1] * sh_m.shape[1]))]
-                        for o in offs:
-                            if best.min() >= 0:
-                                break
-                            delta = numpy.array(o) - r
-                            if numpy.abs(delta).max() != r:
-                                continue
-                            cand = sh_m + delta
-                            ok = numpy.all((cand >= 0) & (cand < dims), axis=1)
-                            cc = numpy.where(ok, (cand * strides).sum(axis=1),
-                                             0).astype(numpy.int64)
-                            good = ok & (lookup['offset'][cc] >= 0) & (best < 0)
-                            best = numpy.where(good, cc, best)
-                    hit = best >= 0
-                    codes[miss[hit]] = best[hit]
-                    present[miss[hit]] = True
             import os as _os
-            if _os.environ.get('MARG_DIAG'):
-                _dxs = numpy.stack(dx, axis=1)
-                _u, _c = numpy.unique(_dxs, axis=0, return_counts=True)
-                _mode = _u[_c.argmax()]
-                _msh = _mode - lo
-                _min = bool(numpy.all((_msh >= 0) & (_msh < dims)))
-                _mcode = int((_msh * strides).sum()) if _min else -1
-                _mpres = bool(_min and lookup['offset'][_mcode] >= 0)
-                logging.info('MARGDIAG draws=%d uniq_delay_tuples=%d '
-                             'modal_tuple=%s modal_frac=%.3f modal_inside=%s '
-                             'modal_present=%s | inside=%.4f present=%.4f '
-                             'n_present=%d dims=%s',
-                             vsamples, len(_u), _mode.tolist(),
-                             _c.max()/vsamples, _min, _mpres,
-                             inside.mean(), present.mean(), int(present.sum()),
-                             list(dims))
             ti = numpy.nonzero(present)[0]
             codes_k = codes[ti]
             counts_k = lookup['count'][codes_k]
@@ -762,70 +716,6 @@ class DistMarg():
             # Selecting member j with probability p_j instead of 1/count means
             # the prior/proposal contribution becomes 1/(N_initial p_j) rather
             # than count/N_initial, so the estimator is unchanged.
-            if _os.environ.get('MARG_COH') and len(ti) and hasattr(self, 'hh'):
-                _ti = numpy.array(ti, dtype=int)
-                _ck = numpy.array(codes_k, dtype=int)
-                _cn = numpy.array(counts_k, dtype=int)
-                _wi = numpy.array(wi, dtype=float)
-                _ix = numpy.array(ix, dtype=int)
-                _multi = numpy.nonzero(_cn > 1)[0]
-                if len(_multi):
-                    _off = lookup['offset'][_ck[_multi]]
-                    _cnt = _cn[_multi]
-                    _grp = numpy.repeat(numpy.arange(len(_multi)), _cnt)
-                    _mem = numpy.concatenate([lookup['flat'][o:o + c]
-                                              for o, c in zip(_off, _cnt)])
-                    _base = (iref[_ti[_multi]] * sref.delta_t
-                             + float(sref.start_time))
-                    _b = numpy.repeat(_base, _cnt)
-                    _y = numpy.zeros((2, len(_mem)), dtype=complex)
-                    _G = numpy.zeros((2, 2, len(_mem)))
-                    _d0 = dtc[ifos[0]][_mem]
-                    for _ifo in ifos:
-                        _t = _b + (dtc[_ifo][_mem] - _d0)
-                        _shv = self.sh[_ifo].at_time(_t, interpolate='quadratic',
-                                                     extrapolate=0.0j)
-                        _F = numpy.stack([fp[_ifo][_mem], fc[_ifo][_mem]])
-                        _hh = float(self.hh[_ifo])
-                        _y += _F * numpy.asarray(_shv)
-                        for _p in range(2):
-                            for _q in range(2):
-                                _G[_p, _q] += _F[_p] * _F[_q] * _hh
-                    _dd = _G[0, 0] * _G[1, 1] - _G[0, 1] * _G[1, 0]
-                    _dd = numpy.where(numpy.abs(_dd) < 1e-30, 1e-30, _dd)
-                    _coh = 0.5 * (numpy.abs(_y[0]) ** 2 * _G[1, 1]
-                                  + numpy.abs(_y[1]) ** 2 * _G[0, 0]
-                                  - 2.0 * (_y[0].conj() * _y[1]).real * _G[0, 1]) / _dd
-                    _coh = numpy.where(numpy.isfinite(_coh), _coh, -numpy.inf)
-                    # softmax within each group, then one draw per group
-                    _mx = numpy.full(len(_multi), -numpy.inf)
-                    numpy.maximum.at(_mx, _grp, _coh)
-                    _T = float(_os.environ.get('MARG_COH_T', '1'))
-                    _e = numpy.exp((_coh - _mx[_grp]) / _T)
-                    _sum = numpy.zeros(len(_multi))
-                    numpy.add.at(_sum, _grp, _e)
-                    _pm = _e / _sum[_grp]
-                    _u = numpy.random.uniform(0, 1, len(_multi))
-                    _cum = numpy.zeros(len(_mem))
-                    _acc = numpy.zeros(len(_multi))
-                    for _j in range(len(_mem)):        # small groups; fine
-                        _acc[_grp[_j]] += _pm[_j]
-                        _cum[_j] = _acc[_grp[_j]]
-                    _hit = _cum >= _u[_grp]
-                    _first = numpy.zeros(len(_multi), dtype=int)
-                    _seen = numpy.zeros(len(_multi), dtype=bool)
-                    for _j in range(len(_mem)):
-                        _g = _grp[_j]
-                        if _hit[_j] and not _seen[_g]:
-                            _first[_g] = _j; _seen[_g] = True
-                    _sel = _first[_seen]
-                    _gs = numpy.nonzero(_seen)[0]
-                    _ix[_multi[_gs]] = _mem[_sel]
-                    _wi[_multi[_gs]] = 1.0 / (self.marginalize_sky_initial_samples
-                                              * _pm[_sel])
-                    ix = list(_ix); wi = list(_wi)
-                    logging.debug('MARG_COH: within-bin selection on %d of %d '
-                                  'candidates', len(_multi), len(_ti))
         else:
             ti = []
             ix = []
@@ -1009,7 +899,13 @@ class DistMarg():
         # the prior VOLUME containment under a uniform-in-volume distance
         # prior, which is what the proposal should track. It is only the
         # proposal, so the approximation costs efficiency and not accuracy.
-        ll = sh2 / (2.0 * hh2) + 2.0 * (numpy.log(hh2) - numpy.log(sh2))
+        # Laplace value of int u^-4 exp(|sh| u - hh u^2/2) du, u = 1/d:
+        # |sh|^2/(2hh) + 4 log(hh/|sh|) = sh2/(2 hh2) + 4 log hh2 - 2 log sh2.
+        ll = (sh2 / (2.0 * hh2)
+              + 4.0 * numpy.log(hh2) - 2.0 * numpy.log(sh2))
+        temper = float(_os.environ.get('MARG_ORIENT_T', '1'))
+        if temper != 1.0:
+            ll = ll / temper
         ll[~numpy.isfinite(ll)] = -numpy.inf
 
         mx = ll.max(axis=0)
@@ -1336,8 +1232,6 @@ def setup_distance_marg_interpolant(dist_marg,
     # survivors. The edge value OVERSTATES a genuinely sub-floor point, but it
     # is negligible against in-range samples (exp(edge) << exp(peak)), so the
     # sum is unchanged while the estimate stays defined.
-    import os as _os
-    _clamp = bool(_os.environ.get('MARG_CLAMP'))
 
     def interp_wrapper(x, y, bounds_check=True):
         k = None
@@ -1345,20 +1239,14 @@ def setup_distance_marg_interpolant(dist_marg,
             if isinstance(x, float):
                 if x > shr_max or x < shr_min or y > hhr_max or y < hhr_min:
                     warn_out_of_range(True)
-                    if not _clamp:
-                        return -numpy.inf
+                    return -numpy.inf
             else:
                 k = (x > shr_max) | (x < shr_min)
                 k = k | (y > hhr_max) | (y < hhr_min)
                 warn_out_of_range(k.any())
 
-        if _clamp:
-            xq = numpy.clip(x, shr_min, shr_max)
-            yq = numpy.clip(y, hhr_min, hhr_max)
-        else:
-            xq, yq = x, y
-        v = interp(xq, yq, grid=False)
-        if k is not None and not _clamp:
+        v = interp(x, y, grid=False)
+        if k is not None:
             v[k] = -numpy.inf
         # a scalar query is a single point with nothing to marginalize over;
         # the spline returns it as a length-one array, which the caller then

@@ -387,16 +387,6 @@ class GameSampler6(DummySampler):
 
         models._global_instance = model
         self.model = model
-        # Diagnostic: a separate model for TILE WEIGHTS only (env-gated).
-        # Must be built before the pool forks so workers inherit it.
-        import os as _os
-        _tini = _os.environ.get('GAMES6_TILE_INI')
-        if _tini:
-            from pycbc.workflow import WorkflowConfigParser as _WCP
-            from pycbc.inference import models as _models
-            logging.info('DIAG building a separate TILE-WEIGHT model from %s '
-                         '(sampling weights still use the main model)', _tini)
-            _models._tile_instance = _models.read_from_config(_WCP([_tini]))
         self.pool = choose_pool(mpi=use_mpi, processes=nprocesses)
         self._samples = {}
 
@@ -461,17 +451,6 @@ class GameSampler6(DummySampler):
             self.draw[i] = numpy.arange(0, len(self.dmap[i]))
         if size > len(self.draw[i]):
             import os as _os
-            if _os.environ.get('GAMES6_DIAG'):
-                remaining = sum(len(self.draw.get(k, self.dmap[k]))
-                                for k in self.dmap)
-                logging.info('DIAG OutOfSamples: bin %i wanted %i has %i left; '
-                             'TOTAL atoms left across all bins=%i of %i; '
-                             'bins fully drained=%i of %i', i, size,
-                             len(self.draw[i]), remaining,
-                             sum(len(self.dmap[k]) for k in self.dmap),
-                             sum(1 for k in self.dmap
-                                 if len(self.draw.get(k, self.dmap[k])) == 0),
-                             len(self.dmap))
             raise OutOfSamples
         numpy.random.shuffle(self.draw[i])
         selected = self.draw[i][:size]
@@ -512,23 +491,6 @@ class GameSampler6(DummySampler):
         if total <= 0:
             raise OutOfSamples
         import os as _os
-        if _os.environ.get('GAMES6_DIAG'):
-            nz = drawcount > 0
-            top = drawcount.argsort()[::-1][:5]
-            rem = numpy.array([len(self.draw.get(node_idx[i],
-                              self.dmap[node_idx[i]])) for i in top])
-            _finite = [v for v in self.leaf_loglr.values()
-                       if numpy.isfinite(v)]
-            mx = max(_finite) if _finite else float('nan')
-            logging.info('DIAG pool_round: %i/%i bins drawn; max_rep=%.1f; '
-                         'top5 drawcount=%s binlen=%s remaining=%s reps=%s '
-                         'maxposw_bin_drawcount=%s',
-                         int(nz.sum()), len(drawcount), mx,
-                         list(drawcount[top]), list(lengths[top]), list(rem),
-                         ['%.1f' % self.leaf_loglr.get(int(i), numpy.nan)
-                          for i in top],
-                         int(drawcount[int(numpy.argmax(bin_weight))]))
-
         psamp = FieldArray(total, dtype=self.samp_dtype)
         pweight = numpy.zeros(total)
         bin_id = numpy.zeros(total, dtype=int)
@@ -876,21 +838,6 @@ class GameSampler6(DummySampler):
                          gsum, ess_p + gsum, self.ncalls)
 
         import os as _os
-        if _os.environ.get('GAMES6_DIAG') and \
-                strata.get('pool', {}).get('logw') is not None:
-            p = strata['pool']
-            path = _os.environ.get('GAMES6_DIAG_DUMP', '/tmp/pooldump.npz')
-            nb = len(self._diag_binid) if self._diag_binid is not None else 0
-            reps = numpy.array([self.leaf_loglr.get(int(b), numpy.nan)
-                                for b in (self._diag_binid
-                                          if nb else [])], dtype=float)
-            numpy.savez(path, logw=p['logw'], loglr=p['loglr'],
-                        bin_id=(self._diag_binid if nb else
-                                numpy.array([])), leaf_rep=reps,
-                        **{q: p['samp'][q] for q in p['samp'].dtype.names})
-            logging.info('DIAG dumped pool stratum (%i samples, %i binids) '
-                         'to %s', len(p['logw']), nb, path)
-
         self._finalise(strata)
 
     def _refine_leaf_weights(self, active_ids, k):
@@ -1778,7 +1725,12 @@ class GameSampler6(DummySampler):
         # exp(2*terms) overflows to inf and inf*0 is nan when a decision is
         # certain (p = 0 or 1).  Everything stays in logs.
         terms = ll + numpy.log(n) - numpy.log(float(self.map_size)) - logz
-        p = norm.cdf((ll - self.loglr_region) / max(sigma_l, 1e-6))
+        # against the cut the descent used, not the region's width:
+        # the docstring above specifies (loglr_i - bound).
+        cut = getattr(self, '_last_bound', None)
+        if cut is None:
+            cut = float(numpy.max(ll)) - self.loglr_region
+        p = norm.cdf((ll - cut) / max(sigma_l, 1e-6))
         # a Bernoulli per subtree: kept or not, weighted by what it carries
         with numpy.errstate(divide='ignore'):
             logvar = 2.0 * terms + numpy.log(p) + numpy.log1p(-p)
