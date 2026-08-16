@@ -1576,12 +1576,18 @@ class RelativeTimeDom(RelativeTime):
         # after the draw, not before: the draw may propose the orientation
         # itself (conditional on each sky sample) rather than leaving the
         # prior values in place, and the likelihood has to be evaluated at
-        # whatever it produced. With the orientation left alone this is the
-        # same values as before.
-        p = self.current_params
-        ic = numpy.cos(p['inclination'])
+        # whatever it produced. Read it out of marginalize_vector_params and
+        # NOT out of current_params: on code where the vector weights are
+        # reset inside that property's getter, reading it here would discard
+        # the sky weights the draw just added. With the orientation left
+        # alone this is the same values as before.
+        vp = self.marginalize_vector_params
+        ic = numpy.cos(vp['inclination'] if 'inclination' in vp
+                       else p['inclination'])
         ip = 0.5 * (1.0 + ic * ic)
-        pol_phase = numpy.exp(-2.0j * p['polarization'])
+        pol_phase = numpy.exp(-2.0j * (vp['polarization']
+                                       if 'polarization' in vp
+                                       else p['polarization']))
 
         for ifo in self.sh:
             if self.precalc_antenna_factors:

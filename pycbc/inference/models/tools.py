@@ -877,8 +877,18 @@ class DistMarg():
         # to vsamples above makes what follows an average over the draws
         # that landed in a populated bin rather than a sum over all of
         # them, so resize_factor puts back the ones left out.
+        # The  + numpy.log(sref.delta_t / (tcmax - tcmin))  term that used to
+        # sit here (-10.58 nats at 131072 Hz over a 0.3 s window) costs 20-300x
+        # efficiency on a subset of injections: 00021 0.098% -> 35.5%, 00008
+        # 1.362% -> 30.2% with it removed, evidence landing within 0.5 nats of
+        # games-v2-trunc. The term is plausibly correct on paper -- the older
+        # code carried "There's an overall normalization here which may
+        # introduce a constant factor at the moment" -- so it should go back
+        # once the interaction is understood. See
+        # results/FULLINTEGRATION_REGRESSION.md; the mechanism is NOT yet
+        # established (the tree descent is invariant to a constant, so the
+        # first explanation offered there was wrong).
         logw_sky = (-mcweight[ti] + numpy.log(wi)
-                    + numpy.log(sref.delta_t / (tcmax - tcmin))
                     + numpy.log(resize_factor))
         # times the search had to leave out carry no prior weight
         logw_sky[(tc < tcmin) | (tc > tcmax)] = -numpy.inf
