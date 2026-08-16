@@ -903,7 +903,13 @@ class DistMarg():
         # |sh|^2/(2hh) + 4 log(hh/|sh|) = sh2/(2 hh2) + 4 log hh2 - 2 log sh2.
         ll = (sh2 / (2.0 * hh2)
               + 4.0 * numpy.log(hh2) - 2.0 * numpy.log(sh2))
-        temper = float(_os.environ.get('MARG_ORIENT_T', '1'))
+        # T=2 measured on this branch: vector ESS over the prior draw is
+        # 16.3x (00021), 21.7x (00008), 3.4x (00006) at T=2 against
+        # 12.8x / 14.8x / 3.6x untempered. The surrogate spans ~160 nats
+        # across cells within one sky sample, so softmax(ll) is nearly a
+        # delta and needs flattening. (An earlier T=4 was measured before
+        # the logw_sky fix and does not hold here.)
+        temper = float(_os.environ.get('MARG_ORIENT_T', '2'))
         if temper != 1.0:
             ll = ll / temper
         ll[~numpy.isfinite(ll)] = -numpy.inf
