@@ -264,8 +264,19 @@ class Relative(DistMarg, BaseGaussianNoise):
         # from, and are kept so that can be done again.
         self.shifted, self.flimits = {}, {}
 
-        self.adapt = str(epsilon).lower() == 'auto'
-        self.epsilon = 0.5 if self.adapt else float(epsilon)
+        # 'auto' or 'auto:<start>'. The relayout only ever refines, so the
+        # starting point is an upper bound on coarseness and must be sane: it
+        # used to be 0.5, five times coarser than the 0.1 production pins, and
+        # a sampler that builds its proposal during setup does so before any
+        # refinement can trigger. Measured, that collapsed 2 of 4 injections to
+        # 0.0-0.1% efficiency.
+        _eps = str(epsilon).lower()
+        self.adapt = _eps.split(':')[0] == 'auto'
+        if self.adapt:
+            _parts = _eps.split(':')
+            self.epsilon = float(_parts[1]) if len(_parts) > 1 else 0.1
+        else:
+            self.epsilon = float(epsilon)
         self.accuracy = float(accuracy)
         self.layout = (gammas, earth_rotation, int(earth_rotation_mode))
         self.best_loglr = -numpy.inf
