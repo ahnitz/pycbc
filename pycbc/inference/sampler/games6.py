@@ -450,7 +450,6 @@ class GameSampler6(DummySampler):
         if i not in self.draw:
             self.draw[i] = numpy.arange(0, len(self.dmap[i]))
         if size > len(self.draw[i]):
-            import os as _os
             raise OutOfSamples
         numpy.random.shuffle(self.draw[i])
         selected = self.draw[i][:size]
@@ -490,7 +489,6 @@ class GameSampler6(DummySampler):
         total = drawcount.sum()
         if total <= 0:
             raise OutOfSamples
-        import os as _os
         psamp = FieldArray(total, dtype=self.samp_dtype)
         pweight = numpy.zeros(total)
         bin_id = numpy.zeros(total, dtype=int)
@@ -837,7 +835,6 @@ class GameSampler6(DummySampler):
                          'total=%.1f ncalls=%i', rnd, ess_p, len(gkeys),
                          gsum, ess_p + gsum, self.ncalls)
 
-        import os as _os
         self._finalise(strata)
 
     def _refine_leaf_weights(self, active_ids, k):

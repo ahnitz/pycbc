@@ -2,7 +2,6 @@
 """
 
 import logging
-import os as _os
 import warnings
 from distutils.util import strtobool
 
@@ -64,6 +63,11 @@ class DistMarg():
                               marginalize_vector_params=None,
                               marginalize_vector_samples=1e3,
                               marginalize_sky_initial_samples=1e6,
+                              marginalize_orientation=False,
+                              marginalize_orientation_ncos=24,
+                              marginalize_orientation_npol=12,
+                              marginalize_orientation_eps=0.02,
+                              marginalize_orientation_temper=2.0,
                               **kwargs):
         """ Setup the model for use with distance marginalization
 
@@ -92,6 +96,22 @@ class DistMarg():
             as -numpy.inf.
         marginalize_distance_density: tuple of intes, (1000, 1000)
             The dimensions of the interpolation grid over (sh, hh).
+        marginalize_orientation: bool, False
+            Draw inclination and polarization conditional on each sky sample
+            rather than from the prior. Off by default; the proposal costs
+            extra work per draw and only pays off where the orientation is
+            well constrained.
+        marginalize_orientation_ncos: int, 24
+            Number of cos(inclination) cells in the orientation proposal grid.
+        marginalize_orientation_npol: int, 12
+            Number of polarization cells in the orientation proposal grid.
+        marginalize_orientation_eps: float, 0.02
+            Floor mixed into the orientation proposal so no cell has zero
+            probability.
+        marginalize_orientation_temper: float, 2.0
+            Flattening applied to the orientation surrogate. The surrogate
+            spans ~160 nats across cells within one sky sample, so an
+            untempered softmax is nearly a delta.
 
         Returns
         -------
@@ -139,6 +159,13 @@ class DistMarg():
 
         self.marginalize_sky_initial_samples = \
             int(float(marginalize_sky_initial_samples))
+
+        self.marginalize_orientation = str_to_bool(marginalize_orientation)
+        self.marginalize_orientation_ncos = int(marginalize_orientation_ncos)
+        self.marginalize_orientation_npol = int(marginalize_orientation_npol)
+        self.marginalize_orientation_eps = float(marginalize_orientation_eps)
+        self.marginalize_orientation_temper = \
+            float(marginalize_orientation_temper)
 
         for param in str_to_tuple(marginalize_vector_params, str):
             logging.info('Marginalizing over %s, %s points from prior',
@@ -342,7 +369,7 @@ class DistMarg():
         self.marginalize_vector_weights = \
             self.marginalize_vector_weights + logw[choice]
 
-        if _os.environ.get('MARG_ORIENT'):
+        if self.marginalize_orientation:
             corr = self._draw_orientation()
             if corr is not None:
                 self.marginalize_vector_weights = \
@@ -545,12 +572,6 @@ class DistMarg():
 
         vsamples = size if size is not None else self.vsamples
 
-        # EXPERIMENT B2 (env MARG_B2=<factor>, default 1 = current behaviour):
-        # oversample the time draws so that enough of them survive the
-        # physical-delay lookup. The draws themselves are cheap integer ops on
-        # an already-computed SNR series, and `resize_factor` below is exactly
-        # the acceptance fraction, so the estimator normalisation is unchanged.
-        import os as _os
         ndraw = vsamples
 
         # No good SNR peaks, go with prior draw
@@ -687,7 +708,6 @@ class DistMarg():
             codes = numpy.where(
                 inside, (shifted * strides).sum(axis=1), 0).astype(numpy.int64)
             present = inside & (lookup['offset'][codes] >= 0)
-            import os as _os
             ti = numpy.nonzero(present)[0]
             codes_k = codes[ti]
             counts_k = lookup['count'][codes_k]
@@ -701,8 +721,8 @@ class DistMarg():
             ix = list(ix)
             wi = list(wi)
 
-            # STEP 2 (env MARG_COH=1): bias WHICH POINT we take from each
-            # delay bin, using amplitude/phase consistency.
+            # Bias WHICH POINT we take from each delay bin, using
+            # amplitude/phase consistency.
             #
             # The delay match fixes the bin; within it the members differ in
             # sub-sample delay and antenna response, and the relative
@@ -784,7 +804,7 @@ class DistMarg():
         self.marginalize_vector_params['ra'] = ra
         self.marginalize_vector_params['dec'] = dec
 
-        if _os.environ.get('MARG_ORIENT'):
+        if self.marginalize_orientation:
             corr = self._draw_orientation()
             if corr is not None:
                 logw_sky = logw_sky + corr
@@ -803,8 +823,8 @@ class DistMarg():
 
         These depend only on the grid, so they are built once and reused.
         """
-        nc = int(_os.environ.get('MARG_ORIENT_NC', '24'))
-        npsi = int(_os.environ.get('MARG_ORIENT_NP', '12'))
+        nc = self.marginalize_orientation_ncos
+        npsi = self.marginalize_orientation_npol
         key = (nc, npsi)
         if getattr(self, '_orient_grid_key', None) == key:
             return self._orient_grid
@@ -882,7 +902,7 @@ class DistMarg():
 
         nc, npsi, ce, pe, Wsh, Whh = self._orientation_grid()
         ncell = nc * npsi
-        eps = float(_os.environ.get('MARG_ORIENT_EPS', '0.02'))
+        eps = self.marginalize_orientation_eps
         YY = Yp.conj() * Yc
         Xsh = numpy.stack([Yp.real ** 2 + Yp.imag ** 2,
                            Yc.real ** 2 + Yc.imag ** 2,
@@ -906,7 +926,7 @@ class DistMarg():
         # across cells within one sky sample, so softmax(ll) is nearly a
         # delta and needs flattening. (An earlier T=4 was measured before
         # the logw_sky fix and does not hold here.)
-        temper = float(_os.environ.get('MARG_ORIENT_T', '2'))
+        temper = self.marginalize_orientation_temper
         if temper != 1.0:
             ll = ll / temper
         ll[~numpy.isfinite(ll)] = -numpy.inf
@@ -1228,13 +1248,13 @@ def setup_distance_marg_interpolant(dist_marg,
             "distance marginalized likelihood is set to zero, which biases "
             "the result. Widen the range.", snr_range)
 
-    # EXPERIMENT (env MARG_CLAMP=1): clamp out-of-range queries to the table
-    # edge instead of setting them to -inf. Zeroing the likelihood makes such
-    # samples unrecoverable, and when a large fraction of the extrinsic draws
-    # fall below the SNR floor the estimate is left resting on a handful of
-    # survivors. The edge value OVERSTATES a genuinely sub-floor point, but it
-    # is negligible against in-range samples (exp(edge) << exp(peak)), so the
-    # sum is unchanged while the estimate stays defined.
+    # Out-of-range queries are set to -inf below. Clamping them to the table
+    # edge instead was considered and NOT adopted: zeroing the likelihood makes
+    # such samples unrecoverable, and when a large fraction of the extrinsic
+    # draws fall below the SNR floor the estimate is left resting on a handful
+    # of survivors. The edge value would OVERSTATE a genuinely sub-floor point
+    # while staying negligible against in-range samples, so revisit this if the
+    # out-of-range warning below fires on a large fraction of draws.
 
     def interp_wrapper(x, y, bounds_check=True):
         k = None
