@@ -178,6 +178,12 @@ Checkpointing
     pycbc can decide whether to checkpoint; it has no effect unless
     ``checkpoint_time_interval`` is set. Defaults to 5000 per pool process.
 
+``no-save-state``
+    Set it, with no value, to write only the results at the end rather than
+    also saving dynesty's own state and validating it. The run cannot then
+    be resumed, so it suits short runs where the state file would be large
+    compared with what is being computed.
+
 ultranest
 =========
 
