@@ -48,6 +48,24 @@ def draw_sample(loglr, size=None):
     return xl
 
 
+def peak_offset(logweight):
+    """Where the weight sits within its range, as a fraction of the half
+    width: zero is centred, one is against an edge.
+
+    A time region is locked around a reference, and the peak it was locked
+    on can move once the parameters vary. This says how far it has moved
+    before the region starts cutting into it, which the size of the
+    likelihood alone does not.
+    """
+    n = len(logweight)
+    if n < 2:
+        return 1.0
+    weight = numpy.exp(logweight)
+    middle = (n - 1) / 2.0
+    centre = (weight * numpy.arange(n)).sum() / weight.sum()
+    return float(abs(centre - middle) / middle)
+
+
 class DistMarg():
     """Help class to add bookkeeping for likelihood marginalization"""
 
@@ -141,6 +159,8 @@ class DistMarg():
             kwargs.pop('polarization_samples')
 
         self.reset_vector_params()
+
+        self.peak_drift_warned = False
 
         self.marginalize_phase = str_to_bool(marginalize_phase)
 
@@ -409,6 +429,17 @@ class DistMarg():
         logweight /= 2.0
         logweight -= logsumexp(logweight)  # Normalize to PDF
 
+        # the region was locked around a reference peak; if the weight
+        # has moved out to the edge of it, the region is about to start
+        # cutting into the posterior rather than bounding it
+        drift = peak_offset(logweight)
+        if drift > 0.8 and not self.peak_drift_warned:
+            self.peak_drift_warned = True
+            logging.warning("Time marginalization is drawing %.0f%% of the "
+                            "way to the edge of the locked region; widen it "
+                            "with peak_lock_time, or raise peak_lock_ratio",
+                            drift * 100)
+
         # Draw proportional to the incoherent likelihood
         # Draw first which time sample
         tci = draw_sample(logweight, size=vsamples)
@@ -599,6 +630,7 @@ class DistMarg():
                         peak_lock_snr=None,
                         peak_lock_ratio=1e4,
                         peak_lock_region=4,
+                        peak_lock_time=None,
                         **kwargs):
         """ Determine where to constrain marginalization based on
         the observed reference SNR peaks.
@@ -618,6 +650,12 @@ class DistMarg():
         peak_lock_region: int
             Number of samples to inclue beyond the strict region
             determined by the relative likelihood
+        peak_lock_time: float
+            Half the width of the region to keep, in seconds, centered on
+            the peak. Given, the region is this wide whatever the peak
+            looks like, and peak_lock_ratio and peak_lock_region are not
+            used. A peak still has to reach peak_lock_snr for any region
+            to be locked at all.
         """
 
         if 'tc' not in self.marginalized_vector_priors:
@@ -654,12 +692,19 @@ class DistMarg():
                              ifo, peak_snr, peak_time)
 
                 if peak_snr > peak_lock_snr:
-                    target = peak_snr ** 2.0 / 2.0 - numpy.log(peak_lock_ratio)
-                    target = (target * 2.0) ** 0.5
+                    if peak_lock_time is not None:
+                        # a region of the width asked for, wherever the
+                        # peak turned out to be
+                        half = float(peak_lock_time)
+                        ts, te = peak_time - half, peak_time + half
+                    else:
+                        target = (peak_snr ** 2.0 / 2.0
+                                  - numpy.log(peak_lock_ratio))
+                        target = (target * 2.0) ** 0.5
 
-                    region = numpy.where(abs(z) > target)[0]
-                    ts = times[region[0]] - peak_lock_region / sample_rate
-                    te = times[region[-1]] + peak_lock_region / sample_rate
+                        region = numpy.where(abs(z) > target)[0]
+                        ts = times[region[0]] - peak_lock_region / sample_rate
+                        te = times[region[-1]] + peak_lock_region / sample_rate
                     self.tstart[ifo] = ts
                     self.num_samples[ifo] = int((te - ts) * sample_rate)
 
