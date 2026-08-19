@@ -1,0 +1,298 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trying out different samplers &mdash; PyCBC inference: choosing a sampler  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sphinx-design.min.css?v=95c83b7e" />
+
+  
+      <script src="../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
+      <script src="../../_static/design-tabs.js?v=f930bc37"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="prev" title="Sampler API" href="../sampler_api.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            PyCBC inference: choosing a sampler
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../sampler_options.html">Choosing and configuring a sampler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sampler_api.html">Sampler API</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Trying out different samplers</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#platter-emcee">Emcee</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#platter-ptemcee">PTEmcee</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#platter-dynesty">Dynesty</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#platter-ultranest">Ultranest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#platter-epsie">Epsie</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#platter-cpnest">cpnest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#platter-multinest">Multinest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#platter-snowline">Snowline</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#platter-nessai">nessai</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">PyCBC inference: choosing a sampler</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Trying out different samplers</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/inference/examples/sampler_platter.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="trying-out-different-samplers">
+<span id="inference-example-samplers"></span><h1>Trying out different samplers<a class="headerlink" href="#trying-out-different-samplers" title="Link to this heading"></a></h1>
+<p>This page shows basic configurations for some of the samplers that PyCBC
+Inference supports. These are configured to run quickly, so there very likely
+are better settings for your problem.</p>
+<p>For what each of these options means, which samplers accept which, and how to
+choose between them, see <a class="reference internal" href="../sampler_options.html#inference-sampler-options"><span class="std std-ref">Choosing and configuring a sampler</span></a>.</p>
+<p>We’ll use a very simple analytic model to test each sampler. The following is
+the configuration to set up a unimodal gaussian likelihood. We’ll have each
+sampler try to fit this.</p>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="k">[model]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">test_normal</span>
+
+<span class="k">[variable_params]</span>
+<span class="na">x</span><span class="w"> </span><span class="o">=</span>
+<span class="na">y</span><span class="w"> </span><span class="o">=</span>
+
+<span class="k">[prior-x]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">uniform</span>
+<span class="na">min-x</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">-10</span>
+<span class="na">max-x</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">10</span>
+
+<span class="k">[prior-y]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">uniform</span>
+<span class="na">min-y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">-10</span>
+<span class="na">max-y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">10</span>
+</pre></div>
+</div>
+<p>Each sampler needs nees a slightly different configuration. Below are basic
+configurations which can analyze this simple problem.</p>
+<section id="platter-emcee">
+<span id="id1"></span><h2><a class="reference external" href="https://emcee.readthedocs.io/en/v2.2.1/">Emcee</a><a class="headerlink" href="#platter-emcee" title="Link to this heading"></a></h2>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="k">[sampler]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">emcee</span>
+<span class="na">nwalkers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">100</span>
+<span class="na">niterations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">200</span>
+
+<span class="c1">;##### Other possible options</span>
+<span class="c1">;effective-nsamples = 1000</span>
+<span class="c1">;max-samples-per-chain = 1000</span>
+<span class="c1">;checkpoint-interval = 2000</span>
+
+<span class="c1">;[sampler-burn_in]</span>
+<span class="c1">;burn-in-test = nacl &amp; max_posterior</span>
+</pre></div>
+</div>
+</section>
+<section id="platter-ptemcee">
+<span id="id2"></span><h2><a class="reference external" href="https://github.com/willvousden/ptemcee">PTEmcee</a><a class="headerlink" href="#platter-ptemcee" title="Link to this heading"></a></h2>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="k">[sampler]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">ptemcee</span>
+<span class="na">nwalkers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">100</span>
+<span class="na">ntemps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">4</span>
+<span class="na">niterations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">100</span>
+
+<span class="c1">;##### Other possible options</span>
+<span class="c1">;effective-nsamples = 1000</span>
+<span class="c1">;max-samples-per-chain = 1000</span>
+<span class="c1">;checkpoint-interval = 2000</span>
+<span class="c1">;adaptive =</span>
+<span class="c1">;adaptation-lag = 10000</span>
+<span class="c1">;adaptation-time = 100</span>
+
+<span class="c1">;[sampler-burn_in]</span>
+<span class="c1">;burn-in-test = nacl &amp; max_posterior</span>
+</pre></div>
+</div>
+</section>
+<section id="platter-dynesty">
+<span id="id3"></span><h2><a class="reference external" href="https://dynesty.readthedocs.io/">Dynesty</a><a class="headerlink" href="#platter-dynesty" title="Link to this heading"></a></h2>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="k">[sampler]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">dynesty</span>
+<span class="na">dlogz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">0.1</span>
+<span class="na">nlive</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">150</span>
+
+<span class="c1">; Other arguments (see Dynesty package for details).</span>
+<span class="c1">; bound, bootstrap, enlarge, update_interval, sample</span>
+<span class="c1">; loglikelihood-function = loglr</span>
+</pre></div>
+</div>
+</section>
+<section id="platter-ultranest">
+<span id="id4"></span><h2><a class="reference external" href="https://johannesbuchner.github.io/UltraNest/">Ultranest</a><a class="headerlink" href="#platter-ultranest" title="Link to this heading"></a></h2>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="k">[sampler]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">ultranest</span>
+<span class="na">dlogz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">0.1</span>
+
+<span class="c1">;##### Other possible options (see ultranest package for useage)</span>
+<span class="c1">; update_interval_iter_fraction, update_interval_ncall</span>
+<span class="c1">; log_interval, show_status, dKL, frac_remain,</span>
+<span class="c1">; Lepsilon, min_ess, max_iters, max_ncalls,</span>
+<span class="c1">; max_num_improvement_loops, min_num_live_points,</span>
+<span class="c1">; cluster_num_live_points</span>
+</pre></div>
+</div>
+</section>
+<section id="platter-epsie">
+<span id="id5"></span><h2><a class="reference external" href="https://github.com/cdcapano/epsie">Epsie</a><a class="headerlink" href="#platter-epsie" title="Link to this heading"></a></h2>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="k">[sampler]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">epsie</span>
+<span class="na">nchains</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">100</span>
+<span class="na">niterations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">100</span>
+<span class="na">ntemps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">4</span>
+
+<span class="c1">;##### Other possible options</span>
+<span class="c1">;effective-nsamples = 1000</span>
+<span class="c1">;max-samples-per-chain = 1000</span>
+<span class="c1">;checkpoint-interval = 2000</span>
+
+<span class="c1">;[sampler-burn_in]</span>
+<span class="c1">;burn-in-test = nacl &amp; max_posterior</span>
+
+<span class="k">[jump_proposal-x]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">normal</span>
+
+<span class="k">[jump_proposal-y]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">normal</span>
+</pre></div>
+</div>
+<p>The following are also supported, but require either python3 support only (cpnest)
+or an external package (multinest).</p>
+</section>
+<section id="platter-cpnest">
+<span id="id6"></span><h2><a class="reference external" href="https://github.com/johnveitch/cpnest">cpnest</a><a class="headerlink" href="#platter-cpnest" title="Link to this heading"></a></h2>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="k">[sampler]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">cpnest</span>
+<span class="na">nlive</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">100</span>
+<span class="na">maxmcmc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">1000</span>
+<span class="na">nthreads</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">1</span>
+<span class="na">verbose</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">1</span>
+
+<span class="c1">;##### Other possible options</span>
+<span class="c1">;verbose = True</span>
+<span class="c1">;loglikelihood-function = </span>
+</pre></div>
+</div>
+</section>
+<section id="platter-multinest">
+<span id="id7"></span><h2><a class="reference external" href="https://johannesbuchner.github.io/PyMultiNest/">Multinest</a><a class="headerlink" href="#platter-multinest" title="Link to this heading"></a></h2>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="k">[sampler]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">multinest</span>
+<span class="na">nlivepoints</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">100</span>
+
+<span class="c1">;##### Optional arguments</span>
+<span class="c1">;evidence-tolerance = 0.1</span>
+<span class="c1">;sampling-efficiency = 0.3</span>
+<span class="c1">;checkpoint-interval = 5000</span>
+<span class="c1">;importance-nested-sampling = True</span>
+</pre></div>
+</div>
+</section>
+<section id="platter-snowline">
+<span id="id8"></span><h2><a class="reference external" href="https://johannesbuchner.github.io/snowline/">Snowline</a><a class="headerlink" href="#platter-snowline" title="Link to this heading"></a></h2>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="k">[sampler]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">snowline</span>
+
+<span class="na">num_gauss_samples</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">500</span>
+<span class="na">min_ess</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">500</span>
+<span class="na">max_improvement_loops</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">3</span>
+</pre></div>
+</div>
+</section>
+<section id="platter-nessai">
+<span id="id9"></span><h2><a class="reference external" href="https://github.com/mj-will/nessai">nessai</a><a class="headerlink" href="#platter-nessai" title="Link to this heading"></a></h2>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="k">[sampler]</span>
+<span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">nessai</span>
+<span class="na">nlive</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">200</span>
+</pre></div>
+</div>
+<p>If we run these samplers, we create the following plot:</p>
+<a class="reference internal image-reference" href="_include/sample.png"><img alt="_include/sample.png" class="align-center" src="_include/sample.png" />
+<aside class="system-message">
+<p class="system-message-title">System Message: WARNING/2 (<span class="docutils literal">/tmp/claude-1000/-home-ahnitz-projects-claude-samplers/b51dfcdc-5f05-4828-a4a7-c6c59db9d82e/scratchpad/docbuild/inference/examples/sampler_platter.rst</span>, line 111)</p>
+<p>Cannot scale image!
+  Could not get size from &quot;_include/sample.png&quot;:
+  Requires Python Imaging Library.</p>
+</aside>
+</a>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="../sampler_api.html" class="btn btn-neutral float-left" title="Sampler API" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright .</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

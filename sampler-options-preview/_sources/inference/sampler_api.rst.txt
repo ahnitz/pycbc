@@ -1,0 +1,4 @@
+Sampler API
+===========
+
+Not included in this preview build; see the full PyCBC documentation.

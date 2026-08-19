@@ -1,0 +1,13 @@
+Choosing and configuring a sampler
+==================================
+
+Preview build of the ``sampler-options-docs`` branch: the new
+:doc:`inference/sampler_options` page and the updated
+:doc:`sampler platter <inference/examples/sampler_platter>`.
+
+.. toctree::
+   :maxdepth: 2
+
+   inference/sampler_options
+   inference/sampler_api
+   inference/examples/sampler_platter
