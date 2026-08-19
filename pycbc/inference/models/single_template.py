@@ -16,7 +16,6 @@
 """This module provides model classes that assume the noise is Gaussian.
 """
 
-import logging
 import numpy
 import itertools
 
@@ -132,12 +131,23 @@ class SingleTemplate(DistMarg, BaseGaussianNoise):
         likelihood
         """
         # Check if this model *can* be included in a multi-signal model.
-        # All marginalizations must currently be disabled to work!
+        # All marginalizations must currently be disabled to work: each
+        # submodel marginalizes before the cross terms are added, and the
+        # log of a product of integrals is not the integral of the joint,
+        # so combining the two gives a wrong answer rather than a slow one.
         if (self.marginalize_vector_params or
-            self.marginalize_distance or
-            self.marginalize_phase):
-            logging.info("Cannot use single template model inside of"
-                         "multi_signal if marginalizations are enabled")
+                self.marginalize_distance or
+                self.marginalize_phase):
+            raise ValueError(
+                "Cannot use %s inside of multi_signal while any "
+                "marginalization is enabled. Each submodel marginalizes "
+                "before the cross terms <h_i|h_j> are added, so the result "
+                "is a wrong likelihood rather than a slow one. Disable "
+                "marginalize_phase, marginalize_distance and "
+                "marginalize_vector_params. If instead the submodels "
+                "describe independent data, so that the cross terms vanish, "
+                "joint_primary_marginalized marginalizes the combined "
+                "likelihood and can be used." % type(self).__name__)
         return [type(self)]
 
     def calculate_hihjs(self, models):

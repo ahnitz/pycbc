@@ -450,12 +450,23 @@ class Relative(DistMarg, BaseGaussianNoise):
         likelihood
         """
         # Check if this model *can* be included in a multi-signal model.
-        # All marginalizations must currently be disabled to work!
+        # All marginalizations must currently be disabled to work: each
+        # submodel marginalizes before the cross terms are added, and the
+        # log of a product of integrals is not the integral of the joint,
+        # so combining the two gives a wrong answer rather than a slow one.
         if (self.marginalize_vector_params or
-            self.marginalize_distance or
-            self.marginalize_phase):
-            logging.info("Cannot use single template model inside of"
-                         "multi_signal if marginalizations are enabled")
+                self.marginalize_distance or
+                self.marginalize_phase):
+            raise ValueError(
+                "Cannot use %s inside of multi_signal while any "
+                "marginalization is enabled. Each submodel marginalizes "
+                "before the cross terms <h_i|h_j> are added, so the result "
+                "is a wrong likelihood rather than a slow one. Disable "
+                "marginalize_phase, marginalize_distance and "
+                "marginalize_vector_params. If instead the submodels "
+                "describe independent data, so that the cross terms vanish, "
+                "joint_primary_marginalized marginalizes the combined "
+                "likelihood and can be used." % type(self).__name__)
         return [type(self)]
 
     def calculate_hihjs(self, models):
@@ -469,19 +480,62 @@ class Relative(DistMarg, BaseGaussianNoise):
                 h2 = m2.h00[ifo]
 
                 # Combine the grids
-                edge = numpy.unique([m1.edges[ifo], m2.edges[ifo]])
+                edge = numpy.union1d(m1.edges[ifo], m2.edges[ifo])
 
-                # Remove any points where either reference is zero
-                keep = numpy.where((h1[edge] != 0) | (h2[edge] != 0))[0]
-                edge = edge[keep]
+                # A reference waveform is zero outside the band its own
+                # model analyzes, and the ratio of signal to reference is
+                # what gets interpolated, so an edge only one of them
+                # covers would be divided by zero. Dropping those leaves
+                # the band both models see.
+                edge = edge[(h1[edge] != 0) & (h2[edge] != 0)]
                 fedge = m1.f[ifo][edge]
+
+                # Each model stores its reference without the time shift it
+                # applies to its own copy of the data instead, so the shifts
+                # go back on before the references are combined; only the
+                # difference between them survives. The kernels pair this
+                # summary data with r1 conj(r2), so the references enter in
+                # the opposite order and what is summed is <h2|h1>. Only the
+                # real part is used, and the two agree there.
+                s1 = numpy.exp(-2.0j * numpy.pi * m1.f[ifo] * m1.ta[ifo])
+                s2 = numpy.exp(-2.0j * numpy.pi * m2.f[ifo] * m2.ta[ifo])
 
                 bins = numpy.array([
                         (edge[i], edge[i + 1])
                         for i in range(len(edge) - 1)
                     ])
-                a0, a1 = self.summary_product(h1, h2, bins, ifo)
+                a0, a1 = self.summary_product(h2 * s2, h1 * s1, bins, ifo)
                 self.hihj[(m1, m2)][ifo] = a0, a1, fedge
+
+    def project_wf_parts(self, parts, ifo, fedge):
+        """ Re-express the current waveform pieces on other frequencies
+
+        The waveform itself oscillates far too quickly to be interpolated,
+        but its ratio to the reference waveform does not; that smoothness is
+        the assumption relative binning is built on. So it is the ratio that
+        is moved onto the requested frequencies here, and the reference
+        waveform is replaced by ones. The likelihood kernels divide by the
+        reference waveform, so they recover the same ratio either way.
+        """
+        freqs = self.fedges[ifo]
+        if numpy.array_equal(freqs, fedge):
+            return parts
+
+        def onto(x):
+            # numpy.interp takes complex values directly; the antenna
+            # factors arrive as scalars and have nothing to move
+            if numpy.ndim(x) == 0:
+                return x
+            return numpy.interp(fedge, freqs, x)
+
+        ones = numpy.ones(len(fedge), dtype=numpy.complex128)
+        if self.still_needs_det_response:
+            dtc, channel, h00 = parts
+            return onto(dtc), onto(channel / h00), ones
+
+        fp, fc, dtc, hp, hc, h00 = parts
+        return (onto(fp), onto(fc), onto(dtc),
+                onto(hp / h00), onto(hc / h00), ones)
 
     def multi_loglikelihood(self, models):
         """ Calculate a multi-model (signal) likelihood
@@ -500,8 +554,10 @@ class Relative(DistMarg, BaseGaussianNoise):
                 for det in self.data:
                     a0, a1, fedge = self.hihj[(m1, m2)][det]
 
-                    dtc, channel, h00 = m1._current_wf_parts[det]
-                    dtc2, channel2, h002 = m2._current_wf_parts[det]
+                    dtc, channel, h00 = m1.project_wf_parts(
+                        m1._current_wf_parts[det], det, fedge)
+                    dtc2, channel2, h002 = m2.project_wf_parts(
+                        m2._current_wf_parts[det], det, fedge)
 
                     c1c2 = self.mlik(fedge,
                                      dtc, channel, h00,
@@ -514,8 +570,10 @@ class Relative(DistMarg, BaseGaussianNoise):
                 for det in self.data:
                     a0, a1, fedge = self.hihj[(m1, m2)][det]
 
-                    fp, fc, dtc, hp, hc, h00 = m1._current_wf_parts[det]
-                    fp2, fc2, dtc2, hp2, hc2, h002 = m2._current_wf_parts[det]
+                    fp, fc, dtc, hp, hc, h00 = m1.project_wf_parts(
+                        m1._current_wf_parts[det], det, fedge)
+                    fp2, fc2, dtc2, hp2, hc2, h002 = m2.project_wf_parts(
+                        m2._current_wf_parts[det], det, fedge)
 
                     h1h2 = self.mlik(fedge,
                                      fp, fc, dtc, hp, hc, h00,
