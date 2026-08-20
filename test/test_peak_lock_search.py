@@ -69,7 +69,7 @@ class TestPeakLockSearch(unittest.TestCase):
         cls.fiducial = dict(mass1=1.4, tc=TC, ra=1.7, dec=-0.4,
                             polarization=0.3)
 
-    def model(self, mass_offset=0.0, **kwargs):
+    def model(self, mass_offset=0.0, data=None, **kwargs):
         numpy.random.seed(5)
         prior = JointDistribution(
             list(VARIABLE), SinAngle(inclination=None),
@@ -77,7 +77,7 @@ class TestPeakLockSearch(unittest.TestCase):
         fiducial = dict(self.fiducial)
         fiducial['mass1'] = fiducial['mass1'] - mass_offset
         return models.RelativeTimeDom(
-            list(VARIABLE), copy.deepcopy(self.data),
+            list(VARIABLE), copy.deepcopy(self.data if data is None else data),
             low_frequency_cutoff={'H1': FLOW}, psds=self.psds,
             static_params=self.static, prior=prior,
             fiducial_params=fiducial, epsilon=0.1, marginalize_phase=True,
@@ -142,6 +142,44 @@ class TestPeakLockSearch(unittest.TestCase):
             model.loglr
         for ifo in first:
             self.assertAlmostEqual(first[ifo], model.tstart[ifo], places=9)
+
+    def test_a_matched_reference_barely_moves_the_region(self):
+        """With nothing to follow, the region must stay where it was.
+
+        The offset is measured from the reference peak, so a reference that
+        is the signal has none to find and the region can move by at most
+        the sample it is rounded to. Measuring from the middle of the region
+        instead moves it by the coarse spacing, which the reference peak
+        does not sit at the centre of.
+        """
+        model = self.model(peak_lock_snr=4.0, **SEARCH)
+        before = dict(model.tstart)
+        model.update(**POINT)
+        model.loglr
+        for ifo in before:
+            self.assertLessEqual(
+                abs(model.tstart[ifo] - before[ifo]) * SAMPLE_RATE, 1.0,
+                "a matched reference moved %s by %s samples"
+                % (ifo, (model.tstart[ifo] - before[ifo]) * SAMPLE_RATE))
+
+    def test_the_region_lands_on_a_sample_of_its_own_grid(self):
+        """The region may only move by whole samples.
+
+        A fractional offset would leave the marginalization sampling the
+        series at shifted phases, which costs more than placing the region
+        more precisely gains. The reference is the signal here: that is
+        where the coarse peak has a genuine fraction of a sample to it,
+        rather than happening to land on one.
+        """
+        model = self.model(peak_lock_snr=4.0, **SEARCH)
+        before = dict(model.tstart)
+        model.update(**POINT)
+        model.loglr
+        for ifo in before:
+            samples = (model.tstart[ifo] - before[ifo]) * SAMPLE_RATE
+            self.assertAlmostEqual(
+                samples, round(samples), places=6,
+                msg="%s moved by %s samples" % (ifo, samples))
 
     def test_the_search_is_a_small_part_of_a_call(self):
         """The coarse pass must cost a fraction of the full resolution one.
