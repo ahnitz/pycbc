@@ -1022,6 +1022,7 @@ class DistMarg():
         num_samples = int(tmax * sample_rate)
         self.tstart = {ifo: tstart for ifo in self.data}
         self.num_samples = {ifo: num_samples for ifo in self.data}
+        self.peak_lock_peak = {}
 
         if snrs is None:
             if not hasattr(self, 'ref_snr'):
@@ -1045,6 +1046,7 @@ class DistMarg():
 
                 logging.info('%s: Max Ref SNR Peak of %s at %s',
                              ifo, peak_snr, peak_time)
+                self.peak_lock_peak[ifo] = float(peak_time)
 
                 if peak_snr > peak_lock_snr:
                     target = peak_snr ** 2.0 / 2.0 - numpy.log(peak_lock_ratio)
@@ -1110,8 +1112,9 @@ class DistMarg():
 
         ifo = (getattr(self, 'keep_ifos', None) or list(wfs))[0]
         rate = self.peak_lock_sample_rate
-        width = self.num_samples[ifo] / rate
-        locked = self.peak_lock_start[ifo] + width / 2.0
+        if ifo not in self.peak_lock_peak:
+            return
+        locked = self.peak_lock_peak[ifo]
 
         stride = self.peak_lock_search_decimate
         delta_t = stride / rate
@@ -1119,7 +1122,20 @@ class DistMarg():
         start = locked - self.peak_lock_search_samples / rate / 2.0
         series = self.coarse_series(ifo, wfs, start, delta_t, num)
         series = abs(numpy.array(series))
-        shift = start + int(numpy.argmax(series)) * delta_t - locked
+        i = int(numpy.argmax(series))
+        # the peak rarely sits on a coarse sample, and its neighbours say
+        # where between them it does. Costs a handful of operations and
+        # saves having to pad the region by a whole stride to absorb the
+        # error of taking the coarse sample itself.
+        if 0 < i < len(series) - 1:
+            a, b, c = series[i - 1], series[i], series[i + 1]
+            curve = a - 2.0 * b + c
+            if curve < 0:
+                i += min(0.5, max(-0.5, 0.5 * (a - c) / curve))
+        # to a whole sample of the region's own grid: a fractional offset
+        # would sample the series at shifted phases, which costs more than
+        # the refinement gains
+        shift = round((start + i * delta_t - locked) * rate) / rate
 
         for name in self.peak_lock_start:
             self.tstart[name] = self.peak_lock_start[name] + shift
