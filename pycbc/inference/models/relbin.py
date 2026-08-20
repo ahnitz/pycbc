@@ -1403,10 +1403,19 @@ class RelativeTime(Relative):
             self._ref_snr = self.get_snr(wfs)
         return self._ref_snr
 
+    def coarse_series(self, ifo, wfs, tstart, delta_t, num_samples):
+        """ The predictor on any grid, used to look for the peak """
+        sdat = self.sdat[ifo]
+        dtc = tstart - self.end_time[ifo] - self.ta[ifo]
+        return snr_predictor(self.fedges[ifo], dtc, delta_t, num_samples,
+                             wfs[ifo][0], wfs[ifo][1], self.h00_sparse[ifo],
+                             sdat['a0'], sdat['a1'], sdat['b0'], sdat['b1'])
+
     def get_snr(self, wfs):
         """ Return hp/hc maximized SNR time series
         """
         delta_t = 1.0 / self.sample_rate
+        self.follow_peak(wfs)
         snrs = {}
         for ifo in wfs:
             sdat = self.sdat[ifo]
@@ -1516,10 +1525,21 @@ class RelativeTimeDom(RelativeTime):
     """
     name = "relative_time_dom"
 
+    def coarse_series(self, ifo, wfs, tstart, delta_t, num_samples):
+        """ The predictor on any grid, used to look for the peak """
+        sdat = self.sdat[ifo]
+        dtc = tstart - self.end_time[ifo] - self.ta[ifo]
+        sh, _ = snr_predictor_dom(self.fedges[ifo], dtc, delta_t, num_samples,
+                                  wfs[ifo][0], self.h00_sparse[ifo],
+                                  sdat['a0'], sdat['a1'],
+                                  sdat['b0'], sdat['b1'])
+        return sh
+
     def get_snr(self, wfs):
         """ Return hp/hc maximized SNR time series
         """
         delta_t = 1.0 / self.sample_rate
+        self.follow_peak(wfs)
         snrs = {}
         self.sh = {}
         self.hh = {}

@@ -973,6 +973,8 @@ class DistMarg():
                         peak_lock_snr=None,
                         peak_lock_ratio=1e4,
                         peak_lock_region=4,
+                        peak_lock_search_samples=None,
+                        peak_lock_search_decimate=8,
                         **kwargs):
         """ Determine where to constrain marginalization based on
         the observed reference SNR peaks.
@@ -992,7 +994,24 @@ class DistMarg():
         peak_lock_region: int
             Number of samples to inclue beyond the strict region
             determined by the relative likelihood
+        peak_lock_search_samples: int
+            How far to search for the peak before each likelihood, in
+            samples, centered on the region locked here. The region is then
+            moved to wherever the peak turned out to be. Off if not given.
+            Counted in samples, as peak_lock_region is, so that it
+            follows the sample rate the model was given rather than
+            having to be restated for each one.
+        peak_lock_search_decimate: int
+            Stride of that search, in samples. It only has to place the
+            peak inside the region, so eight is enough for any region at
+            least eight samples wide, and a shorter stride costs more
+            without improving the answer.
         """
+        self.peak_lock_search_samples = (
+            None if peak_lock_search_samples is None
+            else int(peak_lock_search_samples))
+        self.peak_lock_search_decimate = int(peak_lock_search_decimate)
+        self.peak_lock_sample_rate = float(sample_rate)
 
         if 'tc' not in self.marginalized_vector_priors:
             return
@@ -1061,6 +1080,50 @@ class DistMarg():
         self.tend = self.tstart.copy()
         for ifo in snrs:
             self.tend[ifo] += self.num_samples[ifo] / sample_rate
+        self.peak_lock_start = self.tstart.copy()
+
+    def follow_peak(self, wfs):
+        """ Move the locked region to wherever the peak is now
+
+        The region is locked once, around a reference waveform, but the peak
+        it was locked on moves with the parameters: a hundredth of a solar
+        mass in a component mass moves it by milliseconds, which is wider
+        than the region itself. Past that the region holds no peak, and the
+        likelihood is wrong rather than approximate.
+
+        A coarse pass over a wider range says where the peak went. The
+        offset is measured from the region as locked rather than from
+        wherever the previous call left it, so the region depends on the
+        current parameters alone. One offset is found, in one detector,
+        and applied to all of them, which leaves the regions as
+        commensurate as they were locked: a common shift does not change
+        the delays between detectors, so the sky draw sees what it expects.
+
+        Does nothing when the marginalization points were precalculated,
+        since those were drawn over the locked region, and moving away from
+        them would lose them silently.
+        """
+        if not getattr(self, 'peak_lock_search_samples', None):
+            return
+        if hasattr(self, 'premarg') or not hasattr(self, 'peak_lock_start'):
+            return
+
+        ifo = (getattr(self, 'keep_ifos', None) or list(wfs))[0]
+        rate = self.peak_lock_sample_rate
+        width = self.num_samples[ifo] / rate
+        locked = self.peak_lock_start[ifo] + width / 2.0
+
+        stride = self.peak_lock_search_decimate
+        delta_t = stride / rate
+        num = int(self.peak_lock_search_samples / stride)
+        start = locked - self.peak_lock_search_samples / rate / 2.0
+        series = self.coarse_series(ifo, wfs, start, delta_t, num)
+        series = abs(numpy.array(series))
+        shift = start + int(numpy.argmax(series)) * delta_t - locked
+
+        for name in self.peak_lock_start:
+            self.tstart[name] = self.peak_lock_start[name] + shift
+            self.tend[name] = self.tstart[name] + self.num_samples[name] / rate
 
     def draw_ifos(self, snrs, peak_snr_threshold=4.0, log=True,
                   precalculate_marginalization_points=False,

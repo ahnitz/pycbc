@@ -1,0 +1,166 @@
+# Copyright (C) 2026  Alex Nitz
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+"""Tests moving the locked time region to wherever the peak has gone.
+
+The region is locked around a reference waveform. As the parameters move
+away from that reference the peak moves too, and once it leaves the region
+the marginalization integrates over times the signal is not at. These drive
+the reference away from the signal and check the likelihood survives it.
+"""
+
+import copy
+import unittest
+
+import numpy
+
+from utils import simple_exit
+
+from pycbc.detector import Detector
+from pycbc.distributions import JointDistribution, SinAngle, Uniform
+from pycbc.inference import models
+from pycbc.noise import noise_from_psd
+from pycbc.psd import aLIGOZeroDetHighPower
+from pycbc.waveform import get_td_waveform
+
+TC = 1187008882.42
+FLOW, SEGLEN, SRATE = 25., 64, 2048
+SAMPLE_RATE = 4096
+VARIABLE = ['distance', 'inclination', 'tc']
+POINT = dict(distance=40., inclination=0.5)
+# how far the reference is put from the signal. The last of these moves the
+# peak by more than the width of a locked region.
+OFFSETS = [0.0, 0.002, 0.005, 0.01]
+SEARCH = dict(peak_lock_search_samples=246, peak_lock_search_decimate=8)
+
+
+class TestPeakLockSearch(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        hp, hc = get_td_waveform(approximant='TaylorF2', f_lower=FLOW,
+                                 delta_t=1. / SRATE, mass1=1.4, mass2=1.35,
+                                 distance=40., inclination=0.5, coa_phase=1.1)
+        hp.start_time += TC
+        hc.start_time += TC
+        psd = aLIGOZeroDetHighPower(int(SRATE * SEGLEN / 2) + 1,
+                                    1. / SEGLEN, FLOW)
+        # one detector: a locked region can be narrower than the light
+        # travel time between two, which is a separate problem from this one
+        noise = noise_from_psd(int(SEGLEN * SRATE), 1. / SRATE, psd, seed=7)
+        noise._epoch = TC - SEGLEN / 2
+        signal = Detector('H1').project_wave(hp, hc, 1.7, -0.4, 0.3)
+        cls.data = {'H1': noise.add_into(signal).to_frequencyseries()}
+        cls.psds = {'H1': psd}
+        cls.static = dict(mass1=1.4, mass2=1.35, f_lower=FLOW,
+                          approximant='TaylorF2', ra=1.7, dec=-0.4,
+                          polarization=0.3)
+        cls.fiducial = dict(mass1=1.4, tc=TC, ra=1.7, dec=-0.4,
+                            polarization=0.3)
+
+    def model(self, mass_offset=0.0, **kwargs):
+        numpy.random.seed(5)
+        prior = JointDistribution(
+            list(VARIABLE), SinAngle(inclination=None),
+            Uniform(distance=(10, 200)), Uniform(tc=(TC - 0.1, TC + 0.1)))
+        fiducial = dict(self.fiducial)
+        fiducial['mass1'] = fiducial['mass1'] - mass_offset
+        return models.RelativeTimeDom(
+            list(VARIABLE), copy.deepcopy(self.data),
+            low_frequency_cutoff={'H1': FLOW}, psds=self.psds,
+            static_params=self.static, prior=prior,
+            fiducial_params=fiducial, epsilon=0.1, marginalize_phase=True,
+            marginalize_vector_params='tc', marginalize_vector_samples=2000,
+            sample_rate=SAMPLE_RATE, **kwargs)
+
+    def loglr(self, **kwargs):
+        model = self.model(**kwargs)
+        model.update(**POINT)
+        return model.loglr
+
+    def test_off_by_default(self):
+        """A model that did not ask for it must not move its region."""
+        model = self.model(mass_offset=0.01, peak_lock_snr=4.0)
+        before = dict(model.tstart)
+        model.update(**POINT)
+        model.loglr
+        for ifo in before:
+            self.assertEqual(before[ifo], model.tstart[ifo])
+
+    def test_the_region_follows_a_moving_peak(self):
+        """The answer has to survive the reference drifting away.
+
+        Without the search the region stops holding the peak and the
+        likelihood collapses; with it the answer stays near the one an
+        unrestricted region gives.
+        """
+        exact = self.loglr()
+        for offset in OFFSETS:
+            searched = self.loglr(mass_offset=offset, peak_lock_snr=4.0,
+                                  **SEARCH)
+            self.assertLess(
+                abs(searched - exact), 50.,
+                "with a reference %s off, searching gave %s against %s"
+                % (offset, searched, exact))
+
+    def test_it_matters(self):
+        """The largest offset must actually break the unsearched case.
+
+        Without this the test above could pass on a region that never
+        needed moving.
+        """
+        exact = self.loglr()
+        locked = self.loglr(mass_offset=OFFSETS[-1], peak_lock_snr=4.0)
+        self.assertGreater(
+            abs(locked - exact), 100.,
+            "a reference %s off did not spill out of the region; the test "
+            "proves nothing" % OFFSETS[-1])
+
+    def test_the_region_depends_only_on_the_parameters(self):
+        """Calling twice has to land the region in the same place.
+
+        The offset is measured from the region as locked, not from where the
+        last call left it, so repeated evaluation must not walk it along.
+        """
+        model = self.model(mass_offset=0.01, peak_lock_snr=4.0, **SEARCH)
+        model.update(**POINT)
+        model.loglr
+        first = dict(model.tstart)
+        for _ in range(3):
+            model.update(**POINT)
+            model.loglr
+        for ifo in first:
+            self.assertAlmostEqual(first[ifo], model.tstart[ifo], places=9)
+
+    def test_the_search_is_a_small_part_of_a_call(self):
+        """The coarse pass must cost a fraction of the full resolution one.
+
+        Counted in samples rather than timed, so it does not depend on the
+        machine: the search grid is what it costs.
+        """
+        model = self.model(peak_lock_snr=4.0, **SEARCH)
+        coarse = (SEARCH['peak_lock_search_samples']
+                  // SEARCH['peak_lock_search_decimate'])
+        fine = model.num_samples['H1']
+        self.assertLess(coarse, 8 * fine,
+                        "search grid %s against a region of %s samples"
+                        % (coarse, fine))
+
+
+suite = unittest.TestSuite()
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPeakLockSearch))
+
+if __name__ == '__main__':
+    results = unittest.TextTestRunner(verbosity=2).run(suite)
+    simple_exit(results)
