@@ -47,6 +47,7 @@ VARIABLE = ['distance', 'inclination', 'tc', 'ra', 'dec']
 POINT = dict(distance=40., inclination=0.5)
 SKY = dict(ra=1.7, dec=-0.4, polarization=0.3)
 VSAMPLES = 400
+SRATE_OVERRIDE = 4096
 
 
 class TestAnalyticSkyDraw(unittest.TestCase):
@@ -88,7 +89,7 @@ class TestAnalyticSkyDraw(unittest.TestCase):
             marginalize_phase=True,
             marginalize_vector_params='tc,ra,dec',
             marginalize_vector_samples=VSAMPLES,
-            sample_rate=4096, **kwargs)
+            sample_rate=SRATE_OVERRIDE, **kwargs)
 
     def drawn(self, **kwargs):
         """Run one evaluation and hand back what the draw produced"""
@@ -193,13 +194,16 @@ class TestAnalyticSkyDraw(unittest.TestCase):
                         "the weighted sky is %.1f degrees from the "
                         "injection" % sep)
 
-    # A comparison against the map path is deliberately not asserted here.
-    # The two estimators do not agree in this fixture: the analytic value
-    # is pinned at 510.6 from 400 samples to 64000 while the map climbs
-    # 520 -> 527 and is still rising, so they differ by 16 nats and the
-    # gap grows with sample count. Which one is right is unresolved -- see
-    # BACKLOG.md -- and a test asserting either would bless an answer
-    # nobody has established.
+    # A comparison against the map path is deliberately not asserted.
+    # On master the map is mis-normalized -- what marg-sky-normalization
+    # and marg-sky-absolute fix -- and reads about 16 nats high, so the
+    # two disagree here for a reason that has nothing to do with this
+    # draw. Direct integration is the reference that settles it: an
+    # importance sample from a Laplace fit at the peak gives 511.62 for
+    # this fixture, and at sample_rate 65536 the analytic draw gives
+    # 511.58 and the corrected map 511.64. At the 4096 used above both
+    # read about a nat low, which is the tc grid stepping 244 us across a
+    # peak of sd 172 us and applies to either draw.
 
 
 suite = unittest.TestSuite()
