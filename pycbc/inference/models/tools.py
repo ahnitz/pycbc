@@ -130,6 +130,11 @@ class DistMarg():
 
         self.marginalize_sky_initial_samples = \
             int(float(marginalize_sky_initial_samples))
+        # PCG64 rather than the legacy global state: it is faster per
+        # draw, and seeding it from that state leaves numpy.random.seed
+        # pinning a run as before
+        self._sky_rng = numpy.random.default_rng(
+            numpy.random.randint(0, 2 ** 63))
         self.marginalize_sky_analytic = \
             str_to_bool(marginalize_sky_analytic)
         self.marginalize_sky_candidates = \
@@ -516,7 +521,7 @@ class DistMarg():
         return out
 
     @staticmethod
-    def _draw_in_window(logw, base, delta, lo_t, hi_t):
+    def _draw_in_window(logw, base, delta, lo_t, hi_t, rng):
         """Draw times ``propto exp(logw)`` inside a per-sample time window.
 
         Times are OFFSETS from the epoch the caller works in, not absolute
@@ -538,47 +543,29 @@ class DistMarg():
         lo = numpy.where(empty, 0, lo)
         hi = numpy.where(empty, n, hi)
         norm = cum[hi] - cum[lo]
-        target = cum[lo] + numpy.random.uniform(0, 1, len(lo)) * norm
+        target = cum[lo] + rng.random(len(lo)) * norm
         idx = numpy.clip(numpy.searchsorted(cum, target) - 1, 0, n - 1)
         times = (base + idx * delta
-                 + numpy.random.uniform(-delta / 2.0, delta / 2.0, len(idx)))
+                 + rng.uniform(-delta / 2.0, delta / 2.0, len(idx)))
         dens = (logw[idx] - lmax) - numpy.log(norm) - numpy.log(delta)
         return times, numpy.where(empty, -numpy.inf, dens)
 
     @staticmethod
-    def _alias_draw(weights, shape):
-        """Draw indices ``propto weights`` through a Vose alias table.
+    def _weighted_draw(weights, shape, rng):
+        """Draw indices ``propto weights``, with replacement.
 
-        Each draw is then two array lookups instead of a binary search.
-        The build is a python loop over the cells, so it costs the same
-        whatever the draw size, and it only pays off for a block much
-        larger than the series: measured on the real weights, 1070 cells,
-        it is 2.4x faster than a cumulative sum and a binary search at
-        120000 draws and 12x slower at 2000, which is why the single-row
-        draw does not use it. One
-        uniform serves both alias coordinates -- scaling by ``n`` puts the
-        cell in the integer part and leaves an independent uniform in the
-        remainder -- so this needs no more random numbers than inversion.
-        Zero-weight cells can only appear as the alias of a positive one,
-        never as a direct hit, so underflowed cells stay unreachable.
+        How many draws each cell wins is exactly a multinomial, so the
+        counts can be drawn in one call and expanded, which costs the
+        length of the series plus the number of draws and searches for
+        nothing. The expansion comes out ordered by cell, and the caller
+        pairs each draw with a different sample, so it is shuffled back
+        into an independent order.
         """
-        n = len(weights)
-        prob = weights * (n / weights.sum())
-        alias = numpy.arange(n)
-        small = list(numpy.nonzero(prob < 1.0)[0])
-        large = list(numpy.nonzero(prob >= 1.0)[0])
-        while small and large:
-            lean, full = small.pop(), large.pop()
-            alias[lean] = full
-            prob[full] -= 1.0 - prob[lean]
-            (small if prob[full] < 1.0 else large).append(full)
-        prob[large] = 1.0
-        prob[small] = 1.0
-        x = numpy.random.random_sample(shape)
-        x *= n
-        idx = x.astype(numpy.intp)
-        x -= idx
-        return numpy.where(x < prob[idx], idx, alias[idx])
+        size = int(numpy.prod(shape))
+        counts = rng.multinomial(size, weights / weights.sum())
+        idx = numpy.repeat(numpy.arange(len(weights)), counts)
+        rng.shuffle(idx)
+        return idx.reshape(shape)
 
     def _draw_second_delay(self, series, order, geom, epoch, t_off, dt12):
         """Draw dt13 on the ellipse slice the first delay allows.
@@ -624,7 +611,8 @@ class DistMarg():
         shifted = numpy.exp(logl - lmax)
         total = shifted.sum()
         nsamp = len(dt12)
-        cell = self._alias_draw(shifted, (ncand, nsamp))
+        cell = self._weighted_draw(shifted, (ncand, nsamp),
+                                   self._sky_rng)
         dt13c = t_off[None, :] - (base + cell * delta)
         half_safe = numpy.maximum(half, 1e-300)[None, :]
         mid_row = mid[None, :]
@@ -647,7 +635,7 @@ class DistMarg():
         msafe = numpy.maximum(msum, 1e-300)
         # inverse-cdf over the candidates, accumulated in place: the running
         # sum never has to be materialised as an (ncand, nsamp) array
-        thresh = numpy.random.random_sample(nsamp) * msafe
+        thresh = self._sky_rng.random(nsamp) * msafe
         acc = mass[0].astype(numpy.float64)
         pick = numpy.zeros(nsamp, dtype=numpy.intp)
         for k in range(1, ncand):
@@ -656,7 +644,7 @@ class DistMarg():
         cols = numpy.arange(nsamp)
         theta_lo = edge_lo[pick, cols].astype(numpy.float64)
         theta_hi = edge_hi[pick, cols].astype(numpy.float64)
-        theta = (theta_lo + numpy.random.uniform(0, 1, nsamp)
+        theta = (theta_lo + self._sky_rng.random(nsamp)
                  * (theta_hi - theta_lo))
         dt13 = mid + half * numpy.sin(theta)
         # q = exp(logl_j) p(dt13) / Zhat  =>  p/q = Zhat / exp(logl_j)
@@ -699,13 +687,7 @@ class DistMarg():
         # call whose overhead dwarfs the length-n array it is given
         l0max = logl0.max()
         shifted0 = numpy.exp(logl0 - l0max)
-        # one draw per sample, where a cumulative sum and a binary search
-        # beat the alias table: its build is a python loop over the series
-        # and costs the same whatever the draw size, so it only pays off
-        # for the much larger block drawn in _draw_second_delay
-        cum0 = numpy.cumsum(shifted0)
-        i0 = numpy.searchsorted(
-            cum0, numpy.random.random_sample(vsamples) * cum0[-1])
+        i0 = self._weighted_draw(shifted0, vsamples, self._sky_rng)
         # Every delay below is a difference of two coalescence-time-like
         # quantities. Formed from absolute GPS they are order 1e9 s, which a
         # double holds to about 2.4e-7 s -- a thousandth of a sample at
@@ -719,7 +701,8 @@ class DistMarg():
         # differences exact to ~1e-18 and pins the partition.
         epoch = snr0.start_time
         t_off = (i0 * delta0
-                 + numpy.random.uniform(-delta0 / 2.0, delta0 / 2.0, vsamples))
+                 + self._sky_rng.uniform(-delta0 / 2.0, delta0 / 2.0,
+                                         vsamples))
         dens = ((logl0[i0] - l0max) - numpy.log(shifted0.sum())
                 - numpy.log(delta0))
         invalid = numpy.zeros(vsamples, dtype=bool)
@@ -739,7 +722,7 @@ class DistMarg():
             snr1, logl1 = series[order[1]]
             t_two, dens1 = self._draw_in_window(
                 logl1, float(snr1.start_time - epoch), float(snr1.delta_t),
-                t_off - t12max, t_off + t12max)
+                t_off - t12max, t_off + t12max, self._sky_rng)
             dens = dens + dens1
             dt12 = t_off - t_two
             invalid |= ~numpy.isfinite(dens1) | (numpy.abs(dt12) > t12max)
@@ -750,7 +733,7 @@ class DistMarg():
                 dhat, uvec, vvec = geom['basis']
                 cos_t = numpy.clip(-dt12 / t12max, -1.0, 1.0)
                 sin_t = numpy.sqrt(numpy.maximum(1.0 - cos_t * cos_t, 0.0))
-                az = numpy.random.uniform(0, 2 * numpy.pi, vsamples)
+                az = self._sky_rng.uniform(0, 2 * numpy.pi, vsamples)
                 nhat = (cos_t * dhat[:, None]
                         + sin_t * (numpy.cos(az) * uvec[:, None]
                                    + numpy.sin(az) * vvec[:, None]))
@@ -786,7 +769,7 @@ class DistMarg():
                 ok_dn = (tc_dn >= c['tcmin']) & (tc_dn <= c['tcmax'])
                 nroot = ok_up.astype(numpy.int8) + ok_dn
                 invalid |= nroot == 0
-                coin = numpy.random.uniform(0, 1, vsamples) < 0.5
+                coin = self._sky_rng.random(vsamples) < 0.5
                 up = numpy.where(ok_up & ok_dn, coin, ok_up)
                 branch = numpy.where(up, 1.0, -1.0)
                 nhat = npar + (branch * sgeo) * geom['e3'][:, None]

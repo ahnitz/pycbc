@@ -293,9 +293,9 @@ class TestAnalyticSkyDraw(unittest.TestCase):
         Measured here, analytic against map:
 
             samples    1 det   2 det   3 det
-            2000       0.72x   0.64x   0.82x
-            5000       0.45x   0.43x   0.64x
-            15000      0.29x   0.26x   0.45x
+            2000       0.63x   0.58x   0.77x
+            5000       0.38x   0.38x   0.59x
+            15000      0.26x   0.24x   0.44x
 
         Below about a thousand samples the fixed cost wins and it is
         marginally the slower of the two, but nothing runs there. Each
@@ -305,8 +305,8 @@ class TestAnalyticSkyDraw(unittest.TestCase):
         so this is a ratio and does not depend on the machine, and the
         numbers print so drift shows before it crosses a bound.
         """
-        for vsamples, bound in ((2000, 1.00), (5000, 0.85),
-                                (15000, 0.75)):
+        for vsamples, bound in ((2000, 0.90), (5000, 0.72),
+                                (15000, 0.58)):
             for n in (1, 2, 3):
                 ifos = IFOS[:n]
                 with self.subTest(samples=vsamples, detectors=n):
