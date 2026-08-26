@@ -23,6 +23,7 @@ sample, only on it being self-consistent and inside the prior.
 """
 
 import copy
+import time
 import unittest
 
 import numpy
@@ -75,15 +76,18 @@ class TestAnalyticSkyDraw(unittest.TestCase):
                           polarization=SKY['polarization'])
         cls.fiducial = dict(mass1=1.4, tc=TC, **SKY)
 
-    def model(self, **kwargs):
+    def model(self, ifos=None, **kwargs):
+        ifos = IFOS if ifos is None else ifos
         numpy.random.seed(5)
         prior = JointDistribution(
             list(VARIABLE), SinAngle(inclination=None),
             Uniform(distance=(10, 200)), Uniform(tc=(TC - 0.1, TC + 0.1)),
             Uniform(ra=(0, 2 * numpy.pi)), CosAngle(dec=None))
         return models.RelativeTimeDom(
-            list(VARIABLE), copy.deepcopy(self.data),
-            low_frequency_cutoff={i: FLOW for i in IFOS}, psds=self.psds,
+            list(VARIABLE),
+            {i: copy.deepcopy(self.data[i]) for i in ifos},
+            low_frequency_cutoff={i: FLOW for i in ifos},
+            psds={i: self.psds[i] for i in ifos},
             static_params=self.static, prior=prior,
             fiducial_params=self.fiducial, epsilon=0.1,
             marginalize_phase=True,
@@ -97,6 +101,25 @@ class TestAnalyticSkyDraw(unittest.TestCase):
         model.update(**POINT)
         model.loglr
         return model, model.marginalize_vector_params
+
+    @staticmethod
+    def separation(vp):
+        """Degrees between the weighted mean direction and the injection"""
+        ra = numpy.atleast_1d(vp['ra'])
+        dec = numpy.atleast_1d(vp['dec'])
+        logw = numpy.atleast_1d(vp['logw_partial'])
+        ok = numpy.isfinite(logw)
+        p = numpy.exp(logw[ok] - logw[ok].max())
+        p /= p.sum()
+        nhat = numpy.array([numpy.cos(dec[ok]) * numpy.cos(ra[ok]),
+                            numpy.cos(dec[ok]) * numpy.sin(ra[ok]),
+                            numpy.sin(dec[ok])])
+        mean = (nhat * p).sum(axis=1)
+        mean /= numpy.linalg.norm(mean)
+        inj = numpy.array([numpy.cos(SKY['dec']) * numpy.cos(SKY['ra']),
+                           numpy.cos(SKY['dec']) * numpy.sin(SKY['ra']),
+                           numpy.sin(SKY['dec'])])
+        return numpy.degrees(numpy.arccos(numpy.clip(mean.dot(inj), -1, 1)))
 
     def test_the_option_is_off_by_default(self):
         """A model that did not ask for it must not take this path"""
@@ -193,6 +216,111 @@ class TestAnalyticSkyDraw(unittest.TestCase):
         self.assertLess(sep, 25.0,
                         "the weighted sky is %.1f degrees from the "
                         "injection" % sep)
+
+    def test_every_detector_count_produces_a_usable_draw(self):
+        """One and two detectors take different branches from three.
+
+        With one detector there is no delay and the azimuth is free; with
+        two there is a single delay and one free azimuth; only with three
+        is the sky fully determined. All three have to return real
+        directions inside the prior, and the handed-over validation
+        covered none of them at population scale.
+        """
+        for n in (1, 2, 3):
+            ifos = IFOS[:n]
+            with self.subTest(detectors=n):
+                _, vp = self.drawn(ifos=ifos, marginalize_sky_analytic=True)
+                ra = numpy.atleast_1d(vp['ra'])
+                dec = numpy.atleast_1d(vp['dec'])
+                tc = numpy.atleast_1d(vp['tc'])
+                logw = numpy.atleast_1d(vp['logw_partial'])
+                self.assertTrue(numpy.isfinite(dec).all())
+                self.assertTrue(numpy.isfinite(ra).all())
+                self.assertFalse(numpy.isnan(logw).any())
+                self.assertLessEqual(numpy.abs(dec).max(),
+                                     numpy.pi / 2 + 1e-9)
+                self.assertGreaterEqual(ra.min(), 0.0)
+                self.assertLess(ra.max(), 2 * numpy.pi + 1e-9)
+                self.assertGreaterEqual(tc.min(), TC - 0.1 - 1e-6)
+                self.assertLessEqual(tc.max(), TC + 0.1 + 1e-6)
+                self.assertGreater(
+                    numpy.isfinite(logw).sum(), 0.1 * len(logw),
+                    "only %d of %d samples survived with %d detectors"
+                    % (numpy.isfinite(logw).sum(), len(logw), n))
+
+    def test_two_detectors_still_find_the_signal(self):
+        """A single delay localises to a ring, which still contains it.
+
+        Three detectors give 8 degrees and two give 19; one gives 96,
+        which is why there is no such assertion for one -- with no delay
+        the draw has nothing to localise with and the number is
+        meaningless rather than good or bad.
+        """
+        for n, limit in ((2, 45.0), (3, 25.0)):
+            with self.subTest(detectors=n):
+                _, vp = self.drawn(ifos=IFOS[:n],
+                                   marginalize_sky_analytic=True)
+                sep = self.separation(vp)
+                self.assertLess(
+                    sep, limit,
+                    "%d detectors put the weighted sky %.1f degrees from "
+                    "the injection" % (n, sep))
+
+    def timed(self, ifos, vsamples, **kwargs):
+        """Best of three, ten calls each, in this process"""
+        global VSAMPLES
+        keep, VSAMPLES = VSAMPLES, vsamples
+        try:
+            model = self.model(ifos=ifos, **kwargs)
+            model.update(**POINT)
+            model.loglr
+            best = float('inf')
+            for _ in range(3):
+                start = time.perf_counter()
+                for _ in range(10):
+                    model.update(**POINT)
+                    model.loglr
+                best = min(best, (time.perf_counter() - start) / 10)
+            return best
+        finally:
+            VSAMPLES = keep
+
+    def test_it_keeps_its_advantage_as_the_draw_grows(self):
+        """A guard on the cost, and on where the cost comes from.
+
+        The analytic draw carries a larger fixed cost than the map and
+        much better scaling, so a single number does not describe it.
+        Measured here, analytic against map:
+
+            samples    1 det   2 det   3 det
+            400        1.12x   1.01x   1.13x
+            2000       0.69x   0.67x   0.84x
+
+        At the few-hundred-sample end it is marginally the slower of the
+        two; by a couple of thousand, which is where a real run sits, it
+        is the faster. Both ends are pinned, because a change that traded
+        the scaling for a lower fixed cost would look like an improvement
+        at 400 and be a loss in production. Timed in one process on the
+        same data, so this is a ratio and does not depend on the machine.
+        The numbers print so drift is visible before it crosses a bound.
+        """
+        for vsamples, bound in ((400, 1.30), (2000, 1.00)):
+            for n in (1, 2, 3):
+                ifos = IFOS[:n]
+                with self.subTest(samples=vsamples, detectors=n):
+                    fast = self.timed(ifos, vsamples,
+                                      marginalize_sky_analytic=True)
+                    slow = self.timed(ifos, vsamples)
+                    ratio = fast / slow
+                    print("\n  %5d samples, %d det: analytic %6.3f ms, "
+                          "map %6.3f ms, %.2fx"
+                          % (vsamples, n, fast * 1e3, slow * 1e3, ratio))
+                    self.assertLess(
+                        ratio, bound,
+                        "%d samples, %d detectors: %.2fx against a bound "
+                        "of %.2f (analytic %.3f ms, map %.3f ms)"
+                        % (vsamples, n, ratio, bound, fast * 1e3,
+                           slow * 1e3))
 
     # A comparison against the map path is deliberately not asserted.
     # On master the map is mis-normalized -- what marg-sky-normalization
