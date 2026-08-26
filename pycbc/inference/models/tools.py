@@ -668,10 +668,14 @@ class DistMarg():
             # the second detector's arrival lies within one light crossing
             # of the first, intersected with the series we have: under peak
             # locking the region is narrower than the crossing, so this
-            # clip is the usual case rather than an edge one
-            lo1 = numpy.clip(numpy.ceil((t_off - t12max - base1) / delta1),
+            # clip is the usual case rather than an edge one. A cell is in
+            # the window if it overlaps it at all, as in the third
+            # detector below: a drawn cell is jittered across its width, so
+            # excluding one that straddles an end would leave the times in
+            # the overlap undrawable rather than merely unlikely.
+            lo1 = numpy.clip(numpy.floor((t_off - t12max - base1) / delta1),
                              0, len(logl1)).astype(int)
-            hi1 = numpy.clip(numpy.floor((t_off + t12max - base1) / delta1)
+            hi1 = numpy.clip(numpy.ceil((t_off + t12max - base1) / delta1)
                              + 1, 0, len(logl1)).astype(int)
             i1, mass1 = self._draw_in_cells(logl1, lo1, hi1, self._sky_rng)
             t_two = (base1 + i1 * delta1
