@@ -286,25 +286,27 @@ class TestAnalyticSkyDraw(unittest.TestCase):
             VSAMPLES = keep
 
     def test_it_keeps_its_advantage_as_the_draw_grows(self):
-        """A guard on the cost, and on where the cost comes from.
+        """A guard on the cost at the draw sizes a run actually uses.
 
-        The analytic draw carries a larger fixed cost than the map and
-        much better scaling, so a single number does not describe it.
+        The analytic path carries a larger fixed cost than the map and
+        much better scaling, so its advantage grows with the draw.
         Measured here, analytic against map:
 
             samples    1 det   2 det   3 det
-            400        1.12x   1.01x   1.13x
-            2000       0.69x   0.67x   0.84x
+            2000       0.72x   0.64x   0.82x
+            5000       0.45x   0.43x   0.64x
+            15000      0.29x   0.26x   0.45x
 
-        At the few-hundred-sample end it is marginally the slower of the
-        two; by a couple of thousand, which is where a real run sits, it
-        is the faster. Both ends are pinned, because a change that traded
-        the scaling for a lower fixed cost would look like an improvement
-        at 400 and be a loss in production. Timed in one process on the
-        same data, so this is a ratio and does not depend on the machine.
-        The numbers print so drift is visible before it crosses a bound.
+        Below about a thousand samples the fixed cost wins and it is
+        marginally the slower of the two, but nothing runs there. Each
+        size is bounded separately rather than taking the best, so a
+        change that bought a lower fixed cost by giving up the scaling
+        would still fail at 15000. Timed in one process on the same data,
+        so this is a ratio and does not depend on the machine, and the
+        numbers print so drift shows before it crosses a bound.
         """
-        for vsamples, bound in ((400, 1.30), (2000, 1.00)):
+        for vsamples, bound in ((2000, 1.00), (5000, 0.85),
+                                (15000, 0.75)):
             for n in (1, 2, 3):
                 ifos = IFOS[:n]
                 with self.subTest(samples=vsamples, detectors=n):

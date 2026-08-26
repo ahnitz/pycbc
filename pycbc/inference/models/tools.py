@@ -13,6 +13,7 @@ from scipy.special import logsumexp, i0e
 from scipy.interpolate import RectBivariateSpline, interp1d
 from pycbc.distributions import JointDistribution
 
+from pycbc.constants import C_SI
 from pycbc.detector import Detector
 
 
@@ -20,7 +21,6 @@ from pycbc.detector import Detector
 EARTH_RADIUS = 0.031
 
 # Metres per second, for the analytic delay -> sky inversion
-SPEED_OF_LIGHT = 299792458.0
 
 
 def str_to_tuple(sval, ftype):
@@ -467,7 +467,7 @@ class DistMarg():
                 'ifos': ifos, 'tcmin': tcmin, 'tcmax': tcmax,
                 'gmst': dets[ifos[0]].gmst_estimate(tcave),
                 'loc': {i: numpy.asarray(dets[i].location) for i in ifos},
-                'loc_c': {i: numpy.asarray(dets[i].location) / SPEED_OF_LIGHT
+                'loc_c': {i: numpy.asarray(dets[i].location) / C_SI
                           for i in ifos},
                 'resp': resp, 'log_tcspan': numpy.log(tcmax - tcmin)}
         return self._analytic_const
@@ -490,7 +490,7 @@ class DistMarg():
             else:
                 mat = numpy.vstack([d1, loc[order[0]] - loc[order[2]]])
             mp = numpy.linalg.pinv(mat)
-            smat = SPEED_OF_LIGHT ** 2.0 * (mp.T @ mp)
+            smat = C_SI ** 2.0 * (mp.T @ mp)
             t12max = float(numpy.sqrt(
                 numpy.linalg.inv(numpy.atleast_2d(smat))[0, 0]))
             g = {'d1': d1, 'Mp': mp, 'S': smat, 't12max': t12max,
@@ -533,7 +533,8 @@ class DistMarg():
         makes the draw a genuine density rather than a probability mass on the
         sample grid, which is what lets the sky come out continuous.
         """
-        p = numpy.exp(logw - logw.max())
+        lmax = logw.max()
+        p = numpy.exp(logw - lmax)
         n = len(logw)
         cum = numpy.concatenate(([0.0], numpy.cumsum(p)))
         lo = numpy.clip(numpy.ceil((lo_t - base) / delta), 0, n).astype(int)
@@ -547,7 +548,7 @@ class DistMarg():
         idx = numpy.clip(numpy.searchsorted(cum, target) - 1, 0, n - 1)
         times = (base + idx * delta
                  + numpy.random.uniform(-delta / 2.0, delta / 2.0, len(idx)))
-        dens = (logw[idx] - logw.max()) - numpy.log(norm) - numpy.log(delta)
+        dens = (logw[idx] - lmax) - numpy.log(norm) - numpy.log(delta)
         return times, numpy.where(empty, -numpy.inf, dens)
 
     @staticmethod
@@ -784,7 +785,7 @@ class DistMarg():
                     series, order, geom, epoch, t_off, dt12)
                 dens = dens + dens2
                 invalid |= bad2
-                npar = geom['Mp'] @ (-SPEED_OF_LIGHT
+                npar = geom['Mp'] @ (-C_SI
                                      * numpy.vstack([dt12, dt13]))
                 sgeo = numpy.sqrt(numpy.clip(1.0 - (npar * npar).sum(0),
                                              0.0, None))
