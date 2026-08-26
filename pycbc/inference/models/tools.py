@@ -570,10 +570,10 @@ class DistMarg():
         small = list(numpy.nonzero(prob < 1.0)[0])
         large = list(numpy.nonzero(prob >= 1.0)[0])
         while small and large:
-            s, l = small.pop(), large.pop()
-            alias[s] = l
-            prob[l] -= 1.0 - prob[s]
-            (small if prob[l] < 1.0 else large).append(l)
+            lean, full = small.pop(), large.pop()
+            alias[lean] = full
+            prob[full] -= 1.0 - prob[lean]
+            (small if prob[full] < 1.0 else large).append(full)
         prob[large] = 1.0
         prob[small] = 1.0
         x = numpy.random.random_sample(shape)
