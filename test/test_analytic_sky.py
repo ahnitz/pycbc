@@ -40,7 +40,8 @@ class TestAliasDraw(unittest.TestCase):
         weights = numpy.asarray(weights, dtype=float)
         n = len(weights)
         prob = weights / weights.sum()
-        idx = DistMarg._weighted_draw(weights.copy(), self.ndraw, numpy.random.default_rng(7))
+        idx = DistMarg._weighted_draw(weights.copy(), self.ndraw,
+                                      numpy.random.default_rng(7))
         self.assertGreaterEqual(idx.min(), 0, label)
         self.assertLess(idx.max(), n, label)
         obs = numpy.bincount(idx, minlength=n).astype(float)
