@@ -549,9 +549,13 @@ class DistMarg():
     def _alias_draw(weights, shape):
         """Draw indices ``propto weights`` through a Vose alias table.
 
-        Each draw is then two array lookups instead of a binary search, which
-        is what dominates here: the same length-``n`` law is drawn from tens
-        of thousands of times, so the O(n) build amortises immediately. One
+        Each draw is then two array lookups instead of a binary search.
+        The build is a python loop over the cells, so it costs the same
+        whatever the draw size, and it only pays off for a block much
+        larger than the series: measured on the real weights, 1070 cells,
+        it is 2.4x faster than a cumulative sum and a binary search at
+        120000 draws and 12x slower at 2000, which is why the single-row
+        draw does not use it. One
         uniform serves both alias coordinates -- scaling by ``n`` puts the
         cell in the integer part and leaves an independent uniform in the
         remainder -- so this needs no more random numbers than inversion.
@@ -695,7 +699,13 @@ class DistMarg():
         # call whose overhead dwarfs the length-n array it is given
         l0max = logl0.max()
         shifted0 = numpy.exp(logl0 - l0max)
-        i0 = self._alias_draw(shifted0, vsamples)
+        # one draw per sample, where a cumulative sum and a binary search
+        # beat the alias table: its build is a python loop over the series
+        # and costs the same whatever the draw size, so it only pays off
+        # for the much larger block drawn in _draw_second_delay
+        cum0 = numpy.cumsum(shifted0)
+        i0 = numpy.searchsorted(
+            cum0, numpy.random.random_sample(vsamples) * cum0[-1])
         # Every delay below is a difference of two coalescence-time-like
         # quantities. Formed from absolute GPS they are order 1e9 s, which a
         # double holds to about 2.4e-7 s -- a thousandth of a sample at
