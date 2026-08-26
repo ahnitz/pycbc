@@ -641,9 +641,10 @@ class DistMarg():
         dens = ((logl0[i0] - l0max) - numpy.log(shifted0.sum())
                 - numpy.log(delta0))
         invalid = numpy.zeros(vsamples, dtype=bool)
-        branch_corr = 0.0
 
         if ndet == 1:
+            # no delay to invert, so the sky comes from the prior and only
+            # the arrival time carries anything
             ra = self.marginalized_vector_priors['ra'].rvs(size=vsamples)['ra']
             dec = self.marginalized_vector_priors['dec'].rvs(
                 size=vsamples)['dec']
@@ -656,14 +657,10 @@ class DistMarg():
             # each delay is one linear constraint on the direction; the
             # pseudo-inverse of the baselines turns a delay pair back into
             # the component of the direction they fix
-            first = loc[order[0]] - loc[order[1]]
-            second = loc[order[0]] - loc[order[2]] if ndet > 2 else None
-            mat = (numpy.atleast_2d(first) if second is None
-                   else numpy.vstack([first, second]))
-            mpinv = numpy.linalg.pinv(mat)
+            baselines = [loc[order[0]] - loc[i] for i in order[1:3]]
+            mpinv = numpy.linalg.pinv(numpy.vstack(baselines))
             t12max = dets[order[0]].light_travel_time_to_detector(
                 dets[order[1]])
-            log_const = log_tcspan + numpy.log(2.0 * t12max)
 
             snr1, logl1 = series[order[1]]
             base1 = float(snr1.start_time - epoch)
@@ -681,16 +678,16 @@ class DistMarg():
                      + self._sky_rng.uniform(-delta1 / 2.0, delta1 / 2.0,
                                              vsamples))
             dens1 = mass1 - numpy.log(delta1)
-            dens = dens + dens1
+            dens += dens1
             dt12 = t_off - t_two
             invalid |= ~numpy.isfinite(dens1) | (numpy.abs(dt12) > t12max)
+
+            branch_corr = 0.0
             if ndet == 2:
-                # a single delay leaves a free azimuth about the baseline, and
-                # there the Jacobian is constant, so uniform is exactly
-                # isotropic and needs no correction
-                # a single delay leaves the azimuth about the baseline
-                # free, so build a frame to sweep it in
-                dhat = first / numpy.linalg.norm(first)
+                # One delay leaves the azimuth about the baseline free.
+                # The Jacobian is constant there, so sweeping it uniformly
+                # is exactly isotropic and needs no correction.
+                dhat = baselines[0] / numpy.linalg.norm(baselines[0])
                 uvec = numpy.cross(dhat, [0.0, 0.0, 1.0])
                 uvec = uvec / numpy.linalg.norm(uvec)
                 vvec = numpy.cross(dhat, uvec)
@@ -701,15 +698,14 @@ class DistMarg():
                         + sin_t * (numpy.cos(az) * uvec[:, None]
                                    + numpy.sin(az) * vvec[:, None]))
             else:
-                normal = numpy.cross(first, second)
+                normal = numpy.cross(*baselines)
                 e3 = normal / numpy.linalg.norm(normal)
                 dt13, dens2, bad2 = self._draw_second_delay(
                     series, order, C_SI ** 2.0 * (mpinv.T @ mpinv),
                     epoch, t_off, dt12)
-                dens = dens + dens2
+                dens += dens2
                 invalid |= bad2
-                npar = mpinv @ (-C_SI
-                                     * numpy.vstack([dt12, dt13]))
+                npar = mpinv @ (-C_SI * numpy.vstack([dt12, dt13]))
                 sgeo = numpy.sqrt(numpy.clip(1.0 - (npar * npar).sum(0),
                                              0.0, None))
                 # The delays fix the direction only up to a reflection in
@@ -734,7 +730,8 @@ class DistMarg():
                 nhat = npar + numpy.where(up, sgeo, -sgeo) * e3[:, None]
                 branch_corr = numpy.log(
                     0.5 * numpy.maximum(roots, 1).astype(float))
-            logw = -log_const - dens + branch_corr
+            logw = (-log_tcspan - numpy.log(2.0 * t12max)
+                    - dens + branch_corr)
 
         fplus, fcross, delay = {}, {}, {}
         for ifo, det in dets.items():
