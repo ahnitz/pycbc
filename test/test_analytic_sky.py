@@ -162,71 +162,61 @@ class TestEpochOffsetPrecision(unittest.TestCase):
                         % (worst_off / delta))
 
 
-class TestDrawInWindow(unittest.TestCase):
-    """The per-sample window, at the edges the sky draw has never reached.
+class TestDrawInCells(unittest.TestCase):
+    """The per-sample window, at the bounds the sky draw actually reaches.
 
-    Each sample gets its own window, because the second detector's arrival
+    Each sample gets its own bounds, because the second detector's cell
     has to lie within one light crossing of wherever the first was drawn.
-    On a loud signal the first draw lands on two cells and every window is
-    the same and comfortably inside the series, so the cases below -- a
-    window off the end, and one hanging over an edge -- do not arise there
-    and would otherwise go untested.
+    Under peak locking the locked region is narrower than that crossing,
+    so the bounds are usually the whole series; a window holding no cell
+    at all needs two regions further apart than the crossing, which takes
+    a mis-locked detector.
     """
 
     def setUp(self):
         numpy.random.seed(4)
         self.n = 64
-        self.base, self.delta = 10.0, 0.5
-        # a peak in the middle, so a restricted window has to move the draw
-        cell = numpy.arange(self.n)
-        self.logw = -0.02 * (cell - 32.0) ** 2.0
+        # a peak in the middle, so restricting the bounds has to move the draw
+        self.logw = -0.02 * (numpy.arange(self.n) - 32.0) ** 2.0
         self.rng = numpy.random.default_rng(9)
 
-    def draw(self, lo_t, hi_t, size=400):
-        lo = numpy.full(size, lo_t)
-        hi = numpy.full(size, hi_t)
-        return DistMarg._draw_in_window(self.logw, self.base, self.delta,
-                                        lo, hi, self.rng)
+    def draw(self, lo, hi, size=2000):
+        return DistMarg._draw_in_cells(self.logw,
+                                       numpy.full(size, lo),
+                                       numpy.full(size, hi), self.rng)
 
-    def test_a_window_off_the_end_is_rejected(self):
-        """No cell to draw, so the sample must carry no weight."""
-        past = self.base + self.n * self.delta + 5.0
-        times, dens = self.draw(past, past + 1.0)
-        self.assertTrue(numpy.isneginf(dens).all(),
-                        "a window past the series returned a weight")
-        self.assertFalse(numpy.isnan(times).any(),
-                         "a rejected sample still has to return a number")
-
-    def test_a_window_before_the_start_is_rejected(self):
-        before = self.base - 10.0
-        _, dens = self.draw(before, before + 1.0)
-        self.assertTrue(numpy.isneginf(dens).all())
-
-    def test_a_window_over_the_edge_keeps_the_cells_it_has(self):
-        """Clipped, not rejected: the overhanging part simply is not there."""
-        times, dens = self.draw(self.base - 5.0,
-                                self.base + 3.0 * self.delta)
-        self.assertTrue(numpy.isfinite(dens).all(),
-                        "a window with cells in it was rejected")
-        self.assertGreaterEqual(times.min(), self.base - self.delta)
-        self.assertLessEqual(times.max(),
-                             self.base + 3.0 * self.delta + self.delta)
+    def test_a_window_holding_no_cell_is_rejected(self):
+        """Nothing to draw, so the sample must carry no weight."""
+        idx, mass = self.draw(20, 20)
+        self.assertTrue(numpy.isneginf(mass).all(),
+                        "an empty window returned a weight")
+        self.assertTrue((idx >= 0).all() and (idx < self.n).all(),
+                        "a rejected sample still has to return a valid cell")
 
     def test_the_draw_stays_inside_the_window(self):
-        """The point of the window is that nothing comes back outside it."""
-        lo_t = self.base + 10.0 * self.delta
-        hi_t = self.base + 20.0 * self.delta
-        times, dens = self.draw(lo_t, hi_t)
-        self.assertTrue(numpy.isfinite(dens).all())
-        # the dither can carry a time half a cell past the edge cell
-        self.assertGreaterEqual(times.min(), lo_t - self.delta)
-        self.assertLessEqual(times.max(), hi_t + self.delta)
-        self.assertGreater(len(numpy.unique(numpy.round(times, 6))), 1)
+        idx, mass = self.draw(10, 20)
+        self.assertGreaterEqual(idx.min(), 10)
+        self.assertLess(idx.max(), 20)
+        self.assertTrue(numpy.isfinite(mass).all())
+
+    def test_the_whole_series_is_the_usual_case(self):
+        """Peak locking leaves the bounds at the ends most of the time."""
+        idx, mass = self.draw(0, self.n)
+        self.assertTrue(numpy.isfinite(mass).all())
+        self.assertGreater(len(numpy.unique(idx)), 5)
+
+    def test_the_mass_is_the_probability_within_the_window(self):
+        """What it returns has to be the log probability it drew with."""
+        lo, hi = 10, 20
+        idx, mass = self.draw(lo, hi, size=20000)
+        p = numpy.exp(self.logw[lo:hi] - self.logw.max())
+        want = numpy.log(p / p.sum())
+        self.assertLess(numpy.abs(mass - want[idx - lo]).max(), 1e-12)
 
 
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(
-    TestDrawInWindow))
+    TestDrawInCells))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestAliasDraw))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(
     TestMirrorRootSelection))

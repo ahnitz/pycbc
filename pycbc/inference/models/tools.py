@@ -521,34 +521,29 @@ class DistMarg():
         return out
 
     @staticmethod
-    def _draw_in_window(logw, base, delta, lo_t, hi_t, rng):
-        """Draw times ``propto exp(logw)`` inside a per-sample time window.
+    def _draw_in_cells(logw, lo, hi, rng):
+        """Draw one cell per sample from ``[lo, hi)`` of a shared law.
 
-        Times are OFFSETS from the epoch the caller works in, not absolute
-        GPS; ``base`` is where this detector's series starts in that same
-        frame. See ``analytic_sky_draw`` for why.
+        Every sample has its own bounds, because the window each one may
+        draw in follows from where the previous detector was drawn. The
+        cumulative sum is over the whole series and is formed once; a
+        sample's own normalisation is then the difference of two of its
+        entries.
 
-        Returns the dithered times and the log PROPOSAL DENSITY. The dither
-        makes the draw a genuine density rather than a probability mass on the
-        sample grid, which is what lets the sky come out continuous.
+        Returns the cells and the log probability of drawing each within
+        its own window, or ``-inf`` where the window holds no cell.
         """
         lmax = logw.max()
-        p = numpy.exp(logw - lmax)
-        n = len(logw)
-        cum = numpy.concatenate(([0.0], numpy.cumsum(p)))
-        lo = numpy.clip(numpy.ceil((lo_t - base) / delta), 0, n).astype(int)
-        hi = numpy.clip(numpy.floor((hi_t - base) / delta) + 1,
-                        0, n).astype(int)
+        cum = numpy.concatenate(([0.0], numpy.cumsum(numpy.exp(logw - lmax))))
         empty = hi <= lo
         lo = numpy.where(empty, 0, lo)
-        hi = numpy.where(empty, n, hi)
+        hi = numpy.where(empty, len(logw), hi)
         norm = cum[hi] - cum[lo]
         target = cum[lo] + rng.random(len(lo)) * norm
-        idx = numpy.clip(numpy.searchsorted(cum, target) - 1, 0, n - 1)
-        times = (base + idx * delta
-                 + rng.uniform(-delta / 2.0, delta / 2.0, len(idx)))
-        dens = (logw[idx] - lmax) - numpy.log(norm) - numpy.log(delta)
-        return times, numpy.where(empty, -numpy.inf, dens)
+        idx = numpy.clip(numpy.searchsorted(cum, target) - 1,
+                         0, len(logw) - 1)
+        mass = (logw[idx] - lmax) - numpy.log(norm)
+        return idx, numpy.where(empty, -numpy.inf, mass)
 
     @staticmethod
     def _weighted_draw(weights, shape, rng):
@@ -720,9 +715,21 @@ class DistMarg():
         else:
             t12max = geom['t12max']
             snr1, logl1 = series[order[1]]
-            t_two, dens1 = self._draw_in_window(
-                logl1, float(snr1.start_time - epoch), float(snr1.delta_t),
-                t_off - t12max, t_off + t12max, self._sky_rng)
+            base1 = float(snr1.start_time - epoch)
+            delta1 = float(snr1.delta_t)
+            # the second detector's arrival lies within one light crossing
+            # of the first, intersected with the series we have: under peak
+            # locking the region is narrower than the crossing, so this
+            # clip is the usual case rather than an edge one
+            lo1 = numpy.clip(numpy.ceil((t_off - t12max - base1) / delta1),
+                             0, len(logl1)).astype(int)
+            hi1 = numpy.clip(numpy.floor((t_off + t12max - base1) / delta1)
+                             + 1, 0, len(logl1)).astype(int)
+            i1, mass1 = self._draw_in_cells(logl1, lo1, hi1, self._sky_rng)
+            t_two = (base1 + i1 * delta1
+                     + self._sky_rng.uniform(-delta1 / 2.0, delta1 / 2.0,
+                                             vsamples))
+            dens1 = mass1 - numpy.log(delta1)
             dens = dens + dens1
             dt12 = t_off - t_two
             invalid |= ~numpy.isfinite(dens1) | (numpy.abs(dt12) > t12max)
