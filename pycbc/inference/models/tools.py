@@ -749,8 +749,12 @@ class DistMarg():
         for ifo, det in dets.items():
             fplus[ifo], fcross[ifo] = det.antenna_pattern_from_direction(nhat)
             delay[ifo] = det.time_delay_from_direction(nhat)
-        tc = epoch_t + t_off - delay[order[0]]
-        outside = (tc < tcmin) | (tc > tcmax)
+        # tc has to be absolute; the test against the prior does not, and
+        # in offsets it agrees exactly with the one the roots were chosen
+        # by rather than to the 2.4e-7 s a double resolves near 1.19e9
+        tc_off = t_off - delay[order[0]]
+        outside = (tc_off < tcmin - epoch_t) | (tc_off > tcmax - epoch_t)
+        tc = epoch_t + tc_off
         logw = numpy.where(invalid | outside, -numpy.inf, logw)
         if not numpy.isfinite(logw).any():
             return False
