@@ -15,7 +15,6 @@ from pycbc.distributions import JointDistribution
 
 from pycbc.constants import C_SI
 from pycbc.detector import Detector
-from pycbc.detector.ground import antenna_patterns_from_direction
 
 
 # Earth radius in seconds
@@ -461,7 +460,7 @@ class DistMarg():
             tcave = 0.5 * (tcmin + tcmax)
             dets = {i: Detector(i, reference_time=tcave) for i in ifos}
             self._analytic_const = {
-                'ifos': ifos, 'tcmin': tcmin, 'tcmax': tcmax, 'dets': dets,
+                'tcmin': tcmin, 'tcmax': tcmax, 'dets': dets,
                 'gmst': dets[ifos[0]].gmst_estimate(tcave),
                 'loc': {i: numpy.asarray(dets[i].location) for i in ifos},
                 'log_tcspan': numpy.log(tcmax - tcmin)}
@@ -479,24 +478,23 @@ class DistMarg():
         if key not in self._analytic_geom:
             c = self._analytic_constants()
             loc = c['loc']
-            d1 = loc[order[0]] - loc[order[1]]
-            if len(order) == 2:
-                mat = numpy.atleast_2d(d1)
-            else:
-                mat = numpy.vstack([d1, loc[order[0]] - loc[order[2]]])
+            first = loc[order[0]] - loc[order[1]]
+            second = (loc[order[0]] - loc[order[2]] if len(order) > 2
+                      else None)
+            mat = (numpy.atleast_2d(first) if second is None
+                   else numpy.vstack([first, second]))
             mp = numpy.linalg.pinv(mat)
-            smat = C_SI ** 2.0 * (mp.T @ mp)
             # the widest dt12 the ellipse allows is exactly the light
             # travel time along that baseline, which the detector knows
             t12max = c['dets'][order[0]].light_travel_time_to_detector(
                 c['dets'][order[1]])
-            g = {'d1': d1, 'Mp': mp, 'S': smat, 't12max': t12max,
+            g = {'Mp': mp, 'S': C_SI ** 2.0 * (mp.T @ mp), 't12max': t12max,
                  'log_const': c['log_tcspan'] + numpy.log(2.0 * t12max)}
-            if len(order) > 2:
-                cr = numpy.cross(d1, loc[order[0]] - loc[order[2]])
-                g['e3'] = cr / numpy.linalg.norm(cr)
+            if second is not None:
+                normal = numpy.cross(first, second)
+                g['e3'] = normal / numpy.linalg.norm(normal)
             else:
-                dh = d1 / numpy.linalg.norm(d1)
+                dh = first / numpy.linalg.norm(first)
                 u = numpy.cross(dh, [0.0, 0.0, 1.0])
                 u = u / numpy.linalg.norm(u)
                 g['basis'] = (dh, u, numpy.cross(dh, u))
@@ -780,15 +778,10 @@ class DistMarg():
                     0.5 * numpy.maximum(nroot, 1).astype(float))
             logw = -geom['log_const'] - dens + branch_corr
 
-        # every detector sees the same source direction, and most of the
-        # response depends only on that, so it is formed once for all of
-        # them rather than once each
-        names = c['ifos']
-        fp, fc, dl = antenna_patterns_from_direction(
-            [c['dets'][i] for i in names], nhat)
-        fplus = {i: fp[k] for k, i in enumerate(names)}
-        fcross = {i: fc[k] for k, i in enumerate(names)}
-        delay = {i: dl[k] for k, i in enumerate(names)}
+        fplus, fcross, delay = {}, {}, {}
+        for ifo, det in c['dets'].items():
+            fplus[ifo], fcross[ifo] = det.antenna_pattern_from_direction(nhat)
+            delay[ifo] = det.time_delay_from_direction(nhat)
         tc = float(epoch) + t_off - delay[order[0]]
         outside = (tc < c['tcmin']) | (tc > c['tcmax'])
         logw = numpy.where(invalid | outside, -numpy.inf, logw)
