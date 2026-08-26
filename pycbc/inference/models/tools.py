@@ -695,8 +695,12 @@ class DistMarg():
                 uvec = numpy.cross(dhat, [0.0, 0.0, 1.0])
                 uvec = uvec / numpy.linalg.norm(uvec)
                 vvec = numpy.cross(dhat, uvec)
+                # dt12 can exceed the crossing on a sample already marked
+                # invalid, so the cosine is clipped; the sine is then real
+                # without a guard of its own, since c*c rounds to at most
+                # one for every double in [-1, 1]
                 cos_t = numpy.clip(-dt12 / t12max, -1.0, 1.0)
-                sin_t = numpy.sqrt(numpy.maximum(1.0 - cos_t * cos_t, 0.0))
+                sin_t = numpy.sqrt(1.0 - cos_t * cos_t)
                 az = self._sky_rng.uniform(0, 2 * numpy.pi, vsamples)
                 nhat = (cos_t * dhat[:, None]
                         + sin_t * (numpy.cos(az) * uvec[:, None]
