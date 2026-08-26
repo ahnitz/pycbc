@@ -67,7 +67,6 @@ class DistMarg():
                               marginalize_vector_samples=1e3,
                               marginalize_sky_initial_samples=1e6,
                               marginalize_sky_analytic=False,
-                              marginalize_sky_candidates=8,
                               **kwargs):
         """ Setup the model for use with distance marginalization
 
@@ -137,8 +136,6 @@ class DistMarg():
             numpy.random.randint(0, 2 ** 63))
         self.marginalize_sky_analytic = \
             str_to_bool(marginalize_sky_analytic)
-        self.marginalize_sky_candidates = \
-            max(1, int(float(marginalize_sky_candidates)))
         self._analytic_const = None
         self._analytic_geom = {}
 
@@ -588,16 +585,18 @@ class DistMarg():
         dt13 instead has log-divergent weight variance and is worse than
         the map this replaces.
 
-        The third detector's own SNR then tilts the draw through K
-        candidate cells taken from its shared one-dimensional law, so the
-        arcsine cell mass is evaluated at K cells per sample rather than at
-        every cell and the cost does not depend on the series length. The
-        exact normaliser ``sum_j sh_j P_j`` is replaced by the K-sample
-        estimate ``tot * mean_k(P_k)``, whose variance falls as 1/K.
+        The third detector's own SNR then tilts the draw, exactly as the
+        second detector's does: the slice is a window of arrival times, a
+        cell is drawn from the series inside it, and dt13 is placed within
+        that cell by the arcsine. The window is the cells that OVERLAP the
+        slice rather than those centred in it, because the arcsine density
+        diverges at the ends and the two edge cells carry a fifth of the
+        mass.
 
-        Candidates are held as ``(ncand, nsamples)`` so that the reductions
-        over candidates run along contiguous rows, and so that the
-        per-sample quantities broadcast along them without reshaping.
+        The weight is then ``W P_j / sh_j`` for the drawn cell j, where W
+        is the window's own share of the series. That is exact for the
+        cell drawn, not an estimate, so nothing here has a sample count to
+        choose.
         """
         mid, half, invalid = self._ellipse_slice(geom['S'], dt12)
         # a sample whose slice has no width is already invalid; this only
@@ -606,51 +605,30 @@ class DistMarg():
 
         snr, logl = series[order[2]]
         base, delta = float(snr.start_time - epoch), float(snr.delta_t)
-        ncand, nsamp = self.marginalize_sky_candidates, len(dt12)
-        # shift before the exponential: |SNR|^2/2 reaches several hundred
-        # and the unshifted form overflows to inf
-        lmax = logl.max()
-        shifted = numpy.exp(logl - lmax)
-        cell = self._weighted_draw(shifted, (ncand, nsamp), self._sky_rng)
+        ncell = len(logl)
+        # the slice, as a window of this detector's arrival times
+        lo = numpy.clip(numpy.floor((t_off - mid - half - base) / delta),
+                        0, ncell).astype(int)
+        hi = numpy.clip(numpy.ceil((t_off - mid + half - base) / delta) + 1,
+                        0, ncell).astype(int)
+        cell, logq = self._draw_in_cells(logl, lo, hi, self._sky_rng)
 
-        # each candidate cell's position on the slice, and half a cell,
-        # both in units of the half width, which is what arcsine takes
+        # where the drawn cell sits on the slice, and half a cell, both in
+        # units of the half width, which is what the arcsine takes
         centre = (t_off - (base + cell * delta) - mid) / half
         step = delta / (2.0 * half)
-        # single precision for the arcsine is ~7x faster and costs at most
-        # 5e-5 relative on the cell mass; the same array sets both the
-        # selection probability and the weight, so this stays consistent
-        edge_lo = numpy.arcsin(
-            numpy.clip(centre - step, -1.0, 1.0).astype(numpy.float32))
-        edge_hi = numpy.arcsin(
-            numpy.clip(centre + step, -1.0, 1.0).astype(numpy.float32))
-        # arcsine is monotone and the step is positive, so hi >= lo always:
-        # no absolute value, and no interval to sort
+        edge_lo = numpy.arcsin(numpy.clip(centre - step, -1.0, 1.0))
+        edge_hi = numpy.arcsin(numpy.clip(centre + step, -1.0, 1.0))
+        # arcsine is monotone and the step is positive, so hi >= lo always
         mass = (edge_hi - edge_lo) / numpy.pi
-        # in double: 1e-300 would flush to zero in single
-        total = mass.sum(axis=0, dtype=numpy.float64)
-        invalid |= ~(total > 0)
-        total = numpy.maximum(total, 1e-300)
+        invalid |= ~(mass > 0) | ~numpy.isfinite(logq)
+        safe = numpy.maximum(mass, 1e-300)
 
-        # inverse cdf over the K candidates, accumulated in place: a
-        # cumulative sum would materialise the whole (ncand, nsamp) block
-        # and is 8x slower at 15000 samples for the same picks
-        thresh = self._sky_rng.random(nsamp) * total
-        running = mass[0].astype(numpy.float64)
-        pick = numpy.zeros(nsamp, dtype=numpy.intp)
-        for cand in range(1, ncand):
-            pick += running < thresh
-            running += mass[cand]
-        chosen = (pick, numpy.arange(nsamp))
-
-        theta_lo = edge_lo[chosen].astype(numpy.float64)
-        theta_hi = edge_hi[chosen].astype(numpy.float64)
-        theta = (theta_lo
-                 + self._sky_rng.random(nsamp) * (theta_hi - theta_lo))
+        theta = (edge_lo
+                 + self._sky_rng.random(len(dt12)) * (edge_hi - edge_lo))
         dt13 = mid + half * numpy.sin(theta)
-        # q = exp(logl_j) p(dt13) / Zhat  =>  p/q = Zhat / exp(logl_j)
-        dens = ((logl[cell[chosen]] - lmax)
-                - numpy.log(shifted.sum() * total / ncand))
+        # q = (sh_j / W) p(dt13) / P_j  =>  p/q = W P_j / sh_j
+        dens = logq - numpy.log(safe)
         return dt13, dens, invalid
 
     def analytic_sky_draw(self, snrs, ifos, vsamples):
@@ -1010,13 +988,9 @@ class DistMarg():
             form instead of looking them up in the pregenerated map. The
             physical region is the exact ellipse the delays allow, so a drawn
             delay tuple cannot fail to correspond to a sky position, and the
-            prior/proposal ratio is analytic rather than approximate. Falls
-            back
-            to the map, with a warning, if it cannot produce a usable draw.
-        marginalize_sky_candidates: int
-            Candidate cells used when tilting the second delay by the third
-            detector's SNR. Cost is roughly linear in this and the effective
-            sample size saturates around 8, which is the default.
+            prior/proposal ratio is analytic rather than approximate.
+            Falls back to the map, with a warning, if it cannot produce a
+            usable draw.
         peak_lock_snr: float
             The minimum SNR to bother restricting from the prior range
         peak_lock_ratio: float
