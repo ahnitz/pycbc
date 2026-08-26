@@ -136,8 +136,7 @@ class DistMarg():
             numpy.random.randint(0, 2 ** 63))
         self.marginalize_sky_analytic = \
             str_to_bool(marginalize_sky_analytic)
-        self._analytic_const = None
-        self._analytic_geom = {}
+        self._sky_detectors = None
 
         for param in str_to_tuple(marginalize_vector_params, str):
             logging.info('Marginalizing over %s, %s points from prior',
@@ -444,78 +443,6 @@ class DistMarg():
 
         return self.marginalize_vector_params
 
-    def _analytic_constants(self):
-        """Detector geometry and tc bounds. Constant for the whole run.
-
-        Built once: ``Detector.__init__`` scans the LAL detector table and
-        constructs an astropy EarthLocation, and ``gmst_estimate`` on a fresh
-        object falls through to ``gmst_accurate``; together they cost
-        several ms per call if rebuilt, against ~0.05 ms for the linear
-        algebra they feed.
-        """
-        if self._analytic_const is None:
-            ifos = list(self.data.keys())
-            tcmin, tcmax = self.marginalized_vector_priors['tc'].bounds['tc']
-            tcmin, tcmax = float(tcmin), float(tcmax)
-            tcave = 0.5 * (tcmin + tcmax)
-            dets = {i: Detector(i, reference_time=tcave) for i in ifos}
-            self._analytic_const = {
-                'tcmin': tcmin, 'tcmax': tcmax, 'dets': dets,
-                'gmst': dets[ifos[0]].gmst_estimate(tcave),
-                'loc': {i: numpy.asarray(dets[i].location) for i in ifos},
-                'log_tcspan': numpy.log(tcmax - tcmin)}
-        return self._analytic_const
-
-    def _analytic_geometry(self, order):
-        """Baseline geometry for one detector ORDERING.
-
-        Keyed on the ordering because that is recomputed every call from the
-        current SNR peaks, and ``keep_ifos`` can change between calls too, so a
-        cache without the key would silently reuse another network's geometry.
-        The key space is a handful of entries.
-        """
-        key = tuple(order)
-        if key not in self._analytic_geom:
-            c = self._analytic_constants()
-            loc = c['loc']
-            first = loc[order[0]] - loc[order[1]]
-            second = (loc[order[0]] - loc[order[2]] if len(order) > 2
-                      else None)
-            mat = (numpy.atleast_2d(first) if second is None
-                   else numpy.vstack([first, second]))
-            mp = numpy.linalg.pinv(mat)
-            # the widest dt12 the ellipse allows is exactly the light
-            # travel time along that baseline, which the detector knows
-            t12max = c['dets'][order[0]].light_travel_time_to_detector(
-                c['dets'][order[1]])
-            g = {'Mp': mp, 'S': C_SI ** 2.0 * (mp.T @ mp), 't12max': t12max,
-                 'log_const': c['log_tcspan'] + numpy.log(2.0 * t12max)}
-            if second is not None:
-                normal = numpy.cross(first, second)
-                g['e3'] = normal / numpy.linalg.norm(normal)
-            else:
-                dh = first / numpy.linalg.norm(first)
-                u = numpy.cross(dh, [0.0, 0.0, 1.0])
-                u = u / numpy.linalg.norm(u)
-                g['basis'] = (dh, u, numpy.cross(dh, u))
-            self._analytic_geom[key] = g
-        return self._analytic_geom[key]
-
-    def _analytic_windows(self, snrs, ifos):
-        """Per-detector SNR series sliced to the region the draw may use."""
-        c = self._analytic_constants()
-        out = {}
-        for ifo in ifos:
-            snr = snrs[ifo]
-            tmin, tmax = c['tcmin'] - EARTH_RADIUS, c['tcmax'] + EARTH_RADIUS
-            if hasattr(self, 'tstart'):
-                tmin, tmax = self.tstart[ifo], self.tend[ifo]
-            snr = snr.time_slice(max(tmin, snr.start_time + snr.delta_t),
-                                 min(tmax, snr.end_time - snr.delta_t * 2),
-                                 mode='nearest')
-            out[ifo] = (snr, snr.squared_norm().numpy() / 2.0)
-        return out
-
     @staticmethod
     def _draw_in_cells(logw, lo, hi, rng):
         """Draw one cell per sample from ``[lo, hi)`` of a shared law.
@@ -584,7 +511,8 @@ class DistMarg():
         root = numpy.sqrt(numpy.maximum(disc, 0.0))
         return -lin / (2.0 * quad), root / (2.0 * quad), disc <= 0.0
 
-    def _draw_second_delay(self, series, order, geom, epoch, t_off, dt12):
+    def _draw_second_delay(self, series, order, smat, epoch,
+                           t_off, dt12):
         """Draw dt13 on the ellipse slice the first delay allows.
 
         On that slice the exact isotropic sky prior is the ARCSINE law,
@@ -608,7 +536,7 @@ class DistMarg():
         cell drawn, not an estimate, so nothing here has a sample count to
         choose.
         """
-        mid, half, invalid = self._ellipse_slice(geom['S'], dt12)
+        mid, half, invalid = self._ellipse_slice(smat, dt12)
         # a sample whose slice has no width is already invalid; this only
         # keeps the divisions below finite until it is dropped
         half = numpy.maximum(half, 1e-300)
@@ -663,32 +591,50 @@ class DistMarg():
         Returns True on success. On failure the caller falls back to the map,
         which is reported so that a run cannot silently change estimator.
         """
-        c = self._analytic_constants()
-        series = self._analytic_windows(snrs, ifos)
+        tcmin, tcmax = self.marginalized_vector_priors['tc'].bounds['tc']
+        tcmin, tcmax = float(tcmin), float(tcmax)
+        if self._sky_detectors is None:
+            # the only part of this worth keeping between calls: Detector
+            # scans the LAL table and builds an astropy EarthLocation, about
+            # a millisecond for three of them, against microseconds for
+            # everything else here
+            self._sky_detectors = {
+                i: Detector(i, reference_time=0.5 * (tcmin + tcmax))
+                for i in self.data}
+        dets = self._sky_detectors
+        loc = {i: numpy.asarray(d.location) for i, d in dets.items()}
+        gmst = next(iter(dets.values())).gmst_estimate(
+            0.5 * (tcmin + tcmax))
+
+        # each detector's SNR series, cut to the times the draw may use
+        series = {}
+        for ifo in ifos:
+            snr = snrs[ifo]
+            lo_t, hi_t = tcmin - EARTH_RADIUS, tcmax + EARTH_RADIUS
+            if hasattr(self, 'tstart'):
+                lo_t, hi_t = self.tstart[ifo], self.tend[ifo]
+            snr = snr.time_slice(max(lo_t, snr.start_time + snr.delta_t),
+                                 min(hi_t, snr.end_time - snr.delta_t * 2),
+                                 mode='nearest')
+            series[ifo] = (snr, snr.squared_norm().numpy() / 2.0)
+
         order = sorted(ifos, key=lambda i: -series[i][1].max())
         ndet = len(order)
-        geom = self._analytic_geometry(order) if ndet > 1 else None
+        log_tcspan = numpy.log(tcmax - tcmin)
 
         snr0, logl0 = series[order[0]]
         delta0 = float(snr0.delta_t)
-        # the normaliser is already needed for the density, so forming it
-        # here costs nothing and avoids both a rebuilt cdf and a logsumexp
-        # call whose overhead dwarfs the length-n array it is given
         l0max = logl0.max()
         shifted0 = numpy.exp(logl0 - l0max)
         i0 = self._weighted_draw(shifted0, vsamples, self._sky_rng)
-        # Every delay below is a difference of two coalescence-time-like
-        # quantities. Formed from absolute GPS they are order 1e9 s, which a
-        # double holds to about 2.4e-7 s -- a thousandth of a sample at
-        # 4096 Hz -- and that error lands directly on the cell boundaries the
-        # candidate weights are read from. A drawn dt13 then falls on the
-        # wrong side of a boundary for order 0.1% of samples and is weighted
-        # with the neighbouring cell's SNR, which near a peak differs by
-        # O(1-10) nats: order 1% on the integral, and enough to swamp any
-        # per-point comparison of two versions of this code. So the epoch is
-        # split off and every time here is an OFFSET from it, which makes the
-        # differences exact to ~1e-18 and pins the partition.
+        # Every time below is an OFFSET from this epoch, never an absolute
+        # GPS. The delays are differences of times near 1e9 s, which a
+        # double resolves to 2.4e-7 s -- a thousandth of a sample -- and
+        # that error lands on the cell boundaries the weights are read
+        # from, putting about 0.1% of samples in the neighbouring cell.
+        # As offsets the differences are exact to ~1e-18.
         epoch = snr0.start_time
+        epoch_t = float(epoch)
         t_off = (i0 * delta0
                  + self._sky_rng.uniform(-delta0 / 2.0, delta0 / 2.0,
                                          vsamples))
@@ -701,13 +647,24 @@ class DistMarg():
             ra = self.marginalized_vector_priors['ra'].rvs(size=vsamples)['ra']
             dec = self.marginalized_vector_priors['dec'].rvs(
                 size=vsamples)['dec']
-            lon = ra - c['gmst']
+            lon = ra - gmst
             nhat = numpy.array([numpy.cos(dec) * numpy.cos(lon),
                                 numpy.cos(dec) * numpy.sin(lon),
                                 numpy.sin(dec)])
-            logw = -c['log_tcspan'] - dens
+            logw = -log_tcspan - dens
         else:
-            t12max = geom['t12max']
+            # each delay is one linear constraint on the direction; the
+            # pseudo-inverse of the baselines turns a delay pair back into
+            # the component of the direction they fix
+            first = loc[order[0]] - loc[order[1]]
+            second = loc[order[0]] - loc[order[2]] if ndet > 2 else None
+            mat = (numpy.atleast_2d(first) if second is None
+                   else numpy.vstack([first, second]))
+            mpinv = numpy.linalg.pinv(mat)
+            t12max = dets[order[0]].light_travel_time_to_detector(
+                dets[order[1]])
+            log_const = log_tcspan + numpy.log(2.0 * t12max)
+
             snr1, logl1 = series[order[1]]
             base1 = float(snr1.start_time - epoch)
             delta1 = float(snr1.delta_t)
@@ -731,7 +688,12 @@ class DistMarg():
                 # a single delay leaves a free azimuth about the baseline, and
                 # there the Jacobian is constant, so uniform is exactly
                 # isotropic and needs no correction
-                dhat, uvec, vvec = geom['basis']
+                # a single delay leaves the azimuth about the baseline
+                # free, so build a frame to sweep it in
+                dhat = first / numpy.linalg.norm(first)
+                uvec = numpy.cross(dhat, [0.0, 0.0, 1.0])
+                uvec = uvec / numpy.linalg.norm(uvec)
+                vvec = numpy.cross(dhat, uvec)
                 cos_t = numpy.clip(-dt12 / t12max, -1.0, 1.0)
                 sin_t = numpy.sqrt(numpy.maximum(1.0 - cos_t * cos_t, 0.0))
                 az = self._sky_rng.uniform(0, 2 * numpy.pi, vsamples)
@@ -739,51 +701,47 @@ class DistMarg():
                         + sin_t * (numpy.cos(az) * uvec[:, None]
                                    + numpy.sin(az) * vvec[:, None]))
             else:
+                normal = numpy.cross(first, second)
+                e3 = normal / numpy.linalg.norm(normal)
                 dt13, dens2, bad2 = self._draw_second_delay(
-                    series, order, geom, epoch, t_off, dt12)
+                    series, order, C_SI ** 2.0 * (mpinv.T @ mpinv),
+                    epoch, t_off, dt12)
                 dens = dens + dens2
                 invalid |= bad2
-                npar = geom['Mp'] @ (-C_SI
+                npar = mpinv @ (-C_SI
                                      * numpy.vstack([dt12, dt13]))
                 sgeo = numpy.sqrt(numpy.clip(1.0 - (npar * npar).sum(0),
                                              0.0, None))
-                # The two roots are mirror images through the detector
-                # plane. Both are physical, but they put the coalescence at
-                # times differing by twice the reference detector's offset
-                # from that plane, and for some geometries one of them lies
-                # outside the tc prior for EVERY sample -- measured at 50% and
-                # 62% of the pool on two injections, against ~0% elsewhere.
-                # Drawing the root blind and rejecting afterwards throws that
-                # fraction of the pool away.
-                #
-                # Testing a root costs one dot product, so draw only among the
-                # survivors: root b with probability v_b / (v+ + v-), and
-                # scale the weight by (v+ + v-)/2. The expectation is
-                # unchanged, still (w+ v+ + w- v-)/2, and nothing is
-                # discarded. Verified directly against that target: the
-                # scheme is unbiased at z = -0.5 over 4e6 draws.
-                loc0 = c['loc'][order[0]] / C_SI
-                tc_base = float(epoch) + t_off + loc0 @ npar
-                tc_swing = sgeo * float(loc0 @ geom['e3'])
-                tc_up, tc_dn = tc_base + tc_swing, tc_base - tc_swing
-                ok_up = (tc_up >= c['tcmin']) & (tc_up <= c['tcmax'])
-                ok_dn = (tc_dn >= c['tcmin']) & (tc_dn <= c['tcmax'])
-                nroot = ok_up.astype(numpy.int8) + ok_dn
-                invalid |= nroot == 0
-                coin = self._sky_rng.random(vsamples) < 0.5
-                up = numpy.where(ok_up & ok_dn, coin, ok_up)
-                branch = numpy.where(up, 1.0, -1.0)
-                nhat = npar + (branch * sgeo) * geom['e3'][:, None]
+                # The delays fix the direction only up to a reflection in
+                # the detector plane. Both roots are physical but put the
+                # coalescence at times differing by twice the reference
+                # detector's offset from that plane, so for some geometries
+                # one of them is outside the tc prior for every sample.
+                # Testing a root is one dot product, so rather than draw
+                # blind and reject, draw only among the roots that survive
+                # and scale the weight by how many did: with both kept the
+                # expectation is (w+ + w-)/2 either way.
+                loc0 = loc[order[0]] / C_SI
+                tc_mid = epoch_t + t_off + loc0 @ npar
+                swing = sgeo * float(loc0 @ e3)
+                ok_up = ((tc_mid + swing >= tcmin)
+                         & (tc_mid + swing <= tcmax))
+                ok_dn = ((tc_mid - swing >= tcmin)
+                         & (tc_mid - swing <= tcmax))
+                roots = ok_up.astype(numpy.int8) + ok_dn
+                invalid |= roots == 0
+                up = ok_up & (~ok_dn | (self._sky_rng.random(vsamples) < 0.5))
+                nhat = npar + numpy.where(up, sgeo, -sgeo) * e3[:, None]
                 branch_corr = numpy.log(
-                    0.5 * numpy.maximum(nroot, 1).astype(float))
-            logw = -geom['log_const'] - dens + branch_corr
+                    0.5 * numpy.maximum(roots, 1).astype(float))
+            logw = -log_const - dens + branch_corr
 
         fplus, fcross, delay = {}, {}, {}
-        for ifo, det in c['dets'].items():
+        for ifo, det in dets.items():
             fplus[ifo], fcross[ifo] = det.antenna_pattern_from_direction(nhat)
             delay[ifo] = det.time_delay_from_direction(nhat)
-        tc = float(epoch) + t_off - delay[order[0]]
-        outside = (tc < c['tcmin']) | (tc > c['tcmax'])
+        tc = epoch_t + t_off - delay[order[0]]
+        outside = (tc < tcmin) | (tc > tcmax)
         logw = numpy.where(invalid | outside, -numpy.inf, logw)
         if not numpy.isfinite(logw).any():
             return False
@@ -795,7 +753,7 @@ class DistMarg():
         self.marginalize_vector_params['dec'] = numpy.arcsin(
             numpy.clip(nhat[2], -1.0, 1.0))
         self.marginalize_vector_params['ra'] = numpy.mod(
-            numpy.arctan2(nhat[1], nhat[0]) + c['gmst'], 2 * numpy.pi)
+            numpy.arctan2(nhat[1], nhat[0]) + gmst, 2 * numpy.pi)
         self.marginalize_vector_params['logw_partial'] = logw
         if self._current_params is not None:
             self._current_params.update(self.marginalize_vector_params)
