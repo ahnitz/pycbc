@@ -447,8 +447,9 @@ class DistMarg():
 
         Built once: ``Detector.__init__`` scans the LAL detector table and
         constructs an astropy EarthLocation, and ``gmst_estimate`` on a fresh
-        object falls through to ``gmst_accurate``; together they cost several ms
-        per call if rebuilt, against ~0.05 ms for the linear algebra they feed.
+        object falls through to ``gmst_accurate``; together they cost
+        several ms per call if rebuilt, against ~0.05 ms for the linear
+        algebra they feed.
         """
         if self._analytic_const is None:
             ifos = list(self.data.keys())
@@ -459,7 +460,8 @@ class DistMarg():
             resp = {}
             for i in ifos:
                 d = numpy.asarray(dets[i].response)
-                resp[i] = (0.5 * (d[0, 0] + d[1, 1]), 0.5 * (d[0, 0] - d[1, 1]),
+                resp[i] = (0.5 * (d[0, 0] + d[1, 1]),
+                           0.5 * (d[0, 0] - d[1, 1]),
                            d[0, 1], d[0, 2], d[1, 2], d[2, 2])
             self._analytic_const = {
                 'ifos': ifos, 'tcmin': tcmin, 'tcmax': tcmax,
@@ -582,7 +584,8 @@ class DistMarg():
     def _draw_second_delay(self, series, order, geom, epoch, t_off, dt12):
         """Draw dt13 on the ellipse slice the first delay allows.
 
-        Given dt12 the physical region is the slice of ``dt^T S dt <= 1``, whose
+        Given dt12 the physical region is the slice of ``dt^T S dt <= 1``,
+        whose
         endpoints are a closed-form quadratic solve. On that slice the exact
         isotropic sky prior is the ARCSINE law, and substituting
         ``dt13 = mid + half*sin(theta)`` makes it uniform in theta -- which is
@@ -665,7 +668,8 @@ class DistMarg():
     def _analytic_antenna(self, nhat):
         """F+, Fx and earth-centre delays from the Cartesian source direction.
 
-        Both are algebraic in ``nhat``, which the inversion already produces, so
+        Both are algebraic in ``nhat``, which the inversion already
+        produces, so
         this needs no trigonometry and no ra/dec round trip. Polarisation is
         applied analytically downstream and needs no recomputation here.
         """
@@ -849,8 +853,6 @@ class DistMarg():
 
         vsamples = size if size is not None else self.vsamples
 
-        ndraw = vsamples
-
         if self.marginalize_sky_analytic and len(ifos) > 0:
             # alternative path: invert the delays instead of looking them up.
             # Falls through to the map below if it cannot produce a usable
@@ -859,8 +861,9 @@ class DistMarg():
                 return self.marginalize_vector_params
             if not getattr(self, '_analytic_fellback', False):
                 self._analytic_fellback = True
-                logging.warning("analytic sky draw produced no usable samples; "
-                                "falling back to the pregenerated map")
+                logging.warning(
+                    "analytic sky draw produced no usable samples; "
+                    "falling back to the pregenerated map")
 
         # No good SNR peaks, go with prior draw
         if len(ifos) == 0:
@@ -1033,7 +1036,8 @@ class DistMarg():
             form instead of looking them up in the pregenerated map. The
             physical region is the exact ellipse the delays allow, so a drawn
             delay tuple cannot fail to correspond to a sky position, and the
-            prior/proposal ratio is analytic rather than approximate. Falls back
+            prior/proposal ratio is analytic rather than approximate. Falls
+            back
             to the map, with a warning, if it cannot produce a usable draw.
         marginalize_sky_candidates: int
             Candidate cells used when tilting the second delay by the third
