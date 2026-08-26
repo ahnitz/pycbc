@@ -15,6 +15,7 @@ from pycbc.distributions import JointDistribution
 
 from pycbc.constants import C_SI
 from pycbc.detector import Detector
+from pycbc.detector.ground import antenna_patterns_from_direction
 
 
 # Earth radius in seconds
@@ -768,10 +769,15 @@ class DistMarg():
                     0.5 * numpy.maximum(nroot, 1).astype(float))
             logw = -geom['log_const'] - dens + branch_corr
 
-        fplus, fcross, delay = {}, {}, {}
-        for ifo, det in c['dets'].items():
-            fplus[ifo], fcross[ifo] = det.antenna_pattern_from_direction(nhat)
-            delay[ifo] = det.time_delay_from_direction(nhat)
+        # every detector sees the same source direction, and most of the
+        # response depends only on that, so it is formed once for all of
+        # them rather than once each
+        names = c['ifos']
+        fp, fc, dl = antenna_patterns_from_direction(
+            [c['dets'][i] for i in names], nhat)
+        fplus = {i: fp[k] for k, i in enumerate(names)}
+        fcross = {i: fc[k] for k, i in enumerate(names)}
+        delay = {i: dl[k] for k, i in enumerate(names)}
         tc = float(epoch) + t_off - delay[order[0]]
         outside = (tc < c['tcmin']) | (tc > c['tcmax'])
         logw = numpy.where(invalid | outside, -numpy.inf, logw)

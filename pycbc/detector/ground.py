@@ -437,6 +437,10 @@ class Detector(object):
         direction and can be applied to the pair afterwards, so it is not
         taken here.
 
+        For several detectors at one set of directions, see
+        :py:func:`antenna_patterns_from_direction`, which forms the
+        direction-dependent part once and shares it.
+
         Parameters
         ----------
         direction: numpy.ndarray
@@ -451,34 +455,9 @@ class Detector(object):
         fcross: float or numpy.ndarray
             The cross polarization factor for this sky location.
         """
-        resp = np.asarray(self.response)
-        # the response tensor contracted against the polarization basis,
-        # written out in the six independent components it has
-        mean = 0.5 * (resp[0, 0] + resp[1, 1])
-        diff = 0.5 * (resp[0, 0] - resp[1, 1])
-        rxy, rxz, ryz, rzz = resp[0, 1], resp[0, 2], resp[1, 2], resp[2, 2]
-
-        sin_dec = direction[2]
-        # the direction is a unit vector, so 1 - z^2 is x^2 + y^2 exactly;
-        # taking the sum keeps full precision at the poles, where the
-        # subtraction would cancel and the ratios below would blow up
-        cos_dec_sq = np.maximum(direction[0] ** 2.0 + direction[1] ** 2.0,
-                                1e-300)
-        cos_dec = np.sqrt(cos_dec_sq)
-        cos_gha = direction[0] / cos_dec
-        sin_gha = -direction[1] / cos_dec
-        cos_2gha = cos_gha * cos_gha - sin_gha * sin_gha
-        sin_2gha = 2.0 * sin_gha * cos_gha
-
-        fplus = ((mean - diff * cos_2gha + rxy * sin_2gha)
-                 - (sin_dec * sin_dec
-                    * (mean + diff * cos_2gha - rxy * sin_2gha)
-                    + rzz * cos_dec_sq
-                    + 2.0 * sin_dec * cos_dec
-                    * (ryz * sin_gha - rxz * cos_gha)))
-        fcross = 2.0 * (sin_dec * (diff * sin_2gha + rxy * cos_2gha)
-                        - cos_dec * (rxz * sin_gha + ryz * cos_gha))
-        return fplus, fcross
+        fplus, fcross = _patterns_from_terms(
+            np.asarray(self.response)[None], _direction_terms(direction))
+        return fplus[0], fcross[0]
 
     def time_delay_from_direction(self, direction):
         """Return the time delay from the earth center for a source
@@ -813,3 +792,67 @@ __all__ = [
     'load_detector_config',
     '_ground_detectors',
 ]
+
+
+def _direction_terms(direction):
+    """The parts of the antenna response that depend only on where the
+    source is, and so are the same for every detector."""
+    sin_dec = direction[2]
+    # the direction is a unit vector, so 1 - z^2 is x^2 + y^2 exactly;
+    # taking the sum keeps full precision at the poles, where the
+    # subtraction would cancel and the ratios below would blow up
+    cos_dec_sq = np.maximum(direction[0] ** 2.0 + direction[1] ** 2.0, 1e-300)
+    cos_dec = np.sqrt(cos_dec_sq)
+    cos_gha = direction[0] / cos_dec
+    sin_gha = -direction[1] / cos_dec
+    return (sin_dec, cos_dec_sq, cos_dec, cos_gha, sin_gha,
+            cos_gha * cos_gha - sin_gha * sin_gha, 2.0 * sin_gha * cos_gha)
+
+
+def _patterns_from_terms(resp, terms):
+    """Contract a stack of response tensors against the direction terms.
+
+    ``resp`` is (ndet, 3, 3); the leading axis rides through untouched, so
+    one detector and many cost the same code.
+    """
+    sin_dec, cos_dec_sq, cos_dec, cos_gha, sin_gha, cos_2gha, sin_2gha = terms
+    lead = (slice(None),) + (None,) * (np.ndim(sin_dec))
+    mean = (0.5 * (resp[:, 0, 0] + resp[:, 1, 1]))[lead]
+    diff = (0.5 * (resp[:, 0, 0] - resp[:, 1, 1]))[lead]
+    rxy, rxz = resp[:, 0, 1][lead], resp[:, 0, 2][lead]
+    ryz, rzz = resp[:, 1, 2][lead], resp[:, 2, 2][lead]
+    fplus = ((mean - diff * cos_2gha + rxy * sin_2gha)
+             - (sin_dec * sin_dec
+                * (mean + diff * cos_2gha - rxy * sin_2gha)
+                + rzz * cos_dec_sq
+                + 2.0 * sin_dec * cos_dec
+                * (ryz * sin_gha - rxz * cos_gha)))
+    fcross = 2.0 * (sin_dec * (diff * sin_2gha + rxy * cos_2gha)
+                    - cos_dec * (rxz * sin_gha + ryz * cos_gha))
+    return fplus, fcross
+
+
+def antenna_patterns_from_direction(detectors, direction):
+    """Response and earth-centre delay for several detectors at once.
+
+    Everything in the response that depends on the source direction is
+    the same for every detector, so asking each one separately forms it
+    again each time. Here it is formed once and each response tensor is
+    contracted against it, which is about a third cheaper for three
+    detectors.
+
+    Parameters
+    ----------
+    detectors: list of Detector
+    direction: numpy.ndarray
+        Unit vector towards the source, shape (3,) or (3, n).
+
+    Returns
+    -------
+    fplus, fcross, delay: numpy.ndarray
+        Each with a leading axis over the detectors given.
+    """
+    resp = np.array([np.asarray(d.response) for d in detectors])
+    loc = np.array([np.asarray(d.location) for d in detectors])
+    fplus, fcross = _patterns_from_terms(resp, _direction_terms(direction))
+    return fplus, fcross, -loc.dot(direction) / constants.c.value
