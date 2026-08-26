@@ -457,19 +457,11 @@ class DistMarg():
             tcmin, tcmax = float(tcmin), float(tcmax)
             tcave = 0.5 * (tcmin + tcmax)
             dets = {i: Detector(i, reference_time=tcave) for i in ifos}
-            resp = {}
-            for i in ifos:
-                d = numpy.asarray(dets[i].response)
-                resp[i] = (0.5 * (d[0, 0] + d[1, 1]),
-                           0.5 * (d[0, 0] - d[1, 1]),
-                           d[0, 1], d[0, 2], d[1, 2], d[2, 2])
             self._analytic_const = {
-                'ifos': ifos, 'tcmin': tcmin, 'tcmax': tcmax,
+                'ifos': ifos, 'tcmin': tcmin, 'tcmax': tcmax, 'dets': dets,
                 'gmst': dets[ifos[0]].gmst_estimate(tcave),
                 'loc': {i: numpy.asarray(dets[i].location) for i in ifos},
-                'loc_c': {i: numpy.asarray(dets[i].location) / C_SI
-                          for i in ifos},
-                'resp': resp, 'log_tcspan': numpy.log(tcmax - tcmin)}
+                'log_tcspan': numpy.log(tcmax - tcmin)}
         return self._analytic_const
 
     def _analytic_geometry(self, order):
@@ -491,8 +483,10 @@ class DistMarg():
                 mat = numpy.vstack([d1, loc[order[0]] - loc[order[2]]])
             mp = numpy.linalg.pinv(mat)
             smat = C_SI ** 2.0 * (mp.T @ mp)
-            t12max = float(numpy.sqrt(
-                numpy.linalg.inv(numpy.atleast_2d(smat))[0, 0]))
+            # the widest dt12 the ellipse allows is exactly the light
+            # travel time along that baseline, which the detector knows
+            t12max = c['dets'][order[0]].light_travel_time_to_detector(
+                c['dets'][order[1]])
             g = {'d1': d1, 'Mp': mp, 'S': smat, 't12max': t12max,
                  'log_const': c['log_tcspan'] + numpy.log(2.0 * t12max)}
             if len(order) > 2:
@@ -667,33 +661,17 @@ class DistMarg():
         return dt13, dens, invalid
 
     def _analytic_antenna(self, nhat):
-        """F+, Fx and earth-centre delays from the Cartesian source direction.
+        """F+, Fx and earth-centre delays for the drawn directions.
 
-        Both are algebraic in ``nhat``, which the inversion already
-        produces, so
-        this needs no trigonometry and no ra/dec round trip. Polarisation is
-        applied analytically downstream and needs no recomputation here.
+        The inversion produces the direction as a vector, which is what
+        ``Detector`` takes here, so no ra/dec round trip is needed.
+        Polarization is applied analytically downstream.
         """
         c = self._analytic_constants()
-        sd = nhat[2]
-        # nhat is a unit vector, so 1 - nz^2 == nx^2 + ny^2 exactly; computing
-        # it as the sum keeps full precision near the poles, where the
-        # subtraction would cancel and blow cg, sg up
-        cd2 = numpy.maximum(nhat[0] * nhat[0] + nhat[1] * nhat[1], 1e-300)
-        cd = numpy.sqrt(cd2)
-        cg = nhat[0] / cd
-        sg = -nhat[1] / cd
-        c2 = cg * cg - sg * sg
-        s2 = 2.0 * sg * cg
         fplus, fcross, delay = {}, {}, {}
-        for ifo in c['ifos']:
-            av, bv, d01, d02, d12, d22 = c['resp'][ifo]
-            fplus[ifo] = ((av - bv * c2 + d01 * s2)
-                          - (sd * sd * (av + bv * c2 - d01 * s2) + d22 * cd2
-                             + 2.0 * sd * cd * (d12 * sg - d02 * cg)))
-            fcross[ifo] = 2.0 * (sd * (bv * s2 + d01 * c2)
-                                 - cd * (d02 * sg + d12 * cg))
-            delay[ifo] = -(c['loc_c'][ifo] @ nhat)
+        for ifo, det in c['dets'].items():
+            fplus[ifo], fcross[ifo] = det.antenna_pattern_from_direction(nhat)
+            delay[ifo] = det.time_delay_from_direction(nhat)
         return fplus, fcross, delay
 
     def analytic_sky_draw(self, snrs, ifos, vsamples):
@@ -804,7 +782,7 @@ class DistMarg():
                 # unchanged, still (w+ v+ + w- v-)/2, and nothing is
                 # discarded. Verified directly against that target: the
                 # scheme is unbiased at z = -0.5 over 4e6 draws.
-                loc0 = c['loc_c'][order[0]]
+                loc0 = c['loc'][order[0]] / C_SI
                 tc_base = float(epoch) + t_off + loc0 @ npar
                 tc_swing = sgeo * float(loc0 @ geom['e3'])
                 tc_up, tc_dn = tc_base + tc_swing, tc_base - tc_swing
