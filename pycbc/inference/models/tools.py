@@ -562,89 +562,95 @@ class DistMarg():
         rng.shuffle(idx)
         return idx.reshape(shape)
 
+    @staticmethod
+    def _ellipse_slice(smat, dt12):
+        """The dt13 the physical sky allows, once dt12 is fixed.
+
+        The physical region is the ellipse ``dt^T S dt <= 1``. Fixing dt12
+        cuts a segment from it whose ends are the roots of a quadratic in
+        dt13. Returns the segment's centre and half width, and which
+        samples have no segment because their dt12 is already outside.
+        """
+        quad = smat[1, 1]
+        lin = 2.0 * smat[0, 1] * dt12
+        disc = lin * lin - 4.0 * quad * (smat[0, 0] * dt12 * dt12 - 1.0)
+        root = numpy.sqrt(numpy.maximum(disc, 0.0))
+        return -lin / (2.0 * quad), root / (2.0 * quad), disc <= 0.0
+
     def _draw_second_delay(self, series, order, geom, epoch, t_off, dt12):
         """Draw dt13 on the ellipse slice the first delay allows.
 
-        Given dt12 the physical region is the slice of ``dt^T S dt <= 1``,
-        whose
-        endpoints are a closed-form quadratic solve. On that slice the exact
-        isotropic sky prior is the ARCSINE law, and substituting
-        ``dt13 = mid + half*sin(theta)`` makes it uniform in theta -- which is
-        what cancels the ``1/s`` Jacobian singularity at the ends of the slice,
-        where the source lies in the detector plane and the two timing cones go
-        tangent. A proposal uniform in dt13 instead has log-divergent weight
-        variance and is worse than the map this replaces.
+        On that slice the exact isotropic sky prior is the ARCSINE law,
+        and substituting ``dt13 = mid + half*sin(theta)`` makes it uniform
+        in theta -- which is what cancels the ``1/s`` Jacobian singularity
+        at the ends of the slice, where the source lies in the detector
+        plane and the two timing cones go tangent. A proposal uniform in
+        dt13 instead has log-divergent weight variance and is worse than
+        the map this replaces.
 
-        The third detector's own SNR then tilts the draw through K candidate
-        cells taken from its SHARED one-dimensional law, so the arcsine cell
-        mass is evaluated at K cells per sample rather than at every cell and
-        the cost does not depend on the series length. The exact normaliser
-        ``sum_j sh_j P_j`` is replaced by the K-sample estimate
-        ``tot * mean_k(P_k)``, whose variance falls as 1/K.
+        The third detector's own SNR then tilts the draw through K
+        candidate cells taken from its shared one-dimensional law, so the
+        arcsine cell mass is evaluated at K cells per sample rather than at
+        every cell and the cost does not depend on the series length. The
+        exact normaliser ``sum_j sh_j P_j`` is replaced by the K-sample
+        estimate ``tot * mean_k(P_k)``, whose variance falls as 1/K.
 
         Candidates are held as ``(ncand, nsamples)`` so that the reductions
-        over candidates run along contiguous rows.
+        over candidates run along contiguous rows, and so that the
+        per-sample quantities broadcast along them without reshaping.
         """
-        smat = geom['S']
-        aq = smat[1, 1]
-        bq = 2.0 * smat[0, 1] * dt12
-        cq = smat[0, 0] * dt12 * dt12 - 1.0
-        disc = bq * bq - 4.0 * aq * cq
-        invalid = disc <= 0.0
-        root = numpy.sqrt(numpy.maximum(disc, 0.0))
-        lo13, hi13 = (-bq - root) / (2 * aq), (-bq + root) / (2 * aq)
-        mid = 0.5 * (lo13 + hi13)
-        half = 0.5 * (hi13 - lo13)
+        mid, half, invalid = self._ellipse_slice(geom['S'], dt12)
+        # a sample whose slice has no width is already invalid; this only
+        # keeps the divisions below finite until it is dropped
+        half = numpy.maximum(half, 1e-300)
 
         snr, logl = series[order[2]]
-        ncand = self.marginalize_sky_candidates
-        base = float(snr.start_time - epoch)
-        delta = float(snr.delta_t)
-        # shift before the exponential: |SNR|^2/2 reaches several hundred and
-        # the unshifted form overflows to inf
+        base, delta = float(snr.start_time - epoch), float(snr.delta_t)
+        ncand, nsamp = self.marginalize_sky_candidates, len(dt12)
+        # shift before the exponential: |SNR|^2/2 reaches several hundred
+        # and the unshifted form overflows to inf
         lmax = logl.max()
         shifted = numpy.exp(logl - lmax)
-        total = shifted.sum()
-        nsamp = len(dt12)
-        cell = self._weighted_draw(shifted, (ncand, nsamp),
-                                   self._sky_rng)
-        dt13c = t_off[None, :] - (base + cell * delta)
-        half_safe = numpy.maximum(half, 1e-300)[None, :]
-        mid_row = mid[None, :]
+        cell = self._weighted_draw(shifted, (ncand, nsamp), self._sky_rng)
+
+        # each candidate cell's position on the slice, and half a cell,
+        # both in units of the half width, which is what arcsine takes
+        centre = (t_off - (base + cell * delta) - mid) / half
+        step = delta / (2.0 * half)
         # single precision for the arcsine is ~7x faster and costs at most
         # 5e-5 relative on the cell mass; the same array sets both the
-        # selection probability and the weight, so this stays self-consistent
-        edge_hi = numpy.arcsin(numpy.clip(
-            (dt13c + delta / 2.0 - mid_row) / half_safe,
-            -1.0, 1.0).astype(numpy.float32))
-        edge_lo = numpy.arcsin(numpy.clip(
-            (dt13c - delta / 2.0 - mid_row) / half_safe,
-            -1.0, 1.0).astype(numpy.float32))
-        # the half-cell offset is positive and arcsine is monotone, so
-        # edge_hi >= edge_lo always: no absolute value, and no need to sort
-        # the pair into an interval below
+        # selection probability and the weight, so this stays consistent
+        edge_lo = numpy.arcsin(
+            numpy.clip(centre - step, -1.0, 1.0).astype(numpy.float32))
+        edge_hi = numpy.arcsin(
+            numpy.clip(centre + step, -1.0, 1.0).astype(numpy.float32))
+        # arcsine is monotone and the step is positive, so hi >= lo always:
+        # no absolute value, and no interval to sort
         mass = (edge_hi - edge_lo) / numpy.pi
-        # accumulate in double: 1e-300 would flush to zero in single
-        msum = mass.sum(axis=0, dtype=numpy.float64)
-        invalid |= ~(msum > 0)
-        msafe = numpy.maximum(msum, 1e-300)
-        # inverse-cdf over the candidates, accumulated in place: the running
-        # sum never has to be materialised as an (ncand, nsamp) array
-        thresh = self._sky_rng.random(nsamp) * msafe
-        acc = mass[0].astype(numpy.float64)
+        # in double: 1e-300 would flush to zero in single
+        total = mass.sum(axis=0, dtype=numpy.float64)
+        invalid |= ~(total > 0)
+        total = numpy.maximum(total, 1e-300)
+
+        # inverse cdf over the K candidates, accumulated in place: a
+        # cumulative sum would materialise the whole (ncand, nsamp) block
+        # and is 8x slower at 15000 samples for the same picks
+        thresh = self._sky_rng.random(nsamp) * total
+        running = mass[0].astype(numpy.float64)
         pick = numpy.zeros(nsamp, dtype=numpy.intp)
-        for k in range(1, ncand):
-            pick += acc < thresh
-            acc += mass[k]
-        cols = numpy.arange(nsamp)
-        theta_lo = edge_lo[pick, cols].astype(numpy.float64)
-        theta_hi = edge_hi[pick, cols].astype(numpy.float64)
-        theta = (theta_lo + self._sky_rng.random(nsamp)
-                 * (theta_hi - theta_lo))
+        for cand in range(1, ncand):
+            pick += running < thresh
+            running += mass[cand]
+        chosen = (pick, numpy.arange(nsamp))
+
+        theta_lo = edge_lo[chosen].astype(numpy.float64)
+        theta_hi = edge_hi[chosen].astype(numpy.float64)
+        theta = (theta_lo
+                 + self._sky_rng.random(nsamp) * (theta_hi - theta_lo))
         dt13 = mid + half * numpy.sin(theta)
         # q = exp(logl_j) p(dt13) / Zhat  =>  p/q = Zhat / exp(logl_j)
-        dens = ((logl[cell[pick, cols]] - lmax)
-                - numpy.log(total * msafe / ncand))
+        dens = ((logl[cell[chosen]] - lmax)
+                - numpy.log(shifted.sum() * total / ncand))
         return dt13, dens, invalid
 
     def analytic_sky_draw(self, snrs, ifos, vsamples):

@@ -214,9 +214,56 @@ class TestDrawInCells(unittest.TestCase):
         self.assertLess(numpy.abs(mass - want[idx - lo]).max(), 1e-12)
 
 
+class TestEllipseSlice(unittest.TestCase):
+    """The segment of dt13 that a fixed dt12 leaves physical.
+
+    The delays live inside the ellipse dt^T S dt <= 1, whose interior is
+    the set of delay pairs a real sky direction can produce. Fixing dt12
+    cuts a segment out of it, and what comes back has to be that segment:
+    its ends on the ellipse, its interior inside, and nothing at all when
+    the dt12 asked for is already outside.
+    """
+
+    def setUp(self):
+        # a positive definite S, as the detector geometry always gives
+        self.smat = numpy.array([[9.0e3, 2.0e3], [2.0e3, 7.0e3]])
+
+    def quad(self, dt12, dt13):
+        s = self.smat
+        return (s[0, 0] * dt12 ** 2 + 2 * s[0, 1] * dt12 * dt13
+                + s[1, 1] * dt13 ** 2)
+
+    def test_the_ends_sit_on_the_ellipse(self):
+        dt12 = numpy.linspace(-0.008, 0.008, 40)
+        mid, half, bad = DistMarg._ellipse_slice(self.smat, dt12)
+        good = ~bad
+        self.assertGreater(good.sum(), 10, "nothing to test")
+        for end in (mid[good] - half[good], mid[good] + half[good]):
+            self.assertLess(numpy.abs(self.quad(dt12[good], end) - 1.0).max(),
+                            1e-9, "a segment end is not on the ellipse")
+
+    def test_the_middle_is_inside(self):
+        dt12 = numpy.linspace(-0.008, 0.008, 40)
+        mid, half, bad = DistMarg._ellipse_slice(self.smat, dt12)
+        good = ~bad
+        self.assertLessEqual(self.quad(dt12[good], mid[good]).max(), 1.0)
+
+    def test_a_dt12_outside_the_ellipse_has_no_slice(self):
+        """Past the widest delay the baseline allows, nothing is physical."""
+        widest = (1.0 / numpy.linalg.inv(self.smat)[0, 0]) ** -0.5
+        dt12 = numpy.array([widest * 1.01, widest * 2.0, -widest * 1.5])
+        _, _, bad = DistMarg._ellipse_slice(self.smat, dt12)
+        self.assertTrue(bad.all(), "a dt12 outside the ellipse got a slice")
+        inside = numpy.array([0.0, widest * 0.5])
+        _, _, bad2 = DistMarg._ellipse_slice(self.smat, inside)
+        self.assertFalse(bad2.any(), "a dt12 inside the ellipse got none")
+
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(
     TestDrawInCells))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(
+    TestEllipseSlice))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestAliasDraw))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(
     TestMirrorRootSelection))
