@@ -86,7 +86,7 @@ class TestMirrorRootSelection(unittest.TestCase):
     """Drawing the mirror root among those inside the tc prior must not change
     the expectation.
 
-    The two roots of ``nhat = npar +- sgeo * e3`` are mirror images through the
+    The two roots of ``nhat = npar +- perp * e3`` are mirror images through the
     detector plane. Drawing one blind and rejecting it if its coalescence time
     falls outside the prior estimates ``(w+ v+ + w- v-)/2``. Drawing only among
     the valid roots, with the weight scaled by ``(v+ + v-)/2``, must estimate

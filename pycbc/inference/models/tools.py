@@ -511,7 +511,7 @@ class DistMarg():
         root = numpy.sqrt(numpy.maximum(disc, 0.0))
         return -lin / (2.0 * quad), root / (2.0 * quad), disc <= 0.0
 
-    def _draw_second_delay(self, series, order, smat, epoch,
+    def _draw_second_delay(self, third, smat, epoch,
                            t_off, dt12):
         """Draw dt13 on the ellipse slice the first delay allows.
 
@@ -541,7 +541,7 @@ class DistMarg():
         # keeps the divisions below finite until it is dropped
         half = numpy.maximum(half, 1e-300)
 
-        snr, logl = series[order[2]]
+        snr, logl = third
         base, delta = float(snr.start_time - epoch), float(snr.delta_t)
         ncell = len(logl)
         # the slice, as a window of this detector's arrival times
@@ -701,12 +701,12 @@ class DistMarg():
                 normal = numpy.cross(*baselines)
                 e3 = normal / numpy.linalg.norm(normal)
                 dt13, dens2, bad2 = self._draw_second_delay(
-                    series, order, C_SI ** 2.0 * (mpinv.T @ mpinv),
+                    series[order[2]], C_SI ** 2.0 * (mpinv.T @ mpinv),
                     epoch, t_off, dt12)
                 dens += dens2
                 invalid |= bad2
                 npar = mpinv @ (-C_SI * numpy.vstack([dt12, dt13]))
-                sgeo = numpy.sqrt(numpy.clip(1.0 - (npar * npar).sum(0),
+                perp = numpy.sqrt(numpy.clip(1.0 - (npar * npar).sum(0),
                                              0.0, None))
                 # The delays fix the direction only up to a reflection in
                 # the detector plane. Both roots are physical but put the
@@ -719,17 +719,17 @@ class DistMarg():
                 # expectation is (w+ + w-)/2 either way.
                 loc0 = loc[order[0]] / C_SI
                 tc_mid = epoch_t + t_off + loc0 @ npar
-                swing = sgeo * float(loc0 @ e3)
+                swing = perp * float(loc0 @ e3)
                 ok_up = ((tc_mid + swing >= tcmin)
                          & (tc_mid + swing <= tcmax))
                 ok_dn = ((tc_mid - swing >= tcmin)
                          & (tc_mid - swing <= tcmax))
-                roots = ok_up.astype(numpy.int8) + ok_dn
-                invalid |= roots == 0
+                invalid |= ~(ok_up | ok_dn)
                 up = ok_up & (~ok_dn | (self._sky_rng.random(vsamples) < 0.5))
-                nhat = npar + numpy.where(up, sgeo, -sgeo) * e3[:, None]
-                branch_corr = numpy.log(
-                    0.5 * numpy.maximum(roots, 1).astype(float))
+                nhat = npar + numpy.where(up, perp, -perp) * e3[:, None]
+                # both kept, the half cancels the two roots; one kept, it
+                # does not and the survivor carries the pair
+                branch_corr = numpy.where(ok_up & ok_dn, 0.0, -numpy.log(2.0))
             logw = (-log_tcspan - numpy.log(2.0 * t12max)
                     - dens + branch_corr)
 
