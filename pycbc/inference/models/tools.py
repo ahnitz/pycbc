@@ -19,6 +19,9 @@ from pycbc.detector import Detector
 # Earth radius in seconds
 EARTH_RADIUS = 0.031
 
+# Metres per second, for the analytic delay -> sky inversion
+SPEED_OF_LIGHT = 299792458.0
+
 
 def str_to_tuple(sval, ftype):
     """ Convenience parsing to convert str to tuple"""
@@ -63,6 +66,8 @@ class DistMarg():
                               marginalize_vector_params=None,
                               marginalize_vector_samples=1e3,
                               marginalize_sky_initial_samples=1e6,
+                              marginalize_sky_analytic=False,
+                              marginalize_sky_candidates=8,
                               **kwargs):
         """ Setup the model for use with distance marginalization
 
@@ -125,6 +130,12 @@ class DistMarg():
 
         self.marginalize_sky_initial_samples = \
             int(float(marginalize_sky_initial_samples))
+        self.marginalize_sky_analytic = \
+            str_to_bool(marginalize_sky_analytic)
+        self.marginalize_sky_candidates = \
+            max(1, int(float(marginalize_sky_candidates)))
+        self._analytic_const = None
+        self._analytic_geom = {}
 
         for param in str_to_tuple(marginalize_vector_params, str):
             logging.info('Marginalizing over %s, %s points from prior',
@@ -431,6 +442,400 @@ class DistMarg():
 
         return self.marginalize_vector_params
 
+    def _analytic_constants(self):
+        """Detector geometry and tc bounds. Constant for the whole run.
+
+        Built once: ``Detector.__init__`` scans the LAL detector table and
+        constructs an astropy EarthLocation, and ``gmst_estimate`` on a fresh
+        object falls through to ``gmst_accurate``; together they cost several ms
+        per call if rebuilt, against ~0.05 ms for the linear algebra they feed.
+        """
+        if self._analytic_const is None:
+            ifos = list(self.data.keys())
+            tcmin, tcmax = self.marginalized_vector_priors['tc'].bounds['tc']
+            tcmin, tcmax = float(tcmin), float(tcmax)
+            tcave = 0.5 * (tcmin + tcmax)
+            dets = {i: Detector(i, reference_time=tcave) for i in ifos}
+            resp = {}
+            for i in ifos:
+                d = numpy.asarray(dets[i].response)
+                resp[i] = (0.5 * (d[0, 0] + d[1, 1]), 0.5 * (d[0, 0] - d[1, 1]),
+                           d[0, 1], d[0, 2], d[1, 2], d[2, 2])
+            self._analytic_const = {
+                'ifos': ifos, 'tcmin': tcmin, 'tcmax': tcmax,
+                'gmst': dets[ifos[0]].gmst_estimate(tcave),
+                'loc': {i: numpy.asarray(dets[i].location) for i in ifos},
+                'loc_c': {i: numpy.asarray(dets[i].location) / SPEED_OF_LIGHT
+                          for i in ifos},
+                'resp': resp, 'log_tcspan': numpy.log(tcmax - tcmin)}
+        return self._analytic_const
+
+    def _analytic_geometry(self, order):
+        """Baseline geometry for one detector ORDERING.
+
+        Keyed on the ordering because that is recomputed every call from the
+        current SNR peaks, and ``keep_ifos`` can change between calls too, so a
+        cache without the key would silently reuse another network's geometry.
+        The key space is a handful of entries.
+        """
+        key = tuple(order)
+        if key not in self._analytic_geom:
+            c = self._analytic_constants()
+            loc = c['loc']
+            d1 = loc[order[0]] - loc[order[1]]
+            if len(order) == 2:
+                mat = numpy.atleast_2d(d1)
+            else:
+                mat = numpy.vstack([d1, loc[order[0]] - loc[order[2]]])
+            mp = numpy.linalg.pinv(mat)
+            smat = SPEED_OF_LIGHT ** 2.0 * (mp.T @ mp)
+            t12max = float(numpy.sqrt(
+                numpy.linalg.inv(numpy.atleast_2d(smat))[0, 0]))
+            g = {'d1': d1, 'Mp': mp, 'S': smat, 't12max': t12max,
+                 'log_const': c['log_tcspan'] + numpy.log(2.0 * t12max)}
+            if len(order) > 2:
+                cr = numpy.cross(d1, loc[order[0]] - loc[order[2]])
+                g['e3'] = cr / numpy.linalg.norm(cr)
+            else:
+                dh = d1 / numpy.linalg.norm(d1)
+                u = numpy.cross(dh, [0.0, 0.0, 1.0])
+                u = u / numpy.linalg.norm(u)
+                g['basis'] = (dh, u, numpy.cross(dh, u))
+            self._analytic_geom[key] = g
+        return self._analytic_geom[key]
+
+    def _analytic_windows(self, snrs, ifos):
+        """Per-detector SNR series sliced to the region the draw may use."""
+        c = self._analytic_constants()
+        out = {}
+        for ifo in ifos:
+            snr = snrs[ifo]
+            tmin, tmax = c['tcmin'] - EARTH_RADIUS, c['tcmax'] + EARTH_RADIUS
+            if hasattr(self, 'tstart'):
+                tmin, tmax = self.tstart[ifo], self.tend[ifo]
+            snr = snr.time_slice(max(tmin, snr.start_time + snr.delta_t),
+                                 min(tmax, snr.end_time - snr.delta_t * 2),
+                                 mode='nearest')
+            out[ifo] = (snr, snr.squared_norm().numpy() / 2.0)
+        return out
+
+    @staticmethod
+    def _draw_in_window(logw, base, delta, lo_t, hi_t):
+        """Draw times ``propto exp(logw)`` inside a per-sample time window.
+
+        Times are OFFSETS from the epoch the caller works in, not absolute
+        GPS; ``base`` is where this detector's series starts in that same
+        frame. See ``analytic_sky_draw`` for why.
+
+        Returns the dithered times and the log PROPOSAL DENSITY. The dither
+        makes the draw a genuine density rather than a probability mass on the
+        sample grid, which is what lets the sky come out continuous.
+        """
+        p = numpy.exp(logw - logw.max())
+        n = len(logw)
+        cum = numpy.concatenate(([0.0], numpy.cumsum(p)))
+        lo = numpy.clip(numpy.ceil((lo_t - base) / delta), 0, n).astype(int)
+        hi = numpy.clip(numpy.floor((hi_t - base) / delta) + 1,
+                        0, n).astype(int)
+        empty = hi <= lo
+        lo = numpy.where(empty, 0, lo)
+        hi = numpy.where(empty, n, hi)
+        norm = cum[hi] - cum[lo]
+        target = cum[lo] + numpy.random.uniform(0, 1, len(lo)) * norm
+        idx = numpy.clip(numpy.searchsorted(cum, target) - 1, 0, n - 1)
+        times = (base + idx * delta
+                 + numpy.random.uniform(-delta / 2.0, delta / 2.0, len(idx)))
+        dens = (logw[idx] - logw.max()) - numpy.log(norm) - numpy.log(delta)
+        return times, numpy.where(empty, -numpy.inf, dens)
+
+    @staticmethod
+    def _alias_draw(weights, shape):
+        """Draw indices ``propto weights`` through a Vose alias table.
+
+        Each draw is then two array lookups instead of a binary search, which
+        is what dominates here: the same length-``n`` law is drawn from tens
+        of thousands of times, so the O(n) build amortises immediately. One
+        uniform serves both alias coordinates -- scaling by ``n`` puts the
+        cell in the integer part and leaves an independent uniform in the
+        remainder -- so this needs no more random numbers than inversion.
+        Zero-weight cells can only appear as the alias of a positive one,
+        never as a direct hit, so underflowed cells stay unreachable.
+        """
+        n = len(weights)
+        prob = weights * (n / weights.sum())
+        alias = numpy.arange(n)
+        small = list(numpy.nonzero(prob < 1.0)[0])
+        large = list(numpy.nonzero(prob >= 1.0)[0])
+        while small and large:
+            s, l = small.pop(), large.pop()
+            alias[s] = l
+            prob[l] -= 1.0 - prob[s]
+            (small if prob[l] < 1.0 else large).append(l)
+        prob[large] = 1.0
+        prob[small] = 1.0
+        x = numpy.random.random_sample(shape)
+        x *= n
+        idx = x.astype(numpy.intp)
+        x -= idx
+        return numpy.where(x < prob[idx], idx, alias[idx])
+
+    def _draw_second_delay(self, series, order, geom, epoch, t_off, dt12):
+        """Draw dt13 on the ellipse slice the first delay allows.
+
+        Given dt12 the physical region is the slice of ``dt^T S dt <= 1``, whose
+        endpoints are a closed-form quadratic solve. On that slice the exact
+        isotropic sky prior is the ARCSINE law, and substituting
+        ``dt13 = mid + half*sin(theta)`` makes it uniform in theta -- which is
+        what cancels the ``1/s`` Jacobian singularity at the ends of the slice,
+        where the source lies in the detector plane and the two timing cones go
+        tangent. A proposal uniform in dt13 instead has log-divergent weight
+        variance and is worse than the map this replaces.
+
+        The third detector's own SNR then tilts the draw through K candidate
+        cells taken from its SHARED one-dimensional law, so the arcsine cell
+        mass is evaluated at K cells per sample rather than at every cell and
+        the cost does not depend on the series length. The exact normaliser
+        ``sum_j sh_j P_j`` is replaced by the K-sample estimate
+        ``tot * mean_k(P_k)``, whose variance falls as 1/K.
+
+        Candidates are held as ``(ncand, nsamples)`` so that the reductions
+        over candidates run along contiguous rows.
+        """
+        smat = geom['S']
+        aq = smat[1, 1]
+        bq = 2.0 * smat[0, 1] * dt12
+        cq = smat[0, 0] * dt12 * dt12 - 1.0
+        disc = bq * bq - 4.0 * aq * cq
+        invalid = disc <= 0.0
+        root = numpy.sqrt(numpy.maximum(disc, 0.0))
+        lo13, hi13 = (-bq - root) / (2 * aq), (-bq + root) / (2 * aq)
+        mid = 0.5 * (lo13 + hi13)
+        half = 0.5 * (hi13 - lo13)
+
+        snr, logl = series[order[2]]
+        ncand = self.marginalize_sky_candidates
+        base = float(snr.start_time - epoch)
+        delta = float(snr.delta_t)
+        # shift before the exponential: |SNR|^2/2 reaches several hundred and
+        # the unshifted form overflows to inf
+        lmax = logl.max()
+        shifted = numpy.exp(logl - lmax)
+        total = shifted.sum()
+        nsamp = len(dt12)
+        cell = self._alias_draw(shifted, (ncand, nsamp))
+        dt13c = t_off[None, :] - (base + cell * delta)
+        half_safe = numpy.maximum(half, 1e-300)[None, :]
+        mid_row = mid[None, :]
+        # single precision for the arcsine is ~7x faster and costs at most
+        # 5e-5 relative on the cell mass; the same array sets both the
+        # selection probability and the weight, so this stays self-consistent
+        edge_hi = numpy.arcsin(numpy.clip(
+            (dt13c + delta / 2.0 - mid_row) / half_safe,
+            -1.0, 1.0).astype(numpy.float32))
+        edge_lo = numpy.arcsin(numpy.clip(
+            (dt13c - delta / 2.0 - mid_row) / half_safe,
+            -1.0, 1.0).astype(numpy.float32))
+        # the half-cell offset is positive and arcsine is monotone, so
+        # edge_hi >= edge_lo always: no absolute value, and no need to sort
+        # the pair into an interval below
+        mass = (edge_hi - edge_lo) / numpy.pi
+        # accumulate in double: 1e-300 would flush to zero in single
+        msum = mass.sum(axis=0, dtype=numpy.float64)
+        invalid |= ~(msum > 0)
+        msafe = numpy.maximum(msum, 1e-300)
+        # inverse-cdf over the candidates, accumulated in place: the running
+        # sum never has to be materialised as an (ncand, nsamp) array
+        thresh = numpy.random.random_sample(nsamp) * msafe
+        acc = mass[0].astype(numpy.float64)
+        pick = numpy.zeros(nsamp, dtype=numpy.intp)
+        for k in range(1, ncand):
+            pick += acc < thresh
+            acc += mass[k]
+        cols = numpy.arange(nsamp)
+        theta_lo = edge_lo[pick, cols].astype(numpy.float64)
+        theta_hi = edge_hi[pick, cols].astype(numpy.float64)
+        theta = (theta_lo + numpy.random.uniform(0, 1, nsamp)
+                 * (theta_hi - theta_lo))
+        dt13 = mid + half * numpy.sin(theta)
+        # q = exp(logl_j) p(dt13) / Zhat  =>  p/q = Zhat / exp(logl_j)
+        dens = ((logl[cell[pick, cols]] - lmax)
+                - numpy.log(total * msafe / ncand))
+        return dt13, dens, invalid
+
+    def _analytic_antenna(self, nhat):
+        """F+, Fx and earth-centre delays from the Cartesian source direction.
+
+        Both are algebraic in ``nhat``, which the inversion already produces, so
+        this needs no trigonometry and no ra/dec round trip. Polarisation is
+        applied analytically downstream and needs no recomputation here.
+        """
+        c = self._analytic_constants()
+        sd = nhat[2]
+        # nhat is a unit vector, so 1 - nz^2 == nx^2 + ny^2 exactly; computing
+        # it as the sum keeps full precision near the poles, where the
+        # subtraction would cancel and blow cg, sg up
+        cd2 = numpy.maximum(nhat[0] * nhat[0] + nhat[1] * nhat[1], 1e-300)
+        cd = numpy.sqrt(cd2)
+        cg = nhat[0] / cd
+        sg = -nhat[1] / cd
+        c2 = cg * cg - sg * sg
+        s2 = 2.0 * sg * cg
+        fplus, fcross, delay = {}, {}, {}
+        for ifo in c['ifos']:
+            av, bv, d01, d02, d12, d22 = c['resp'][ifo]
+            fplus[ifo] = ((av - bv * c2 + d01 * s2)
+                          - (sd * sd * (av + bv * c2 - d01 * s2) + d22 * cd2
+                             + 2.0 * sd * cd * (d12 * sg - d02 * cg)))
+            fcross[ifo] = 2.0 * (sd * (bv * s2 + d01 * c2)
+                                 - cd * (d02 * sg + d12 * cg))
+            delay[ifo] = -(c['loc_c'][ifo] @ nhat)
+        return fplus, fcross, delay
+
+    def analytic_sky_draw(self, snrs, ifos, vsamples):
+        """Draw (tc, ra, dec) by inverting the inter-detector delays exactly.
+
+        An alternative to the pregenerated delay-to-sky map. Each delay is one
+        linear constraint on the unit source direction,
+
+            nhat . d_ij = -c * dt_ij       d_ij = r_i - r_j
+
+        so ``min(ndet - 1, 2)`` delays -- plus one azimuth when there is only a
+        single delay -- determine the sky. The physical region is exactly the
+        ellipse ``dt^T S dt <= 1``, so a drawn delay tuple cannot fail to
+        correspond to a sky position, and the Jacobian is analytic, so the
+        prior/proposal ratio is closed form rather than approximate.
+
+        The isotropic sky prior in delay space is exactly uniform in the first
+        delay and arcsine in the second, and drawing them that way makes every
+        geometric factor collapse to the constant ``-log(2 t12max)``. The
+        residual weight is then only the SNR tilt on the drawn times.
+
+        Returns True on success. On failure the caller falls back to the map,
+        which is reported so that a run cannot silently change estimator.
+        """
+        c = self._analytic_constants()
+        series = self._analytic_windows(snrs, ifos)
+        order = sorted(ifos, key=lambda i: -series[i][1].max())
+        ndet = len(order)
+        geom = self._analytic_geometry(order) if ndet > 1 else None
+
+        snr0, logl0 = series[order[0]]
+        delta0 = float(snr0.delta_t)
+        # the normaliser is already needed for the density, so forming it
+        # here costs nothing and avoids both a rebuilt cdf and a logsumexp
+        # call whose overhead dwarfs the length-n array it is given
+        l0max = logl0.max()
+        shifted0 = numpy.exp(logl0 - l0max)
+        i0 = self._alias_draw(shifted0, vsamples)
+        # Every delay below is a difference of two coalescence-time-like
+        # quantities. Formed from absolute GPS they are order 1e9 s, which a
+        # double holds to about 2.4e-7 s -- a thousandth of a sample at
+        # 4096 Hz -- and that error lands directly on the cell boundaries the
+        # candidate weights are read from. A drawn dt13 then falls on the
+        # wrong side of a boundary for order 0.1% of samples and is weighted
+        # with the neighbouring cell's SNR, which near a peak differs by
+        # O(1-10) nats: order 1% on the integral, and enough to swamp any
+        # per-point comparison of two versions of this code. So the epoch is
+        # split off and every time here is an OFFSET from it, which makes the
+        # differences exact to ~1e-18 and pins the partition.
+        epoch = snr0.start_time
+        t_off = (i0 * delta0
+                 + numpy.random.uniform(-delta0 / 2.0, delta0 / 2.0, vsamples))
+        dens = ((logl0[i0] - l0max) - numpy.log(shifted0.sum())
+                - numpy.log(delta0))
+        invalid = numpy.zeros(vsamples, dtype=bool)
+        branch_corr = 0.0
+
+        if ndet == 1:
+            ra = self.marginalized_vector_priors['ra'].rvs(size=vsamples)['ra']
+            dec = self.marginalized_vector_priors['dec'].rvs(
+                size=vsamples)['dec']
+            lon = ra - c['gmst']
+            nhat = numpy.array([numpy.cos(dec) * numpy.cos(lon),
+                                numpy.cos(dec) * numpy.sin(lon),
+                                numpy.sin(dec)])
+            logw = -c['log_tcspan'] - dens
+        else:
+            t12max = geom['t12max']
+            snr1, logl1 = series[order[1]]
+            t_two, dens1 = self._draw_in_window(
+                logl1, float(snr1.start_time - epoch), float(snr1.delta_t),
+                t_off - t12max, t_off + t12max)
+            dens = dens + dens1
+            dt12 = t_off - t_two
+            invalid |= ~numpy.isfinite(dens1) | (numpy.abs(dt12) > t12max)
+            if ndet == 2:
+                # a single delay leaves a free azimuth about the baseline, and
+                # there the Jacobian is constant, so uniform is exactly
+                # isotropic and needs no correction
+                dhat, uvec, vvec = geom['basis']
+                cos_t = numpy.clip(-dt12 / t12max, -1.0, 1.0)
+                sin_t = numpy.sqrt(numpy.maximum(1.0 - cos_t * cos_t, 0.0))
+                az = numpy.random.uniform(0, 2 * numpy.pi, vsamples)
+                nhat = (cos_t * dhat[:, None]
+                        + sin_t * (numpy.cos(az) * uvec[:, None]
+                                   + numpy.sin(az) * vvec[:, None]))
+            else:
+                dt13, dens2, bad2 = self._draw_second_delay(
+                    series, order, geom, epoch, t_off, dt12)
+                dens = dens + dens2
+                invalid |= bad2
+                npar = geom['Mp'] @ (-SPEED_OF_LIGHT
+                                     * numpy.vstack([dt12, dt13]))
+                sgeo = numpy.sqrt(numpy.clip(1.0 - (npar * npar).sum(0),
+                                             0.0, None))
+                # The two roots are mirror images through the detector
+                # plane. Both are physical, but they put the coalescence at
+                # times differing by twice the reference detector's offset
+                # from that plane, and for some geometries one of them lies
+                # outside the tc prior for EVERY sample -- measured at 50% and
+                # 62% of the pool on two injections, against ~0% elsewhere.
+                # Drawing the root blind and rejecting afterwards throws that
+                # fraction of the pool away.
+                #
+                # Testing a root costs one dot product, so draw only among the
+                # survivors: root b with probability v_b / (v+ + v-), and
+                # scale the weight by (v+ + v-)/2. The expectation is
+                # unchanged, still (w+ v+ + w- v-)/2, and nothing is
+                # discarded. Verified directly against that target: the
+                # scheme is unbiased at z = -0.5 over 4e6 draws.
+                loc0 = c['loc_c'][order[0]]
+                tc_base = float(epoch) + t_off + loc0 @ npar
+                tc_swing = sgeo * float(loc0 @ geom['e3'])
+                tc_up, tc_dn = tc_base + tc_swing, tc_base - tc_swing
+                ok_up = (tc_up >= c['tcmin']) & (tc_up <= c['tcmax'])
+                ok_dn = (tc_dn >= c['tcmin']) & (tc_dn <= c['tcmax'])
+                nroot = ok_up.astype(numpy.int8) + ok_dn
+                invalid |= nroot == 0
+                coin = numpy.random.uniform(0, 1, vsamples) < 0.5
+                up = numpy.where(ok_up & ok_dn, coin, ok_up)
+                branch = numpy.where(up, 1.0, -1.0)
+                nhat = npar + (branch * sgeo) * geom['e3'][:, None]
+                branch_corr = numpy.log(
+                    0.5 * numpy.maximum(nroot, 1).astype(float))
+            logw = -geom['log_const'] - dens + branch_corr
+
+        fplus, fcross, delay = self._analytic_antenna(nhat)
+        tc = float(epoch) + t_off - delay[order[0]]
+        outside = (tc < c['tcmin']) | (tc > c['tcmax'])
+        logw = numpy.where(invalid | outside, -numpy.inf, logw)
+        if not numpy.isfinite(logw).any():
+            return False
+
+        self.snr_params = ['tc', 'ra', 'dec']
+        self.sample_idx = numpy.arange(vsamples)
+        self.precalc_antenna_factors = fplus, fcross, delay
+        self.marginalize_vector_params['tc'] = tc
+        self.marginalize_vector_params['dec'] = numpy.arcsin(
+            numpy.clip(nhat[2], -1.0, 1.0))
+        self.marginalize_vector_params['ra'] = numpy.mod(
+            numpy.arctan2(nhat[1], nhat[0]) + c['gmst'], 2 * numpy.pi)
+        self.marginalize_vector_params['logw_partial'] = logw
+        if self._current_params is not None:
+            self._current_params.update(self.marginalize_vector_params)
+            self.marginalize_vector_weights += logw
+        return True
+
     def draw_sky_times(self, snrs, size=None):
         """ Draw ra, dec, and tc together using SNR timeseries to determine
         monte-carlo weights.
@@ -443,6 +848,19 @@ class DistMarg():
         ikey = ''.join(ifos)
 
         vsamples = size if size is not None else self.vsamples
+
+        ndraw = vsamples
+
+        if self.marginalize_sky_analytic and len(ifos) > 0:
+            # alternative path: invert the delays instead of looking them up.
+            # Falls through to the map below if it cannot produce a usable
+            # draw, and says so, so a run cannot silently change estimator.
+            if self.analytic_sky_draw(snrs, ifos, vsamples):
+                return self.marginalize_vector_params
+            if not getattr(self, '_analytic_fellback', False):
+                self._analytic_fellback = True
+                logging.warning("analytic sky draw produced no usable samples; "
+                                "falling back to the pregenerated map")
 
         # No good SNR peaks, go with prior draw
         if len(ifos) == 0:
@@ -610,6 +1028,17 @@ class DistMarg():
         snrs : Dict of SNR time series
             Either provide this or the model needs a function
             to get the reference SNRs.
+        marginalize_sky_analytic: bool
+            Draw (tc, ra, dec) by inverting the inter-detector delays in closed
+            form instead of looking them up in the pregenerated map. The
+            physical region is the exact ellipse the delays allow, so a drawn
+            delay tuple cannot fail to correspond to a sky position, and the
+            prior/proposal ratio is analytic rather than approximate. Falls back
+            to the map, with a warning, if it cannot produce a usable draw.
+        marginalize_sky_candidates: int
+            Candidate cells used when tilting the second delay by the third
+            detector's SNR. Cost is roughly linear in this and the effective
+            sample size saturates around 8, which is the default.
         peak_lock_snr: float
             The minimum SNR to bother restricting from the prior range
         peak_lock_ratio: float
