@@ -529,10 +529,21 @@ class DistMarg():
         entries.
 
         Returns the cells and the log probability of drawing each within
-        its own window, or ``-inf`` where the window holds no cell.
+        its own window, or ``-inf`` where the window holds no cell. The
+        cell returned for such a sample is arbitrary; every caller drops
+        it on the ``-inf``.
         """
         lmax = logw.max()
         cum = numpy.concatenate(([0.0], numpy.cumsum(numpy.exp(logw - lmax))))
+        # A window holding no cell is rejected on the last line; what
+        # these two do is keep the arithmetic between here and there
+        # defined. Left alone, such a sample divides by a zero or negative
+        # norm and carries an inf or a nan through to a value that is
+        # discarded anyway, so the only thing lost would be two warnings
+        # -- but the same inf from a window that is NOT empty would be a
+        # real fault, and silencing the warning would hide it. So they are
+        # pointed at the whole series, which is always drawable, and the
+        # result thrown away.
         empty = hi <= lo
         lo = numpy.where(empty, 0, lo)
         hi = numpy.where(empty, len(logw), hi)
