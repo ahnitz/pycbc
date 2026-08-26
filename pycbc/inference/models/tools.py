@@ -570,6 +570,8 @@ class DistMarg():
         return {'lo': lo, 'strides': strides, 'dims': dims,
                 'offset': offset, 'count': count,
                 'flat': numpy.array(flat, dtype=numpy.int64)}
+
+    @staticmethod
     def _draw_in_cells(logw, lo, hi, rng):
         """Draw one cell per sample from ``[lo, hi)`` of a shared law.
 
