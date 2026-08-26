@@ -725,19 +725,23 @@ class DistMarg():
                 # blind and reject, draw only among the roots that survive
                 # and scale the weight by how many did: with both kept the
                 # expectation is (w+ + w-)/2 either way.
+                # where each root puts the coalescence, still as an offset
+                # from the epoch: the bounds move to offsets rather than
+                # the times moving to GPS, which would cost the 2.4e-7 s
                 loc0 = loc[order[0]] / C_SI
-                tc_mid = epoch_t + t_off + loc0 @ npar
-                swing = perp * float(loc0 @ e3)
-                ok_up = ((tc_mid + swing >= tcmin)
-                         & (tc_mid + swing <= tcmax))
-                ok_dn = ((tc_mid - swing >= tcmin)
-                         & (tc_mid - swing <= tcmax))
+                centre = t_off + loc0 @ npar
+                swing = perp * (loc0 @ e3)
+                pair = numpy.stack([centre + swing, centre - swing])
+                ok_up, ok_dn = ((pair >= tcmin - epoch_t)
+                                & (pair <= tcmax - epoch_t))
+                both = ok_up & ok_dn
                 invalid |= ~(ok_up | ok_dn)
-                up = ok_up & (~ok_dn | (self._sky_rng.random(vsamples) < 0.5))
+                # with both roots in the prior take either; with one, take
+                # it, and the half below no longer cancels the pair
+                up = numpy.where(both, self._sky_rng.random(vsamples) < 0.5,
+                                 ok_up)
                 nhat = npar + numpy.where(up, perp, -perp) * e3[:, None]
-                # both kept, the half cancels the two roots; one kept, it
-                # does not and the survivor carries the pair
-                branch_corr = numpy.where(ok_up & ok_dn, 0.0, -numpy.log(2.0))
+                branch_corr = numpy.where(both, 0.0, -numpy.log(2.0))
             logw = (-log_tcspan - numpy.log(2.0 * t12max)
                     - dens + branch_corr)
 
