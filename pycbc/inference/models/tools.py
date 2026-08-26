@@ -660,20 +660,6 @@ class DistMarg():
                 - numpy.log(total * msafe / ncand))
         return dt13, dens, invalid
 
-    def _analytic_antenna(self, nhat):
-        """F+, Fx and earth-centre delays for the drawn directions.
-
-        The inversion produces the direction as a vector, which is what
-        ``Detector`` takes here, so no ra/dec round trip is needed.
-        Polarization is applied analytically downstream.
-        """
-        c = self._analytic_constants()
-        fplus, fcross, delay = {}, {}, {}
-        for ifo, det in c['dets'].items():
-            fplus[ifo], fcross[ifo] = det.antenna_pattern_from_direction(nhat)
-            delay[ifo] = det.time_delay_from_direction(nhat)
-        return fplus, fcross, delay
-
     def analytic_sky_draw(self, snrs, ifos, vsamples):
         """Draw (tc, ra, dec) by inverting the inter-detector delays exactly.
 
@@ -798,7 +784,10 @@ class DistMarg():
                     0.5 * numpy.maximum(nroot, 1).astype(float))
             logw = -geom['log_const'] - dens + branch_corr
 
-        fplus, fcross, delay = self._analytic_antenna(nhat)
+        fplus, fcross, delay = {}, {}, {}
+        for ifo, det in c['dets'].items():
+            fplus[ifo], fcross[ifo] = det.antenna_pattern_from_direction(nhat)
+            delay[ifo] = det.time_delay_from_direction(nhat)
         tc = float(epoch) + t_off - delay[order[0]]
         outside = (tc < c['tcmin']) | (tc > c['tcmax'])
         logw = numpy.where(invalid | outside, -numpy.inf, logw)
