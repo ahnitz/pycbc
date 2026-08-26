@@ -206,46 +206,37 @@ if 'PYCBC_DETECTOR_CONFIG' in os.environ:
     load_detector_config(os.environ['PYCBC_DETECTOR_CONFIG'].split(':'))
 
 
-def _apply_response(resp, v0, v1, v2):
-    """Return the vector (v0, v1, v2) and the response matrix applied to it.
-
-    The three components need not have the same shape: a set of sky
-    positions may share one time, or one position be asked about at many
-    times. They used to be collected into an array of dtype object, which
-    tolerates that but then does every multiplication one python float at
-    a time. Broadcasting them against each other first keeps the stack
-    rectangular, so it stays a float array, and the matrix product is
-    written out as three multiply-adds, which is the order the object
-    version summed in and so gives the same answer to the last bit. For a
-    thousand sky positions it is about ten times faster.
-
-    Parameters
-    ----------
-    resp: numpy.ndarray
-        The 3x3 detector response matrix.
-    v0, v1, v2: float or numpy.ndarray
-        The components of the vector.
-
-    Returns
-    -------
-    v: numpy.ndarray
-        The components stacked along the first axis.
-    dv: numpy.ndarray
-        The response matrix applied to it, with the same shape.
-    """
-    v = np.array(np.broadcast_arrays(v0, v1, v2))
-    # line the matrix columns up with the leading axis of the stack,
-    # whatever the components' own shape is
-    col = (3,) + (1,) * (v.ndim - 1)
-    dv = (resp[:, 0].reshape(col) * v[0]
-          + resp[:, 1].reshape(col) * v[1]
-          + resp[:, 2].reshape(col) * v[2])
-    return v, dv
 
 
 class Detector(object):
     """A gravitational wave detector
     """
+    @staticmethod
+    def _apply_response(resp, v0, v1, v2):
+        """Return the vector (v0, v1, v2) and the response applied to it.
+
+        The components need not share a shape: many sky positions may share one
+        time, or one position be asked about at many times. Broadcasting them
+        together gives a float array whatever shapes they arrive in, so the
+        product runs over the whole set at once.
+
+        Parameters
+        ----------
+        resp: numpy.ndarray
+            The 3x3 detector response matrix.
+        v0, v1, v2: float or numpy.ndarray
+            The components of the vector.
+
+        Returns
+        -------
+        v: numpy.ndarray
+            The components stacked along the first axis.
+        dv: numpy.ndarray
+            The response matrix applied to it, with the same shape.
+        """
+        v = np.array(np.broadcast_arrays(v0, v1, v2))
+        return v, resp.dot(v)
+
     def __init__(self, detector_name, reference_time=1126259462.0):
         """ Create class representing a gravitational-wave detector
         Parameters
@@ -392,19 +383,19 @@ class Detector(object):
         x1 = -cospsi * cosgha + sinpsi * singha * sindec
         x2 =  sinpsi * cosdec
 
-        x, dx = _apply_response(resp, x0, x1, x2)
+        x, dx = self._apply_response(resp, x0, x1, x2)
 
         y0 =  sinpsi * singha - cospsi * cosgha * sindec
         y1 =  sinpsi * cosgha + cospsi * singha * sindec
         y2 =  cospsi * cosdec
 
-        y, dy = _apply_response(resp, y0, y1, y2)
+        y, dy = self._apply_response(resp, y0, y1, y2)
 
         if polarization_type != 'tensor':
             z0 = -cosdec * cosgha
             z1 = cosdec * singha
             z2 = -sindec
-            z, dz = _apply_response(resp, z0, z1, z2)
+            z, dz = self._apply_response(resp, z0, z1, z2)
 
         if polarization_type == 'tensor':
             if hasattr(dx, 'shape'):
@@ -433,6 +424,83 @@ class Detector(object):
                 fb = (x * dx + y * dy).sum()
                 fl = (z * dz).sum()
             return fb, fl
+
+    def antenna_pattern_from_direction(self, direction):
+        """Return the detector response for a source direction given as a
+        vector in the earth-fixed frame.
+
+        The same quantities as :py:meth:`antenna_pattern` at a zero
+        polarization angle, reached without trigonometry. A caller that
+        already holds the direction as a vector -- inverting the arrival
+        time delays between detectors produces one -- would otherwise have
+        to turn it into a right ascension and a declination, and hand back
+        the sidereal time it was formed with, only for this to undo all
+        three. Polarization is a rotation in the plane transverse to the
+        direction and can be applied to the pair afterwards, so it is not
+        taken here.
+
+        Parameters
+        ----------
+        direction: numpy.ndarray
+            Unit vector from the earth centre towards the source, in the
+            same frame as :py:attr:`location`. Shape (3,) for one
+            direction or (3, n) for many.
+
+        Returns
+        -------
+        fplus: float or numpy.ndarray
+            The plus polarization factor for this sky location.
+        fcross: float or numpy.ndarray
+            The cross polarization factor for this sky location.
+        """
+        resp = np.asarray(self.response)
+        # the response tensor contracted against the polarization basis,
+        # written out in the six independent components it has
+        mean = 0.5 * (resp[0, 0] + resp[1, 1])
+        diff = 0.5 * (resp[0, 0] - resp[1, 1])
+        rxy, rxz, ryz, rzz = resp[0, 1], resp[0, 2], resp[1, 2], resp[2, 2]
+
+        x, y, sin_dec = direction[0], direction[1], direction[2]
+        # the direction is a unit vector, so 1 - z^2 is x^2 + y^2 exactly;
+        # taking the sum keeps full precision at the poles, where the
+        # subtraction would cancel and the ratios below would blow up
+        cos_dec_sq = np.maximum(x * x + y * y, 1e-300)
+        # cos(dec)cos(gha) is x and cos(dec)sin(gha) is -y, so only the
+        # double-angle pair needs dividing by cos(dec) at all, and it
+        # needs the square, which is already here. Nothing takes a root.
+        cos_2gha = (x * x - y * y) / cos_dec_sq
+        sin_2gha = -2.0 * x * y / cos_dec_sq
+
+        fplus = ((mean - diff * cos_2gha + rxy * sin_2gha)
+                 - (sin_dec * sin_dec
+                    * (mean + diff * cos_2gha - rxy * sin_2gha)
+                    + rzz * cos_dec_sq
+                    - 2.0 * sin_dec * (ryz * y + rxz * x)))
+        fcross = 2.0 * (sin_dec * (diff * sin_2gha + rxy * cos_2gha)
+                        - (ryz * x - rxz * y))
+        return fplus, fcross
+
+    def time_delay_from_direction(self, direction):
+        """Return the time delay from the earth center for a source
+        direction given as a vector in the earth-fixed frame.
+
+        The same quantity as :py:meth:`time_delay_from_earth_center`, for
+        a caller that holds the direction as a vector; see
+        :py:meth:`antenna_pattern_from_direction`.
+
+        Parameters
+        ----------
+        direction: numpy.ndarray
+            Unit vector from the earth centre towards the source, in the
+            same frame as :py:attr:`location`. Shape (3,) for one
+            direction or (3, n) for many.
+
+        Returns
+        -------
+        delay: float or numpy.ndarray
+            The time delay in seconds.
+        """
+        return -np.asarray(self.location).dot(direction) / constants.c.value
 
     def time_delay_from_earth_center(self, right_ascension, declination, t_gps):
         """Return the time delay from the earth center
@@ -473,9 +541,9 @@ class Detector(object):
         e1 = cosd * -sin(ra_angle)
         e2 = sin(declination)
 
-        # written out rather than stacked into a vector and dotted: the
-        # components may have different shapes, which used to mean an
-        # array of dtype object and a multiplication per python float
+        # written out componentwise rather than stacked and dotted: the
+        # stack costs more to build than the reduction saves, measured at
+        # every size, and the components may have different shapes anyway
         dx = other_location - self.location
         proj = dx[0] * e0 + dx[1] * e1 + dx[2] * e2
         return proj / constants.c.value

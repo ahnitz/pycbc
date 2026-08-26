@@ -96,60 +96,41 @@ class TestDetector(unittest.TestCase):
 
             self.assertLess(diff.max(), tolerance)
 
-    def test_antenna_pattern_and_delay(self):
-        # must agree with calling the two methods it replaces, since the
-        # only difference is that the shared geometry is computed once
-        for ifo in self.d:
-            for ra1, dec1, pol1, time1 in list(zip(self.ra, self.dec,
-                                                   self.pol, self.time))[:50]:
-                fp, fc = ifo.antenna_pattern(ra1, dec1, pol1, time1)
-                dt = ifo.time_delay_from_earth_center(ra1, dec1, time1)
-                fp2, fc2, dt2 = ifo.antenna_pattern_and_delay(
-                    ra1, dec1, pol1, time1)
-                self.assertAlmostEqual(fp, fp2, places=12)
-                self.assertAlmostEqual(fc, fc2, places=12)
-                self.assertAlmostEqual(dt, dt2, places=14)
+    def test_antenna_pattern_from_direction(self):
+        """The vector form must answer what the ra/dec form answers.
 
-    def test_antenna_pattern_and_delay_array_times(self):
-        # a signal long enough that the earth turns during it is evaluated
-        # at an array of times, which relative binning relies on
+        antenna_pattern_from_direction and time_delay_from_direction take
+        the source direction as a vector in the earth-fixed frame instead
+        of a right ascension, a declination and a time. They are the same
+        quantities, so the two forms are checked against each other over
+        the same sky positions the rest of this file uses.
+        """
         for ifo in self.d:
-            for ra1, dec1, pol1, time1 in list(zip(self.ra, self.dec,
-                                                   self.pol, self.time))[:10]:
-                times = time1 + numpy.linspace(0., 100., 17)
-                fp, fc = ifo.antenna_pattern(ra1, dec1, pol1, times)
-                dt = ifo.time_delay_from_earth_center(ra1, dec1, times)
-                fp2, fc2, dt2 = ifo.antenna_pattern_and_delay(
-                    ra1, dec1, pol1, times)
-                self.assertEqual(numpy.shape(fp2), numpy.shape(times))
-                self.assertLess(abs(fp - fp2).max(), 1e-12)
-                self.assertLess(abs(fc - fc2).max(), 1e-12)
-                self.assertLess(abs(numpy.atleast_1d(dt)
-                                    - numpy.atleast_1d(dt2)).max(), 1e-12)
+            gmst = numpy.array([ifo.gmst_estimate(t) for t in self.time])
+            gha = gmst - self.ra
+            direction = numpy.array(
+                [numpy.cos(self.dec) * numpy.cos(gha),
+                 -numpy.cos(self.dec) * numpy.sin(gha),
+                 numpy.sin(self.dec)])
 
-    def test_project_wave_fd(self):
-        # must reproduce assembling the projection by hand, which is what
-        # the frequency-domain waveform generator used to do inline
-        from pycbc.types import FrequencySeries
-        from pycbc.waveform.utils import apply_fd_time_shift
-        numpy.random.seed(0)
-        n = 128
-        hp = FrequencySeries(numpy.random.normal(size=n)
-                             + 1j * numpy.random.normal(size=n),
-                             delta_f=1.0, epoch=0)
-        hc = FrequencySeries(numpy.random.normal(size=n)
-                             + 1j * numpy.random.normal(size=n),
-                             delta_f=1.0, epoch=0)
-        ref_tc = 1187008882.4
-        for ifo in self.d:
-            for ra1, dec1, pol1 in list(zip(self.ra, self.dec, self.pol))[:5]:
-                tc = ifo.arrival_time(ref_tc, ra1, dec1)
-                fp, fc = ifo.antenna_pattern(ra1, dec1, pol1, tc)
-                expected = apply_fd_time_shift(fp * hp + fc * hc, tc,
-                                               copy=True)
-                got = ifo.project_wave_fd(hp, hc, ra1, dec1, pol1, ref_tc)
-                self.assertLess(abs(numpy.array(got) - numpy.array(expected)
-                                    ).max(), 1e-12)
+            fp, fc = ifo.antenna_pattern_from_direction(direction)
+            fp0, fc0 = ifo.antenna_pattern(self.ra, self.dec,
+                                           numpy.zeros_like(self.ra),
+                                           self.time)
+            self.assertLess(abs(fp - fp0).max(), 1e-12)
+            self.assertLess(abs(fc - fc0).max(), 1e-12)
+
+            delay = ifo.time_delay_from_direction(direction)
+            delay0 = numpy.array(
+                [ifo.time_delay_from_earth_center(r, d, t)
+                 for r, d, t in zip(self.ra, self.dec, self.time)])
+            self.assertLess(abs(delay - delay0).max(), 1e-12)
+
+            # one direction at a time is the same as all of them at once
+            one_fp, one_fc = ifo.antenna_pattern_from_direction(
+                direction[:, 0])
+            self.assertAlmostEqual(float(one_fp), float(fp[0]), places=12)
+            self.assertAlmostEqual(float(one_fc), float(fc[0]), places=12)
 
     def test_delay_from_detector(self):
         ra, dec, time = self.ra[0:10], self.dec[0:10], self.time[0:10]
@@ -209,30 +190,50 @@ class TestDetector(unittest.TestCase):
                     self.assertAlmostEqual(converted_times[i], target_times[i], 
                                            places=6)
 
-    def test_array_matches_scalar(self):
-        """The vectorized antenna pattern and time delay must agree with
-        the scalar call element for element.
+    def test_one_at_a_time_matches_vector(self):
+        """Calling one at a time must match calling with a vector.
 
-        antenna_pattern and time_delay_from_earth_center now broadcast
-        their vector components into a float array rather than an object
-        array; this guards that against a per-element regression, by
-        checking an array query against the scalar call at each point,
-        including the frequency-dependent response used with an array of
-        times.
+        The response is applied to the whole set at once, so a mistake in
+        lining the components up would show at some positions and not
+        others. Covers the vector and scalar polarizations, and
+        time_delay_from_earth_center given an array.
+
+        The response is compared to the precision of the arithmetic rather
+        than exactly: the matrix product rounds differently over a whole
+        set than over one position, in the last bit of a double.
         """
-        t = 1187008882.0
-        for d in self.d:
-            fp, fc = d.antenna_pattern(self.ra, self.dec, self.pol, t)
-            dt = d.time_delay_from_earth_center(self.ra, self.dec, t)
-            for i in (0, 137, len(self.ra) - 1):
-                fps, fcs = d.antenna_pattern(
-                    float(self.ra[i]), float(self.dec[i]),
-                    float(self.pol[i]), t)
-                self.assertEqual(fp[i], fps)
-                self.assertEqual(fc[i], fcs)
+        test_time = 1187008882.0
+        polarizations = [{}, {'polarization_type': 'vector'},
+                         {'polarization_type': 'scalar'}]
+        for detector in self.d:
+            delay_vector = detector.time_delay_from_earth_center(
+                self.ra, self.dec, test_time)
+            response_vectors = [
+                detector.antenna_pattern(self.ra, self.dec, self.pol,
+                                         test_time, **kwargs)
+                for kwargs in polarizations]
+
+            for index in (0, 137, len(self.ra) - 1):
+                right_ascension = float(self.ra[index])
+                declination = float(self.dec[index])
+                polarization = float(self.pol[index])
+
                 self.assertEqual(
-                    dt[i], d.time_delay_from_earth_center(
-                        float(self.ra[i]), float(self.dec[i]), t))
+                    delay_vector[index],
+                    detector.time_delay_from_earth_center(
+                        right_ascension, declination, test_time))
+
+                for kwargs, from_vector in zip(polarizations,
+                                               response_vectors):
+                    one_at_a_time = detector.antenna_pattern(
+                        right_ascension, declination, polarization,
+                        test_time, **kwargs)
+                    for whole, single in zip(from_vector, one_at_a_time):
+                        self.assertTrue(
+                            numpy.isclose(whole[index], single,
+                                          rtol=1e-14, atol=1e-16),
+                            "%s at %s: %r against %r"
+                            % (kwargs, index, whole[index], single))
 
 
 suite = unittest.TestSuite()

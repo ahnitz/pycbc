@@ -41,11 +41,11 @@ configurations which can analyze this simple problem.
 .. literalinclude:: ../../../examples/inference/samplers/dynesty_stub.ini
    :language: ini
    
-==================================================================
-`i-nessai <https://nessai.readthedocs.io/>`_ (importance nested)
-==================================================================
+==============================================================
+`Nautilus <https://nautilus-sampler.readthedocs.io/>`_
+==============================================================
    
-.. literalinclude:: ../../../examples/inference/samplers/inessai_stub.ini
+.. literalinclude:: ../../../examples/inference/samplers/nautilus_stub.ini
    :language: ini
    
 ============================================================
