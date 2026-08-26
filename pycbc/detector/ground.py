@@ -458,26 +458,24 @@ class Detector(object):
         diff = 0.5 * (resp[0, 0] - resp[1, 1])
         rxy, rxz, ryz, rzz = resp[0, 1], resp[0, 2], resp[1, 2], resp[2, 2]
 
-        sin_dec = direction[2]
+        x, y, sin_dec = direction[0], direction[1], direction[2]
         # the direction is a unit vector, so 1 - z^2 is x^2 + y^2 exactly;
         # taking the sum keeps full precision at the poles, where the
         # subtraction would cancel and the ratios below would blow up
-        cos_dec_sq = np.maximum(direction[0] ** 2.0 + direction[1] ** 2.0,
-                                1e-300)
-        cos_dec = np.sqrt(cos_dec_sq)
-        cos_gha = direction[0] / cos_dec
-        sin_gha = -direction[1] / cos_dec
-        cos_2gha = cos_gha * cos_gha - sin_gha * sin_gha
-        sin_2gha = 2.0 * sin_gha * cos_gha
+        cos_dec_sq = np.maximum(x * x + y * y, 1e-300)
+        # cos(dec)cos(gha) is x and cos(dec)sin(gha) is -y, so only the
+        # double-angle pair needs dividing by cos(dec) at all, and it
+        # needs the square, which is already here. Nothing takes a root.
+        cos_2gha = (x * x - y * y) / cos_dec_sq
+        sin_2gha = -2.0 * x * y / cos_dec_sq
 
         fplus = ((mean - diff * cos_2gha + rxy * sin_2gha)
                  - (sin_dec * sin_dec
                     * (mean + diff * cos_2gha - rxy * sin_2gha)
                     + rzz * cos_dec_sq
-                    + 2.0 * sin_dec * cos_dec
-                    * (ryz * sin_gha - rxz * cos_gha)))
+                    - 2.0 * sin_dec * (ryz * y + rxz * x)))
         fcross = 2.0 * (sin_dec * (diff * sin_2gha + rxy * cos_2gha)
-                        - cos_dec * (rxz * sin_gha + ryz * cos_gha))
+                        - (ryz * x - rxz * y))
         return fplus, fcross
 
     def time_delay_from_direction(self, direction):
