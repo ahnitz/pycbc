@@ -335,18 +335,28 @@ class GameSampler6(DummySampler):
         instead. The descent only earns its calls by pruning; below SNR ~10
         it prunes nothing and enumerates the map. 0 disables.
     gen_defer : float
-        Defer a parameter to its exact uniform prior when it loads below this
-        on every informative direction. The loading is a direction cosine --
-        |V[i,j]| for eigenvector j of the posterior covariance in prior units
-        -- so 0.2 means the parameter axis sits within 12 degrees of
-        perpendicular to everything the likelihood constrained, and at most 4%
-        of any informative direction's variance projects onto it. Measured
-        loadings separate cleanly, 0.00-0.02 for deferrable parameters against
-        0.31-0.95 for the rest, and the selection is unchanged over 0.10-0.30.
-        A parameter once deferred is released only above 1.75x this, which
-        stops the set churning while little posterior has accumulated. 0
-        disables. Directions count as informative below lambda = 0.8, which is
-        not currently configurable.
+        Loading below which a parameter is ELIGIBLE to be handed to its exact
+        uniform prior instead of being modelled by the kernel. The loading is
+        a direction cosine -- |V[i,j]| for eigenvector j of the posterior
+        covariance in prior units -- so 0.2 means the parameter axis sits
+        within 12 degrees of perpendicular to everything the likelihood
+        constrained. ELIGIBILITY ONLY: whether an eligible parameter is
+        actually deferred is decided on measured efficiency, see
+        `_defer_dimensions`. 0 disables deferral entirely.
+    gen_defer_ratio : float
+        Only attempt deferral when the generative round's efficiency has
+        fallen below the pool stratum's by this factor. Deferral is a remedy
+        for a kernel that is measurably doing badly; a kernel already beating
+        the pool needs no remedy and must not be given one speculatively.
+    gen_defer_patience : int
+        Consecutive poor rounds required before attempting deferral, and the
+        window over which "recovering on its own" is judged. The kernel is
+        legitimately poor in its first rounds while it has few centres, and
+        recovers unaided; acting on that transient is what has to be avoided.
+    gen_defer_margin : float
+        A trial deferral is kept only if it improves efficiency by at least
+        this factor. Otherwise it is reverted and no further parameter is
+        tried, so a wrong guess costs one round rather than the whole run.
     gen_truncate : int
         Truncate each kernel to the prior box and renormalise it. Requires
         every sampled parameter to have a bounded prior; inert otherwise.
@@ -367,6 +377,9 @@ class GameSampler6(DummySampler):
                  gen_local_k=160,
                  gen_truncate=1,
                  gen_defer=0.2,
+                 gen_defer_ratio=2.0,
+                 gen_defer_patience=2,
+                 gen_defer_margin=1.1,
                  tree_start_level=0,
                  tree_accept_fraction=0.9,
                  min_active_points=100,
@@ -414,7 +427,15 @@ class GameSampler6(DummySampler):
         # Loading on informative directions below which a parameter is
         # handed to the prior exactly. 0 disables.
         self.gen_defer = float(gen_defer)
+        self.gen_defer_ratio = float(gen_defer_ratio)
+        self.gen_defer_patience = int(gen_defer_patience)
+        self.gen_defer_margin = float(gen_defer_margin)
         self._deferred = set()
+        self._defer_trial = None
+        self._defer_eff_before = None
+        self._defer_frozen = False
+        self._pool_eff = None
+        self._gen_eff = []
         self.tree_start_level = int(tree_start_level)
         self.tree_accept_fraction = float(tree_accept_fraction)
         self.tree_shortcut = 0
@@ -746,6 +767,12 @@ class GameSampler6(DummySampler):
         strata = {'pool': {'samp': None, 'loglr': None, 'logw': None}}
         self.stratum_calls = {}
         self._logz_terms = {}
+        self._deferred = set()
+        self._defer_trial = None
+        self._defer_eff_before = None
+        self._defer_frozen = False
+        self._pool_eff = None
+        self._gen_eff = []
         proposal = self._seed_proposal_from_leaves() \
             if self.gen_seed_leaves else None
         pool_dead = False
@@ -813,6 +840,14 @@ class GameSampler6(DummySampler):
                     # different failure from one that is uniformly poor,
                     # and only the first is a proposal-tail problem.
                     wn = numpy.exp(gw - logsumexp(gw))
+                    # Per-round efficiency, and the pool's, are what the
+                    # deferral gate is judged on -- see `_defer_gate`.
+                    self._gen_eff.append(
+                        self._ess(gw) / max(len(gw), 1))
+                    pc = self.stratum_calls.get('pool', 0)
+                    if pc:
+                        self._pool_eff = \
+                            self._ess(strata['pool']['logw']) / pc
                     logging.info('round %i generative: ESS %.1f from %i '
                                  'calls (%.2f%%), max weight %.3f',
                                  rnd, self._ess(gw), len(gw),
@@ -1409,8 +1444,10 @@ class GameSampler6(DummySampler):
         defers it, destroys the ridge, and costs 22x (efficiency 22.4% ->
         0.99%).
 
-        Recomputed every refit: each round is its own stratum, so the split
-        may change freely as evidence accumulates.
+        This method only MEASURES; `_defer_decide` chooses. The split may
+        change freely between rounds because each round is its own stratum,
+        but it is only ever changed on measured efficiency -- the old code
+        changed it on this loading alone and latched, see `_defer_decide`.
         """
         box = self._box()
         if box is None or self.gen_defer <= 0:
@@ -1426,41 +1463,103 @@ class GameSampler6(DummySampler):
         if not informative.any():
             return []
         load = numpy.abs(V[:, informative]).max(axis=1)
-        # Hysteresis, as a Schmitt trigger on two thresholds, because the
-        # loadings are noisy while little posterior has accumulated. At
-        # precessing SNR 30 the set otherwise flipped between five subsets
-        # over 19 refits, and the seed whose set stayed fixed reached 19.1%
-        # efficiency against 8.8% for the most unstable. Deferring is safe;
-        # deferring only sometimes wastes the rounds that model it.
-        #
-        # A unanimity window over recent refits does NOT fix this, and was
-        # measured not to (distinct sets 3/4/5 against 1/5/3 without it):
-        # requiring agreement makes the decision more conservative rather
-        # than more stable, so a loading oscillating near the threshold makes
-        # the set alternate instead. What is needed is STATE -- once deferred,
-        # a parameter stays deferred until its loading climbs clearly above.
-        for i in range(len(names)):
-            if load[i] < self.gen_defer:
-                self._deferred.add(i)
-            elif load[i] > 1.75 * self.gen_defer:
-                self._deferred.discard(i)
-        out = sorted(self._deferred)
-        # Never defer so much that the modelled block cannot support a
-        # covariance. At low SNR one parameter can carry the single
-        # informative direction on its own -- mchirp at loading 0.95 leaves
-        # the other five below 0.2 -- and deferring five of six then makes
-        # the kernel fit raise, which costs the round and, on a first fit,
-        # ends the run for want of any generative proposal. Keep the highest
-        # loading parameters back until two remain modelled.
-        if len(names) - len(out) < 2:
-            out = sorted(out, key=lambda i: load[i])[:max(0, len(names) - 2)]
         logging.info('information per direction: %s',
                      ' '.join('%.3f' % v for v in numpy.sort(lam)))
-        logging.info('loading on informative directions: %s (defer below '
+        logging.info('loading on informative directions: %s (eligible below '
                      '%.2f)', ' '.join('%s=%.2f' % (p, load[i])
                                        for i, p in enumerate(names)),
                      self.gen_defer)
-        return out
+        return self._defer_decide(load, names)
+
+    def _defer_decide(self, load, names):
+        """ Which eligible parameters to actually defer, decided on MEASURED
+        efficiency rather than on the loading.
+
+        The loading is a suggestion, not a trigger. Applying it speculatively
+        is what broke: measured at idx 223, the fifth eigenvalue sits at
+        0.757 while the informative cut is 0.8, the round-1 estimate has
+        bootstrap scatter +-0.031 AND is biased high because the seed
+        proposal has already deferred, and the resulting state LATCHES --
+        deferring inflates the very eigenvalue that holds it deferred, so the
+        old 1.75x release could never fire. Two seeds of one identical
+        configuration gave 36.0% and 6.4%. Across the ten worst rows of a
+        300-injection P-P the same latch cost 1.5-9.7x, every one of which
+        recovered to 28-40% with deferral simply switched off.
+
+        So: model everything unless the kernel has DEMONSTRATED it is sick.
+
+        The reference is the pool stratum, not an absolute threshold, because
+        it is measured on the same problem and so self-calibrates across
+        SNR and dimension. Un-deferred, the kernel beat the pool by
+        1.52-4.28x on all ten of those rows, while the ten-parameter
+        precessing case deferral was built for runs ~2.5x WORSE than its
+        deferred self. A 2x-worse-than-pool gate is a factor ~3 clear of
+        both populations, which is why one rule serves both ends.
+
+        Parameters are then added ONE AT A TIME, lowest loading first, and an
+        addition is kept only if it pays. A wrong guess costs one round.
+        """
+        # Judge the outcome of the previous trial addition before anything
+        # else: a trial that did not pay is reverted, and no more are tried.
+        if self._defer_trial is not None:
+            got = self._gen_eff[-1] if self._gen_eff else 0.0
+            base = self._defer_eff_before or 0.0
+            if got > base * self.gen_defer_margin:
+                logging.info('deferring %s paid off (%.2f%% -> %.2f%%); '
+                             'keeping it', names[self._defer_trial],
+                             100 * base, 100 * got)
+                self._defer_trial = None
+            else:
+                logging.info('deferring %s did not pay (%.2f%% -> %.2f%%); '
+                             'reverting and stopping',
+                             names[self._defer_trial], 100 * base, 100 * got)
+                self._deferred.discard(self._defer_trial)
+                self._defer_trial = None
+                self._defer_frozen = True
+                return sorted(self._deferred)
+
+        if self._defer_frozen:
+            return sorted(self._deferred)
+
+        # The gate. Deferral is a remedy; do not treat a healthy kernel.
+        if not self._defer_gate():
+            return sorted(self._deferred)
+
+        cand = [i for i in range(len(names))
+                if load[i] < self.gen_defer and i not in self._deferred]
+        # Never defer so much that the modelled block cannot support a
+        # covariance: at low SNR one parameter can carry the single
+        # informative direction on its own, and deferring the rest makes the
+        # kernel fit raise, which costs the round.
+        if not cand or len(names) - len(self._deferred) - 1 < 2:
+            return sorted(self._deferred)
+        pick = min(cand, key=lambda i: load[i])
+        self._deferred.add(pick)
+        self._defer_trial = pick
+        self._defer_eff_before = self._gen_eff[-1] if self._gen_eff else 0.0
+        logging.info('kernel is %.2f%% against pool %.2f%%; trying deferral '
+                     'of %s (loading %.2f)', 100 * self._defer_eff_before,
+                     100 * (self._pool_eff or 0.0), names[pick], load[pick])
+        return sorted(self._deferred)
+
+    def _defer_gate(self):
+        """ True when the kernel has measurably earned a remedy.
+
+        Poor relative to the pool for `gen_defer_patience` consecutive rounds
+        AND not improving over that window. The second condition matters: the
+        kernel is legitimately poor while it has few centres and climbs on
+        its own -- on a healthy run it went 50%% to 78%% over 13 rounds -- so
+        a dip that is recovering must not trigger a remedy.
+        """
+        if self._pool_eff is None or self.gen_defer_ratio <= 0:
+            return False
+        recent = self._gen_eff[-self.gen_defer_patience:]
+        if len(recent) < self.gen_defer_patience:
+            return False
+        if not all(e < self._pool_eff / self.gen_defer_ratio for e in recent):
+            return False
+        return recent[-1] <= recent[0]
+
 
     def _box(self):
         """ Per-parameter prior bounds, or None if any is unbounded. """
