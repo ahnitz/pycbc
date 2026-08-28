@@ -423,6 +423,83 @@ class Detector(object):
                 fl = (z * dz).sum()
             return fb, fl
 
+    def antenna_pattern_from_direction(self, direction):
+        """Return the detector response for a source direction given as a
+        vector in the earth-fixed frame.
+
+        The same quantities as :py:meth:`antenna_pattern` at a zero
+        polarization angle, reached without trigonometry. A caller that
+        already holds the direction as a vector -- inverting the arrival
+        time delays between detectors produces one -- would otherwise have
+        to turn it into a right ascension and a declination, and hand back
+        the sidereal time it was formed with, only for this to undo all
+        three. Polarization is a rotation in the plane transverse to the
+        direction and can be applied to the pair afterwards, so it is not
+        taken here.
+
+        Parameters
+        ----------
+        direction: numpy.ndarray
+            Unit vector from the earth centre towards the source, in the
+            same frame as :py:attr:`location`. Shape (3,) for one
+            direction or (3, n) for many.
+
+        Returns
+        -------
+        fplus: float or numpy.ndarray
+            The plus polarization factor for this sky location.
+        fcross: float or numpy.ndarray
+            The cross polarization factor for this sky location.
+        """
+        resp = np.asarray(self.response)
+        # the response tensor contracted against the polarization basis,
+        # written out in the six independent components it has
+        mean = 0.5 * (resp[0, 0] + resp[1, 1])
+        diff = 0.5 * (resp[0, 0] - resp[1, 1])
+        rxy, rxz, ryz, rzz = resp[0, 1], resp[0, 2], resp[1, 2], resp[2, 2]
+
+        x, y, sin_dec = direction[0], direction[1], direction[2]
+        # the direction is a unit vector, so 1 - z^2 is x^2 + y^2 exactly;
+        # taking the sum keeps full precision at the poles, where the
+        # subtraction would cancel and the ratios below would blow up
+        cos_dec_sq = np.maximum(x * x + y * y, 1e-300)
+        # cos(dec)cos(gha) is x and cos(dec)sin(gha) is -y, so only the
+        # double-angle pair needs dividing by cos(dec) at all, and it
+        # needs the square, which is already here. Nothing takes a root.
+        cos_2gha = (x * x - y * y) / cos_dec_sq
+        sin_2gha = -2.0 * x * y / cos_dec_sq
+
+        fplus = ((mean - diff * cos_2gha + rxy * sin_2gha)
+                 - (sin_dec * sin_dec
+                    * (mean + diff * cos_2gha - rxy * sin_2gha)
+                    + rzz * cos_dec_sq
+                    - 2.0 * sin_dec * (ryz * y + rxz * x)))
+        fcross = 2.0 * (sin_dec * (diff * sin_2gha + rxy * cos_2gha)
+                        - (ryz * x - rxz * y))
+        return fplus, fcross
+
+    def time_delay_from_direction(self, direction):
+        """Return the time delay from the earth center for a source
+        direction given as a vector in the earth-fixed frame.
+
+        The same quantity as :py:meth:`time_delay_from_earth_center`, for
+        a caller that holds the direction as a vector; see
+        :py:meth:`antenna_pattern_from_direction`.
+
+        Parameters
+        ----------
+        direction: numpy.ndarray
+            Unit vector from the earth centre towards the source, in the
+            same frame as :py:attr:`location`. Shape (3,) for one
+            direction or (3, n) for many.
+
+        Returns
+        -------
+        delay: float or numpy.ndarray
+            The time delay in seconds.
+        """
+        return -np.asarray(self.location).dot(direction) / constants.c.value
+
     def time_delay_from_earth_center(self, right_ascension, declination, t_gps):
         """Return the time delay from the earth center
         """
