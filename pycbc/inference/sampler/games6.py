@@ -1597,6 +1597,24 @@ class GameSampler6(DummySampler):
         logging.info('combined ESS=%.1f ncalls=%i (setup %i, tree cut %i)',
                      total_ess, self.ncalls,
                      self.meta.get('setup_ncalls', 0), self.tree_ncalls)
+        # The extrinsic marginalization's own effective sample size, summed
+        # over the run. If this is small the importance weights carry the
+        # sky integral's Monte-Carlo noise and no intrinsic proposal can
+        # recover the loss, so it distinguishes "the proposal is bad" from
+        # "the likelihood we handed the proposal is noisy".
+        n = getattr(self.model, 'vess_n', 0)
+        if n:
+            mean = self.model.vess_sum / n
+            self.meta['vector_ess_mean'] = float(mean)
+            self.meta['vector_ess_min'] = float(self.model.vess_min)
+            self.meta['vector_ess_max'] = float(self.model.vess_max)
+            self.meta['vector_ess_calls'] = int(n)
+            logging.info('extrinsic marginalization ESS: mean %.1f, range '
+                         '%.1f-%.1f of %i samples over %i calls (%.2f%%)',
+                         mean, self.model.vess_min, self.model.vess_max,
+                         getattr(self.model, 'vsamples', 0), n,
+                         100.0 * mean / max(getattr(self.model, 'vsamples', 1),
+                                            1))
 
         # Setup and tree-cut calls are deliberately NOT folded into ncalls:
         # both are one-time costs paid before/while resolving which leaves

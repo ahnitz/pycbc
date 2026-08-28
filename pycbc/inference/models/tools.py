@@ -146,6 +146,17 @@ class DistMarg():
         # the effective sample size of the most recent vector
         # marginalization, filled in by marginalize_loglr; nan until then
         self.vector_ess = numpy.nan
+        # ... and a running summary over the whole run, because the
+        # per-call value was being computed and thrown away. A starved
+        # extrinsic marginalization injects variance straight into the
+        # importance weights, so this is the quantity that says whether a
+        # run's efficiency is capped by the sky integral rather than by the
+        # intrinsic proposal. Kept as accumulators, not a list, so a 60k
+        # call run costs nothing to instrument.
+        self.vess_n = 0
+        self.vess_sum = 0.0
+        self.vess_min = numpy.inf
+        self.vess_max = 0.0
 
         # Handle any requested parameter vector / brute force marginalizations
         self.marginalize_vector_params = {}
@@ -346,6 +357,12 @@ class DistMarg():
                                         return_ess=want_ess)
         if want_ess:
             loglr, self.vector_ess = result
+            v = float(self.vector_ess)
+            if numpy.isfinite(v):
+                self.vess_n += 1
+                self.vess_sum += v
+                self.vess_min = min(self.vess_min, v)
+                self.vess_max = max(self.vess_max, v)
             return loglr
         return result
 
