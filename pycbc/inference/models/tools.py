@@ -312,7 +312,17 @@ class DistMarg():
                                      return_vector=inline)
         if inline:
             out, vector = out
-            self.draw_inline(sh_total, hh_total, vector)
+            # The likelihood the sampler sees and the draw must not come from
+            # the same vector samples. A sampler keeps the points whose noisy
+            # estimate happened to land high, so a draw from that same
+            # realization inherits the same luck and lands nearer the peak
+            # than the parameter really is. Split the samples and give each
+            # job its own half.
+            draw_from = None
+            if numpy.ndim(vector) and len(vector) > 1:
+                draw_from = numpy.arange(len(vector)) % 2 == 1
+                out = self.marginalize_subset(vector, ~draw_from)
+            self.draw_inline(sh_total, hh_total, vector, draw_from)
         return out
 
     def premarg_draw(self):
@@ -789,7 +799,7 @@ class DistMarg():
         """Adds whatever is being drawn inline to the model's own stats."""
         return super()._extra_stats + self.reconstruct_stats
 
-    def draw_inline(self, sh_total, hh_total, vector):
+    def draw_inline(self, sh_total, hh_total, vector, subset=None):
         """ Draw the marginalized parameters from the vectors the
         marginalization has just built, rather than by evaluating the
         likelihood again.
@@ -806,7 +816,7 @@ class DistMarg():
 
         levels = self.reconstruct_inline
         if 'vector' in levels and self.marginalize_vector_params:
-            drawn, loglr, xl = self.draw_vector(vector)
+            drawn, loglr, xl = self.draw_vector(vector, subset)
             rec.update(drawn)
             if numpy.ndim(sh):
                 sh, hh = sh[xl], hh[xl]
@@ -830,13 +840,32 @@ class DistMarg():
         for name in self.reconstruct_stats:
             setattr(self._current_stats, name, rec[name])
 
-    def draw_vector(self, loglr):
+    def marginalize_subset(self, vector, subset):
+        """ The marginalized loglr over part of the vector samples, their
+        weights renormalized to that part.
+        """
+        logw = self.marginalize_vector_weights
+        logw = (logw[subset] if numpy.ndim(logw)
+                else numpy.zeros(int(subset.sum())))
+        return float(logsumexp(vector[subset] + logw) - logsumexp(logw))
+
+    def draw_vector(self, loglr, subset=None):
         """ Draw one of the vector marginalization points, given the
         unmarginalized loglr at each. Returns the parameters there, the loglr
         there, and the index, which the next level conditions on.
+
+        `subset` restricts the draw to part of the samples, so it can be kept
+        independent of the part the likelihood was marginalized over.
         """
-        xl = draw_sample(loglr + self.marginalize_vector_weights,
-                         rng=self.marginalize_rng)
+        logw = self.marginalize_vector_weights
+        if subset is not None:
+            idx = numpy.flatnonzero(subset)
+            xl = idx[draw_sample(
+                loglr[idx] + (logw[idx] if numpy.ndim(logw) else logw),
+                rng=self.marginalize_rng)]
+            rec = {k: v[xl] for k, v in self.marginalize_vector_params.items()}
+            return rec, loglr[xl], xl
+        xl = draw_sample(loglr + logw, rng=self.marginalize_rng)
         rec = {k: v[xl] for k, v in self.marginalize_vector_params.items()}
         return rec, loglr[xl], xl
 
