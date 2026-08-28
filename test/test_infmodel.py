@@ -493,10 +493,92 @@ class TestMarginalizedPolModels(unittest.TestCase):
         polsamples = margpol_model.pol
         self._test_models(margpol_model, orig_model, polsamples)
 
+class TestMarginalizeSubset(unittest.TestCase):
+    """Splitting the vector samples keeps the marginalization honest."""
+
+    def setUp(self):
+        from pycbc.inference.models.tools import DistMarg
+        self.d = DistMarg.__new__(DistMarg)
+        self.n = 400
+        self.half = numpy.arange(self.n) % 2 == 1
+
+    def full(self, vector, logw):
+        return float(special.logsumexp(vector + logw))
+
+    def test_whole_set_is_the_plain_marginalization(self):
+        """Asking for all of the samples must change nothing."""
+        rng = numpy.random.RandomState(5)
+        for logw in (numpy.full(self.n, -numpy.log(self.n)),
+                     numpy.log(rng.uniform(size=self.n))):
+            logw = logw - special.logsumexp(logw)
+            vector = rng.normal(0., 3., self.n)
+            self.d.marginalize_vector_weights = logw
+            self.assertAlmostEqual(
+                self.d.marginalize_subset(vector, numpy.ones(self.n, bool)),
+                self.full(vector, logw), places=9)
+
+    def test_scalar_weights_are_the_uniform_case(self):
+        """A scalar weight means every sample counts the same."""
+        rng = numpy.random.RandomState(6)
+        vector = rng.normal(0., 3., self.n)
+        self.d.marginalize_vector_weights = -numpy.log(self.n)
+        both = numpy.ones(self.n, bool)
+        self.assertAlmostEqual(
+            self.d.marginalize_subset(vector, both),
+            self.full(vector, numpy.full(self.n, -numpy.log(self.n))),
+            places=9)
+
+    def test_subset_gets_that_subsets_answer(self):
+        """A subset must be marginalized over, and only over, itself."""
+        rng = numpy.random.RandomState(11)
+        logw = numpy.log(rng.uniform(size=self.n))
+        logw = logw - special.logsumexp(logw)
+        vector = rng.normal(0., 3., self.n)
+        self.d.marginalize_vector_weights = logw
+        want = (special.logsumexp(vector[self.half] + logw[self.half])
+                - special.logsumexp(logw[self.half]))
+        self.assertAlmostEqual(
+            self.d.marginalize_subset(vector, self.half), want, places=9)
+        # and that is not simply the answer for the whole set
+        self.assertNotAlmostEqual(
+            self.d.marginalize_subset(vector, self.half),
+            self.full(vector, logw), places=3)
+
+    def test_half_is_unbiased(self):
+        """Half the samples estimate the same integral as all of them.
+
+        The truth is known: for vector ~ N(0, sigma^2) the mean of
+        exp(vector) is exp(sigma^2 / 2).
+        """
+        rng = numpy.random.RandomState(7)
+        sigma, trials = 2.0, 3000
+        self.d.marginalize_vector_weights = -numpy.log(self.n)
+        est = numpy.array([
+            numpy.exp(self.d.marginalize_subset(
+                rng.normal(0., sigma, self.n), self.half))
+            for _ in range(trials)])
+        truth = numpy.exp(sigma ** 2 / 2.)
+        # the estimator is a mean of lognormals; compare against its own error
+        self.assertLess(abs(est.mean() - truth),
+                        4. * est.std() / numpy.sqrt(trials))
+
+    def test_draw_only_sees_its_own_half(self):
+        """A draw restricted to one half never returns the other half."""
+        from pycbc.inference.models.tools import DistMarg
+        d = DistMarg.__new__(DistMarg)
+        d.marginalize_vector_weights = -numpy.log(self.n)
+        d.marginalize_rng = numpy.random.default_rng(8)
+        d.marginalize_vector_params = {'tc': numpy.arange(self.n) * 1.0}
+        loglr = numpy.zeros(self.n)
+        drawn = [d.draw_vector(loglr, self.half)[2] for _ in range(200)]
+        self.assertTrue(self.half[numpy.array(drawn)].all())
+
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestModels))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestWaveformErrors))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMarginalizedPolModels))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMarginalizeSubset))
 
 if __name__ == '__main__':
     from astropy.utils import iers
