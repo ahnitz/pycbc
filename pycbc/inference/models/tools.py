@@ -38,13 +38,17 @@ def str_to_bool(sval):
     return sval
 
 
-def draw_sample(loglr, size=None):
+def draw_sample(loglr, size=None, rng=None):
     """ Draw a random index from a 1-d vector with loglr weights
+
+    A generator may be given so drawing does not consume the global random
+    state, which would move every sampler's trajectory.
     """
+    rng = numpy.random if rng is None else rng
     if size:
-        x = numpy.random.uniform(size=size)
+        x = rng.uniform(size=size)
     else:
-        x = numpy.random.uniform()
+        x = rng.uniform()
     loglr = loglr - loglr.max()
     cdf = numpy.exp(loglr).cumsum()
     cdf /= cdf[-1]
@@ -74,6 +78,7 @@ class DistMarg():
                               marginalize_orientation_temper=2.0,
                               marginalize_sky_analytic=False,
                               marginalize_sky_amplitude=False,
+                              marginalize_reconstruct=None,
                               **kwargs):
         """ Setup the model for use with distance marginalization
 
@@ -118,6 +123,11 @@ class DistMarg():
             Flattening applied to the orientation surrogate. The surrogate
             spans ~160 nats across cells within one sky sample, so an
             untempered softmax is nearly a delta.
+        marginalize_reconstruct: str, None
+            Draw the marginalized parameters while the likelihood is being
+            marginalized instead of re-evaluating it afterwards. Names the
+            level to demarginalize to: 'vector', 'distance' or 'phase', each
+            including the ones above it. Default None draws nothing inline.
 
         Returns
         -------
@@ -159,6 +169,15 @@ class DistMarg():
         self.vess_sum = 0.0
         self.vess_min = numpy.inf
         self.vess_max = 0.0
+        # each level is conditional on the point the one before it drew, so
+        # asking for a level asks for the ones above it too
+        levels = ['vector', 'distance', 'phase']
+        self.reconstruct_inline = levels[:levels.index(
+            marginalize_reconstruct) + 1] if marginalize_reconstruct else []
+        # drawing happens every likelihood call, so it gets its own generator
+        # rather than moving the sampler's random state
+        self.marginalize_rng = (numpy.random.default_rng()
+                                if self.reconstruct_inline else None)
 
         # Handle any requested parameter vector / brute force marginalizations
         self.marginalize_vector_params = {}
@@ -347,30 +366,61 @@ class DistMarg():
             skip_vector = True
             return_complex = True
 
-        # ask for the effective sample size when doing the ordinary
-        # vector marginalization, so a run can see whether it drew enough
-        # points; the reconstruction and peak paths do not marginalize a
-        # vector here, so there is nothing to measure
-        want_ess = not (return_peak or return_complex or skip_vector)
-        result = marginalize_likelihood(sh_total, hh_total,
-                                        logw=self.marginalize_vector_weights,
-                                        phase=self.marginalize_phase,
-                                        interpolator=interpolator,
-                                        distance=distance,
-                                        skip_vector=skip_vector,
-                                        return_complex=return_complex,
-                                        return_peak=return_peak,
-                                        return_ess=want_ess)
-        if want_ess:
-            loglr, self.vector_ess = result
-            v = float(self.vector_ess)
-            if numpy.isfinite(v):
-                self.vess_n += 1
-                self.vess_sum += v
-                self.vess_min = min(self.vess_min, v)
-                self.vess_max = max(self.vess_max, v)
-            return loglr
-        return result
+        # The per-sample vector is what BOTH the effective sample size and
+        # the inline draw are built from, so ask for it once. The peak and
+        # reconstruction paths do not marginalize a vector here.
+        want_vector = not (return_peak or return_complex or skip_vector)
+        out = marginalize_likelihood(sh_total, hh_total,
+                                     logw=self.marginalize_vector_weights,
+                                     phase=self.marginalize_phase,
+                                     interpolator=interpolator,
+                                     distance=distance,
+                                     skip_vector=skip_vector,
+                                     return_complex=return_complex,
+                                     return_peak=return_peak,
+                                     return_vector=want_vector)
+        if not want_vector:
+            return out
+        out, vector = out
+        self._record_vector_ess(vector)
+        if self.reconstruct_inline:
+            # NO SPLIT. Upstream halves the samples, giving the likelihood one
+            # half and the draw the other, so that a draw cannot inherit the
+            # luck of the points the sampler kept. That is the right thing to
+            # measure in a test, but here it would make ASKING FOR THE OUTPUT
+            # CHANGE THE ANSWER: the returned loglr would rest on half the
+            # vector samples, and the extrinsic marginalization is already
+            # starved -- measured at an effective 11 to 500 of 15000, so
+            # halving it is not free. The draw therefore uses every sample and
+            # `out` is the full-vector marginalization, identical to a run
+            # that reconstructs nothing.
+            self.draw_inline(sh_total, hh_total, vector, None)
+        return out
+
+    def _record_vector_ess(self, vector):
+        """ Effective sample size of the extrinsic marginalization, kept as
+        running accumulators over the run.
+
+        (sum w)^2 / sum w^2 with w the combined weights. Low against the
+        number drawn means the marginal rests on a handful of them, which is
+        the quantity that says whether a run is capped by the sky integral
+        rather than by its intrinsic proposal.
+        """
+        lw = vector + self.marginalize_vector_weights
+        if not numpy.ndim(lw) or not numpy.size(lw):
+            return
+        lwmax = lw.max()
+        if not numpy.isfinite(lwmax):
+            self.vector_ess = numpy.nan
+            return
+        w = numpy.exp(lw - lwmax)
+        v = float(w.sum() ** 2.0 / numpy.vdot(w, w))
+        self.vector_ess = v
+        if numpy.isfinite(v):
+            self.vess_n += 1
+            self.vess_sum += v
+            self.vess_min = min(self.vess_min, v)
+            self.vess_max = max(self.vess_max, v)
 
     def premarg_draw(self):
         """ Choose random samples from prechosen set"""
@@ -1836,6 +1886,112 @@ class DistMarg():
         """
         super().update(**params)
         self.marginalize_vector_weights = - numpy.log(self.vsamples)
+    @property
+    def reconstruct_stats(self):
+        """The parameters being drawn inline, in the order the levels run."""
+        levels = getattr(self, 'reconstruct_inline', [])
+        names = []
+        if 'vector' in levels:
+            names += list(self.marginalize_vector_params)
+        if 'distance' in levels and self.distance_marginalization:
+            names.append('distance')
+        if 'phase' in levels and self.marginalize_phase:
+            names.append('coa_phase')
+        return names
+
+    @property
+    def _extra_stats(self):
+        """Adds whatever is being drawn inline to the model's own stats."""
+        return super()._extra_stats + self.reconstruct_stats
+
+    def draw_inline(self, sh_total, hh_total, vector, subset=None):
+        """ Draw the marginalized parameters from the vectors the
+        marginalization has just built, rather than by evaluating the
+        likelihood again.
+
+        The levels run in the order `reconstruct` does them, each conditioned
+        on the point the level above drew. Conditioning is indexing here: the
+        drawn vector point selects one entry of the inner products, and the
+        drawn distance rescales them. `vector` is the unmarginalized loglr at
+        each vector point.
+        """
+        rec = {}
+        sh, hh = sh_total, hh_total
+        loglr = None
+
+        levels = self.reconstruct_inline
+        if 'vector' in levels and self.marginalize_vector_params:
+            drawn, loglr, xl = self.draw_vector(vector, subset)
+            rec.update(drawn)
+            if numpy.ndim(sh):
+                sh, hh = sh[xl], hh[xl]
+
+        if 'distance' in levels and self.distance_marginalization:
+            dist_rescale, _ = self.distance_marginalization
+            dloglr = marginalize_likelihood(
+                sh, hh, phase=self.marginalize_phase,
+                distance=self.distance_marginalization, skip_vector=True)
+            drawn, loglr, xl = self.draw_distance(dloglr)
+            rec.update(drawn)
+            sh, hh = sh * dist_rescale[xl], hh * dist_rescale[xl] ** 2.0
+
+        if 'phase' in levels and self.marginalize_phase:
+            drawn, loglr, _ = self.draw_phase(sh, -0.5 * hh)
+            rec.update(drawn)
+
+        # recorded like any other stat, so whatever the sampler keeps for a
+        # point carries its drawn parameters with it. The marginalized
+        # loglikelihood is left alone; it is what the sampler is sampling.
+        for name in self.reconstruct_stats:
+            setattr(self._current_stats, name, rec[name])
+
+    def marginalize_subset(self, vector, subset):
+        """ The marginalized loglr over part of the vector samples, their
+        weights renormalized to that part.
+        """
+        logw = self.marginalize_vector_weights
+        logw = (logw[subset] if numpy.ndim(logw)
+                else numpy.zeros(int(subset.sum())))
+        return float(logsumexp(vector[subset] + logw) - logsumexp(logw))
+
+    def draw_vector(self, loglr, subset=None):
+        """ Draw one of the vector marginalization points, given the
+        unmarginalized loglr at each. Returns the parameters there, the loglr
+        there, and the index, which the next level conditions on.
+
+        `subset` restricts the draw to part of the samples, so it can be kept
+        independent of the part the likelihood was marginalized over.
+        """
+        logw = self.marginalize_vector_weights
+        if subset is not None:
+            idx = numpy.flatnonzero(subset)
+            xl = idx[draw_sample(
+                loglr[idx] + (logw[idx] if numpy.ndim(logw) else logw),
+                rng=self.marginalize_rng)]
+            rec = {k: v[xl] for k, v in self.marginalize_vector_params.items()}
+            return rec, loglr[xl], xl
+        xl = draw_sample(loglr + logw, rng=self.marginalize_rng)
+        rec = {k: v[xl] for k, v in self.marginalize_vector_params.items()}
+        return rec, loglr[xl], xl
+
+    def draw_distance(self, loglr):
+        """ Draw a distance, given the loglr at each point of the distance
+        grid. Returns as `draw_vector` does.
+        """
+        _, weights = self.distance_marginalization
+        xl = draw_sample(loglr + numpy.log(weights), rng=self.marginalize_rng)
+        return {'distance': self.dist_locs[xl]}, loglr[xl], xl
+
+    def draw_phase(self, sh, hh):
+        """ Draw a coalescence phase, given the inner products before phase
+        marginalization (`hh` being minus one half of it). Returns as
+        `draw_vector` does.
+        """
+        phasev = numpy.linspace(0, numpy.pi*2.0, int(1e4))
+        # This assumes that the template was conjugated in inner products
+        loglr = (numpy.exp(-2.0j * phasev) * sh).real + hh
+        xl = draw_sample(loglr, rng=self.marginalize_rng)
+        return {'coa_phase': phasev[xl]}, loglr[xl], xl
 
     def reconstruct(self, rec=None, seed=None, set_loglr=None):
         """ Reconstruct the distance or vectored marginalized parameter
@@ -1843,6 +1999,8 @@ class DistMarg():
         """
         if seed:
             numpy.random.seed(seed)
+            if self.marginalize_rng is not None:
+                self.marginalize_rng = numpy.random.default_rng(seed)
 
         if rec is None:
             rec = {}
@@ -1860,34 +2018,26 @@ class DistMarg():
             logging.debug('Reconstruct vector')
             self.reconstruct_vector = True
             self.reset_vector_params()
-            loglr = get_loglr()
-            xl = draw_sample(loglr + self.marginalize_vector_weights)
-            for k in self.marginalize_vector_params:
-                rec[k] = self.marginalize_vector_params[k][xl]
+            drawn, loglr, _ = self.draw_vector(get_loglr())
+            rec.update(drawn)
             self.reconstruct_vector = False
 
         if self.distance_marginalization:
             logging.debug('Reconstruct distance')
             # call likelihood to get vector output
             self.reconstruct_distance = True
-            _, weights = self.distance_marginalization
-            loglr = get_loglr()
-            xl = draw_sample(loglr + numpy.log(weights))
-            rec['distance'] = self.dist_locs[xl]
+            drawn, loglr, _ = self.draw_distance(get_loglr())
+            rec.update(drawn)
             self.reconstruct_distance = False
 
         if self.marginalize_phase:
             logging.debug('Reconstruct phase')
             self.reconstruct_phase = True
-            s, h = get_loglr()
-            phasev = numpy.linspace(0, numpy.pi*2.0, int(1e4))
-            # This assumes that the template was conjugated in inner products
-            loglr = (numpy.exp(-2.0j * phasev) * s).real + h
-            xl = draw_sample(loglr)
-            rec['coa_phase'] = phasev[xl]
+            drawn, loglr, _ = self.draw_phase(*get_loglr())
+            rec.update(drawn)
             self.reconstruct_phase = False
 
-        rec['loglr'] = loglr[xl]
+        rec['loglr'] = loglr
         rec['loglikelihood'] = self.lognl + rec['loglr']
         return rec
 
@@ -2014,7 +2164,7 @@ def marginalize_likelihood(sh, hh,
                            interpolator=None,
                            return_peak=False,
                            return_complex=False,
-                           return_ess=False,
+                           return_vector=False,
                            ):
     """ Return the marginalized likelihood.
 
@@ -2050,6 +2200,10 @@ def marginalize_likelihood(sh, hh,
         Return the sh / hh data products before applying phase marginalization.
         This option is intended to aid in reconstucting phase marginalization
         and is unlikely to be useful for other purposes.
+    return_vector: bool, False
+        Also return the unmarginalized loglr at each point. That is the
+        distribution reconstruction draws from, so returning it saves
+        evaluating the likelihood again to get it back.
 
     Returns
     -------
@@ -2078,7 +2232,7 @@ def marginalize_likelihood(sh, hh,
         vloglr = interpolator(sh, hh)
 
         if skip_vector:
-            return (vloglr, None) if return_ess else vloglr
+            return vloglr
     else:
         # explicit calculation
         if distance:
@@ -2102,45 +2256,16 @@ def marginalize_likelihood(sh, hh,
         maxv = vloglr.argmax()
         maxl = vloglr[maxv]
 
+    vector = vloglr
+
     # Do brute-force marginalization if loglr is a vector
-    ess = None
     if isinstance(vloglr, float):
         vloglr = float(vloglr)
     elif not skip_vector:
-        if return_ess:
-            # the effective number of the drawn points that carry the
-            # answer: (sum w)^2 / sum w^2 with w the combined weights.
-            # Low against the number drawn means the marginal rests on a
-            # handful of them and its error is correspondingly large.
-            #
-            # Exponentiate once and form the ratio directly rather than
-            # asking logsumexp twice for the same array. Subtracting the
-            # largest log weight first is what keeps exp in range, exactly
-            # as logsumexp does it internally, and the ratio is scale free
-            # so that shift cancels. Doing the sums in linear space instead
-            # of log space moves the answer against the logsumexp route by
-            # of order 1e-14 relative, a few times 1e-13 at worst. That is
-            # accepted deliberately: the effective sample size is a
-            # monitoring number, it enters neither the posterior nor the
-            # evidence, and chasing bit-identity would mean copying
-            # scipy's internals and tracking their changes.
-            lw = vloglr + logw
-            # an empty draw has no maximum to take, and no sample size to
-            # report, so it joins the degenerate cases rather than raising
-            lwmax = lw.max() if lw.size else numpy.nan
-            if numpy.isfinite(lwmax):
-                # the largest weight is exactly one after the shift, so the
-                # denominator is at least one and the sums cannot overflow
-                w = numpy.exp(lw - lwmax)
-                ess = float(w.sum() ** 2.0 / numpy.vdot(w, w))
-            else:
-                # every weight vanished, or one is infinite; there is
-                # nothing meaningful to count
-                ess = numpy.nan
         vloglr = float(logsumexp(vloglr, b=numpy.exp(logw)))
 
     if return_peak:
         return vloglr, maxv, maxl
-    if return_ess:
-        return vloglr, ess
+    if return_vector:
+        return vloglr, vector
     return vloglr
