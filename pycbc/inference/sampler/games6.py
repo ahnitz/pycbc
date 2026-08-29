@@ -1683,6 +1683,11 @@ class GameSampler6(DummySampler):
         them. `log_evidence` is where every reader looks for it.
         """
         super().finalize()
+        # Add any parameters the model drew inline. These are part of
+        # default_stats, so they are read back from the model's cache;
+        # uncached points are recomputed.
+        if getattr(self.model, 'reconstruct_stats', None):
+            self.write_cached_stats()
         if 'logz' in self.meta:
             with self.io(self.checkpoint_file, 'a') as fp:
                 # the TOTAL, not the within-proposal floor: this is the
