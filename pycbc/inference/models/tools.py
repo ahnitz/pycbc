@@ -10,7 +10,8 @@ import numpy.random
 import tqdm
 
 from scipy.special import logsumexp, i0e
-from scipy.interpolate import RectBivariateSpline, interp1d
+from scipy.interpolate import interp1d
+from scipy import ndimage
 from pycbc.distributions import JointDistribution
 
 from pycbc.constants import C_SI
@@ -1705,7 +1706,11 @@ def setup_distance_marg_interpolant(dist_marg,
             lvals[i, j] = marginalize_likelihood(sh, hh,
                                                  distance=dist_marg,
                                                  phase=phase)
-    interp = RectBivariateSpline(shr, hhr, lvals)
+    # geomspace: uniform in log, so the cell index is arithmetic
+    log_shr, log_hhr = numpy.log(shr), numpy.log(hhr)
+    dlog_shr = (log_shr[-1] - log_shr[0]) / (len(log_shr) - 1)
+    dlog_hhr = (log_hhr[-1] - log_hhr[0]) / (len(log_hhr) - 1)
+    coeffs = ndimage.spline_filter(lvals, order=3, mode='nearest')
 
     # said once, the first time it happens
     warned = [False]
@@ -1728,8 +1733,10 @@ def setup_distance_marg_interpolant(dist_marg,
 
     def interp_wrapper(x, y, bounds_check=True):
         k = None
+        # a zero-dimensional array is a single point but is not a float
+        scalar = numpy.ndim(x) == 0
         if bounds_check:
-            if isinstance(x, float):
+            if scalar:
                 if x > shr_max or x < shr_min or y > hhr_max or y < hhr_min:
                     if not warned[0]:
                         warn_out_of_range()
@@ -1741,18 +1748,28 @@ def setup_distance_marg_interpolant(dist_marg,
                 if not warned[0] and k.any():
                     warn_out_of_range()
 
-        v = interp(x, y, grid=False)
+        # clipped before the log: sh can be negative without phase
+        # marginalization, and the mask does not overwrite a nan. Nothing
+        # then reaches the boundary, but mode must not be the default,
+        # which reads outside the grid as zero.
+        index = numpy.empty((2, numpy.size(x)))
+        index[0] = (numpy.log(numpy.clip(x, shr_min, shr_max))
+                    - log_shr[0]) / dlog_shr
+        index[1] = (numpy.log(numpy.clip(y, hhr_min, hhr_max))
+                    - log_hhr[0]) / dlog_hhr
+        v = ndimage.map_coordinates(coeffs, index, order=3, mode='nearest',
+                                    prefilter=False)
         if k is not None:
             v[k] = -numpy.inf
-        # a scalar query is a single point with nothing to marginalize over;
-        # the spline returns it as a length-one array, which the caller then
-        # mistakes for a vector and folds through the vector-marginalization
-        # weight, subtracting log(marginalize_vector_samples) from the
-        # distance-marginalized likelihood. Hand back a scalar so it does
-        # not. Only bites distance marginalization without an accompanying
-        # time or sky marginalization; with one, x is a genuine vector.
-        if numpy.ndim(x) == 0:
-            return float(v)
+        # marginalize_likelihood tells a point from a vector by asking for a
+        # float, and a length-one array goes through the vector-marginalization
+        # weight instead -- subtracting log(marginalize_vector_samples) from
+        # the distance-marginalized likelihood. Only bites distance
+        # marginalization without an accompanying time or sky marginalization;
+        # with one, x is a genuine vector. map_coordinates always returns an
+        # array, hence v[0].
+        if scalar:
+            return float(v[0])
         return v
     return interp_wrapper
 
