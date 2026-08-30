@@ -34,11 +34,15 @@ def str_to_bool(sval):
     return sval
 
 
-def draw_sample(loglr, size=None, rng=None):
+def draw_sample(loglr, size=None, rng=None, locs=None):
     """ Draw a random index from a 1-d vector with loglr weights
 
     A generator may be given so drawing does not consume the global random
     state, which would move every sampler's trajectory.
+
+    If `locs` gives the location of each weight, the draw is placed by
+    inverting the cdf between two of them instead of returning the index of
+    one, so the answer does not carry the spacing of the grid.
     """
     rng = numpy.random if rng is None else rng
     if size:
@@ -46,7 +50,12 @@ def draw_sample(loglr, size=None, rng=None):
     else:
         x = rng.uniform()
     loglr = loglr - loglr.max()
-    cdf = numpy.exp(loglr).cumsum()
+    p = numpy.exp(loglr)
+    cdf = p.cumsum()
+    if locs is not None:
+        # each point carries its own weight, so it sits at the middle of it,
+        # not at the end -- putting it at the end costs half a spacing
+        return numpy.interp(x, (cdf - 0.5 * p) / cdf[-1], locs)
     cdf /= cdf[-1]
     xl = numpy.searchsorted(cdf, x)
     return xl
@@ -232,6 +241,7 @@ class DistMarg():
 
         dist_weights /= dist_weights.sum()
         dist_ref = 0.5 * (dmax + dmin)
+        self.dist_ref = dist_ref
         self.dist_locs = dist_locs
         self.distance_marginalization = dist_ref / dist_locs, dist_weights
         self.distance_interpolator = None
@@ -811,13 +821,13 @@ class DistMarg():
                 sh, hh = sh[xl], hh[xl]
 
         if 'distance' in levels and self.distance_marginalization:
-            dist_rescale, _ = self.distance_marginalization
             dloglr = marginalize_likelihood(
                 sh, hh, phase=self.marginalize_phase,
                 distance=self.distance_marginalization, skip_vector=True)
-            drawn, _, xl = self.draw_distance(dloglr)
+            drawn, _, _ = self.draw_distance(dloglr)
             rec.update(drawn)
-            sh, hh = sh * dist_rescale[xl], hh * dist_rescale[xl] ** 2.0
+            rescale = self.dist_ref / drawn['distance']
+            sh, hh = sh * rescale, hh * rescale ** 2.0
 
         if 'phase' in levels and self.marginalize_phase:
             drawn, _, _ = self.draw_phase(sh, -0.5 * hh)
@@ -842,10 +852,17 @@ class DistMarg():
     def draw_distance(self, loglr):
         """ Draw a distance, given the loglr at each point of the distance
         grid. Returns as `draw_vector` does.
+
+        The draw is placed between grid points, not on one. Marginalizing
+        integrates over the grid and averages its spacing away; a draw would
+        otherwise carry that spacing into the answer as a comb.
         """
         _, weights = self.distance_marginalization
-        xl = draw_sample(loglr + numpy.log(weights), rng=self.marginalize_rng)
-        return {'distance': self.dist_locs[xl]}, loglr[xl], xl
+        distance = draw_sample(loglr + numpy.log(weights),
+                               rng=self.marginalize_rng, locs=self.dist_locs)
+        xl = min(int(numpy.searchsorted(self.dist_locs, distance)),
+                 len(loglr) - 1)
+        return {'distance': distance}, loglr[xl], xl
 
     def draw_phase(self, sh, hh):
         """ Draw a coalescence phase, given the inner products before phase

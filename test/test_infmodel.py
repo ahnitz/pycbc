@@ -493,10 +493,119 @@ class TestMarginalizedPolModels(unittest.TestCase):
         polsamples = margpol_model.pol
         self._test_models(margpol_model, orig_model, polsamples)
 
+class TestDistanceDrawRefinement(unittest.TestCase):
+    """A drawn distance should not carry the spacing of the grid it came
+    from. The marginalization integrates the grid away; a draw does not."""
+
+    DMIN, DMAX, S, H = 10., 1000., 300., 300.
+
+    def grid(self, n):
+        """The same three arrays setup_marginalization builds."""
+        locs = numpy.linspace(self.DMIN, self.DMAX, n)
+        w = locs ** 2                      # uniform in volume
+        ref = 0.5 * (self.DMAX + self.DMIN)
+        r = ref / locs
+        return locs, numpy.log(w / w.sum()) + self.S * r - 0.5 * self.H * r ** 2
+
+    def exact(self, m=200001):
+        d = numpy.linspace(self.DMIN, self.DMAX, m)
+        r = 0.5 * (self.DMAX + self.DMIN) / d
+        lp = self.S * r - 0.5 * self.H * r ** 2 + 2 * numpy.log(d)
+        p = numpy.exp(lp - lp.max())
+        c = numpy.cumsum(p)
+        return d, c / c[-1]
+
+    def draws(self, n, ndraw=6000, locs=True, seed=3):
+        from pycbc.inference.models.tools import draw_sample
+        g, logp = self.grid(n)
+        rng = numpy.random.default_rng(seed)
+        if locs:
+            return numpy.array([draw_sample(logp, rng=rng, locs=g)
+                                for _ in range(ndraw)])
+        return numpy.array([g[draw_sample(logp, rng=rng)]
+                            for _ in range(ndraw)])
+
+    def test_refined_draw_leaves_the_grid(self):
+        """Without refinement every draw is one of 40 values; with it, not."""
+        self.assertLessEqual(len(numpy.unique(self.draws(40, locs=False))), 40)
+        self.assertGreater(len(numpy.unique(self.draws(40))), 2000)
+
+    def test_refinement_beats_a_grid_four_times_finer(self):
+        """80 refined points track the true distribution better than 320
+        unrefined ones, so the spacing and not the count was the limit.
+        Measured across five seeds; the gain runs out around eight times."""
+        d, c = self.exact()
+
+        def ks(x):
+            x = numpy.sort(x)
+            e = numpy.interp(x, d, c)
+            n = len(x)
+            return numpy.abs(e - numpy.arange(1, n + 1) / n).max()
+
+        for seed in range(3):
+            self.assertLess(ks(self.draws(80, seed=seed)),
+                            ks(self.draws(320, locs=False, seed=seed)))
+
+    def test_no_half_spacing_offset(self):
+        """A point sits in the middle of the weight it carries, not at the
+        end of it. Getting that wrong shifts every draw by half a spacing."""
+        d, c = self.exact()
+        truth = numpy.interp(0.5, c, d)
+        n = 40
+        spacing = (self.DMAX - self.DMIN) / (n - 1)
+        err = numpy.median(self.draws(n, ndraw=20000)) - truth
+        self.assertLess(abs(err), 0.25 * spacing)
+
+    def test_phase_is_conditioned_on_the_drawn_distance(self):
+        """The level below must see the distance that was drawn, not the
+        grid point nearest it, or the two disagree about the amplitude."""
+        from pycbc.inference.models.tools import DistMarg
+        from pycbc.inference.models.base import ModelStats
+        m = DistMarg.__new__(DistMarg)
+        n = 40
+        locs = numpy.linspace(self.DMIN, self.DMAX, n)
+        w = locs ** 2
+        m.dist_ref = 0.5 * (self.DMAX + self.DMIN)
+        m.dist_locs = locs
+        m.distance_marginalization = (m.dist_ref / locs, w / w.sum())
+        m.reconstruct_inline = ['vector', 'distance', 'phase']
+        m.marginalize_vector_params = {}
+        m.marginalize_phase = True
+        m.marginalize_rng = numpy.random.default_rng(4)
+        m._current_stats = ModelStats()
+        seen = {}
+
+        def spy(sh, hh):
+            seen['sh'] = sh
+            return {'coa_phase': 0.0}, 0.0, 0
+        m.draw_phase = spy
+
+        sh_total, hh_total = 300.0 + 0.0j, 300.0
+        m.draw_inline(sh_total, hh_total, None)
+        drawn = m._current_stats.distance
+        # the amplitude handed down is the one the drawn distance implies
+        self.assertAlmostEqual(seen['sh'],
+                               sh_total * (m.dist_ref / drawn), places=6)
+        # and that distance is genuinely off-grid
+        self.assertGreater(numpy.abs(locs - drawn).min(), 0.0)
+
+
+    def test_index_draw_is_unchanged(self):
+        """Asking for an index still returns one, for the callers that
+        index the vector samples with it."""
+        from pycbc.inference.models.tools import draw_sample
+        _, logp = self.grid(40)
+        rng = numpy.random.default_rng(1)
+        i = draw_sample(logp, rng=rng)
+        self.assertIsInstance(int(i), int)
+        self.assertTrue(0 <= int(i) < 40)
+
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestModels))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestWaveformErrors))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMarginalizedPolModels))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestDistanceDrawRefinement))
 
 if __name__ == '__main__':
     from astropy.utils import iers
