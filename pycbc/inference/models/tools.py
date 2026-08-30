@@ -48,6 +48,34 @@ def draw_sample(loglr, size=None):
     return xl
 
 
+# Adaptive vector marginalization. The proposal is a piecewise-constant
+# reweighting of the prior over bins of equal prior mass, so the prior density
+# itself is never needed and any bounded 1-d prior works unchanged.
+
+# Bins the counts are kept in. The proposal is drawn on a coarsening of this
+# grid, chosen per parameter from what the samples support, so this is only a
+# ceiling on resolution and a memory cost.
+ADAPT_MAX_BINS = 4096
+
+# The resolution the proposal is drawn at is chosen by cross-validation, which
+# has nothing to tune: resolving structure that is not there is not free, since
+# it lets sampling noise move the proposal away from the prior for no gain, and
+# that is what makes a flat parameter prefer few cells and a peaked one many.
+
+# Each cell keeps at least this share of its prior weight, which bounds the
+# importance ratio at 1 / ADAPT_FLOOR. Without it a badly fitted proposal could
+# produce an arbitrarily large weight.
+ADAPT_FLOOR = 0.1
+
+# Calls' worth of samples the proposal is allowed to accumulate. Calls enter
+# weighted by their effective sample size, since a call made from a poor
+# proposal carries far less information than one made from a good one, and
+# weighting them equally lets the early calls dominate for the whole run. The
+# cap bounds how far back the proposal remembers, so it can still follow a
+# conditional that moves as the other parameters do.
+ADAPT_ESS_CALLS = 10
+
+
 class DistMarg():
     """Help class to add bookkeeping for likelihood marginalization"""
 
@@ -62,6 +90,7 @@ class DistMarg():
                               marginalize_distance_density=None,
                               marginalize_vector_params=None,
                               marginalize_vector_samples=1e3,
+                              marginalize_vector_adaptive=None,
                               marginalize_sky_initial_samples=1e6,
                               **kwargs):
         """ Setup the model for use with distance marginalization
@@ -91,6 +120,13 @@ class DistMarg():
             as -numpy.inf.
         marginalize_distance_density: tuple of intes, (1000, 1000)
             The dimensions of the interpolation grid over (sh, hh).
+        marginalize_vector_adaptive: str or list of str, None
+            Names of marginalized vector parameters whose samples should be
+            drawn from a proposal that follows the likelihood, and redrawn
+            each call, instead of from one fixed draw of the prior. The
+            estimate is of the same marginal likelihood; the samples are
+            importance weighted. Parameters that have a dedicated handler
+            (tc, and ra/dec when the sky draw is active) are not eligible.
 
         Returns
         -------
@@ -140,6 +176,7 @@ class DistMarg():
             self.vsamples = int(kwargs['polarization_samples'])
             kwargs.pop('polarization_samples')
 
+        self._setup_adaptive(marginalize_vector_adaptive)
         self.reset_vector_params()
 
         self.marginalize_phase = str_to_bool(marginalize_phase)
@@ -246,6 +283,175 @@ class DistMarg():
             values = vprior.rvs(self.vsamples)[param]
             self.marginalize_vector_params[param] = values
 
+    def _setup_adaptive(self, params):
+        """ Set up the proposals for adaptively drawn vector parameters
+        """
+        self.marginalize_vector_adaptive = {}
+        # current_params is a property that models read more than once per
+        # call, so the draw is tied to the identity of the parameter dict and
+        # reused within it. Redrawing per read would decouple the samples the
+        # waveform used from the bins the record attributes them to.
+        self._adapt_token = None
+        self._adapt_logw = None
+        if params is None:
+            return
+
+        marged = set(self.marginalized_vector_priors)
+
+        # These are drawn from the data by a dedicated handler, which would
+        # overwrite anything done here (see snr_draw).
+        handled = set()
+        if 'tc' in marged:
+            handled.add('tc')
+            if {'ra', 'dec'}.issubset(marged):
+                handled |= {'ra', 'dec'}
+
+        for param in str_to_tuple(params, str):
+            if param not in marged:
+                raise ValueError(
+                    'Cannot adapt {}, it is not being marginalized over. '
+                    'Marginalized parameters are {}'
+                    .format(param, ', '.join(sorted(marged)) or 'none'))
+            if param in handled:
+                raise ValueError(
+                    'Cannot adapt {}, it already has a handler that draws '
+                    'it from the data'.format(param))
+            prior = self.marginalized_vector_priors[param]
+            try:
+                prior.cdfinv(**{param: numpy.array([0.5])})
+            except Exception as e:
+                raise ValueError(
+                    'Cannot adapt {}, its prior does not provide a usable '
+                    'cdfinv ({})'.format(param, e))
+
+            # Bins are equal-probability intervals of the prior, so bin i is
+            # exactly the quantile range [i, i+1) / nbin and the prior density
+            # is never needed. Counts are kept on the finest grid and the
+            # proposal is drawn on a coarsening of it.
+            logging.info('Adapting the %s draw to the likelihood', param)
+            self.marginalize_vector_adaptive[param] = {
+                'nbin': 2,
+                'bin': None,
+                'acc': None,
+                'wsum': 0.0,
+            }
+
+    def _adapting(self):
+        """ Whether the adaptive draw applies to this call
+        """
+        if not self.marginalize_vector_adaptive:
+            return False
+        # The precalculated points are drawn once for the whole run and
+        # replayed, so there is no per-call proposal to adapt.
+        if hasattr(self, 'premarg'):
+            return False
+        # Reconstruction re-runs the likelihood to draw a stored sample; the
+        # samples must stay as they were.
+        return not (self.reconstruct_vector or self.reconstruct_distance
+                    or self.reconstruct_phase)
+
+    def _adapt_pmf(self, a):
+        """ The proposal, resolved as finely as the counts justify
+
+        The resolution is chosen by leave-one-out cross validation of the
+        histogram, so a parameter whose likelihood is flat stays on a coarse
+        grid instead of chasing its own sampling noise, and a peaked one is
+        resolved as far as its samples reach. Choosing it by whether the
+        structure is statistically significant does not work: the coarse
+        splits of a periodic parameter are exactly even, which stops a
+        top-down search before it reaches the scale that carries the
+        structure.
+        """
+        if a['acc'] is None or a['wsum'] <= 1:
+            a['nbin'] = 2
+            return numpy.full(2, 0.5)
+
+        # counts in units of effective samples, which is what sets the noise
+        counts = a['acc'] / a['acc'].sum() * a['wsum']
+        weight = a['wsum']
+
+        best, nbin = None, 2
+        while nbin <= ADAPT_MAX_BINS:
+            mass = counts.reshape(nbin, -1).sum(axis=1)
+            mass = mass / mass.sum()
+            score = nbin * (2.0 - (weight + 1.0) * (mass ** 2).sum()) \
+                / (weight - 1.0)
+            if best is None or score < best[1]:
+                best = (nbin, score)
+            nbin *= 2
+
+        nbin = best[0]
+        pmf = counts.reshape(nbin, -1).sum(axis=1)
+        pmf = pmf / pmf.sum()
+        a['nbin'] = nbin
+        return (1 - ADAPT_FLOOR) * pmf + ADAPT_FLOOR / nbin
+
+    def _adapt_draw(self, params):
+        """ Draw the adaptive parameters from the proposal built by the
+        previous call, and set the matching importance weights.
+
+        The proposal reweights the prior by r, constant within each bin and
+        averaging to one over the prior, so a sample mean of loglr / r is
+        still an estimate of the same marginal likelihood.
+        """
+        for param, a in self.marginalize_vector_adaptive.items():
+            pmf = self._adapt_pmf(a)
+            nbin = len(pmf)
+            drawn = numpy.random.choice(nbin, size=self.vsamples, p=pmf)
+            u = (drawn + numpy.random.uniform(size=self.vsamples)) / nbin
+
+            v = self.marginalized_vector_priors[param].cdfinv(**{param: u})
+            if isinstance(v, dict):
+                v = v[param]
+            self.marginalize_vector_params[param] = v
+            params[param] = v
+
+            # record against the finest grid, so the resolution can change
+            # between calls without invalidating what came before
+            a['bin'] = numpy.minimum((u * ADAPT_MAX_BINS).astype(int),
+                                     ADAPT_MAX_BINS - 1)
+            self.marginalize_vector_weights = \
+                self.marginalize_vector_weights - numpy.log(pmf[drawn] * nbin)
+
+    def _adapt_apply(self, params):
+        """ Draw once for this set of parameters, then reuse it
+        """
+        if self._adapt_token is not params:
+            self._adapt_draw(params)
+            self._adapt_token = params
+            self._adapt_logw = self.marginalize_vector_weights
+        else:
+            for param in self.marginalize_vector_adaptive:
+                params[param] = self.marginalize_vector_params[param]
+            self.marginalize_vector_weights = self._adapt_logw
+
+    def _adapt_record(self, vloglr):
+        """ Fold this call's result into the proposal for the next one
+
+        A sample counts for as much as it contributed to the marginal
+        likelihood, so points that scored well are the ones the next draw
+        concentrates on.
+        """
+        logw = self.marginalize_vector_weights + vloglr
+        w = numpy.exp(logw - logsumexp(logw))
+
+        for a in self.marginalize_vector_adaptive.values():
+            if a['bin'] is None:
+                continue
+            success = numpy.bincount(a['bin'], weights=w,
+                                     minlength=ADAPT_MAX_BINS)
+            ess = 1.0 / (w ** 2).sum()
+            cap = ADAPT_ESS_CALLS * self.vsamples
+            acc, wsum = a['acc'], a['wsum']
+            if acc is None:
+                acc, wsum = success * ess, ess
+            else:
+                if wsum + ess > cap:
+                    scale = max(cap - ess, 0.0) / wsum
+                    acc, wsum = acc * scale, wsum * scale
+                acc, wsum = acc + success * ess, wsum + ess
+            a['acc'], a['wsum'] = acc, wsum
+
     def marginalize_loglr(self, sh_total, hh_total,
                           skip_vector=False, return_peak=False):
         """ Return the marginal likelihood
@@ -276,6 +482,25 @@ class DistMarg():
             distance = False
             skip_vector = True
             return_complex = True
+
+        if self._adapting() and not skip_vector and not return_complex \
+                and not numpy.isscalar(sh_total):
+            # Take the per-sample values so this call can shape the next
+            # call's proposal, then finish the sum here.
+            vloglr = marginalize_likelihood(
+                sh_total, hh_total,
+                logw=self.marginalize_vector_weights,
+                phase=self.marginalize_phase,
+                interpolator=interpolator,
+                distance=distance,
+                skip_vector=True)
+            self._adapt_record(vloglr)
+            logw = self.marginalize_vector_weights
+            loglr = float(logsumexp(vloglr, b=numpy.exp(logw)))
+            if return_peak:
+                peak = vloglr.argmax()
+                return loglr, peak, vloglr[peak]
+            return loglr
 
         return marginalize_likelihood(sh_total, hh_total,
                                       logw=self.marginalize_vector_weights,
@@ -740,6 +965,8 @@ class DistMarg():
             if k not in params:
                 params[k] = self.marginalize_vector_params[k]
         self.marginalize_vector_weights = - numpy.log(self.vsamples)
+        if self._adapting():
+            self._adapt_apply(params)
         return params
 
     def reconstruct(self, rec=None, seed=None, set_loglr=None):
