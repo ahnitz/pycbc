@@ -119,6 +119,10 @@ class TestModels(unittest.TestCase):
         cls.a2 = 542.581
         cls.pol_samples = 200
 
+        # brute marginalized over inclination and polarization
+        # together, measured with 200000 samples
+        cls.a4 = 541.2686
+
         # answer with gate applied, no normalization. This moved by 0.27
         # when the detectors stopped being left at the default sidereal
         # time reference, which for this data sits two years away; the
@@ -330,6 +334,110 @@ class TestModels(unittest.TestCase):
         reldom.update(**self.q1)
         self.assertAlmostEqual(marg.loglr, reldom.loglr, delta=1.5)
 
+
+    def pol_marg_model(self, **kwargs):
+        """ Single template with polarization marginalized over """
+        return models.SingleTemplate(
+                        list(self.variable2), copy.deepcopy(self.data),
+                        low_frequency_cutoff=self.flow,
+                        psds = self.psds,
+                        static_params = self.static2,
+                        prior = copy.deepcopy(self.prior2),
+                        marginalize_vector_samples = 1000,
+                        marginalize_vector_params = 'polarization',
+                        **kwargs
+                        )
+
+    def test_vector_adaptive_matches_brute(self):
+        """ Adapting the draw must not move the answer """
+        numpy.random.seed(7)
+        model = self.pol_marg_model(
+            marginalize_vector_adaptive='polarization')
+        # the proposal is built from the previous call, so let it settle
+        for _ in range(15):
+            model.update(**self.q1)
+            model.loglr
+        v = []
+        for _ in range(10):
+            model.update(**self.q1)
+            v.append(model.loglr)
+        self.assertAlmostEqual(self.a2, numpy.mean(v), delta=0.04)
+
+    def test_vector_adaptive_resolution_follows_structure(self):
+        """ The grid is only resolved as finely as the samples support """
+        numpy.random.seed(7)
+        model = self.pol_marg_model(
+            marginalize_vector_adaptive='polarization')
+        a = model.marginalize_vector_adaptive['polarization']
+        self.assertEqual(a['nbin'], 2)          # nothing measured yet
+        for _ in range(20):
+            model.update(**self.q1)
+            model.loglr
+        # settled somewhere between the coarsest grid and the ceiling
+        self.assertGreater(a['nbin'], 2)
+        self.assertLessEqual(a['nbin'], tools.ADAPT_MAX_BINS)
+
+    def test_vector_adaptive_weights_bounded(self):
+        """ No sample may carry an unbounded importance weight """
+        numpy.random.seed(7)
+        model = self.pol_marg_model(
+            marginalize_vector_adaptive='polarization')
+        for _ in range(15):
+            model.update(**self.q1)
+            model.loglr
+        w = model.marginalize_vector_weights
+        self.assertFalse(numpy.isscalar(w))
+        # every bin keeps at least ADAPT_FLOOR of its prior share
+        self.assertLessEqual(numpy.exp(w.max() - w.min()),
+                             1.0 / tools.ADAPT_FLOOR + 1e-9)
+
+    def test_vector_adaptive_off_by_default(self):
+        """ Without the option nothing about the draw changes """
+        model = self.pol_marg_model()
+        model.update(**self.q1)
+        model.loglr
+        self.assertEqual(model.marginalize_vector_adaptive, {})
+        self.assertFalse(model._adapting())
+        # the weights stay the single uniform value the fixed draw uses
+        self.assertTrue(numpy.isscalar(model.marginalize_vector_weights))
+
+    def test_vector_adaptive_not_with_precalc(self):
+        """ Precalculated points are replayed, so there is nothing to adapt """
+        model = self.pol_marg_model(
+            marginalize_vector_adaptive='polarization')
+        self.assertTrue(model._adapting())
+        model.premarg = {}
+        self.assertFalse(model._adapting())
+
+    def test_vector_adaptive_two_parameters(self):
+        """ Each adapted parameter gets its own grid """
+        numpy.random.seed(7)
+        model = self.incpol_marg_model(
+            marginalize_vector_adaptive='inclination,polarization')
+        self.assertEqual(sorted(model.marginalize_vector_adaptive),
+                         ['inclination', 'polarization'])
+        v = []
+        for i in range(35):
+            model.update(distance=self.q1['distance'])
+            if i >= 25:
+                v.append(model.loglr)
+            else:
+                model.loglr
+        self.assertAlmostEqual(self.a4, numpy.mean(v), delta=0.1)
+
+    def test_vector_adaptive_rejects_handled_params(self):
+        """ tc is drawn from the data, so it cannot also be adapted """
+        model = self.pol_marg_model()
+        model.marginalized_vector_priors['tc'] = None
+        with self.assertRaises(ValueError):
+            model._setup_adaptive('tc')
+
+    def test_vector_adaptive_rejects_bad_params(self):
+        """ Ask for something that cannot be adapted and find out at setup """
+        with self.assertRaises(ValueError):
+            self.pol_marg_model(marginalize_vector_adaptive='distance')
+        with self.assertRaises(ValueError):
+            self.pol_marg_model(marginalize_vector_adaptive='not_a_param')
 
 class TestAnalyticModels(unittest.TestCase):
     """Tests the analytic models against their closed-form answers.
