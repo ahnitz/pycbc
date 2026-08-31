@@ -362,7 +362,9 @@ class DistMarg():
         top-down search before it reaches the scale that carries the
         structure.
         """
-        if a['acc'] is None or a['wsum'] <= 1:
+        if (a['acc'] is None or a['wsum'] <= 1
+                or not numpy.isfinite(a['acc']).all()
+                or a['acc'].sum() <= 0):
             a['nbin'] = 2
             return numpy.full(2, 0.5)
 
@@ -433,7 +435,14 @@ class DistMarg():
         concentrates on.
         """
         logw = self.marginalize_vector_weights + vloglr
-        w = numpy.exp(logw - logsumexp(logw))
+        total = logsumexp(logw)
+        if not numpy.isfinite(total):
+            # Every point underflowed, which the distance interpolator does
+            # for a whole vector at once outside its SNR range. Such a call
+            # says nothing about where the likelihood is large, and the
+            # weights it would give are 0/0.
+            return
+        w = numpy.exp(logw - total)
 
         for a in self.marginalize_vector_adaptive.values():
             if a['bin'] is None:

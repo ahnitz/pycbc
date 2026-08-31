@@ -208,6 +208,28 @@ class TestModels(unittest.TestCase):
         self.assertGreater(a['nbin'], 2)
         self.assertLessEqual(a['nbin'], tools.ADAPT_MAX_BINS)
 
+    def test_vector_adaptive_survives_underflow(self):
+        """ A call where every point underflows must not poison the proposal
+
+        The distance interpolator returns -inf outside its SNR range, and it
+        can do so for a whole vector at once, which would otherwise leave the
+        accumulated proposal as nan and fail on a later call.
+        """
+        numpy.random.seed(7)
+        model = self.pol_marg_model(
+            marginalize_vector_adaptive='polarization')
+        for _ in range(5):
+            model.update(**self.q1)
+            model.loglr
+        a = model.marginalize_vector_adaptive['polarization']
+        kept = a['acc'].copy()
+
+        model._adapt_record(numpy.full(model.vsamples, -numpy.inf))
+        self.assertTrue(numpy.array_equal(kept, a['acc']))
+
+        model.update(**self.q1)
+        self.assertTrue(numpy.isfinite(model.loglr))
+
     def test_vector_adaptive_weights_bounded(self):
         """ No sample may carry an unbounded importance weight """
         numpy.random.seed(7)
