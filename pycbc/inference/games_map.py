@@ -160,6 +160,9 @@ class OnlineTree:
         if d == len(self.thresholds) - 1:
             lid = self.n_leaves
             self.n_leaves += 1
+        # the caller may be handing us a view into a buffer it reuses, and
+        # a node keeps its representative for the life of the tree
+        rep = numpy.array(rep, copy=True)
         child = Node(rep, params, lid)
         idx.add(rep)
         kids.append(child)

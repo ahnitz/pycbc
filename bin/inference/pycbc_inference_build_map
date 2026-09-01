@@ -73,6 +73,9 @@ from pycbc.psd import from_cli, insert_psd_option_group
 from pycbc.types.config import InterpolatingConfigParser
 from pycbc.distributions import (draw_samples_from_config,
                                  read_params_from_config)
+from multiprocessing import Pool
+from multiprocessing.shared_memory import SharedMemory
+
 from pycbc.inference.games_map import OnlineTree, whiten_padded
 
 _G = {}       # worker-visible globals, populated before the pool forks
@@ -102,6 +105,20 @@ def make_rep(params):
     rc = whiten_padded(hc.numpy()[_G['kmin']:_G['kmax']], _G['psd'],
                        _G['kmin'], _G['kmax'], _G['nfft'])
     return numpy.stack([rp, rc])
+
+
+def probe_one(arg):
+    """ Pool worker: build one representative and probe the tree with it.
+
+    The representative goes into a shared buffer rather than the return
+    value, since it is 16 kB and pickling one per draw would cost more than
+    the probe saves. Only the probe record comes back, which is a handful of
+    indices and floats.
+    """
+    i, params = arg
+    rep = make_rep(params)
+    _G['reps'][i] = rep
+    return _G['tree'].probe(rep)
 
 
 def all_fields(samples, i):
@@ -145,6 +162,10 @@ parser.add_argument('--delta-f', type=float, default=2.0,
                          'time-maximization IFFT is padded to 2*kmax, which '
                          'at the default gives 0.5 ms resolution and '
                          'reproduces pycbc.filter.match to ~4e-4')
+parser.add_argument('--nprocesses', type=int, default=1,
+                    help='processes probing each batch. Workers fork, so '
+                         'they share the tree read-only; only the small '
+                         'probe records are returned')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--two-polarization', action='store_true',
                     help='represent each template by both + and x '
@@ -177,11 +198,18 @@ logging.info('thresholds=%s (time-maximized match at %s)', args.thresholds,
              [t for t, m in zip(args.thresholds, tree.use_match) if m])
 
 # ---------------- insert ----------------
-# Every draw goes through the same path. The alternative was to freeze the
-# tree after a fixed number of draws and route the rest by argmax without
+# Every draw takes the same path. The alternative was to freeze the tree
+# after a fixed number of draws and route the rest by argmax without
 # checking the threshold, which put a draw that matched nothing well into
 # the nearest tile instead of giving it its own, and made the structure
 # depend on a draw budget rather than on the space.
+#
+# Within a batch the expensive part -- building the representative and
+# descending the tree -- is independent per draw and runs in parallel. Only
+# the commit is serial, and it reconciles each draw against whatever earlier
+# draws in the same batch added, so the result is what a purely serial build
+# would have produced. As the map fills, fewer draws create anything and the
+# serial residue shrinks.
 #
 # Points are held as flat blocks of int32 leaf id and float32 params rather
 # than a list of tuples per node; grouping happens once at write time via a
@@ -189,27 +217,47 @@ logging.info('thresholds=%s (time-maximized match at %s)', args.thresholds,
 numpy.random.seed(args.seed)
 done = 0
 blocks_id, blocks_pt = [], []
+shm = SharedMemory(create=True, size=args.block * nfft * 16)
+_G['reps'] = numpy.ndarray((args.block, nfft), dtype=numpy.complex128,
+                           buffer=shm.buf)
+_G['tree'] = tree
 t0 = time.perf_counter()
-while done < args.sample_size:
-    n = min(args.block, args.sample_size - done)
-    s_ = draw_samples_from_config(args.config_file, n, seed=args.seed + done)
-    before = tree.n_leaves
-    ids = numpy.empty(n, dtype=numpy.int32)
-    for i in range(n):
-        full = all_fields(s_, i)
-        ids[i] = tree.insert(make_rep(full), tuple(full[p] for p in var))
-    blocks_id.append(ids)
-    blocks_pt.append(numpy.column_stack(
-        [s_[p][:n] for p in var]).astype(numpy.float32))
-    done += n
-    logging.info('insert: %i/%i | nodes/level %s | new leaves/draw %.4f | '
-                 '%.0f draws/s', done, args.sample_size, tree.counts,
-                 (tree.n_leaves - before) / n,
-                 done / (time.perf_counter() - t0))
+try:
+    while done < args.sample_size:
+        n = min(args.block, args.sample_size - done)
+        s_ = draw_samples_from_config(args.config_file, n,
+                                      seed=args.seed + done)
+        rows = [all_fields(s_, i) for i in range(n)]
+        before = tree.n_leaves
+        if args.nprocesses > 1:
+            with Pool(args.nprocesses) as pool:
+                probes = pool.map(
+                    probe_one, list(enumerate(rows)),
+                    chunksize=max(1, n // (args.nprocesses * 8)))
+        else:
+            probes = [probe_one(a) for a in enumerate(rows)]
+        reps = _G['reps']
+        ids = numpy.empty(n, dtype=numpy.int32)
+        for i in range(n):
+            ids[i] = tree.commit(reps[i], tuple(rows[i][p] for p in var),
+                                 probes[i])
+        blocks_id.append(ids)
+        blocks_pt.append(numpy.column_stack(
+            [s_[p][:n] for p in var]).astype(numpy.float32))
+        done += n
+        logging.info('insert: %i/%i | nodes/level %s | new leaves/draw %.4f '
+                     '| %.0f draws/s', done, args.sample_size, tree.counts,
+                     (tree.n_leaves - before) / n,
+                     done / (time.perf_counter() - t0))
+finally:
+    del _G['reps']
+    shm.close()
+    shm.unlink()
 
 leaves = tree.leaves()
-logging.info('inserted %i draws, nodes/level %s, %i leaves, %.1f comp/draw',
-             done, tree.counts, len(leaves), tree.ncomp / max(done, 1))
+logging.info('inserted %i draws, nodes/level %s, %i leaves, %.1f comp/draw, '
+             '%i rechecks, %i diverged', done, tree.counts, len(leaves),
+             tree.ncomp / max(done, 1), tree.n_recheck, tree.n_diverge)
 
 all_id = numpy.concatenate(blocks_id)
 all_pt = numpy.concatenate(blocks_pt)
