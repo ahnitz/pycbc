@@ -33,13 +33,11 @@ Two artifacts are written, both read directly by the samplers:
   --tree-output  the hierarchy: tree/<i> per root tile, with is_leaf /
                  n_points / prior_mass / param_<p> / children/<c> / points_<p>.
 
-Two phases, because the tree mutates while it grows but not afterwards:
-
-  1. GROW (serial) -- insert draws, creating branches as needed, until the
-     rate of new-leaf creation falls below --saturation, i.e. the tree has
-     stopped discovering new regions.
-  2. ASSIGN (parallel) -- freeze the structure and route the remaining draws
-     read-only, so workers can fork and share it copy-on-write.
+Every draw takes the same path: descend, and create a branch wherever no
+child is close enough. There is no separate phase that freezes the structure
+and routes the remainder by argmax, which used to put a draw matching nothing
+well into the nearest tile rather than giving it its own, and made the
+structure depend on a draw budget rather than on the space.
 
 The configuration file is an ordinary pycbc inference config: the prior is
 read from its [variable_params], [static_params], [prior-*] and
@@ -54,8 +52,7 @@ Example:
         --map-output map.hdf --tree-output tree.hdf \\
         --sample-size 100000000 \\
         --thresholds 0.7 0.9 0.95 0.98 0.99 0.995 \\
-        --psd-model aLIGOZeroDetHighPower \\
-        --nprocesses 16 --verbose
+        --psd-model aLIGOZeroDetHighPower --verbose
 """
 import os
 
@@ -73,7 +70,6 @@ import numpy
 import pycbc
 from pycbc.waveform import get_fd_waveform
 from pycbc.psd import from_cli, insert_psd_option_group
-from pycbc.pool import choose_pool
 from pycbc.types.config import InterpolatingConfigParser
 from pycbc.distributions import (draw_samples_from_config,
                                  read_params_from_config)
@@ -108,14 +104,6 @@ def make_rep(params):
     return numpy.stack([rp, rc])
 
 
-def assign_one(params):
-    """ Pool worker: route one draw through the frozen tree. Returns the
-    leaf's integer id, or -1 if the tree could not accept it.
-    """
-    leaf = _G['tree'].assign(make_rep(params))
-    return _G['leaf_id'].get(id(leaf), -1) if leaf is not None else -1
-
-
 def all_fields(samples, i):
     """ Every drawn field (including transform-derived mass1/mass2). """
     return {k: float(samples[k][i]) for k in samples.dtype.names}
@@ -146,13 +134,8 @@ parser.add_argument('--match-below', type=float, default=0.98,
                          'time-maximized match; above it the cheaper '
                          'fixed-time overlap, which is a good '
                          'approximation only at high match')
-parser.add_argument('--grow-draws', type=int, default=200000,
-                    help='max draws for the serial growth phase')
-parser.add_argument('--saturation', type=float, default=0.02,
-                    help='end growth once new leaves per draw falls below '
-                         'this over a monitoring block')
 parser.add_argument('--block', type=int, default=20000,
-                    help='draws per growth-phase monitoring block')
+                    help='draws per progress block')
 parser.add_argument('--low-frequency-cutoff', type=float, default=20.0,
                     help='start frequency of the representative waveforms')
 parser.add_argument('--high-frequency-cutoff', type=float, default=1000.0,
@@ -162,8 +145,6 @@ parser.add_argument('--delta-f', type=float, default=2.0,
                          'time-maximization IFFT is padded to 2*kmax, which '
                          'at the default gives 0.5 ms resolution and '
                          'reproduces pycbc.filter.match to ~4e-4')
-parser.add_argument('--nprocesses', type=int, default=1,
-                    help='processes for the parallel assign phase')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--two-polarization', action='store_true',
                     help='represent each template by both + and x '
@@ -195,73 +176,43 @@ tree = OnlineTree(args.thresholds, kmin, kmax, nfft=nfft,
 logging.info('thresholds=%s (time-maximized match at %s)', args.thresholds,
              [t for t, m in zip(args.thresholds, tree.use_match) if m])
 
-# ---------------- phase 1: grow ----------------
+# ---------------- insert ----------------
+# Every draw goes through the same path. The alternative was to freeze the
+# tree after a fixed number of draws and route the rest by argmax without
+# checking the threshold, which put a draw that matched nothing well into
+# the nearest tile instead of giving it its own, and made the structure
+# depend on a draw budget rather than on the space.
+#
+# Points are held as flat blocks of int32 leaf id and float32 params rather
+# than a list of tuples per node; grouping happens once at write time via a
+# single stable argsort.
 numpy.random.seed(args.seed)
-grown = 0
+done = 0
+blocks_id, blocks_pt = [], []
 t0 = time.perf_counter()
-while grown < args.grow_draws:
-    n = min(args.block, args.grow_draws - grown)
-    s = draw_samples_from_config(args.config_file, n, seed=args.seed + grown)
-    before = tree.counts[-1]
+while done < args.sample_size:
+    n = min(args.block, args.sample_size - done)
+    s_ = draw_samples_from_config(args.config_file, n, seed=args.seed + done)
+    before = tree.n_leaves
+    ids = numpy.empty(n, dtype=numpy.int32)
     for i in range(n):
-        full = all_fields(s, i)
-        tree.insert(make_rep(full), tuple(full[p] for p in var))
-    grown += n
-    rate = (tree.counts[-1] - before) / n
-    logging.info('grow: %i draws | nodes/level %s | new leaves/draw %.4f | '
-                 '%.0f draws/s', grown, tree.counts, rate,
-                 grown / (time.perf_counter() - t0))
-    if rate < args.saturation:
-        logging.info('saturated (new-leaf rate %.4f < %.4f); freezing',
-                     rate, args.saturation)
-        break
+        full = all_fields(s_, i)
+        ids[i] = tree.insert(make_rep(full), tuple(full[p] for p in var))
+    blocks_id.append(ids)
+    blocks_pt.append(numpy.column_stack(
+        [s_[p][:n] for p in var]).astype(numpy.float32))
+    done += n
+    logging.info('insert: %i/%i | nodes/level %s | new leaves/draw %.4f | '
+                 '%.0f draws/s', done, args.sample_size, tree.counts,
+                 (tree.n_leaves - before) / n,
+                 done / (time.perf_counter() - t0))
 
 leaves = tree.leaves()
-leaf_id = {id(lf): k for k, lf in enumerate(leaves)}
-tree.frozen = True
-_G.update(tree=tree, leaf_id=leaf_id)
-logging.info('grown: %i draws, nodes/level %s, %i leaves, %.1f comp/draw',
-             grown, tree.counts, len(leaves), tree.ncomp / max(grown, 1))
+logging.info('inserted %i draws, nodes/level %s, %i leaves, %.1f comp/draw',
+             done, tree.counts, len(leaves), tree.ncomp / max(done, 1))
 
-# ---------------- phase 2: assign ----------------
-# Points are accumulated as flat numpy blocks (int32 leaf id + float32
-# params) rather than per-leaf Python objects, which costs several times
-# less memory at the draw counts a production map needs. Grouping by leaf
-# happens once at write time via a single argsort.
-remaining = max(0, args.sample_size - grown)
-blocks_id, blocks_pt = [], []
-grown_pts = [(leaf_id[id(lf)], p) for lf in leaves for p in (lf.points or [])]
-if grown_pts:
-    blocks_id.append(numpy.array([g[0] for g in grown_pts],
-                                 dtype=numpy.int32))
-    blocks_pt.append(numpy.array([g[1] for g in grown_pts],
-                                 dtype=numpy.float32))
-if remaining:
-    pool = choose_pool(processes=args.nprocesses)
-    logging.info('assigning %i remaining draws on %i processes',
-                 remaining, args.nprocesses)
-    done = 0
-    t0 = time.perf_counter()
-    while done < remaining:
-        n = min(500000, remaining - done)
-        s = draw_samples_from_config(args.config_file, n,
-                                     seed=args.seed + grown + done)
-        work = [all_fields(s, i) for i in range(n)]
-        cs = max(1, n // (args.nprocesses * 20))
-        ids = numpy.fromiter(pool.imap(assign_one, work, chunksize=cs),
-                             dtype=numpy.int32, count=n)
-        keep = ids >= 0
-        blocks_id.append(ids[keep])
-        blocks_pt.append(numpy.column_stack(
-            [s[p][:n] for p in var]).astype(numpy.float32)[keep])
-        done += n
-        logging.info('assign: %i/%i (%.0f draws/s)', done, remaining,
-                     done / (time.perf_counter() - t0))
-
-all_id = numpy.concatenate(blocks_id) if blocks_id else numpy.zeros(
-    0, dtype=numpy.int32)
-all_pt = numpy.concatenate(blocks_pt) if blocks_pt else numpy.zeros(
-    (0, len(var)), dtype=numpy.float32)
+all_id = numpy.concatenate(blocks_id)
+all_pt = numpy.concatenate(blocks_pt)
 del blocks_id, blocks_pt
 order = numpy.argsort(all_id, kind='stable')
 all_id, all_pt = all_id[order], all_pt[order]
@@ -309,7 +260,7 @@ with h5py.File(args.map_output, 'w') as out:
     for i, r in enumerate(roots):
         acc = []
         subtree_leaves(r, acc)
-        ids = [leaf_id[id(lf)] for lf in acc]
+        ids = [lf.lid for lf in acc]
         blocks = [all_pt[bounds[j]:bounds[j + 1]] for j in ids]
         pts = (numpy.concatenate(blocks) if blocks
                else numpy.zeros((0, len(var)), dtype=numpy.float32))
@@ -332,7 +283,7 @@ with h5py.File(args.tree_output, 'w') as out:
         for k, p in enumerate(var):
             group.attrs['param_%s' % p] = float(node.params[k])
         if node.children is None:
-            lid = leaf_id[id(node)]
+            lid = node.lid
             pts = all_pt[bounds[lid]:bounds[lid + 1]]
             group.attrs['is_leaf'] = True
             group.attrs['n_points'] = len(pts)

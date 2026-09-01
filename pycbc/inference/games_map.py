@@ -4,8 +4,8 @@ Each level has a match threshold. A draw descends from the root, compared
 at each level only against the current node's children; if the best child
 clears that level's threshold the draw descends into it, otherwise the
 draw becomes the representative of a new branch, and of a fresh chain of
-nodes down the remaining levels. Draws reaching the bottom are stored as
-that leaf's points.
+nodes down the remaining levels. Draws reaching the bottom are recorded against
+that leaf's id.
 
 With branching b over d levels a draw costs ~d*b comparisons rather than
 N against a flat bank, and each comparison set is one node's children --
@@ -57,52 +57,64 @@ class LevelIndex:
             self._mat = numpy.ascontiguousarray(numpy.array(self.reps))
         return self._mat
 
+    def _prep(self, b, lo, hi):
+        A = self.matrix()[lo:hi]
+        if A.ndim == 2:                 # (N, nfft) -> single polarization
+            A = A[:, None, :]
+        return A, numpy.atleast_2d(b), slice(self.kmin, self.kmax)
+
+    def overlap_best(self, b, lo=0, hi=None):
+        """ (index, score) of the best fixed-time overlap over reps[lo:hi].
+        Score is the MIN over polarizations, so a draw belongs to a tile
+        only if every polarization matches its centre. """
+        hi = len(self.reps) if hi is None else hi
+        if lo >= hi:
+            return -1, -1.0
+        A, b, sl = self._prep(b, lo, hi)
+        ov = numpy.empty((A.shape[0], A.shape[1]))
+        for p in range(A.shape[1]):
+            ov[:, p] = numpy.abs(A[:, p, sl].conj() @ b[p, sl])
+        ov = ov.min(axis=1)
+        i = int(numpy.argmax(ov))
+        return lo + i, float(ov[i])
+
+    def match_best(self, b, lo=0, hi=None):
+        """ Same, for the time-maximized match. One FFT per rep, about 19x
+        the cost of the overlap. """
+        hi = len(self.reps) if hi is None else hi
+        if lo >= hi:
+            return -1, -1.0
+        A, b, _ = self._prep(b, lo, hi)
+        m = numpy.empty((A.shape[0], A.shape[1]))
+        for p in range(A.shape[1]):
+            Z = numpy.fft.ifft(numpy.conj(A[:, p, :]) * b[p][None, :],
+                               axis=1) * self.nfft
+            m[:, p] = numpy.abs(Z).max(axis=1)
+        m = m.min(axis=1)
+        j = int(numpy.argmax(m))
+        return lo + j, float(m[j])
+
     def best(self, b, threshold):
         """ (index, score) of the best child, and whether it clears
         `threshold`. Uses the cheap overlap first; only falls back to the
         FFT-based match when overlap is below threshold AND this level
         wants match, since overlap >= threshold already proves
         match >= threshold.
-
-        Representatives may carry more than one polarization
-        (shape ``(n_pol, nfft)``). The score is then the MIN of the
-        per-polarization matches: a draw belongs to a tile only if BOTH
-        its + and x polarizations match the centre. This is the
-        conservative (over-splitting) proxy the precessing map needs,
-        where the two polarizations carry independent information; for a
-        single polarization (aligned) it reduces to the old behaviour.
         """
-        A = self.matrix()
-        if A.ndim == 2:                 # (N, nfft) -> single polarization
-            A = A[:, None, :]
-        b = numpy.atleast_2d(b)         # (n_pol, nfft)
-        npol = A.shape[1]
-        sl = slice(self.kmin, self.kmax)
-        ov_p = numpy.empty((A.shape[0], npol))
-        for p in range(npol):
-            ov_p[:, p] = numpy.abs(A[:, p, sl].conj() @ b[p, sl])
-        ov = ov_p.min(axis=1)           # min over polarizations
-        i = int(numpy.argmax(ov))
-        if ov[i] >= threshold or not self.use_match:
-            return i, float(ov[i])
-        m_p = numpy.empty((A.shape[0], npol))
-        for p in range(npol):
-            Z = numpy.fft.ifft(numpy.conj(A[:, p, :]) * b[p][None, :],
-                               axis=1) * self.nfft
-            m_p[:, p] = numpy.abs(Z).max(axis=1)
-        m = m_p.min(axis=1)             # min over polarizations
-        j = int(numpy.argmax(m))
-        return j, float(m[j])
+        i, ov = self.overlap_best(b)
+        if ov >= threshold or not self.use_match:
+            return i, ov
+        return self.match_best(b)
 
 
 class Node:
-    __slots__ = ('rep', 'params', 'children', 'points')
+    __slots__ = ('rep', 'params', 'children', 'lid')
 
-    def __init__(self, rep, params):
+    def __init__(self, rep, params, lid=-1):
         self.rep = rep
         self.params = params
         self.children = None     # LevelIndex + list of Nodes
-        self.points = None       # leaf: list of param tuples
+        self.lid = lid           # leaf: index into the caller's point blocks
 
 
 class OnlineTree:
@@ -133,57 +145,145 @@ class OnlineTree:
         self.counts = [0] * len(self.thresholds)
         self.ncomp = 0
         self.n_match_calls = 0
-        self.frozen = False
+        self.n_leaves = 0
+        self.n_recheck = 0
+        self.n_diverge = 0
 
     def _new_index(self, depth):
         idx = LevelIndex(self.nfft, self.use_match[depth])
         idx.kmin, idx.kmax = self.kmin, self.kmax
         return idx
 
+    def _grow(self, idx, kids, d, rep, params):
+        """ Add a child at level `d`, numbering it if it is a leaf. """
+        lid = -1
+        if d == len(self.thresholds) - 1:
+            lid = self.n_leaves
+            self.n_leaves += 1
+        child = Node(rep, params, lid)
+        idx.add(rep)
+        kids.append(child)
+        self.counts[d] += 1
+        return child
+
     def insert(self, rep, params):
-        """ Route one draw, creating branches as needed. Returns the leaf
-        it landed in. """
+        """ Route one draw, creating branches as needed. Returns the id of
+        the leaf it landed in.
+
+        Leaves live at a fixed depth, one per threshold, so a node created
+        at the last level is a leaf for good and can be numbered on the
+        spot. The caller keeps the points themselves in flat arrays keyed
+        by that id, which costs far less than a list of tuples per node.
+        """
         node = self.root
         for d, thr in enumerate(self.thresholds):
             if node.children is None:
                 node.children = (self._new_index(d), [])
             idx, kids = node.children
             if not kids:
-                child = Node(rep, params)
-                idx.add(rep)
-                kids.append(child)
-                self.counts[d] += 1
-                node = child
+                node = self._grow(idx, kids, d, rep, params)
                 continue
             i, score = idx.best(rep, thr)
             self.ncomp += len(idx)
             if score < thr:
-                child = Node(rep, params)
-                idx.add(rep)
-                kids.append(child)
-                self.counts[d] += 1
-                node = child
+                node = self._grow(idx, kids, d, rep, params)
             else:
                 node = kids[i]
-        if node.points is None:
-            node.points = []
-        node.points.append(params)
-        return node
+        return node.lid
 
-    def assign(self, rep):
-        """ Route a draw through the FROZEN tree without creating nodes.
-        Returns the leaf, or None if the tree cannot accept it (which can
-        only happen if the tree is empty). Used for the bulk phase, where
-        the structure is fixed and workers are read-only.
+    def probe(self, rep):
+        """ Descend read-only and record what was seen, for a later commit.
+
+        Returns a list with one record per level reached,
+        ``(chosen, nkids, i_ov, ov, i_m, m)``. Everything is an index or a
+        float, never a node, so a worker can hand it back to the process
+        that owns the tree. ``i_m`` is -1 where the match was not needed,
+        which is exactly when the overlap already cleared the threshold.
+
+        The list stops at the level that would split, so its length also
+        says where that happened.
         """
         node = self.root
+        out = []
         for d, thr in enumerate(self.thresholds):
             if node.children is None:
-                return None
+                return out
             idx, kids = node.children
-            i, _score = idx.best(rep, thr)
-            node = kids[i]
-        return node
+            if not kids:
+                return out
+            i_ov, ov = idx.overlap_best(rep)
+            i_m, m = -1, -1.0
+            if ov < thr and idx.use_match:
+                i_m, m = idx.match_best(rep)
+            if ov >= thr or not idx.use_match:
+                chosen, score = i_ov, ov
+            else:
+                chosen, score = i_m, m
+            out.append((chosen, len(kids), i_ov, ov, i_m, m))
+            if score < thr:
+                return out
+            node = kids[chosen]
+        return out
+
+    def commit(self, rep, params, probed):
+        """ Apply a probed draw, reconciling against anything added since.
+
+        Children are only ever appended, so the ones added after the probe
+        are exactly ``kids[nkids:]``. Comparing against just those and
+        folding the result into the probed score reproduces what a single
+        call over all children would have given: the overlap can only rise,
+        so a probe that already cleared the threshold still clears it, and
+        where it did not, the match over the union is the better of the two
+        halves.
+
+        A record is only reusable while the walk stays on the probed path.
+        Diverging invalidates every record below, so the rest is redone in
+        full; that costs a normal descent and is rare once the map fills.
+        """
+        node = self.root
+        on_path = True
+        for d, thr in enumerate(self.thresholds):
+            if node.children is None:
+                node.children = (self._new_index(d), [])
+            idx, kids = node.children
+            if not kids:
+                node = self._grow(idx, kids, d, rep, params)
+                on_path = False
+                continue
+            rec = probed[d] if (on_path and d < len(probed)) else None
+            if rec is None:
+                i, score = idx.best(rep, thr)
+                self.ncomp += len(idx)
+                if on_path:
+                    self.n_diverge += 1
+                    on_path = False
+            else:
+                chosen, nkids, i_ov, ov, i_m, m = rec
+                if len(kids) > nkids:
+                    self.n_recheck += 1
+                    j, ov_new = idx.overlap_best(rep, nkids)
+                    if ov_new > ov:
+                        i_ov, ov = j, ov_new
+                    if ov >= thr or not idx.use_match:
+                        i, score = i_ov, ov
+                    else:
+                        if i_m < 0:      # probe cleared on overlap alone
+                            i_m, m = idx.match_best(rep, 0, nkids)
+                        j, m_new = idx.match_best(rep, nkids)
+                        if m_new > m:
+                            i_m, m = j, m_new
+                        i, score = i_m, m
+                else:
+                    i, score = (chosen, ov if (ov >= thr
+                                               or not idx.use_match) else m)
+            if score < thr:
+                node = self._grow(idx, kids, d, rep, params)
+                on_path = False
+            else:
+                if rec is not None and i != rec[0]:
+                    on_path = False
+                node = kids[i]
+        return node.lid
 
     def leaves(self):
         out = []
