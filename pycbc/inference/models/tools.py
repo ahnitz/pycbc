@@ -455,6 +455,14 @@ class DistMarg():
             a['nbin'] = 2
             return numpy.full(2, 0.5)
 
+        # and fall back to the prior if the accumulator is unusable, rather
+        # than dividing by a zero or a nan and failing in the draw
+        asum = a['acc'].sum()
+        if not numpy.isfinite(asum) or asum <= 0 \
+                or not numpy.all(numpy.isfinite(a['acc'])):
+            a['nbin'] = 2
+            return numpy.full(2, 0.5)
+
         # counts in units of effective samples, which is what sets the noise
         counts = a['acc'] / a['acc'].sum() * a['wsum']
         weight = a['wsum']
@@ -522,7 +530,19 @@ class DistMarg():
         concentrates on.
         """
         logw = self.marginalize_vector_weights + vloglr
-        w = numpy.exp(logw - logsumexp(logw))
+        # A call whose whole vector underflows leaves every logw at -inf, so
+        # logsumexp is -inf too and the subtraction is nan. That happens when
+        # the distance marginalization returns zero for the entire vector,
+        # which marginalize_distance_snr_range does by design. Folding the
+        # nan in poisons the accumulator for good and the NEXT draw dies in
+        # numpy.random.choice, far from the cause. A call that produced no
+        # usable weight should contribute nothing instead.
+        total = logsumexp(logw)
+        if not numpy.isfinite(total):
+            return
+        w = numpy.exp(logw - total)
+        if not numpy.all(numpy.isfinite(w)):
+            return
 
         for a in self.marginalize_vector_adaptive.values():
             if a['bin'] is None:
