@@ -117,7 +117,8 @@ def probe_one(arg):
     """
     i, params = arg
     rep = make_rep(params)
-    _G['reps'][i] = rep
+    lo, hi = _G['band']
+    _G['reps'][i] = rep[lo:hi]      # the rest is the zero padding
     return _G['tree'].probe(rep)
 
 
@@ -152,7 +153,15 @@ parser.add_argument('--match-below', type=float, default=0.98,
                          'fixed-time overlap, which is a good '
                          'approximation only at high match')
 parser.add_argument('--block', type=int, default=20000,
-                    help='draws per progress block')
+                    help='draws in the first batch, and the floor the batch '
+                         'size is never taken below')
+parser.add_argument('--max-block', type=int, default=200000,
+                    help='ceiling on the batch size. The shared buffer is '
+                         'sized for this, at (kmax-kmin)*16 bytes a draw')
+parser.add_argument('--batch-new-nodes', type=int, default=2000,
+                    help='batch size is steered to create about this many '
+                         'nodes, so the serial reconciliation stays bounded '
+                         'while batches grow as the map fills')
 parser.add_argument('--low-frequency-cutoff', type=float, default=20.0,
                     help='start frequency of the representative waveforms')
 parser.add_argument('--high-frequency-cutoff', type=float, default=1000.0,
@@ -217,18 +226,36 @@ logging.info('thresholds=%s (time-maximized match at %s)', args.thresholds,
 numpy.random.seed(args.seed)
 done = 0
 blocks_id, blocks_pt = [], []
-shm = SharedMemory(create=True, size=args.block * nfft * 16)
-_G['reps'] = numpy.ndarray((args.block, nfft), dtype=numpy.complex128,
+nband = kmax - kmin
+shm = SharedMemory(create=True, size=args.max_block * nband * 16)
+_G['reps'] = numpy.ndarray((args.max_block, nband), dtype=numpy.complex128,
                            buffer=shm.buf)
+_G['band'] = (kmin, kmax)
+scratch = numpy.zeros(nfft, dtype=numpy.complex128)
 _G['tree'] = tree
 t0 = time.perf_counter()
 try:
+    # Draws come in fixed chunks whose seed is set by how many have been
+    # drawn, so the stream does not depend on how they are batched. A batch
+    # is a whole number of chunks; without that, changing the batch size
+    # changes the seeds and the map is built from different draws.
+    chunk = args.block
+    nchunk = 1
     while done < args.sample_size:
-        n = min(args.block, args.sample_size - done)
-        s_ = draw_samples_from_config(args.config_file, n,
-                                      seed=args.seed + done)
-        rows = [all_fields(s_, i) for i in range(n)]
+        rows, pts = [], []
+        for _ in range(nchunk):
+            if done + len(rows) >= args.sample_size:
+                break
+            m = min(chunk, args.sample_size - done - len(rows))
+            s_ = draw_samples_from_config(args.config_file, m,
+                                          seed=args.seed + done + len(rows))
+            pts.append(numpy.column_stack(
+                [s_[p][:m] for p in var]).astype(numpy.float32))
+            rows.extend(all_fields(s_, i) for i in range(m))
+        n = len(rows)
+        tA = time.perf_counter()
         before = tree.n_leaves
+        tB = tA
         if args.nprocesses > 1:
             with Pool(args.nprocesses) as pool:
                 probes = pool.map(
@@ -236,15 +263,33 @@ try:
                     chunksize=max(1, n // (args.nprocesses * 8)))
         else:
             probes = [probe_one(a) for a in enumerate(rows)]
+        tC = time.perf_counter()
         reps = _G['reps']
         ids = numpy.empty(n, dtype=numpy.int32)
         for i in range(n):
-            ids[i] = tree.commit(reps[i], tuple(rows[i][p] for p in var),
+            scratch[kmin:kmax] = reps[i]
+            ids[i] = tree.commit(scratch, tuple(rows[i][p] for p in var),
                                  probes[i])
+        tD = time.perf_counter()
         blocks_id.append(ids)
-        blocks_pt.append(numpy.column_stack(
-            [s_[p][:n] for p in var]).astype(numpy.float32))
+        blocks_pt.extend(pts)
         done += n
+        tE = time.perf_counter()
+        made = tree.n_leaves - before
+        logging.info('  batch %i (%i chunks): probe %.2fs commit %.2fs | '
+                     'serial %.0f%% | %i new nodes', n, nchunk, tC - tB,
+                     tD - tC, 100 * (1 - (tC - tB) / (tE - tA)), made)
+        # Steer the batch towards a fixed number of new nodes. Collisions
+        # within a batch are what the serial commit has to reconcile, and
+        # they scale with the nodes created, so holding that fixed lets the
+        # batch grow as the map fills without the reconciliation growing
+        # with it. Batch size never changes the result, only the cost.
+        if made > 0:
+            want = n * args.batch_new_nodes / made
+        else:
+            want = n * 2
+        nchunk = max(1, min(args.max_block // chunk,
+                            min(int(want // chunk) or 1, nchunk * 2)))
         logging.info('insert: %i/%i | nodes/level %s | new leaves/draw %.4f '
                      '| %.0f draws/s', done, args.sample_size, tree.counts,
                      (tree.n_leaves - before) / n,
