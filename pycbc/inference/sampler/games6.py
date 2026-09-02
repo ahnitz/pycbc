@@ -380,7 +380,8 @@ class GameSampler6(DummySampler):
     name = 'games6'
 
     def __init__(self, model, *args, nprocesses=1, use_mpi=False,
-                 mapfile=None, treefile=None,
+                 mapfile=None, treefile=None, dagfile=None,
+                 dag_cull=0,
                  loglr_region=0,
                  loglr_coverage=1e-4,
                  target_likelihood_calls=1e5,
@@ -412,6 +413,11 @@ class GameSampler6(DummySampler):
 
         self.meta = {}
         self.mapfile = mapfile
+        self.dagfile = dagfile
+        # Opt-in, like gen_switch_ess: a cut that prunes is a behaviour
+        # change, and one that is on by default cannot be validated against
+        # the version without it.
+        self.dag_cull = int(dag_cull)
         self.treefile = treefile
         self.rounds = int(rounds)
         self.dmap = {}
@@ -648,6 +654,94 @@ class GameSampler6(DummySampler):
             out.extend(self._nodes_at_depth(group['children'][c], depth - 1))
         return out
 
+    def _dag_cut(self):
+        """ Reach the cut by descending a multi-parent structure.
+
+        The flat cut evaluates a likelihood at every tile. Here the levels
+        are template banks, coarsest first, and each node lists EVERY parent
+        within reach of it rather than the one it was filed under. A level is
+        evaluated, pruned, and only the children of survivors are evaluated
+        next, so most tiles are never touched.
+
+        Two things make the pruning sound, and both were got wrong before:
+
+        The reference is the best representative seen AT THIS LEVEL. The best
+        leaf is not known until the descent ends, so comparing against it is
+        not something the algorithm can do; comparing against the level's own
+        maximum also means the maximum always survives, so a level can never
+        come back empty.
+
+        The allowance is rho^2 sqrt(1 - M^2) / 2, the most the loglr can RISE
+        from a representative to a point within match M of it: with
+        loglr = rho^2 cos^2(theta)/2 that maximum is rho^2 sin(acos(M))/2.
+        The obvious rho^2 (1 - M^2)/2 is the drop from a perfect match down
+        to M, which is smaller by sqrt(1 - M^2) and prunes nodes holding the
+        peak.
+
+        A node survives if ANY of its parents did. That is what the extra
+        links buy: a node is judged by its best parent, not by the accident
+        of which one it hangs from, and it is what stopped the strict tree
+        losing 178 of 1363 tiles across 18 of 39 injections.
+
+        Returns (loglrs, nevaluated) with -inf at every tile never reached,
+        so the caller's region cut sees only what was actually evaluated.
+        """
+        with h5py.File(self.dagfile, 'r') as dag:
+            nlev = len([k for k in dag if k.startswith('level_')])
+            thr, params, links = [], [], [None]
+            for d in range(nlev):
+                g = dag['level_%i' % d]
+                thr.append(float(g.attrs['threshold']))
+                params.append({p: g['param_%s' % p][:]
+                               for p in self.dtype.names})
+                if d:
+                    off = g['parent_offset'][:]
+                    par = g['parents'][:]
+                    links.append((par, off))
+        logging.info('dag cut: %s nodes per level, thresholds %s',
+                     [len(next(iter(p.values()))) for p in params], thr)
+
+        alive, total, rho2 = None, 0, None
+        last_loglr = None
+        for d in range(nlev):
+            n = len(next(iter(params[d].values())))
+            if alive is None:
+                idx = numpy.arange(n)
+            else:
+                par, off = links[d]
+                idx = numpy.array(
+                    [j for j in range(n)
+                     if alive.intersection(par[off[j]:off[j + 1]].tolist())],
+                    dtype=int)
+            if not len(idx):
+                logging.warning('dag cut: level %i reached no nodes', d)
+                break
+            args = [dict(getattr(self, 'extra_reference', {}),
+                         **{p: float(params[d][p][j])
+                            for p in self.dtype.names}) for j in idx]
+            vals = numpy.array(list(self.pool.imap(call_tile_likelihood,
+                                                   args)))
+            total += len(idx)
+            here = numpy.nanmax(vals)
+            if rho2 is None or 2.0 * here > rho2:
+                rho2 = 2.0 * max(here, 0.0)
+            allow = rho2 * numpy.sqrt(max(0.0, 1.0 - thr[d] ** 2)) / 2.0
+            keep = idx[vals >= here - allow - self.loglr_region]
+            logging.info('dag cut: level %i evaluated %i kept %i '
+                         '(best %.2f, allowance %.1f + region %.1f)',
+                         d, len(idx), len(keep), here, allow,
+                         self.loglr_region)
+            alive = set(keep.tolist())
+            if d == nlev - 1:
+                last_loglr = numpy.full(n, -numpy.inf)
+                last_loglr[idx] = vals
+        if last_loglr is None:
+            raise RuntimeError('dag cut never reached the finest level')
+        logging.info('dag cut: %i likelihoods against %i tiles (%.1fx fewer)',
+                     total, len(last_loglr),
+                     len(last_loglr) / max(total, 1))
+        return last_loglr, total
+
     def _evaluate_start_nodes(self, treefile):
         """ Likelihood at the representative of every start node.
 
@@ -655,6 +749,10 @@ class GameSampler6(DummySampler):
         cut runs over the flat map's root tiles rather than a tree depth.
         """
         start_nodes = None
+        if self.dag_cull and self.dagfile:
+            loglrs, nev = self._dag_cut()
+            self.meta['setup_ncalls'] = nev
+            return None, loglrs
         if treefile is not None and self.tree_start_level > 0:
             start_nodes = []
             for k in sorted(treefile['tree'], key=int):
