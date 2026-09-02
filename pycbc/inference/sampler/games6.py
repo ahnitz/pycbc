@@ -412,6 +412,7 @@ class GameSampler6(DummySampler):
                  gen_anneal_ess=0.20,
                  gen_anneal_step=0.5,
                  gen_anneal_patience=1,
+                 gen_anneal_drop=0,
                  gen_switch_patience=2,
                  gen_switch_backoff=2.0,
                  tree_start_level=0,
@@ -477,6 +478,15 @@ class GameSampler6(DummySampler):
         self.gen_anneal_ess = float(gen_anneal_ess)
         self.gen_anneal_step = float(gen_anneal_step)
         self.gen_anneal_patience = int(gen_anneal_patience)
+        # Drop rounds run at tau < 1 from the FINAL estimator. Their tau=1
+        # weights are exact, so keeping them is not a bias -- but they were
+        # drawn from deliberately broad proposals, so their weights are
+        # heavy-tailed and the standard ESS formula overstates how much they
+        # deserve. At SNR 500 they carried beta = 0.122, and a 12% admixture
+        # of samples a few times too broad is arithmetically enough to
+        # inflate the recovered width about twofold. 1 to exclude them.
+        self.gen_anneal_drop = int(gen_anneal_drop)
+        self._stratum_tau = {}
         self._tau_rounds = 0
         self._tau = 1.0
         self._tau_log = []
@@ -1034,6 +1044,7 @@ class GameSampler6(DummySampler):
                     # with themselves
                     rk = 'gen:r%i' % rnd
                     strata[rk] = {'samp': gs, 'loglr': gl, 'logw': gw}
+                    self._stratum_tau[rk] = float(self._tau)
                     self.stratum_calls[rk] = len(gw)
                     # max normalised weight alongside the ESS: a round
                     # whose ESS collapses because ONE draw dominates is a
@@ -2069,6 +2080,18 @@ class GameSampler6(DummySampler):
         inverse-variance choice and makes the combined ESS additive.
         """
         parts = [(k, v) for k, v in strata.items() if v['samp'] is not None]
+        if self.gen_anneal and self.gen_anneal_drop:
+            keep = [(k, v) for k, v in parts
+                    if self._stratum_tau.get(k, 1.0) >= 1.0]
+            if keep:
+                logging.info('anneal: dropping %i of %i strata drawn at '
+                             'tau < 1 from the posterior and evidence',
+                             len(parts) - len(keep), len(parts))
+                parts = keep
+            else:
+                logging.warning('anneal: every stratum was drawn at tau < 1, '
+                                'so none can be dropped; the run never '
+                                'reached full temperature')
         esss = numpy.array([self._ess(v['logw']) for _, v in parts])
         total_ess = float(esss.sum())
         beta = esss / esss.sum() if esss.sum() > 0 else \
