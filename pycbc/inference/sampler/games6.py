@@ -504,6 +504,10 @@ class GameSampler6(DummySampler):
         self._tau_rounds = 0
         self._tau = 1.0
         self._tau_log = []
+        # keys of the generative strata drawn at the CURRENT temperature;
+        # cleared on every step. `_step_tau` measures its retention floor
+        # over these.
+        self._tau_keys = []
         self.gen_switch_patience = int(gen_switch_patience)
         self.gen_switch_backoff = float(gen_switch_backoff)
         self._deferred = set()
@@ -1067,6 +1071,8 @@ class GameSampler6(DummySampler):
                     rk = 'gen:r%i' % rnd
                     strata[rk] = {'samp': gs, 'loglr': gl, 'logw': gw}
                     self.stratum_calls[rk] = len(gw)
+                    if self.gen_anneal:
+                        self._tau_keys.append(rk)
                     # max normalised weight alongside the ESS: a round
                     # whose ESS collapses because ONE draw dominates is a
                     # different failure from one that is uniformly poor,
