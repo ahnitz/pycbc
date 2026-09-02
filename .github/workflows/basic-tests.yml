@@ -22,6 +22,11 @@ jobs:
       uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
       with:
         pixi-version: latest
+        # Do not solve yet. The manifest does not constrain the interpreter,
+        # so installing here would take the newest one available rather than
+        # the one this job is for, and the version below would arrive too
+        # late to matter.
+        run-install: false
 
     - name: Inject Python Version
       run: |
