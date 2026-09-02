@@ -37,6 +37,7 @@ from pycbc.frame import read_frame
 from pycbc.filter import highpass, resample_to_delta_t
 from astropy.utils.data import download_file
 from pycbc.inference import models
+from pycbc.inference.models import tools
 from pycbc.distributions import Uniform, JointDistribution, SinAngle, UniformAngle
 from pycbc.waveform.waveform import FailedWaveformError
 
@@ -493,10 +494,131 @@ class TestMarginalizedPolModels(unittest.TestCase):
         polsamples = margpol_model.pol
         self._test_models(margpol_model, orig_model, polsamples)
 
+
+class TestDemarginalizationDraws(unittest.TestCase):
+    """ The distance and phase draws against the distributions they are of
+
+    Both are compared with a two sample KS to a reference built by inverting
+    the cdf on a two million point grid. The threshold is the 5% critical
+    value for the sizes used, so passing means the draw is not distinguishable
+    from the distribution it is supposed to be from.
+    """
+    DMIN, DMAX, NDRAW = 10.0, 100.0, 4000
+
+    def setUp(self):
+        self.crit = 1.36 * numpy.sqrt(2.0 / self.NDRAW)
+
+    def model(self, phase=True, seed=4):
+        """ Only the attributes the two draws read """
+        m = tools.DistMarg()
+        m.marginalize_phase = phase
+        m.marginalize_rng = numpy.random.default_rng(seed)
+        locs = numpy.linspace(self.DMIN, self.DMAX, 10000)
+        weights = numpy.ones(len(locs)) / len(locs)
+        m.dist_ref = 0.5 * (self.DMIN + self.DMAX)
+        m.dist_locs = locs
+        m.dist_density = weights / (locs[1] - locs[0])
+        m.dist_coarse = numpy.linspace(self.DMIN, self.DMAX, 100)
+        m.distance_marginalization = (m.dist_ref / locs, weights)
+        return m
+
+    def distance_reference(self, sh, hh, phase, n=2000001):
+        d = numpy.linspace(self.DMIN, self.DMAX, n)
+        r = 0.5 * (self.DMIN + self.DMAX) / d
+        x = (abs(sh) if phase else sh.real) * r
+        lr = x - 0.5 * hh * r ** 2
+        if phase:
+            lr = lr + numpy.log(special.i0e(x))
+        lr -= lr.max()
+        cdf = numpy.exp(lr).cumsum()
+        return d, cdf / cdf[-1]
+
+    def test_distance_matches_its_distribution(self):
+        """ Across signal strengths, including one loud enough to be narrow """
+        for phase in (True, False):
+            for snr in (8.0, 20.0, 60.0, 150.0):
+                hh = snr ** 2
+                sh = complex(hh * numpy.exp(0.3j)) if phase else complex(hh)
+                m = self.model(phase=phase)
+                drawn = numpy.array(
+                    [m.draw_distance(sh, -0.5 * hh)[0]['distance']
+                     for _ in range(self.NDRAW)])
+                d, cdf = self.distance_reference(sh, hh, phase)
+                ks = numpy.abs(
+                    numpy.interp(numpy.sort(drawn), d, cdf)
+                    - numpy.arange(1, self.NDRAW + 1) / self.NDRAW).max()
+                self.assertLess(ks, self.crit,
+                                'phase=%s snr=%s' % (phase, snr))
+
+    def test_distance_is_not_stuck_on_the_grid(self):
+        """ A drawn distance is a distance, not one of the grid points """
+        m = self.model()
+        hh = 400.0
+        drawn = numpy.array([m.draw_distance(complex(hh), -0.5 * hh)[0]
+                             ['distance'] for _ in range(500)])
+        self.assertEqual(len(numpy.unique(drawn)), len(drawn))
+        self.assertEqual(len(numpy.intersect1d(drawn, m.dist_locs)), 0)
+        self.assertTrue((drawn > self.DMIN).all())
+        self.assertTrue((drawn < self.DMAX).all())
+
+    def test_distance_resolves_the_peak_it_is_told_about(self):
+        """ The fine points go where the weight is, not where a scan looked """
+        m = self.model(phase=False)
+        hh = 60.0 ** 2
+        sh = complex(hh)
+        # the weight is quadratic in dref / d, so the peak is known
+        expect = m.dist_ref * hh / abs(sh)
+        drawn = numpy.array([m.draw_distance(sh, -0.5 * hh)[0]['distance']
+                             for _ in range(2000)])
+        self.assertAlmostEqual(numpy.median(drawn), expect,
+                               delta=0.05 * expect)
+
+    def test_phase_matches_its_distribution(self):
+        """ The von Mises draw against the weight it is drawn from """
+        for snr in (8.0, 20.0, 150.0):
+            sh = complex(snr ** 2 * numpy.exp(-2j * 1.1))
+            hh = -0.5 * snr ** 2
+            m = self.model()
+            drawn = numpy.array([m.draw_phase(sh, hh)[0]['coa_phase']
+                                 for _ in range(self.NDRAW)])
+            ph = numpy.linspace(0, 2 * numpy.pi, 2000001)
+            lr = (numpy.exp(-2.0j * ph) * sh).real
+            lr -= lr.max()
+            cdf = numpy.exp(lr).cumsum()
+            cdf /= cdf[-1]
+            ks = numpy.abs(
+                numpy.interp(numpy.sort(drawn), ph, cdf)
+                - numpy.arange(1, self.NDRAW + 1) / self.NDRAW).max()
+            self.assertLess(ks, self.crit, 'snr=%s' % snr)
+
+    def test_phase_covers_both_modes(self):
+        """ Only twice the phase is fixed, so both halves must be drawn """
+        m = self.model()
+        sh = complex(400.0 * numpy.exp(-2j * 0.4))
+        drawn = numpy.array([m.draw_phase(sh, -200.0)[0]['coa_phase']
+                             for _ in range(1000)])
+        self.assertTrue((drawn >= 0).all() and (drawn < 2 * numpy.pi).all())
+        upper = (drawn > numpy.pi).mean()
+        self.assertGreater(upper, 0.4)
+        self.assertLess(upper, 0.6)
+        # the two modes are a half turn apart
+        folded = drawn % numpy.pi
+        self.assertLess(folded.std(), 0.1)
+
+    def test_phase_returns_the_value_it_drew(self):
+        """ The reported weight is at the drawn phase, not a neighbour's """
+        m = self.model()
+        sh = complex(120.0 * numpy.exp(-2j * 2.0))
+        drawn, at, _ = m.draw_phase(sh, -60.0)
+        expect = (numpy.exp(-2.0j * drawn['coa_phase']) * sh).real - 60.0
+        self.assertAlmostEqual(at, expect, places=12)
+
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestModels))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestWaveformErrors))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMarginalizedPolModels))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestDemarginalizationDraws))
 
 if __name__ == '__main__':
     from astropy.utils import iers

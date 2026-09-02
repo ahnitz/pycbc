@@ -34,6 +34,14 @@ def str_to_bool(sval):
     return sval
 
 
+# How far either side of the peak the fine grid runs, in widths, and how many
+# points it puts inside one width. The bound is deliberately loose: the width
+# is exact only while the weight is quadratic in dref/d, and the coarse grid
+# underneath it carries anything that falls outside.
+DISTANCE_WIDTHS = 8
+DISTANCE_PER_WIDTH = 12
+
+
 def draw_sample(loglr, size=None, rng=None):
     """ Draw a random index from a 1-d vector with loglr weights
 
@@ -232,7 +240,12 @@ class DistMarg():
 
         dist_weights /= dist_weights.sum()
         dist_ref = 0.5 * (dmax + dmin)
+        self.dist_ref = dist_ref
         self.dist_locs = dist_locs
+        # the draw reads the prior as a density, so it can weight points the
+        # setup grid does not have
+        self.dist_density = dist_weights / (dist_locs[1] - dist_locs[0])
+        self.dist_coarse = numpy.linspace(dist_locs[0], dist_locs[-1], 100)
         self.distance_marginalization = dist_ref / dist_locs, dist_weights
         self.distance_interpolator = None
 
@@ -289,7 +302,9 @@ class DistMarg():
 
         if self.reconstruct_distance:
             interpolator = None
+            distance = False
             skip_vector = True
+            return_complex = True
 
         if self.reconstruct_phase:
             interpolator = None
@@ -811,13 +826,10 @@ class DistMarg():
                 sh, hh = sh[xl], hh[xl]
 
         if 'distance' in levels and self.distance_marginalization:
-            dist_rescale, _ = self.distance_marginalization
-            dloglr = marginalize_likelihood(
-                sh, hh, phase=self.marginalize_phase,
-                distance=self.distance_marginalization, skip_vector=True)
-            drawn, _, xl = self.draw_distance(dloglr)
+            drawn, _, _ = self.draw_distance(sh, -0.5 * hh)
             rec.update(drawn)
-            sh, hh = sh * dist_rescale[xl], hh * dist_rescale[xl] ** 2.0
+            rescale = self.dist_ref / drawn['distance']
+            sh, hh = sh * rescale, hh * rescale ** 2.0
 
         if 'phase' in levels and self.marginalize_phase:
             drawn, _, _ = self.draw_phase(sh, -0.5 * hh)
@@ -839,24 +851,84 @@ class DistMarg():
         rec = {k: v[xl] for k, v in self.marginalize_vector_params.items()}
         return rec, loglr[xl], xl
 
-    def draw_distance(self, loglr):
-        """ Draw a distance, given the loglr at each point of the distance
-        grid. Returns as `draw_vector` does.
+    def draw_distance(self, sh, mhh):
+        """ Draw a distance, given the inner products at the reference
+        distance (`mhh` being minus one half of the second). Returns as
+        `draw_vector` does.
+
+        Marginalizing integrates over a grid spanning the prior; the draw only
+        needs to resolve where the weight actually is. Those are separate
+        requirements, and the second one is met here without a fine grid
+        everywhere: the weight is quadratic in dref / d, so its peak and width
+        follow from the inner products, and points are put there directly
+        rather than searched for. A coarse grid underneath carries the tails
+        and anything the width misses.
         """
-        _, weights = self.distance_marginalization
-        xl = draw_sample(loglr + numpy.log(weights), rng=self.marginalize_rng)
-        return {'distance': self.dist_locs[xl]}, loglr[xl], xl
+        hh = -2.0 * mhh
+        dref = self.dist_ref
+        # with the phase marginalized the weight follows the modulus
+        amp = abs(sh) if self.marginalize_phase else sh.real
+
+        locs = self.dist_coarse
+        if amp > 0 and hh > 0:
+            rpeak = amp / hh
+            dpeak = dref / rpeak
+            # a width in dref / d carried over to a width in d
+            width = dref / (numpy.sqrt(hh) * rpeak ** 2)
+            lo = max(self.dist_locs[0], dpeak - DISTANCE_WIDTHS * width)
+            hi = min(self.dist_locs[-1], dpeak + DISTANCE_WIDTHS * width)
+            if hi > lo:
+                n = int(numpy.clip(DISTANCE_PER_WIDTH * (hi - lo) / width,
+                                   16, 4096))
+                locs = numpy.union1d(locs, numpy.linspace(lo, hi, n))
+
+        r = dref / locs
+        x = amp * r
+        loglr = x - 0.5 * hh * r ** 2
+        if self.marginalize_phase:
+            loglr = loglr + numpy.log(i0e(x))
+
+        # cells meet halfway between their points, so a point sits inside the
+        # weight it carries however uneven the spacing is
+        edges = numpy.empty(len(locs) + 1)
+        edges[1:-1] = 0.5 * (locs[1:] + locs[:-1])
+        edges[0] = 1.5 * locs[0] - 0.5 * locs[1]
+        edges[-1] = 1.5 * locs[-1] - 0.5 * locs[-2]
+        mass = (numpy.exp(loglr - loglr.max())
+                * numpy.interp(locs, self.dist_locs, self.dist_density)
+                * numpy.diff(edges))
+
+        rng = numpy.random if self.marginalize_rng is None \
+            else self.marginalize_rng
+        cdf = mass.cumsum()
+        xl = int(numpy.searchsorted(cdf, rng.uniform() * cdf[-1]))
+        xl = min(xl, len(locs) - 1)
+        distance = edges[xl] + rng.uniform() * (edges[xl + 1] - edges[xl])
+        return {'distance': distance}, float(numpy.interp(
+            distance, locs, loglr)), xl
 
     def draw_phase(self, sh, hh):
         """ Draw a coalescence phase, given the inner products before phase
         marginalization (`hh` being minus one half of it). Returns as
-        `draw_vector` does.
+        `draw_vector` does, without an index, as nothing is indexed.
+
+        The phase enters as exp(-2i phase), so the weight is
+        |sh| cos(2 phase - arg sh), which is a von Mises in twice the phase.
+        That is drawn from directly rather than off a grid: the draw is then
+        the exact one, and a grid fine enough to hide its own spacing is not
+        needed. This uses the same dominant-mode assumption that phase
+        marginalization itself does.
         """
-        phasev = numpy.linspace(0, numpy.pi*2.0, int(1e4))
-        # This assumes that the template was conjugated in inner products
-        loglr = (numpy.exp(-2.0j * phasev) * sh).real + hh
-        xl = draw_sample(loglr, rng=self.marginalize_rng)
-        return {'coa_phase': phasev[xl]}, loglr[xl], xl
+        rng = numpy.random if self.marginalize_rng is None \
+            else self.marginalize_rng
+        # only twice the phase is determined, leaving two modes a half turn
+        # apart, so pick between them
+        angle = rng.vonmises(numpy.angle(sh), abs(sh))
+        phase = (0.5 * angle) % numpy.pi
+        if rng.uniform() < 0.5:
+            phase += numpy.pi
+        return ({'coa_phase': phase},
+                (numpy.exp(-2.0j * phase) * sh).real + hh, None)
 
     def reconstruct(self, rec=None, seed=None, set_loglr=None):
         """ Reconstruct the distance or vectored marginalized parameter
@@ -891,7 +963,7 @@ class DistMarg():
             logging.debug('Reconstruct distance')
             # call likelihood to get vector output
             self.reconstruct_distance = True
-            drawn, loglr, _ = self.draw_distance(get_loglr())
+            drawn, loglr, _ = self.draw_distance(*get_loglr())
             rec.update(drawn)
             self.reconstruct_distance = False
 
