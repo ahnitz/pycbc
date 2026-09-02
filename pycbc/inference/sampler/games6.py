@@ -30,6 +30,7 @@ proposal. Out-of-prior draws are dropped before any likelihood call.
 The map is built by ``pycbc_inference_build_map``.
 """
 import logging
+import os
 import tqdm
 import h5py
 import numpy
@@ -703,6 +704,7 @@ class GameSampler6(DummySampler):
 
         alive, total, rho2 = None, 0, None
         last_loglr = None
+        lognl = float(self.model.lognl)
         for d in range(nlev):
             n = len(next(iter(params[d].values())))
             if alive is None:
@@ -723,13 +725,17 @@ class GameSampler6(DummySampler):
                                                    args)))
             total += len(idx)
             here = numpy.nanmax(vals)
-            if rho2 is None or 2.0 * here > rho2:
-                rho2 = 2.0 * max(here, 0.0)
+            # call_tile_likelihood returns a loglikelihood, so the noise term
+            # has to come off before this is a loglr and 2 * loglr a rho^2.
+            # Without that subtraction rho^2 is max(-5e5, 0) = 0 and the
+            # match allowance is identically zero at every level.
+            if rho2 is None or 2.0 * (here - lognl) > rho2:
+                rho2 = 2.0 * max(here - lognl, 0.0)
             allow = rho2 * numpy.sqrt(max(0.0, 1.0 - thr[d] ** 2)) / 2.0
             keep = idx[vals >= here - allow - self.loglr_region]
             logging.info('dag cut: level %i evaluated %i kept %i '
-                         '(best %.2f, allowance %.1f + region %.1f)',
-                         d, len(idx), len(keep), here, allow,
+                         '(best loglr %.2f, allowance %.1f + region %.1f)',
+                         d, len(idx), len(keep), here - lognl, allow,
                          self.loglr_region)
             alive = set(keep.tolist())
             if d == nlev - 1:
@@ -835,6 +841,16 @@ class GameSampler6(DummySampler):
         bound = finite.max() - self.loglr_region
         # NaN and -inf both compare False, so they are excluded here
         passed = numpy.where(node_loglrs > bound)[0]
+        # the tile set is what the dag cut has to reproduce, so it is logged
+        # in full rather than just counted, and GAMES6_DUMP_CUT names a file
+        # to write the per-tile likelihoods to for a value-level comparison
+        logging.info('cut kept tiles: %i of %i, best %.4f, bound %.4f',
+                     len(passed), len(node_loglrs), finite.max(), bound)
+        logging.info('cut kept tiles: %s', ','.join(map(str, passed)))
+        dump = os.environ.get('GAMES6_DUMP_CUT')
+        if dump:
+            numpy.save(dump, node_loglrs)
+            logging.info('wrote the cut likelihoods to %s', dump)
 
         if start_nodes is not None \
                 and finite.max() - finite.min() < self.loglr_region:
