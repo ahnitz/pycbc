@@ -1623,25 +1623,37 @@ class GameSampler6(DummySampler):
                 and v['loglr'] is not None}
         if not live:
             return
-        here = [strata[k] for k in self._tau_keys
-                if k in strata and strata[k]['loglr'] is not None]
-        if last is not None and last['loglr'] is not None \
-                and not any(v is last for v in here):
-            here.append(last)
-        if here:
-            def acc(tau):
-                lw = numpy.concatenate([self._at_tau(v, tau) for v in here])
-                return self._ess(lw)
-        else:
-            def acc(tau):
-                lw = numpy.concatenate([self._at_tau(v, tau)
-                                        for v in live.values()])
-                return self._ess(lw)
+        # Retention is measured on the LAST ROUND, the same sample and the
+        # same quantity the trigger uses. That makes the decision
+        # self-consistent: the gate fires at `gen_anneal_ess` of the round's
+        # draws, and the step retains `gen_anneal_step` of THAT, so a 20%
+        # gate with a 0.5 floor targets ~10% of the round's draws after the
+        # step -- about 200 effective of 2000, which is well conditioned.
+        #
+        # The earlier pooled version mixed in the rounds from earlier in the
+        # rung, which were drawn from broader, less converged proposals that
+        # no longer exist. At tau=0.0022 those ran 0.92, 7.75, ..., 20.30%,
+        # so pooling eight of them gave only 1.6x the last round's own
+        # T-ESS while distorting the shape of the ESS(tau) curve.
+        if last is None or last['loglr'] is None:
+            return
+        nlast = max(len(last['logw']), 1)
+
+        def acc(tau):
+            return self._ess(self._at_tau(last, tau))
 
         now = acc(self._tau)
         if not numpy.isfinite(now) or now <= 0:
             return
         floor = self.gen_anneal_step * now
+        # A patience step happens BECAUSE the round was poor, so `now` is a
+        # few effective samples and the retention rule has nothing to bind
+        # on -- measured, it let tau jump 1200x at 0.12% efficiency. Cap
+        # those steps at a fixed multiple instead and let the next rung's
+        # rounds re-establish a measurable curve.
+        cap = None
+        if not gate or now < 0.02 * nlast:
+            cap = min(1.0, self._tau * 2.0) if self._tau > 0 else None
         # Log-spaced STEP SIZES, not a linear tau grid. The tilt applied by
         # a step is (tau' - tau) * loglr, and loglr spans thousands of nats
         # inside one tile at high SNR, so the first affordable step is
@@ -1657,6 +1669,8 @@ class GameSampler6(DummySampler):
         best = None
         for dt in deltas:
             t = min(1.0, self._tau + dt)
+            if cap is not None and t > cap:
+                continue
             e = acc(t)
             if numpy.isfinite(e) and e >= floor:
                 best = (t, e)
@@ -1664,10 +1678,11 @@ class GameSampler6(DummySampler):
             return
         t, e = best
         logging.info('anneal: %s at %.2f%% of draws, so tau %.4f -> %.4f '
-                     '(this-rung fit ESS %.1f -> %.1f over %i rounds, floor %.1f)',
+                     '(last-round T-ESS %.1f -> %.1f of %i draws, floor %.1f%s)',
                      'efficiency gate' if gate else 'patience', 
                      100.0 * (last_eff or 0.0), self._tau, t, now, e,
-                     len(here), floor)
+                     nlast, floor,
+                     '' if cap is None else ', capped at %.4g' % cap)
         self._tau = float(t)
         self._tau_log.append(float(t))
         self._tau_rounds = 0
