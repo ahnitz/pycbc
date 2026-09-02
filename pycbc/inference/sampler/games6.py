@@ -373,6 +373,30 @@ class GameSampler6(DummySampler):
         only, never the posterior or the evidence. 1 to enable; at low SNR
         the pool already clears the target and this is a no-op. See
         `_pool_fit_weights`.
+    gen_anneal : int
+        Fit the proposal to a TEMPERED target L^tau pi and sharpen tau to 1
+        as the shape converges, instead of demanding the KDE represent the
+        posterior from a starved pool in one step. 0 reproduces the
+        un-annealed behaviour exactly. Above netSNR ~130 the un-annealed run
+        is degenerate -- Pareto k of order 100, a hundred samples carrying
+        99.9% of the weight, mchirp recovered 2.6-2.8 sigma from the truth --
+        and this repairs it. Below netSNR ~90 it costs 4-16%, since those
+        rounds at tau < 1 were not needed. See ANNEAL_LADDER.md.
+    gen_anneal_ess : float
+        Fraction of a round's draws that must be effective AT THE CURRENT
+        TEMPERATURE before tau sharpens. Cannot be met near tau = 0, where
+        the target is the prior and a sum of local kernels is a poor match to
+        it whatever the shape; `gen_anneal_patience` carries the cold start.
+    gen_anneal_step : float
+        Fraction of the accumulated fit ESS a step must retain. The step is
+        chosen over LOG-SPACED sizes, because one tile spans thousands of
+        nats at high SNR and the first affordable step in tau is ~1e-4.
+    gen_anneal_patience : int
+        Rounds at one temperature after which tau sharpens regardless of
+        efficiency. Do NOT set this to 1: `_tau_rounds` is already 1 when the
+        test runs, so every round steps and the efficiency gate stops having
+        any authority. At netSNR 500 that took all 14 steps on patience, one
+        at 0.13% efficiency, and tau reached 1 unconverged.
     gen_switch_patience : int
         Consecutive rounds the kernel must run BELOW the pool's most recent
         round rate before handing back. One bad round is noise.
@@ -411,7 +435,7 @@ class GameSampler6(DummySampler):
                  gen_anneal=0,
                  gen_anneal_ess=0.20,
                  gen_anneal_step=0.5,
-                 gen_anneal_patience=1,
+                 gen_anneal_patience=10,
                  gen_switch_patience=2,
                  gen_switch_backoff=2.0,
                  tree_start_level=0,
