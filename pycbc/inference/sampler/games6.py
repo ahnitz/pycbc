@@ -408,6 +408,9 @@ class GameSampler6(DummySampler):
                  gen_defer_margin=1.1,
                  gen_switch_ess=0,
                  gen_temper_seed=0,
+                 gen_anneal=0,
+                 gen_anneal_ess=0.20,
+                 gen_anneal_step=0.5,
                  gen_switch_patience=2,
                  gen_switch_backoff=2.0,
                  tree_start_level=0,
@@ -468,6 +471,12 @@ class GameSampler6(DummySampler):
         self.gen_switch_ess = float(gen_switch_ess)
         # Opt-in, like gen_switch_ess and dag_cull.
         self.gen_temper_seed = int(gen_temper_seed)
+        # Anneal the WHOLE fit, not just the seed: see `_step_tau`.
+        self.gen_anneal = int(gen_anneal)
+        self.gen_anneal_ess = float(gen_anneal_ess)
+        self.gen_anneal_step = float(gen_anneal_step)
+        self._tau = 1.0
+        self._tau_log = []
         self.gen_switch_patience = int(gen_switch_patience)
         self.gen_switch_backoff = float(gen_switch_backoff)
         self._deferred = set()
@@ -1032,6 +1041,18 @@ class GameSampler6(DummySampler):
                     # deferral gate is judged on -- see `_defer_gate`.
                     self._gen_eff.append(
                         self._ess(gw) / max(len(gw), 1))
+                    # the anneal trigger is the round's efficiency AT THE
+                    # CURRENT TEMPERATURE, which is what the proposal was
+                    # actually fitted to; the tau=1 efficiency logged above
+                    # is the run's real output and stays the headline
+                    if self.gen_anneal and self._tau < 1.0:
+                        st_now = {'samp': gs, 'loglr': gl, 'logw': gw}
+                        eff_tau = self._ess(
+                            self._at_tau(st_now, self._tau)) / max(len(gw), 1)
+                        logging.info('round %i at tau=%.4f: %.2f%% of draws '
+                                     'effective against the tempered target',
+                                     rnd, self._tau, 100.0 * eff_tau)
+                        self._step_tau(strata, eff_tau)
                     logging.info('round %i generative: ESS %.1f from %i '
                                  'calls (%.2f%%), max weight %.3f',
                                  rnd, self._ess(gw), len(gw),
@@ -1455,6 +1476,114 @@ class GameSampler6(DummySampler):
                          len(samp))
         return prop
 
+    def _at_tau(self, st, tau):
+        """ A stratum's log weights against the TEMPERED target L^tau pi.
+
+        Every stratum stores its tau=1 weight, `logw = loglr + log(prior) -
+        log(proposal)`, so the residual `logw - loglr` is the
+        prior-over-proposal ratio and
+
+            logw(tau) = logw - (1 - tau) * loglr
+
+        holds for the pool and for every generative round alike, whatever
+        proposal drew it. That is the whole reason this is cheap: the stored
+        weights never change, so `_finalise` and `_finalise_evidence` keep
+        seeing exact tau=1 values and the posterior and evidence need no
+        correction. Tempering touches only what the KDE is fitted to and
+        when the temperature moves.
+        """
+        logw, loglr = st['logw'], st['loglr']
+        if tau >= 1.0 or loglr is None:
+            return logw
+        out = numpy.full(len(logw), -numpy.inf)
+        ok = numpy.isfinite(logw) & numpy.isfinite(loglr)
+        out[ok] = logw[ok] - (1.0 - tau) * loglr[ok]
+        return out
+
+    def _init_tau(self, strata):
+        """ Where the ladder starts: the hottest temperature the pool can
+        support, so the first fit is one the KDE can actually sample.
+
+        Same scan as `_pool_fit_weights`, and the same clip at 0 when even a
+        flat likelihood cannot reach the target. If the pool already clears
+        the target then tau stays 1 and the whole feature is inert, which is
+        what happens below about netSNR 40.
+        """
+        st = strata.get('pool')
+        if st is None or st['samp'] is None or st['loglr'] is None:
+            return
+        target = self.gen_switch_ess if self.gen_switch_ess > 0 \
+            else self.gen_min_ess
+        if target <= 0:
+            return
+        if self._ess(st['logw']) >= target:
+            return
+        taus = numpy.linspace(0.0, 1.0, 101)
+        esss = numpy.array([self._ess(self._at_tau(st, t)) for t in taus])
+        esss[~numpy.isfinite(esss)] = 0.0
+        hit = numpy.where(esss >= target)[0]
+        t = float(taus[hit.max()]) if len(hit) \
+            else float(taus[int(numpy.argmax(esss))])
+        self._tau = t
+        self._tau_log.append(t)
+        logging.info('anneal: starting at tau=%.4f, where the pool gives '
+                     '%.1f effective points of a %.0f target (tau=1 gives '
+                     '%.1f)', t, self._ess(self._at_tau(st, t)), target,
+                     self._ess(st['logw']))
+
+    def _step_tau(self, strata, last_eff):
+        """ Lower the temperature once the shape has converged at this one.
+
+        The KDE cannot jump straight to a sharp posterior from a starved
+        pool: it has no way to converge a shape it can never sample well.
+        So the run works at a temperature where it CAN, and sharpens only
+        when the current temperature is being sampled efficiently.
+
+        Trigger: the last round reached `gen_anneal_ess` of its draws as
+        effective samples AT THE CURRENT TEMPERATURE. Step: the largest
+        tau' that keeps the accumulated fit ESS at `gen_anneal_step` of its
+        present value, found by scanning rather than bisection because ESS
+        is not monotone in tau (see `_pool_fit_weights`).
+
+        For a locally Gaussian posterior L^tau pi is Gaussian with
+        covariance scaled by 1/tau, so the family is self-similar and a
+        GEOMETRIC step costs a roughly fixed ESS fraction whatever the SNR.
+        The number of steps therefore grows only logarithmically with SNR:
+        about sixteen spans SNR 20 to 500.
+        """
+        if not self.gen_anneal or self._tau >= 1.0:
+            return
+        if last_eff is None or last_eff < self.gen_anneal_ess:
+            return
+        live = {k: v for k, v in strata.items() if v['samp'] is not None
+                and v['loglr'] is not None}
+        if not live:
+            return
+
+        def acc(tau):
+            lw = numpy.concatenate([self._at_tau(v, tau)
+                                    for v in live.values()])
+            return self._ess(lw)
+
+        now = acc(self._tau)
+        if not numpy.isfinite(now) or now <= 0:
+            return
+        floor = self.gen_anneal_step * now
+        taus = numpy.linspace(self._tau, 1.0, 41)[1:]
+        best = None
+        for t in taus:
+            e = acc(t)
+            if numpy.isfinite(e) and e >= floor:
+                best = (t, e)
+        if best is None:
+            return
+        t, e = best
+        logging.info('anneal: round ran at %.1f%% of draws, so tau %.4f -> '
+                     '%.4f (accumulated fit ESS %.1f -> %.1f, floor %.1f)',
+                     100.0 * last_eff, self._tau, t, now, e, floor)
+        self._tau = float(t)
+        self._tau_log.append(float(t))
+
     def _pool_fit_weights(self, st):
         """ The pool's log weights AS THE KDE SHOULD SEE THEM.
 
@@ -1547,6 +1676,8 @@ class GameSampler6(DummySampler):
         from every stratum, resampled to equal weight.
         """
         names = list(self.model.variable_params)
+        if self.gen_anneal and self._tau >= 1.0 and not self._tau_log:
+            self._init_tau(strata)
         # Weight each stratum's contribution by its own ESS. Normalising
         # every stratum to sum to 1 and concatenating would give each
         # equal total mass regardless of quality, letting a weak stratum
@@ -1559,7 +1690,13 @@ class GameSampler6(DummySampler):
             # the pool is the only stratum that can be weight-degenerate:
             # the generative rounds are drawn from a fitted proposal and
             # carry their own well-behaved weights
-            lw = self._pool_fit_weights(st) if key == 'pool' else st['logw']
+            if self.gen_anneal:
+                # every stratum at the run's current temperature; the pool
+                # is not special once the whole fit is annealed
+                lw = self._at_tau(st, self._tau)
+            else:
+                lw = self._pool_fit_weights(st) if key == 'pool' \
+                    else st['logw']
             wv = numpy.exp(lw - logsumexp(lw))
             ess = self._ess(lw)
             if ess <= 0:
@@ -1943,6 +2080,9 @@ class GameSampler6(DummySampler):
         # a tree whose root level is too coarse prunes weakly and descends
         # a large fraction of its nodes, which shows up here.
         self._finalise_evidence(parts, beta)
+        if self._tau_log:
+            self.meta['anneal_tau_final'] = float(self._tau)
+            self.meta['anneal_tau_steps'] = int(len(self._tau_log))
         self.meta['ncalls'] = self.ncalls
         self.meta['ess'] = total_ess
         self.meta['setup_ncalls'] = self.meta.get('setup_ncalls', 0)
