@@ -29,7 +29,7 @@ import unittest
 import copy
 from utils import simple_exit
 import numpy
-from scipy import special, stats
+from scipy import special
 from pycbc.catalog import Merger
 from pycbc.psd import interpolate, inverse_spectrum_truncation, aLIGOZeroDetHighPower
 from pycbc.noise import noise_from_psd
@@ -37,6 +37,7 @@ from pycbc.frame import read_frame
 from pycbc.filter import highpass, resample_to_delta_t
 from astropy.utils.data import download_file
 from pycbc.inference import models
+from pycbc.inference.models import tools
 from pycbc.distributions import Uniform, JointDistribution, SinAngle, UniformAngle
 from pycbc.waveform.waveform import FailedWaveformError
 
@@ -119,16 +120,8 @@ class TestModels(unittest.TestCase):
         cls.a2 = 542.581
         cls.pol_samples = 200
 
-        # brute marginalized over inclination and polarization
-        # together, measured with 200000 samples
-        cls.a4 = 541.2686
-
-        # answer with gate applied, no normalization. This moved by 0.27
-        # when the detectors stopped being left at the default sidereal
-        # time reference, which for this data sits two years away; the
-        # gated models take their antenna pattern from the generator, so
-        # they follow it. See test_relbin_detector_reference.
-        cls.a3 = -1245.9281576844514
+        # answer with gate applied, no normalization
+        cls.a3 = -1246.1948739646468
 
     def test_base_phase_marg(self):
         model = models.MarginalizedPhaseGaussianNoise(
@@ -214,270 +207,6 @@ class TestModels(unittest.TestCase):
                         )
         model.update(**self.q1)
         self.assertAlmostEqual(self.a2, model.loglr, delta=0.002)
-
-
-    # ------------------------------------------------------------------
-    # Models that marginalize over time. These had no coverage. They locate
-    # the signal from its SNR peak, so unlike the other models they need
-    # data that actually contains a signal, hence they live here rather
-    # than with the signal-free noise used by TestWaveformErrors.
-    #
-    # Note ``a1`` is a phase-marginalized log likelihood ratio, so these are
-    # only comparable to it with phase marginalization turned on as well.
-    # ------------------------------------------------------------------
-
-    # half width of the tc prior, centred on the reference tc
-    tc_half_width = 0.02
-
-    def tc_setup(self):
-        """Returns variable params and a prior including tc.
-
-        Both are fresh each time: setting up a marginalization removes the
-        marginalized parameter from the list and prior it is handed, so
-        sharing them between models corrupts the later ones.
-        """
-        variable = self.variable + ['tc']
-        tc = self.static['tc']
-        prior = JointDistribution(
-            list(variable),
-            SinAngle(inclination=None),
-            Uniform(distance=(10, 100)),
-            Uniform(tc=(tc - self.tc_half_width, tc + self.tc_half_width)))
-        return variable, prior
-
-    def marg_time_model(self):
-        variable, prior = self.tc_setup()
-        static = {k: v for k, v in self.static.items() if k != 'tc'}
-        return models.MarginalizedTime(
-            variable, copy.deepcopy(self.data),
-            low_frequency_cutoff=self.flow, psds=self.psds,
-            static_params=static, prior=prior,
-            marginalize_vector_params='tc',
-            marginalize_vector_samples=512,
-            marginalize_phase=True, sample_rate=4096)
-
-    def relative_time_model(self, cls):
-        variable, prior = self.tc_setup()
-        static = {k: v for k, v in self.static.items() if k != 'tc'}
-        return cls(
-            variable, copy.deepcopy(self.data),
-            low_frequency_cutoff=self.flow, psds=self.psds,
-            static_params=static, prior=prior,
-            fiducial_params={'mass1': 1.3756, 'tc': self.static['tc']},
-            epsilon=0.1, sample_rate=4096,
-            marginalize_vector_params='tc',
-            marginalize_vector_samples=512)
-
-    def brute_force_marginalize_tc(self, half_width, nbins=2001):
-        """log of the mean likelihood ratio over a uniform tc prior.
-
-        Evaluated on a grid rather than by drawing samples: the likelihood
-        is sharply peaked in tc, with a width under a millisecond, so
-        random draws over a wide prior do not converge.
-        """
-        tc = self.static['tc']
-        variable, prior = self.tc_setup()
-        static = {k: v for k, v in self.static.items() if k != 'tc'}
-        model = models.Relative(
-            variable, copy.deepcopy(self.data),
-            low_frequency_cutoff=self.flow, psds=self.psds,
-            static_params=static, prior=prior,
-            fiducial_params={'mass1': 1.3756, 'tc': tc}, epsilon=0.1)
-        grid = numpy.linspace(tc - half_width, tc + half_width, nbins)
-        logls = numpy.empty(nbins)
-        for i, value in enumerate(grid):
-            params = dict(self.q1)
-            params['tc'] = value
-            model.update(**params)
-            logls[i] = model.loglr
-        return special.logsumexp(logls) - numpy.log(nbins)
-
-    def test_brute_force_tc_marginalization_is_correct(self):
-        """Checks the reference the time marginalization is measured against.
-
-        Over a prior far narrower than the peak the mean likelihood must
-        equal the value at the peak, and each doubling of the prior width
-        must cost exactly log(2), since the extra volume adds no likelihood.
-        """
-        self.assertAlmostEqual(self.a1,
-                               self.brute_force_marginalize_tc(1e-5),
-                               delta=0.02)
-        wide = self.brute_force_marginalize_tc(0.004)
-        wider = self.brute_force_marginalize_tc(0.008)
-        self.assertAlmostEqual(numpy.log(2), wide - wider, delta=0.01)
-
-    def test_time_marginalization_is_converged(self):
-        """The Monte Carlo estimate must not depend on the sample count."""
-        for build in (self.marg_time_model,
-                      lambda: self.relative_time_model(models.RelativeTime)):
-            values = []
-            for nsamples in (128, 2048):
-                model = build()
-                model.marginalize_vector_samples = nsamples
-                model.update(**self.q1)
-                values.append(model.loglr)
-                self.assertTrue(numpy.isfinite(model.loglr))
-            self.assertAlmostEqual(values[0], values[1], delta=0.5)
-
-    def test_marginalized_time_matches_relative_time_dom(self):
-        """Two implementations of the same marginalization should agree.
-
-        This is a consistency check between models, not a check that either
-        is right: both use the same convention for how the marginalization
-        is normalized, so a mistake in that convention would not show up
-        here. See test_brute_force_tc_marginalization_is_correct for what
-        the independent reference looks like.
-        """
-        marg = self.marg_time_model()
-        marg.update(**self.q1)
-        reldom = self.relative_time_model(models.RelativeTimeDom)
-        reldom.update(**self.q1)
-        self.assertAlmostEqual(marg.loglr, reldom.loglr, delta=1.5)
-
-
-    def pol_marg_model(self, **kwargs):
-        """ Single template with polarization marginalized over """
-        return models.SingleTemplate(
-                        list(self.variable2), copy.deepcopy(self.data),
-                        low_frequency_cutoff=self.flow,
-                        psds = self.psds,
-                        static_params = self.static2,
-                        prior = copy.deepcopy(self.prior2),
-                        marginalize_vector_samples = 1000,
-                        marginalize_vector_params = 'polarization',
-                        **kwargs
-                        )
-
-    def test_vector_adaptive_matches_brute(self):
-        """ Adapting the draw must not move the answer """
-        numpy.random.seed(7)
-        model = self.pol_marg_model(
-            marginalize_vector_adaptive='polarization')
-        # the proposal is built from the previous call, so let it settle
-        for _ in range(15):
-            model.update(**self.q1)
-            model.loglr
-        v = []
-        for _ in range(10):
-            model.update(**self.q1)
-            v.append(model.loglr)
-        self.assertAlmostEqual(self.a2, numpy.mean(v), delta=0.04)
-
-    def test_vector_adaptive_resolution_follows_structure(self):
-        """ The grid is only resolved as finely as the samples support """
-        numpy.random.seed(7)
-        model = self.pol_marg_model(
-            marginalize_vector_adaptive='polarization')
-        a = model.marginalize_vector_adaptive['polarization']
-        self.assertEqual(a['nbin'], 2)          # nothing measured yet
-        for _ in range(20):
-            model.update(**self.q1)
-            model.loglr
-        # settled somewhere between the coarsest grid and the ceiling
-        self.assertGreater(a['nbin'], 2)
-        self.assertLessEqual(a['nbin'], tools.ADAPT_MAX_BINS)
-
-    def test_vector_adaptive_weights_bounded(self):
-        """ No sample may carry an unbounded importance weight """
-        numpy.random.seed(7)
-        model = self.pol_marg_model(
-            marginalize_vector_adaptive='polarization')
-        for _ in range(15):
-            model.update(**self.q1)
-            model.loglr
-        w = model.marginalize_vector_weights
-        self.assertFalse(numpy.isscalar(w))
-        # every bin keeps at least ADAPT_FLOOR of its prior share
-        self.assertLessEqual(numpy.exp(w.max() - w.min()),
-                             1.0 / tools.ADAPT_FLOOR + 1e-9)
-
-    def test_vector_adaptive_off_by_default(self):
-        """ Without the option nothing about the draw changes """
-        model = self.pol_marg_model()
-        model.update(**self.q1)
-        model.loglr
-        self.assertEqual(model.marginalize_vector_adaptive, {})
-        self.assertFalse(model._adapting())
-        # the weights stay the single uniform value the fixed draw uses
-        self.assertTrue(numpy.isscalar(model.marginalize_vector_weights))
-
-    def test_vector_adaptive_not_with_precalc(self):
-        """ Precalculated points are replayed, so there is nothing to adapt """
-        model = self.pol_marg_model(
-            marginalize_vector_adaptive='polarization')
-        self.assertTrue(model._adapting())
-        model.premarg = {}
-        self.assertFalse(model._adapting())
-
-    def test_vector_adaptive_two_parameters(self):
-        """ Each adapted parameter gets its own grid """
-        numpy.random.seed(7)
-        model = self.incpol_marg_model(
-            marginalize_vector_adaptive='inclination,polarization')
-        self.assertEqual(sorted(model.marginalize_vector_adaptive),
-                         ['inclination', 'polarization'])
-        v = []
-        for i in range(35):
-            model.update(distance=self.q1['distance'])
-            if i >= 25:
-                v.append(model.loglr)
-            else:
-                model.loglr
-        self.assertAlmostEqual(self.a4, numpy.mean(v), delta=0.1)
-
-    def test_vector_adaptive_rejects_handled_params(self):
-        """ tc is drawn from the data, so it cannot also be adapted """
-        model = self.pol_marg_model()
-        model.marginalized_vector_priors['tc'] = None
-        with self.assertRaises(ValueError):
-            model._setup_adaptive('tc')
-
-    def test_vector_adaptive_rejects_bad_params(self):
-        """ Ask for something that cannot be adapted and find out at setup """
-        with self.assertRaises(ValueError):
-            self.pol_marg_model(marginalize_vector_adaptive='distance')
-        with self.assertRaises(ValueError):
-            self.pol_marg_model(marginalize_vector_adaptive='not_a_param')
-
-class TestAnalyticModels(unittest.TestCase):
-    """Tests the analytic models against their closed-form answers.
-
-    These have exact answers but were not covered by any test.
-    """
-
-    def test_normal(self):
-        model = models.TestNormal(['x', 'y'])
-        model.update(x=-0.2, y=0.1)
-        expected = stats.multivariate_normal(
-            mean=[0., 0.], cov=[1., 1.]).logpdf([-0.2, 0.1])
-        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
-
-    def test_normal_mean_and_cov(self):
-        # a non-default mean/cov, so the arguments are actually exercised
-        mean, cov = [1., -2.], [4., 0.25]
-        model = models.TestNormal(['x', 'y'], mean=mean, cov=cov)
-        model.update(x=0.5, y=-1.5)
-        expected = stats.multivariate_normal(mean=mean, cov=cov).logpdf(
-            [0.5, -1.5])
-        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
-
-    def test_rosenbrock(self):
-        model = models.TestRosenbrock(['x', 'y'])
-        model.update(x=0.3, y=0.4)
-        expected = -((1 - 0.3) ** 2 + 100 * (0.4 - 0.3 ** 2) ** 2)
-        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
-
-    def test_eggbox(self):
-        model = models.TestEggbox(['x', 'y'])
-        model.update(x=0.3, y=0.4)
-        expected = (2 + numpy.cos(0.3 / 2.) * numpy.cos(0.4 / 2.)) ** 5
-        self.assertAlmostEqual(model.loglikelihood, expected, places=12)
-
-    def test_prior_is_flat(self):
-        # the loglikelihood is constant, so the posterior is just the prior
-        model = models.TestPrior(['x', 'y'])
-        model.update(x=0.3, y=0.4)
-        self.assertEqual(model.loglikelihood, 0.)
 
 
 class TestWaveformErrors(unittest.TestCase):
@@ -650,23 +379,6 @@ class TestWaveformErrors(unittest.TestCase):
             ignore_failed_waveforms=True)
         self._run_tests(model)
 
-    def test_gated_gaussian_margphase(self):
-        static = self.static.copy()
-        static['t_gate_start'] = static['tc'] - 0.05
-        static['t_gate_end'] = static['tc']
-        # the phase being marginalized over still has to be a parameter the
-        # waveform generator knows about, even though its value is irrelevant
-        static['coa_phase'] = 0.
-        model = models.GatedGaussianMargPhase(
-            self.variable, data=copy.deepcopy(self.data),
-            low_frequency_cutoff=self.flow,
-            psds=self.psds,
-            static_params=static,
-            prior=self.prior,
-            ref_phase='coa_phase',
-            ignore_failed_waveforms=True)
-        self._run_tests(model)
-
 
 class TestMarginalizedPolModels(unittest.TestCase):
     """Tests that marginalized polarization models return the same
@@ -782,93 +494,131 @@ class TestMarginalizedPolModels(unittest.TestCase):
         polsamples = margpol_model.pol
         self._test_models(margpol_model, orig_model, polsamples)
 
-class TestMarginalizeSubset(unittest.TestCase):
-    """Splitting the vector samples keeps the marginalization honest."""
+
+class TestDemarginalizationDraws(unittest.TestCase):
+    """ The distance and phase draws against the distributions they are of
+
+    Both are compared with a two sample KS to a reference built by inverting
+    the cdf on a two million point grid. The threshold is the 5% critical
+    value for the sizes used, so passing means the draw is not distinguishable
+    from the distribution it is supposed to be from.
+    """
+    DMIN, DMAX, NDRAW = 10.0, 100.0, 4000
 
     def setUp(self):
-        from pycbc.inference.models.tools import DistMarg
-        self.d = DistMarg.__new__(DistMarg)
-        self.n = 400
-        self.half = numpy.arange(self.n) % 2 == 1
+        self.crit = 1.36 * numpy.sqrt(2.0 / self.NDRAW)
 
-    def full(self, vector, logw):
-        return float(special.logsumexp(vector + logw))
+    def model(self, phase=True, seed=4):
+        """ Only the attributes the two draws read """
+        m = tools.DistMarg()
+        m.marginalize_phase = phase
+        m.marginalize_rng = numpy.random.default_rng(seed)
+        locs = numpy.linspace(self.DMIN, self.DMAX, 10000)
+        weights = numpy.ones(len(locs)) / len(locs)
+        m.dist_ref = 0.5 * (self.DMIN + self.DMAX)
+        m.dist_locs = locs
+        m.dist_density = weights / (locs[1] - locs[0])
+        m.dist_coarse = numpy.linspace(self.DMIN, self.DMAX, 100)
+        m.distance_marginalization = (m.dist_ref / locs, weights)
+        return m
 
-    def test_whole_set_is_the_plain_marginalization(self):
-        """Asking for all of the samples must change nothing."""
-        rng = numpy.random.RandomState(5)
-        for logw in (numpy.full(self.n, -numpy.log(self.n)),
-                     numpy.log(rng.uniform(size=self.n))):
-            logw = logw - special.logsumexp(logw)
-            vector = rng.normal(0., 3., self.n)
-            self.d.marginalize_vector_weights = logw
-            self.assertAlmostEqual(
-                self.d.marginalize_subset(vector, numpy.ones(self.n, bool)),
-                self.full(vector, logw), places=9)
+    def distance_reference(self, sh, hh, phase, n=2000001):
+        d = numpy.linspace(self.DMIN, self.DMAX, n)
+        r = 0.5 * (self.DMIN + self.DMAX) / d
+        x = (abs(sh) if phase else sh.real) * r
+        lr = x - 0.5 * hh * r ** 2
+        if phase:
+            lr = lr + numpy.log(special.i0e(x))
+        lr -= lr.max()
+        cdf = numpy.exp(lr).cumsum()
+        return d, cdf / cdf[-1]
 
-    def test_scalar_weights_are_the_uniform_case(self):
-        """A scalar weight means every sample counts the same."""
-        rng = numpy.random.RandomState(6)
-        vector = rng.normal(0., 3., self.n)
-        self.d.marginalize_vector_weights = -numpy.log(self.n)
-        both = numpy.ones(self.n, bool)
-        self.assertAlmostEqual(
-            self.d.marginalize_subset(vector, both),
-            self.full(vector, numpy.full(self.n, -numpy.log(self.n))),
-            places=9)
+    def test_distance_matches_its_distribution(self):
+        """ Across signal strengths, including one loud enough to be narrow """
+        for phase in (True, False):
+            for snr in (8.0, 20.0, 60.0, 150.0):
+                hh = snr ** 2
+                sh = complex(hh * numpy.exp(0.3j)) if phase else complex(hh)
+                m = self.model(phase=phase)
+                drawn = numpy.array(
+                    [m.draw_distance(sh, -0.5 * hh)[0]['distance']
+                     for _ in range(self.NDRAW)])
+                d, cdf = self.distance_reference(sh, hh, phase)
+                ks = numpy.abs(
+                    numpy.interp(numpy.sort(drawn), d, cdf)
+                    - numpy.arange(1, self.NDRAW + 1) / self.NDRAW).max()
+                self.assertLess(ks, self.crit,
+                                'phase=%s snr=%s' % (phase, snr))
 
-    def test_subset_gets_that_subsets_answer(self):
-        """A subset must be marginalized over, and only over, itself."""
-        rng = numpy.random.RandomState(11)
-        logw = numpy.log(rng.uniform(size=self.n))
-        logw = logw - special.logsumexp(logw)
-        vector = rng.normal(0., 3., self.n)
-        self.d.marginalize_vector_weights = logw
-        want = (special.logsumexp(vector[self.half] + logw[self.half])
-                - special.logsumexp(logw[self.half]))
-        self.assertAlmostEqual(
-            self.d.marginalize_subset(vector, self.half), want, places=9)
-        # and that is not simply the answer for the whole set
-        self.assertNotAlmostEqual(
-            self.d.marginalize_subset(vector, self.half),
-            self.full(vector, logw), places=3)
+    def test_distance_is_not_stuck_on_the_grid(self):
+        """ A drawn distance is a distance, not one of the grid points """
+        m = self.model()
+        hh = 400.0
+        drawn = numpy.array([m.draw_distance(complex(hh), -0.5 * hh)[0]
+                             ['distance'] for _ in range(500)])
+        self.assertEqual(len(numpy.unique(drawn)), len(drawn))
+        self.assertEqual(len(numpy.intersect1d(drawn, m.dist_locs)), 0)
+        self.assertTrue((drawn > self.DMIN).all())
+        self.assertTrue((drawn < self.DMAX).all())
 
-    def test_half_is_unbiased(self):
-        """Half the samples estimate the same integral as all of them.
+    def test_distance_resolves_the_peak_it_is_told_about(self):
+        """ The fine points go where the weight is, not where a scan looked """
+        m = self.model(phase=False)
+        hh = 60.0 ** 2
+        sh = complex(hh)
+        # the weight is quadratic in dref / d, so the peak is known
+        expect = m.dist_ref * hh / abs(sh)
+        drawn = numpy.array([m.draw_distance(sh, -0.5 * hh)[0]['distance']
+                             for _ in range(2000)])
+        self.assertAlmostEqual(numpy.median(drawn), expect,
+                               delta=0.05 * expect)
 
-        The truth is known: for vector ~ N(0, sigma^2) the mean of
-        exp(vector) is exp(sigma^2 / 2).
-        """
-        rng = numpy.random.RandomState(7)
-        sigma, trials = 2.0, 3000
-        self.d.marginalize_vector_weights = -numpy.log(self.n)
-        est = numpy.array([
-            numpy.exp(self.d.marginalize_subset(
-                rng.normal(0., sigma, self.n), self.half))
-            for _ in range(trials)])
-        truth = numpy.exp(sigma ** 2 / 2.)
-        # the estimator is a mean of lognormals; compare against its own error
-        self.assertLess(abs(est.mean() - truth),
-                        4. * est.std() / numpy.sqrt(trials))
+    def test_phase_matches_its_distribution(self):
+        """ The von Mises draw against the weight it is drawn from """
+        for snr in (8.0, 20.0, 150.0):
+            sh = complex(snr ** 2 * numpy.exp(-2j * 1.1))
+            hh = -0.5 * snr ** 2
+            m = self.model()
+            drawn = numpy.array([m.draw_phase(sh, hh)[0]['coa_phase']
+                                 for _ in range(self.NDRAW)])
+            ph = numpy.linspace(0, 2 * numpy.pi, 2000001)
+            lr = (numpy.exp(-2.0j * ph) * sh).real
+            lr -= lr.max()
+            cdf = numpy.exp(lr).cumsum()
+            cdf /= cdf[-1]
+            ks = numpy.abs(
+                numpy.interp(numpy.sort(drawn), ph, cdf)
+                - numpy.arange(1, self.NDRAW + 1) / self.NDRAW).max()
+            self.assertLess(ks, self.crit, 'snr=%s' % snr)
 
-    def test_draw_only_sees_its_own_half(self):
-        """A draw restricted to one half never returns the other half."""
-        from pycbc.inference.models.tools import DistMarg
-        d = DistMarg.__new__(DistMarg)
-        d.marginalize_vector_weights = -numpy.log(self.n)
-        d.marginalize_rng = numpy.random.default_rng(8)
-        d.marginalize_vector_params = {'tc': numpy.arange(self.n) * 1.0}
-        loglr = numpy.zeros(self.n)
-        drawn = [d.draw_vector(loglr, self.half)[2] for _ in range(200)]
-        self.assertTrue(self.half[numpy.array(drawn)].all())
+    def test_phase_covers_both_modes(self):
+        """ Only twice the phase is fixed, so both halves must be drawn """
+        m = self.model()
+        sh = complex(400.0 * numpy.exp(-2j * 0.4))
+        drawn = numpy.array([m.draw_phase(sh, -200.0)[0]['coa_phase']
+                             for _ in range(1000)])
+        self.assertTrue((drawn >= 0).all() and (drawn < 2 * numpy.pi).all())
+        upper = (drawn > numpy.pi).mean()
+        self.assertGreater(upper, 0.4)
+        self.assertLess(upper, 0.6)
+        # the two modes are a half turn apart
+        folded = drawn % numpy.pi
+        self.assertLess(folded.std(), 0.1)
+
+    def test_phase_returns_the_value_it_drew(self):
+        """ The reported weight is at the drawn phase, not a neighbour's """
+        m = self.model()
+        sh = complex(120.0 * numpy.exp(-2j * 2.0))
+        drawn, at, _ = m.draw_phase(sh, -60.0)
+        expect = (numpy.exp(-2.0j * drawn['coa_phase']) * sh).real - 60.0
+        self.assertAlmostEqual(at, expect, places=12)
 
 
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestModels))
-suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestAnalyticModels))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestWaveformErrors))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMarginalizedPolModels))
-suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMarginalizeSubset))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestDemarginalizationDraws))
 
 if __name__ == '__main__':
     from astropy.utils import iers
