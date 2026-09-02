@@ -667,7 +667,8 @@ class GameSampler6(DummySampler):
                     leaves = self._find_active_leaves(
                         start_nodes[tile], bound,
                         root_loglr=node_loglrs[tile])
-                elif str(tile) in treefile['tree']:
+                elif treefile is not None and 'tree' in treefile \
+                        and str(tile) in treefile['tree']:
                     leaves = self._find_active_leaves(
                         treefile['tree'][str(tile)], bound,
                         root_loglr=node_loglrs[tile])

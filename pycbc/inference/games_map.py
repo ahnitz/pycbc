@@ -288,6 +288,35 @@ class OnlineTree:
                 node = kids[i]
         return node.lid
 
+    def route(self, rep):
+        """ Descend a PRE-BUILT tree, creating nothing. Returns the leaf id.
+
+        For a structure whose levels are template banks rather than promoted
+        draws: coverage at each level is the bank's guarantee, so a draw is
+        placed by taking the closest child at every level. Nothing can be
+        added, which is what lets the whole fill run in parallel.
+        """
+        node = self.root
+        for d, _thr in enumerate(self.thresholds):
+            if node.children is None:
+                return -1
+            idx, kids = node.children
+            if not kids:
+                return -1
+            i, _score = idx.best(rep, -1.0)
+            node = kids[i]
+        return node.lid
+
+    def graft(self, rep, params, parent, depth):
+        """ Attach a node under `parent` at `depth`, numbering it if it is a
+        leaf. Used to assemble a tree from banks rather than from draws.
+        """
+        if parent.children is None:
+            parent.children = (self._new_index(depth), [])
+        idx, kids = parent.children
+        child = self._grow(idx, kids, depth, rep, params)
+        return child
+
     def leaves(self):
         out = []
 

@@ -1,0 +1,358 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2026 Alexander Harvey Nitz
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.
+
+"""Build the games map from template banks rather than from the draws.
+
+The online builder promotes a draw to a representative whenever it fails to
+match any child of the node it reached. That is a covering constrained by
+the hierarchy: a draw can fail locally and split even though a perfectly
+good tile exists elsewhere in the tree, so the tile count runs well above
+what the match level actually requires. Measured against stochastic banks
+over the same space, the online tree used 1.6x the tiles at match 0.90 and
+4.0x at 0.97, and the gap widens as the match tightens.
+
+Here each level is a bank built by pycbc_brute_bank at that level's match,
+so coverage is the bank's guarantee rather than an accident of draw order.
+
+Two steps:
+
+  1. GRAFT -- every template at level d is attached to its closest
+     template at level d-1. Only the banks take part; no draws.
+  2. FILL -- draws descend the finished tree to a leaf. Nothing can be
+     created, so this is embarrassingly parallel: a worker returns one
+     integer and needs nothing back.
+
+Freezing is safe here in a way it was not for the online builder's old
+assign phase, which froze a structure grown from a fixed draw budget: that
+structure was too sparse to honour its own finest threshold, and 6.2% of
+the points landed outside it. A bank covers by construction.
+
+The banks must be built over the SAME prior, PSD, and frequency range as
+this map, or the levels do not describe the same space.
+
+Example:
+
+    pycbc_brute_bank --input-config prior.ini --minimal-match 0.90 \\
+        --output-file bank090.hdf --asd-file asd.txt \\
+        --low-frequency-cutoff 30 ...
+
+    pycbc_inference_build_map_banked \\
+        --config-file prior.ini \\
+        --bank-file bank090.hdf bank097.hdf bank099.hdf \\
+        --map-output map.hdf --tree-output tree.hdf \\
+        --sample-size 30000000 --asd-file asd.txt \\
+        --low-frequency-cutoff 30 --nprocesses 16 --verbose
+"""
+import os
+
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+
+import argparse
+import logging
+import time
+
+import h5py
+import numpy
+
+import pycbc
+from pycbc.waveform import get_fd_waveform
+from pycbc.psd import from_cli, insert_psd_option_group
+from pycbc.types.config import InterpolatingConfigParser
+from pycbc.distributions import (draw_samples_from_config,
+                                 read_params_from_config)
+from pycbc.inference.games_map import whiten_padded
+from multiprocessing import Pool
+
+_G = {}
+
+
+def make_rep(params):
+    """ Whitened, unit-norm, zero-padded representative for one point. """
+    p = dict(params)
+    p.update(_G['stat'])
+    hp, _hc = get_fd_waveform(delta_f=_G['delta_f'], **p)
+    hp.resize(_G['kmax'])
+    return whiten_padded(hp.numpy()[_G['kmin']:_G['kmax']], _G['psd'],
+                         _G['kmin'], _G['kmax'], _G['nfft'])
+
+
+def route_one(params):
+    """ Pool worker: place one draw. The structure is frozen, so all that
+    comes back is the leaf id; route_multi is defined below. """
+    return route_multi(params)
+
+
+def all_fields(samples, i):
+    return {k: float(samples[k][i]) for k in samples.dtype.names}
+
+
+parser = argparse.ArgumentParser(
+    description=__doc__,
+    formatter_class=argparse.RawDescriptionHelpFormatter)
+pycbc.add_common_pycbc_options(parser)
+parser.add_argument('--config-file', required=True,
+                    help='pycbc inference config giving the prior the draws '
+                         'come from; must match the banks')
+parser.add_argument('--bank-file', nargs='+', required=True,
+                    help='one bank per level, COARSEST FIRST')
+parser.add_argument('--map-output', required=True)
+parser.add_argument('--tree-output', required=True)
+parser.add_argument('--sample-size', type=int, required=True)
+parser.add_argument('--block', type=int, default=200000,
+                    help='draws per progress block. Nothing is created while '
+                         'filling, so this only sets reporting granularity')
+parser.add_argument('--low-frequency-cutoff', type=float, default=20.0)
+parser.add_argument('--high-frequency-cutoff', type=float, default=1000.0)
+parser.add_argument('--delta-f', type=float, default=2.0)
+parser.add_argument('--thresholds', type=float, nargs='+', required=True,
+                    help='the match each bank was built at, coarsest first')
+parser.add_argument('--link-margin', type=float, default=0.02,
+                    help='extra angle on the link radius, for the banks '
+                         'being stochastic coverings with a tolerance '
+                         'rather than exact ones')
+parser.add_argument('--match-below', type=float, default=0.98,
+                    help='levels at or below this use time-maximized match '
+                         'when grafting; above it the cheaper overlap')
+parser.add_argument('--nprocesses', type=int, default=1)
+parser.add_argument('--seed', type=int, default=0)
+insert_psd_option_group(parser, include_data_options=False)
+args = parser.parse_args()
+
+pycbc.init_logging(args.verbose)
+
+delta_f = args.delta_f
+kmin = int(args.low_frequency_cutoff / delta_f)
+kmax = int(args.high_frequency_cutoff / delta_f)
+nfft = 2 * kmax
+
+cp = InterpolatingConfigParser([args.config_file])
+var, stat = read_params_from_config(cp, vargs_section='variable_params',
+                                    sargs_section='static_params')
+psd = from_cli(args, kmax + 1, delta_f,
+               args.low_frequency_cutoff - 5)[kmin:kmax].numpy()
+_G.update(stat=stat, psd=psd, nfft=nfft, kmin=kmin, kmax=kmax, delta_f=delta_f)
+
+# ---------------- step 1: levels and links ----------------
+# Each level is a bank, so coverage is guaranteed rather than incidental.
+# A node links to EVERY parent within
+#     acos(M_leaf) + acos(M_d)  (+ a margin)
+# not just its closest. Mismatch is an angle and obeys the triangle
+# inequality, so if a node is the best for some point, every parent that
+# point could descend through lies inside that radius. The margin covers
+# the bank being a stochastic covering with its own tolerance rather than
+# an exact one.
+banks, reps = [], []
+for f in args.bank_file:
+    with h5py.File(f, 'r') as h:
+        n = len(h[var[0]])
+        # a bank template has no waveform_transforms applied, so take
+        # mass1/mass2 from the bank itself
+        extra = [k for k in ('mass1', 'mass2') if k in h]
+        banks.append([{p: float(h[p][i]) for p in list(var) + extra}
+                      for i in range(n)])
+    logging.info('bank %s: %i templates', f, len(banks[-1]))
+nlev = len(banks)
+for d, b in enumerate(banks):
+    reps.append(numpy.array([make_rep(t)[kmin:kmax] for t in b]))
+    logging.info('level %i representatives built', d)
+
+thr = args.thresholds
+if len(thr) != nlev:
+    raise ValueError('need one --thresholds value per bank')
+leaf_ang = numpy.arccos(thr[-1])
+margin = args.link_margin
+
+
+def _match(A, b):
+    """ time-maximized match of b against every row of A, both banded """
+    P = numpy.zeros((len(A), nfft), dtype=complex)
+    P[:, kmin:kmax] = A
+    x = numpy.zeros(nfft, dtype=complex)
+    x[kmin:kmax] = b
+    return numpy.abs(numpy.fft.ifft(numpy.conj(P) * x[None, :],
+                                    axis=1) * nfft).max(axis=1)
+
+
+links = [None]
+for d in range(1, nlev):
+    radius = numpy.cos(leaf_ang + numpy.arccos(thr[d - 1]) + margin)
+    lk = []
+    rescued = 0
+    for i in range(len(reps[d])):
+        m = _match(reps[d - 1], reps[d][i])
+        par = numpy.where(m >= radius)[0]
+        if not len(par):
+            # No parent inside the radius. The node would be unreachable by
+            # any descent and its points would go silently elsewhere, so
+            # fall back to the closest parent: worse than the radius
+            # guarantee, but reachable, and it is reported.
+            par = numpy.array([int(numpy.argmax(m))])
+            rescued += 1
+        lk.append(par.astype(numpy.int32))
+    npar = numpy.array([len(x) for x in lk])
+    if rescued:
+        logging.warning('level %i: %i node(s) had no parent within the '
+                        'radius and were attached to their closest',
+                        d, rescued)
+    logging.info('links level %i -> %i: radius %.4f, parents per node '
+                 'median %.1f max %i, min %i', d, d - 1, radius,
+                 numpy.median(npar), npar.max(), npar.min())
+    links.append(lk)
+
+# cumulative radius: to be sure of reaching the best leaf from level d, a
+# point must keep every node there within the leaf radius plus every link
+# radius below it
+cum = [0.0] * nlev
+acc = leaf_ang
+for d in range(nlev - 1, -1, -1):
+    cum[d] = numpy.cos(acc)
+    if d > 0:
+        acc += numpy.arccos(thr[d - 1]) + margin
+logging.info('descent radii per level: %s',
+             ['%.4f' % c for c in cum])
+_G.update(reps=reps, links=links, cum=cum, nlev=nlev,
+          kmin=kmin, kmax=kmax, nfft=nfft)
+
+
+def route_multi(params):
+    """ Follow EVERY qualifying link down and return the best leaf.
+
+    Single-path descent takes the closest child at each level, which can
+    send a point into a subtree that does not hold its closest leaf when it
+    sits near a cell boundary. Keeping every node inside the cumulative
+    radius removes that.
+    """
+    x = make_rep(params)[_G['kmin']:_G['kmax']]
+    cand = numpy.where(_match(_G['reps'][0], x) >= _G['cum'][0])[0]
+    if not len(cand):
+        cand = numpy.array([int(numpy.argmax(_match(_G['reps'][0], x)))])
+    for d in range(1, _G['nlev']):
+        alive = set(cand.tolist())
+        kids = [i for i, ps in enumerate(_G['links'][d])
+                if alive.intersection(ps.tolist())]
+        if not kids:
+            return -1, -1.0
+        m = _match(_G['reps'][d][kids], x)
+        keep = m >= _G['cum'][d]
+        if not keep.any():
+            keep = m >= m.max()
+        cand = numpy.array(kids)[keep]
+        last = m[keep]
+    j = int(numpy.argmax(last))
+    return int(cand[j]), float(last[j])
+
+
+# ---------------- step 2: fill ----------------
+numpy.random.seed(args.seed)
+done = 0
+blocks_id, blocks_pt, blocks_m = [], [], []
+t0 = time.perf_counter()
+while done < args.sample_size:
+    n = min(args.block, args.sample_size - done)
+    s_ = draw_samples_from_config(args.config_file, n, seed=args.seed + done)
+    rows = [all_fields(s_, i) for i in range(n)]
+    if args.nprocesses > 1:
+        with Pool(args.nprocesses) as pool:
+            got = list(pool.imap(route_one, rows,
+                                 chunksize=max(1, n // (args.nprocesses * 8))))
+            ids = numpy.array([g[0] for g in got], dtype=numpy.int32)
+            ms = numpy.array([g[1] for g in got], dtype=numpy.float32)
+    else:
+        got = [route_one(r) for r in rows]
+        ids = numpy.array([g[0] for g in got], dtype=numpy.int32)
+        ms = numpy.array([g[1] for g in got], dtype=numpy.float32)
+    blocks_id.append(ids)
+    blocks_m.append(ms)
+    blocks_pt.append(numpy.column_stack(
+        [s_[p][:n] for p in var]).astype(numpy.float32))
+    done += n
+    logging.info('fill: %i/%i | %.0f draws/s', done, args.sample_size,
+                 done / (time.perf_counter() - t0))
+
+all_id = numpy.concatenate(blocks_id)
+all_pt = numpy.concatenate(blocks_pt)
+all_m = numpy.concatenate(blocks_m)
+del blocks_id, blocks_pt, blocks_m
+lost = int((all_id < 0).sum())
+if lost:
+    logging.warning('%i draws could not be placed', lost)
+    keep = all_id >= 0
+    all_pt, all_m, all_id = all_pt[keep], all_m[keep], all_id[keep]
+order = numpy.argsort(all_id, kind='stable')
+all_id, all_pt, all_m = all_id[order], all_pt[order], all_m[order]
+bounds = numpy.searchsorted(all_id, numpy.arange(len(reps[-1]) + 1))
+counts = numpy.diff(bounds)
+logging.info('points per leaf: min=%i median=%i max=%i total=%i empty=%i',
+             counts.min(), int(numpy.median(counts)), counts.max(),
+             counts.sum(), int((counts == 0).sum()))
+
+for q in (0.0, 1.0, 5.0, 50.0):
+    logging.info('achieved match p%g = %.4f', q, numpy.percentile(all_m, q))
+logging.info('draws below the leaf threshold %.2f: %.3f%%',
+             thr[-1], 100 * (all_m < thr[-1]).mean())
+
+dtype = [(p, numpy.float32) for p in var]
+meta = {'config': open(args.config_file).read(),
+        'sample_size': int(args.sample_size),
+        'requested_sample_size': int(args.sample_size),
+        'low_frequency_cutoff': float(args.low_frequency_cutoff),
+        'high_frequency_cutoff': float(args.high_frequency_cutoff),
+        'delta_f': float(delta_f), 'seed': int(args.seed),
+        'thresholds': ','.join('%g' % t for t in thr),
+        'link_margin': float(args.link_margin),
+        'banks': ','.join(args.bank_file)}
+
+logging.info('writing %s', args.map_output)
+with h5py.File(args.map_output, 'w') as out:
+    for k_, v_ in meta.items():
+        out.attrs[k_] = v_
+    # the tiles the sampler cuts on are the finest bank
+    for k, p in enumerate(var):
+        out['bank/%s' % p] = numpy.array([t[p] for t in banks[-1]],
+                                         dtype=numpy.float64)
+    for i in range(len(reps[-1])):
+        pts = all_pt[bounds[i]:bounds[i + 1]]
+        arr = numpy.zeros(len(pts), dtype=dtype)
+        for k, p in enumerate(var):
+            arr[p] = pts[:, k]
+        out.create_dataset('map/%i' % i, data=arr, compression='gzip',
+                           shuffle=True, compression_opts=9)
+
+logging.info('writing %s', args.tree_output)
+with h5py.File(args.tree_output, 'w') as out:
+    for k_, v_ in meta.items():
+        out.attrs[k_] = v_
+    # Levels and links as flat arrays. A node can have several parents, so
+    # the hierarchy is an adjacency list rather than a nesting; storing it
+    # as one array per level also avoids the group-per-node layout, which
+    # on the online builder's output was 99.6% HDF5 metadata.
+    for d in range(nlev):
+        g = out.create_group('level_%i' % d)
+        g.attrs['threshold'] = float(thr[d])
+        g.attrs['descent_radius'] = float(cum[d])
+        for k, p in enumerate(var):
+            g['param_%s' % p] = numpy.array([t[p] for t in banks[d]],
+                                            dtype=numpy.float64)
+        if d:
+            flat = numpy.concatenate(links[d]) if len(links[d]) else \
+                numpy.zeros(0, dtype=numpy.int32)
+            off = numpy.zeros(len(links[d]) + 1, dtype=numpy.int64)
+            off[1:] = numpy.cumsum([len(x) for x in links[d]])
+            g['parents'] = flat.astype(numpy.int32)
+            g['parent_offset'] = off
+    out['leaf_n_points'] = counts.astype(numpy.int64)
+    out['leaf_prior_mass'] = counts.astype(numpy.float64)
+
+logging.info('done: %i tiles at the finest level, %i points, %i levels',
+             len(reps[-1]), len(all_pt), nlev)

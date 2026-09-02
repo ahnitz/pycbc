@@ -1,0 +1,198 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2026 Alexander Harvey Nitz
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+
+"""Build a games map with no hierarchy: one bank, points assigned by search.
+
+The hierarchy was meant to avoid comparing a draw against every template,
+but the sampler's cut evaluates a likelihood at EVERY leaf anyway, so the
+tree only pays off if the cut prunes at a coarse level -- which is the
+culling that has never worked. Meanwhile the online tree's tile count runs
+well above what the match level needs, because a draw compares only against
+its current node's children and splits when it fails locally even though a
+good tile exists elsewhere. Against stochastic banks over the same space it
+used 1.6x the tiles at match 0.90 and 4.0x at 0.97.
+
+So: take a single bank at the finest match, assign every draw to its closest
+template by direct search, and write the result as root tiles with no tree.
+The sampler already reads this -- with no tree the cut runs over the flat
+map's tiles.
+
+Assignment is exact. There is no routing, so the boundary problem a
+hierarchy has, where a draw is sent into a subtree that does not hold its
+closest tile, cannot arise.
+
+Overlap is used rather than time-maximized match, which is what the tree
+does at its finest level for the same reason: above about 0.98 the two
+agree closely and overlap is ~19x cheaper. The achieved distribution is
+reported so the assumption can be checked rather than trusted.
+
+Example:
+
+    pycbc_inference_build_map_flat \\
+        --config-file prior.ini --bank-file bank099.hdf \\
+        --map-output map.hdf --sample-size 30000000 \\
+        --asd-file asd.txt --low-frequency-cutoff 30 \\
+        --nprocesses 16 --verbose
+"""
+import os
+
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+
+import argparse
+import logging
+import time
+from multiprocessing import Pool
+
+import h5py
+import numpy
+
+import pycbc
+from pycbc.waveform import get_fd_waveform
+from pycbc.psd import from_cli, insert_psd_option_group
+from pycbc.types.config import InterpolatingConfigParser
+from pycbc.distributions import (draw_samples_from_config,
+                                 read_params_from_config)
+from pycbc.inference.games_map import whiten_padded
+
+_G = {}
+
+
+def make_rep(params):
+    p = dict(params)
+    p.update(_G['stat'])
+    hp, _hc = get_fd_waveform(delta_f=_G['delta_f'], **p)
+    hp.resize(_G['kmax'])
+    return whiten_padded(hp.numpy()[_G['kmin']:_G['kmax']], _G['psd'],
+                         _G['kmin'], _G['kmax'], _G['nfft'])
+
+
+def assign_chunk(rows):
+    """ Pool worker: closest bank template for each draw in `rows`.
+
+    One zgemm against the whole bank rather than a loop, and only the
+    indices and their scores come back.
+    """
+    lo, hi = _G['band']
+    B = numpy.empty((len(rows), hi - lo), dtype=numpy.complex128)
+    for i, r in enumerate(rows):
+        B[i] = make_rep(r)[lo:hi]
+    ov = numpy.abs(_G['bank'] @ B.conj().T)      # (ntmplt, nrows)
+    idx = ov.argmax(axis=0).astype(numpy.int32)
+    return idx, ov[idx, numpy.arange(len(rows))].astype(numpy.float32)
+
+
+def all_fields(samples, i):
+    return {k: float(samples[k][i]) for k in samples.dtype.names}
+
+
+parser = argparse.ArgumentParser(
+    description=__doc__,
+    formatter_class=argparse.RawDescriptionHelpFormatter)
+pycbc.add_common_pycbc_options(parser)
+parser.add_argument('--config-file', required=True)
+parser.add_argument('--bank-file', required=True,
+                    help='template bank defining the tiles')
+parser.add_argument('--map-output', required=True)
+parser.add_argument('--sample-size', type=int, required=True)
+parser.add_argument('--block', type=int, default=100000)
+parser.add_argument('--low-frequency-cutoff', type=float, default=20.0)
+parser.add_argument('--high-frequency-cutoff', type=float, default=1000.0)
+parser.add_argument('--delta-f', type=float, default=2.0)
+parser.add_argument('--nprocesses', type=int, default=1)
+parser.add_argument('--seed', type=int, default=0)
+insert_psd_option_group(parser, include_data_options=False)
+args = parser.parse_args()
+
+pycbc.init_logging(args.verbose)
+delta_f = args.delta_f
+kmin = int(args.low_frequency_cutoff / delta_f)
+kmax = int(args.high_frequency_cutoff / delta_f)
+nfft = 2 * kmax
+
+cp = InterpolatingConfigParser([args.config_file])
+var, stat = read_params_from_config(cp, vargs_section='variable_params',
+                                    sargs_section='static_params')
+psd = from_cli(args, kmax + 1, delta_f,
+               args.low_frequency_cutoff - 5)[kmin:kmax].numpy()
+_G.update(stat=stat, psd=psd, nfft=nfft, kmin=kmin, kmax=kmax,
+          delta_f=delta_f, band=(kmin, kmax))
+
+with h5py.File(args.bank_file, 'r') as h:
+    ntm = len(h[var[0]])
+    # the config derives mass1/mass2 from mchirp/q for a DRAW, but a bank
+    # template arrives without that step; the bank carries them itself
+    extra = [k for k in ('mass1', 'mass2') if k in h]
+    tmplt = [{p: float(h[p][i]) for p in list(var) + extra}
+             for i in range(ntm)]
+logging.info('bank %s: %i templates', args.bank_file, ntm)
+_G['bank'] = numpy.array([make_rep(t)[kmin:kmax] for t in tmplt])
+logging.info('representatives built')
+
+numpy.random.seed(args.seed)
+done = 0
+blocks_id, blocks_pt, blocks_ov = [], [], []
+t0 = time.perf_counter()
+while done < args.sample_size:
+    n = min(args.block, args.sample_size - done)
+    s_ = draw_samples_from_config(args.config_file, n, seed=args.seed + done)
+    rows = [all_fields(s_, i) for i in range(n)]
+    step = max(1, n // (args.nprocesses * 4))
+    parts = [rows[i:i + step] for i in range(0, n, step)]
+    if args.nprocesses > 1:
+        with Pool(args.nprocesses) as pool:
+            out = pool.map(assign_chunk, parts)
+    else:
+        out = [assign_chunk(p) for p in parts]
+    blocks_id.append(numpy.concatenate([o[0] for o in out]))
+    blocks_ov.append(numpy.concatenate([o[1] for o in out]))
+    blocks_pt.append(numpy.column_stack(
+        [s_[p][:n] for p in var]).astype(numpy.float32))
+    done += n
+    logging.info('assign: %i/%i | %.0f draws/s', done, args.sample_size,
+                 done / (time.perf_counter() - t0))
+
+all_id = numpy.concatenate(blocks_id)
+all_pt = numpy.concatenate(blocks_pt)
+all_ov = numpy.concatenate(blocks_ov)
+del blocks_id, blocks_pt, blocks_ov
+for q in (0.0, 1.0, 5.0, 50.0):
+    logging.info('achieved overlap p%g = %.4f', q, numpy.percentile(all_ov, q))
+logging.info('draws below 0.99: %.2f%%', 100 * (all_ov < 0.99).mean())
+
+order = numpy.argsort(all_id, kind='stable')
+all_id, all_pt = all_id[order], all_pt[order]
+bounds = numpy.searchsorted(all_id, numpy.arange(ntm + 1))
+counts = numpy.diff(bounds)
+logging.info('points per tile: min=%i median=%i max=%i empty=%i',
+             counts.min(), int(numpy.median(counts)), counts.max(),
+             int((counts == 0).sum()))
+
+dtype = [(p, numpy.float32) for p in var]
+meta = {'config': open(args.config_file).read(),
+        'sample_size': int(args.sample_size),
+        'requested_sample_size': int(args.sample_size),
+        'low_frequency_cutoff': float(args.low_frequency_cutoff),
+        'high_frequency_cutoff': float(args.high_frequency_cutoff),
+        'delta_f': float(delta_f), 'seed': int(args.seed),
+        'thresholds': 'flat', 'bank_file': args.bank_file}
+logging.info('writing %s', args.map_output)
+with h5py.File(args.map_output, 'w') as out:
+    for k_, v_ in meta.items():
+        out.attrs[k_] = v_
+    for k, p in enumerate(var):
+        out['bank/%s' % p] = numpy.array([t[p] for t in tmplt],
+                                         dtype=numpy.float64)
+    for i in range(ntm):
+        pts = all_pt[bounds[i]:bounds[i + 1]]
+        arr = numpy.zeros(len(pts), dtype=dtype)
+        for k, p in enumerate(var):
+            arr[p] = pts[:, k]
+        out.create_dataset('map/%i' % i, data=arr, compression='gzip',
+                           shuffle=True, compression_opts=9)
+logging.info('done: %i flat tiles, %i points', ntm, len(all_pt))
