@@ -1602,21 +1602,30 @@ class GameSampler6(DummySampler):
         gate = last_eff is not None and last_eff >= self.gen_anneal_ess
         if not gate and self._tau_rounds < self.gen_anneal_patience:
             return
-        # The floor is measured on the LAST ROUND only. Taken over the
-        # accumulation it is dominated by thousands of older, colder samples
-        # that stay well weighted under a small tau increase even when the
-        # live proposal cannot follow -- so it is weakest exactly where tau
-        # is large. That is what let tau jump 0.008 -> 0.204 at netSNR 500
-        # and collapse the tempered efficiency from 25% to 0.06%. Measuring
-        # it on the round just drawn puts it on the same footing as the
-        # efficiency gate: both now ask what the CURRENT proposal can do.
+        # The floor is measured over the rounds AT THE CURRENT TEMPERATURE,
+        # which is the only set commensurate with what the live proposal can
+        # do. Two wrong choices were tried first. The whole accumulation is
+        # dominated by thousands of older, colder samples that barely notice
+        # a tau increase, so it approved a 0.008 -> 0.204 jump that collapsed
+        # the tempered efficiency from 25% to 0.06%. The single last round
+        # is the right temperature but has no statistical power: at netSNR
+        # 500 a round yields an ESS of 2.5, so "retain half of it" is met by
+        # a 1200x jump in tau, and that was worse still. Pooling the rounds
+        # since the last step keeps the temperature clean and grows the
+        # sample as the rung accumulates.
         live = {k: v for k, v in strata.items() if v['samp'] is not None
                 and v['loglr'] is not None}
         if not live:
             return
-        if last is not None and last['loglr'] is not None:
+        here = [strata[k] for k in self._tau_keys
+                if k in strata and strata[k]['loglr'] is not None]
+        if last is not None and last['loglr'] is not None \
+                and not any(v is last for v in here):
+            here.append(last)
+        if here:
             def acc(tau):
-                return self._ess(self._at_tau(last, tau))
+                lw = numpy.concatenate([self._at_tau(v, tau) for v in here])
+                return self._ess(lw)
         else:
             def acc(tau):
                 lw = numpy.concatenate([self._at_tau(v, tau)
@@ -1649,12 +1658,14 @@ class GameSampler6(DummySampler):
             return
         t, e = best
         logging.info('anneal: %s at %.2f%% of draws, so tau %.4f -> %.4f '
-                     '(last-round fit ESS %.1f -> %.1f, floor %.1f)',
+                     '(this-rung fit ESS %.1f -> %.1f over %i rounds, floor %.1f)',
                      'efficiency gate' if gate else 'patience', 
-                     100.0 * (last_eff or 0.0), self._tau, t, now, e, floor)
+                     100.0 * (last_eff or 0.0), self._tau, t, now, e,
+                     len(here), floor)
         self._tau = float(t)
         self._tau_log.append(float(t))
         self._tau_rounds = 0
+        self._tau_keys = []
 
     def _pool_fit_weights(self, st):
         """ The pool's log weights AS THE KDE SHOULD SEE THEM.
