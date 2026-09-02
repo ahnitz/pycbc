@@ -1466,10 +1466,25 @@ class GameSampler6(DummySampler):
 
         flattens the weights without touching the prior-over-proposal
         ratio, so many more distinct pool points inform the centres and
-        covariance. t is not a tunable: it is solved so that ESS(t) reaches
-        the transition target, and clipped at 0 because that is the most
-        shape those points can carry -- there w -> prior/proposal and the
-        ESS is whatever the pool's own coverage gives.
+        covariance. t is not a tunable: it is chosen to reach the transition
+        target with as little tempering as possible.
+
+        ESS(t) is NOT monotone in t, which is the trap here. The residual
+        `logw - loglr` is the pool's own prior-over-proposal ratio, and that
+        is itself skewed: the pool over-samples high-loglr tiles, so at t=0
+        the ratio alone can be MORE degenerate than the untempered weights.
+        Measured on a netSNR 12 case, ESS was 1354 at t=1 and 891 at t=0.
+        A bisection assuming monotonicity therefore picks a temperature that
+        makes the fit worse. Instead the curve is scanned, and
+
+          * if any t reaches the target, take the LARGEST such t, which is
+            the least tempering that suffices and so keeps the most shape;
+          * otherwise take the t that MAXIMISES ESS, which is the most
+            effective shape those draws can give.
+
+        Draws with a non-finite loglr or weight are excluded at every t.
+        They are the distance-range underflows, which carry no information
+        and would otherwise be handed full weight at t=0 where L^0 = 1.
 
         The result is a deliberately over-dispersed PROPOSAL. That costs
         nothing in correctness: every draw is weighted against the proposal
@@ -1479,42 +1494,52 @@ class GameSampler6(DummySampler):
         and the evidence and need the untempered values.
 
         No annealing schedule is needed. `_fit_proposal` weights each
-        stratum by its own ESS, so the pool enters as `target` effective
-        points while every later round enters at full temperature with its
-        own ESS. The seed is outvoted as soon as the generative rounds
-        accumulate past the target, and the fitted shape deflates on its
-        own.
+        stratum by its own ESS, so the pool enters as at most `target`
+        effective points while every later round enters at full temperature
+        with its own ESS. The seed is outvoted once the generative rounds
+        accumulate past the target, and the fitted shape deflates on its own.
         """
         logw, loglr = st['logw'], st['loglr']
         target = self.gen_switch_ess
         if not self.gen_temper_seed or target <= 0 or loglr is None:
             return logw
-        base = logw - loglr
+        ok = numpy.isfinite(logw) & numpy.isfinite(loglr)
+        if not ok.any():
+            return logw
         ess1 = self._ess(logw)
         if ess1 >= target:
             return logw
-        ess0 = self._ess(base)
-        if ess0 <= target:
-            # even a flat likelihood cannot reach the target: take the most
-            # these points can give, which is the pool's own coverage
-            logging.info('tempered pool seed: t=0 gives ESS %.1f against a '
-                         'target of %.0f, so the pool has only %i draws of '
-                         'shape to give (ESS at t=1 was %.1f)',
-                         ess0, target, len(logw), ess1)
-            return base
-        lo, hi = 0.0, 1.0
-        for _ in range(60):
-            mid = 0.5 * (lo + hi)
-            if self._ess(mid * loglr + base) < target:
-                hi = mid
-            else:
-                lo = mid
-        t = 0.5 * (lo + hi)
-        out = t * loglr + base
-        logging.info('tempered pool seed: t=%.4f raises the fit ESS from '
-                     '%.1f to %.1f (target %.0f, %i draws, ESS at t=0 '
-                     'would be %.1f)', t, ess1, self._ess(out), target,
-                     len(logw), ess0)
+
+        base = numpy.full(len(logw), -numpy.inf)
+        base[ok] = logw[ok] - loglr[ok]
+        lr = numpy.where(ok, loglr, 0.0)
+
+        def at(t):
+            out = numpy.full(len(logw), -numpy.inf)
+            out[ok] = t * lr[ok] + base[ok]
+            return out
+
+        ts = numpy.linspace(0.0, 1.0, 101)
+        esss = numpy.array([self._ess(at(t)) for t in ts])
+        esss[~numpy.isfinite(esss)] = 0.0
+        hit = numpy.where(esss >= target)[0]
+        if len(hit):
+            t = float(ts[hit.max()])
+            why = 'least tempering that reaches the target'
+        else:
+            t = float(ts[int(numpy.argmax(esss))])
+            why = 'target unreachable, so this is the ESS maximum'
+        out = at(t)
+        eout = self._ess(out)
+        if eout <= ess1:
+            logging.info('tempered pool seed: no temperature beats the '
+                         'untempered fit (best ESS %.1f at t=%.2f against '
+                         '%.1f at t=1), so it is left alone',
+                         eout, t, ess1)
+            return logw
+        logging.info('tempered pool seed: t=%.3f lifts the fit ESS %.1f -> '
+                     '%.1f of a %.0f target (%s; %i of %i draws usable)',
+                     t, ess1, eout, target, why, int(ok.sum()), len(logw))
         return out
 
     def _fit_proposal(self, strata):
