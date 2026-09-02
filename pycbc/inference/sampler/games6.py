@@ -388,9 +388,21 @@ class GameSampler6(DummySampler):
         the target is the prior and a sum of local kernels is a poor match to
         it whatever the shape; `gen_anneal_patience` carries the cold start.
     gen_anneal_step : float
-        Fraction of the accumulated fit ESS a step must retain. The step is
-        chosen over LOG-SPACED sizes, because one tile spans thousands of
+        Fraction of the LAST ROUND's tempered ESS a step must retain -- the
+        same round and the same quantity the trigger uses, which is what
+        makes the decision self-consistent and easy to reason about. With a
+        0.20 trigger and a 0.5 floor the step lands at about 10% of the
+        round's draws: measured 411 -> 206 and 516 -> 285 of 2000 at netSNR
+        500, so the constraint binds at the floor rather than passing
+        vacuously. Steps come out around 2.5x in tau, geometric as the
+        self-similarity argument predicts.
+
+        Chosen over LOG-SPACED sizes, because one tile spans thousands of
         nats at high SNR and the first affordable step in tau is ~1e-4.
+        A patience step is capped at 2x in tau instead: it happens BECAUSE
+        the round was poor, so the last round holds a few effective samples
+        and the retention rule has nothing to bind on -- uncapped, it let tau
+        jump 1200x at 0.12% efficiency.
     gen_anneal_patience : int
         Rounds at one temperature after which tau sharpens regardless of
         efficiency. Do NOT set this to 1: `_tau_rounds` is already 1 when the
@@ -504,10 +516,6 @@ class GameSampler6(DummySampler):
         self._tau_rounds = 0
         self._tau = 1.0
         self._tau_log = []
-        # keys of the generative strata drawn at the CURRENT temperature;
-        # cleared on every step. `_step_tau` measures its retention floor
-        # over these.
-        self._tau_keys = []
         self.gen_switch_patience = int(gen_switch_patience)
         self.gen_switch_backoff = float(gen_switch_backoff)
         self._deferred = set()
@@ -1071,8 +1079,6 @@ class GameSampler6(DummySampler):
                     rk = 'gen:r%i' % rnd
                     strata[rk] = {'samp': gs, 'loglr': gl, 'logw': gw}
                     self.stratum_calls[rk] = len(gw)
-                    if self.gen_anneal:
-                        self._tau_keys.append(rk)
                     # max normalised weight alongside the ESS: a round
                     # whose ESS collapses because ONE draw dominates is a
                     # different failure from one that is uniformly poor,
@@ -1686,7 +1692,6 @@ class GameSampler6(DummySampler):
         self._tau = float(t)
         self._tau_log.append(float(t))
         self._tau_rounds = 0
-        self._tau_keys = []
 
     def _pool_fit_weights(self, st):
         """ The pool's log weights AS THE KDE SHOULD SEE THEM.
