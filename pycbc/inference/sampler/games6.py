@@ -411,7 +411,7 @@ class GameSampler6(DummySampler):
                  gen_anneal=0,
                  gen_anneal_ess=0.20,
                  gen_anneal_step=0.5,
-                 gen_anneal_patience=2,
+                 gen_anneal_patience=1,
                  gen_switch_patience=2,
                  gen_switch_backoff=2.0,
                  tree_start_level=0,
@@ -1584,9 +1584,21 @@ class GameSampler6(DummySampler):
         if not numpy.isfinite(now) or now <= 0:
             return
         floor = self.gen_anneal_step * now
-        taus = numpy.linspace(self._tau, 1.0, 41)[1:]
+        # Log-spaced STEP SIZES, not a linear tau grid. The tilt applied by
+        # a step is (tau' - tau) * loglr, and loglr spans thousands of nats
+        # inside one tile at high SNR, so the first affordable step is
+        # around 1e-4 in tau. A linear grid whose smallest step is 0.025
+        # only ever offers steps that annihilate the ESS, and the search
+        # then reports that no step is possible -- which is exactly what it
+        # did on the SNR 111 and 500 rungs.
+        span = 1.0 - self._tau
+        if span <= 0:
+            return
+        deltas = numpy.unique(numpy.concatenate([
+            numpy.geomspace(max(span * 1e-7, 1e-9), span, 80), [span]]))
         best = None
-        for t in taus:
+        for dt in deltas:
+            t = min(1.0, self._tau + dt)
             e = acc(t)
             if numpy.isfinite(e) and e >= floor:
                 best = (t, e)
