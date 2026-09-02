@@ -705,6 +705,7 @@ class GameSampler6(DummySampler):
         alive, total, rho2 = None, 0, None
         last_loglr = None
         lognl = float(self.model.lognl)
+        perlev = []
         for d in range(nlev):
             n = len(next(iter(params[d].values())))
             if alive is None:
@@ -738,6 +739,8 @@ class GameSampler6(DummySampler):
                          d, len(idx), len(keep), here - lognl, allow,
                          self.loglr_region)
             alive = set(keep.tolist())
+            perlev.append((idx.copy(), vals.copy(), keep.copy(),
+                           float(here - lognl), float(allow)))
             if d == nlev - 1:
                 last_loglr = numpy.full(n, -numpy.inf)
                 last_loglr[idx] = vals
@@ -746,6 +749,14 @@ class GameSampler6(DummySampler):
         logging.info('dag cut: %i likelihoods against %i tiles (%.1fx fewer)',
                      total, len(last_loglr),
                      len(last_loglr) / max(total, 1))
+        dump = os.environ.get('GAMES6_DUMP_LEVELS')
+        if dump:
+            numpy.savez(dump, lognl=lognl,
+                        **{'l%i_%s' % (d, k): v
+                           for d, row in enumerate(perlev)
+                           for k, v in zip(('idx', 'vals', 'keep', 'best',
+                                            'allow'), row)})
+            logging.info('wrote the per-level cut to %s', dump)
         return last_loglr, total
 
     def _evaluate_start_nodes(self, treefile):
