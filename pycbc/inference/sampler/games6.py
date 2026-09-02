@@ -1000,6 +1000,14 @@ class GameSampler6(DummySampler):
             # enough to fit a kernel with, and `_switch_bad` hands back if
             # that turns out to be premature. See `gen_switch_ess`.
             use_gen = pool_dead or self._switched
+            # Annealing is for a pool that hands over a starved seed, so the
+            # pool-health gate in `_init_tau` is only meaningful once the
+            # pool is FINISHED. Evaluated on the first fit it fires against a
+            # pool of 2000 draws: at netSNR 20 that read 540 effective points
+            # and started tau at 0.25, when the pool went on to reach 1690
+            # and would have skipped annealing altogether. That early latch
+            # is the 4-16% this cost below netSNR 90.
+            self._handover = bool(use_gen)
             if not use_gen:
                 try:
                     ps, pl, pw, bid = self.pool_round(
@@ -1079,7 +1087,7 @@ class GameSampler6(DummySampler):
                         logging.info('round %i at tau=%.4f: %.2f%% of draws '
                                      'effective against the tempered target',
                                      rnd, self._tau, 100.0 * eff_tau)
-                        self._step_tau(strata, eff_tau)
+                        self._step_tau(strata, eff_tau, st_now)
                     logging.info('round %i generative: ESS %.1f from %i '
                                  'calls (%.2f%%), max weight %.3f',
                                  rnd, self._ess(gw), len(gw),
@@ -1558,7 +1566,7 @@ class GameSampler6(DummySampler):
                      '%.1f)', t, self._ess(self._at_tau(st, t)), target,
                      self._ess(st['logw']))
 
-    def _step_tau(self, strata, last_eff):
+    def _step_tau(self, strata, last_eff, last=None):
         """ Lower the temperature once the shape has converged at this one.
 
         The KDE cannot jump straight to a sharp posterior from a starved
@@ -1594,15 +1602,26 @@ class GameSampler6(DummySampler):
         gate = last_eff is not None and last_eff >= self.gen_anneal_ess
         if not gate and self._tau_rounds < self.gen_anneal_patience:
             return
+        # The floor is measured on the LAST ROUND only. Taken over the
+        # accumulation it is dominated by thousands of older, colder samples
+        # that stay well weighted under a small tau increase even when the
+        # live proposal cannot follow -- so it is weakest exactly where tau
+        # is large. That is what let tau jump 0.008 -> 0.204 at netSNR 500
+        # and collapse the tempered efficiency from 25% to 0.06%. Measuring
+        # it on the round just drawn puts it on the same footing as the
+        # efficiency gate: both now ask what the CURRENT proposal can do.
         live = {k: v for k, v in strata.items() if v['samp'] is not None
                 and v['loglr'] is not None}
         if not live:
             return
-
-        def acc(tau):
-            lw = numpy.concatenate([self._at_tau(v, tau)
-                                    for v in live.values()])
-            return self._ess(lw)
+        if last is not None and last['loglr'] is not None:
+            def acc(tau):
+                return self._ess(self._at_tau(last, tau))
+        else:
+            def acc(tau):
+                lw = numpy.concatenate([self._at_tau(v, tau)
+                                        for v in live.values()])
+                return self._ess(lw)
 
         now = acc(self._tau)
         if not numpy.isfinite(now) or now <= 0:
@@ -1630,7 +1649,7 @@ class GameSampler6(DummySampler):
             return
         t, e = best
         logging.info('anneal: %s at %.2f%% of draws, so tau %.4f -> %.4f '
-                     '(accumulated fit ESS %.1f -> %.1f, floor %.1f)',
+                     '(last-round fit ESS %.1f -> %.1f, floor %.1f)',
                      'efficiency gate' if gate else 'patience', 
                      100.0 * (last_eff or 0.0), self._tau, t, now, e, floor)
         self._tau = float(t)
@@ -1729,7 +1748,8 @@ class GameSampler6(DummySampler):
         from every stratum, resampled to equal weight.
         """
         names = list(self.model.variable_params)
-        if self.gen_anneal and self._tau >= 1.0 and not self._tau_log:
+        if self.gen_anneal and self._tau >= 1.0 and not self._tau_log \
+                and getattr(self, '_handover', False):
             self._init_tau(strata)
         # Weight each stratum's contribution by its own ESS. Normalising
         # every stratum to sum to 1 and concatenating would give each
