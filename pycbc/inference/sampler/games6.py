@@ -411,6 +411,7 @@ class GameSampler6(DummySampler):
                  gen_anneal=0,
                  gen_anneal_ess=0.20,
                  gen_anneal_step=0.5,
+                 gen_anneal_patience=2,
                  gen_switch_patience=2,
                  gen_switch_backoff=2.0,
                  tree_start_level=0,
@@ -475,6 +476,8 @@ class GameSampler6(DummySampler):
         self.gen_anneal = int(gen_anneal)
         self.gen_anneal_ess = float(gen_anneal_ess)
         self.gen_anneal_step = float(gen_anneal_step)
+        self.gen_anneal_patience = int(gen_anneal_patience)
+        self._tau_rounds = 0
         self._tau = 1.0
         self._tau_log = []
         self.gen_switch_patience = int(gen_switch_patience)
@@ -1553,7 +1556,19 @@ class GameSampler6(DummySampler):
         """
         if not self.gen_anneal or self._tau >= 1.0:
             return
-        if last_eff is None or last_eff < self.gen_anneal_ess:
+        self._tau_rounds += 1
+        # Two ways in. The efficiency gate is the intended one: sharpen once
+        # the current temperature is being sampled well. But it cannot open
+        # at very low tau, because there the target IS the prior and a KDE
+        # is a sum of local kernels -- its density is lumpy against a broad
+        # flat prior, so w = pi/q spans orders of magnitude and the round
+        # efficiency sits at a few percent however well the shape has
+        # converged. Measured 1-2% at tau=0 on the SNR 111 and 500 rungs.
+        # So patience is the fallback: after that many rounds at one
+        # temperature, step anyway and let the ESS-retention floor below be
+        # the thing that limits how far.
+        gate = last_eff is not None and last_eff >= self.gen_anneal_ess
+        if not gate and self._tau_rounds < self.gen_anneal_patience:
             return
         live = {k: v for k, v in strata.items() if v['samp'] is not None
                 and v['loglr'] is not None}
@@ -1578,11 +1593,13 @@ class GameSampler6(DummySampler):
         if best is None:
             return
         t, e = best
-        logging.info('anneal: round ran at %.1f%% of draws, so tau %.4f -> '
-                     '%.4f (accumulated fit ESS %.1f -> %.1f, floor %.1f)',
-                     100.0 * last_eff, self._tau, t, now, e, floor)
+        logging.info('anneal: %s at %.2f%% of draws, so tau %.4f -> %.4f '
+                     '(accumulated fit ESS %.1f -> %.1f, floor %.1f)',
+                     'efficiency gate' if gate else 'patience', 
+                     100.0 * (last_eff or 0.0), self._tau, t, now, e, floor)
         self._tau = float(t)
         self._tau_log.append(float(t))
+        self._tau_rounds = 0
 
     def _pool_fit_weights(self, st):
         """ The pool's log weights AS THE KDE SHOULD SEE THEM.
