@@ -365,6 +365,14 @@ class GameSampler6(DummySampler):
         2000 ESS -- and converged to 68-79% regardless of it, so the handover
         is worth making early. 0 keeps the old behaviour of waiting for
         exhaustion.
+    gen_temper_seed : int
+        Temper the POOL's likelihood when fitting the generative proposal,
+        so a weight-degenerate pool still hands the kernel a usable shape.
+        The temperature is solved, not tuned: it is whatever reaches
+        `gen_switch_ess` effective points, clipped at 0. Affects the fit
+        only, never the posterior or the evidence. 1 to enable; at low SNR
+        the pool already clears the target and this is a no-op. See
+        `_pool_fit_weights`.
     gen_switch_patience : int
         Consecutive rounds the kernel must run BELOW the pool's most recent
         round rate before handing back. One bad round is noise.
@@ -399,6 +407,7 @@ class GameSampler6(DummySampler):
                  gen_defer_patience=2,
                  gen_defer_margin=1.1,
                  gen_switch_ess=0,
+                 gen_temper_seed=0,
                  gen_switch_patience=2,
                  gen_switch_backoff=2.0,
                  tree_start_level=0,
@@ -457,6 +466,8 @@ class GameSampler6(DummySampler):
         self.gen_defer_patience = int(gen_defer_patience)
         self.gen_defer_margin = float(gen_defer_margin)
         self.gen_switch_ess = float(gen_switch_ess)
+        # Opt-in, like gen_switch_ess and dag_cull.
+        self.gen_temper_seed = int(gen_temper_seed)
         self.gen_switch_patience = int(gen_switch_patience)
         self.gen_switch_backoff = float(gen_switch_backoff)
         self._deferred = set()
@@ -1444,6 +1455,68 @@ class GameSampler6(DummySampler):
                          len(samp))
         return prop
 
+    def _pool_fit_weights(self, st):
+        """ The pool's log weights AS THE KDE SHOULD SEE THEM.
+
+        At high SNR the pool's weight is carried by a handful of draws, so
+        the fit gets almost no shape and the KDE has to rediscover it over
+        many rounds. Tempering the LIKELIHOOD only,
+
+            logw(t) = t * loglr + (logw - loglr)
+
+        flattens the weights without touching the prior-over-proposal
+        ratio, so many more distinct pool points inform the centres and
+        covariance. t is not a tunable: it is solved so that ESS(t) reaches
+        the transition target, and clipped at 0 because that is the most
+        shape those points can carry -- there w -> prior/proposal and the
+        ESS is whatever the pool's own coverage gives.
+
+        The result is a deliberately over-dispersed PROPOSAL. That costs
+        nothing in correctness: every draw is weighted against the proposal
+        actually in force, so only coverage matters, and inflation is the
+        safe direction. These weights are for FITTING ONLY and must never
+        reach `_finalise` or `_finalise_evidence`, which own the posterior
+        and the evidence and need the untempered values.
+
+        No annealing schedule is needed. `_fit_proposal` weights each
+        stratum by its own ESS, so the pool enters as `target` effective
+        points while every later round enters at full temperature with its
+        own ESS. The seed is outvoted as soon as the generative rounds
+        accumulate past the target, and the fitted shape deflates on its
+        own.
+        """
+        logw, loglr = st['logw'], st['loglr']
+        target = self.gen_switch_ess
+        if not self.gen_temper_seed or target <= 0 or loglr is None:
+            return logw
+        base = logw - loglr
+        ess1 = self._ess(logw)
+        if ess1 >= target:
+            return logw
+        ess0 = self._ess(base)
+        if ess0 <= target:
+            # even a flat likelihood cannot reach the target: take the most
+            # these points can give, which is the pool's own coverage
+            logging.info('tempered pool seed: t=0 gives ESS %.1f against a '
+                         'target of %.0f, so the pool has only %i draws of '
+                         'shape to give (ESS at t=1 was %.1f)',
+                         ess0, target, len(logw), ess1)
+            return base
+        lo, hi = 0.0, 1.0
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            if self._ess(mid * loglr + base) < target:
+                hi = mid
+            else:
+                lo = mid
+        t = 0.5 * (lo + hi)
+        out = t * loglr + base
+        logging.info('tempered pool seed: t=%.4f raises the fit ESS from '
+                     '%.1f to %.1f (target %.0f, %i draws, ESS at t=0 '
+                     'would be %.1f)', t, ess1, self._ess(out), target,
+                     len(logw), ess0)
+        return out
+
     def _fit_proposal(self, strata):
         """ Fit the generative proposal to the accumulated posterior samples
         from every stratum, resampled to equal weight.
@@ -1455,11 +1528,15 @@ class GameSampler6(DummySampler):
         # drag the fit toward wherever it happened to draw. This is the
         # same beta-proportional-to-ESS choice `_finalise` uses.
         xs, ws = [], []
-        for st in strata.values():
+        for key, st in strata.items():
             if st['samp'] is None:
                 continue
-            wv = numpy.exp(st['logw'] - logsumexp(st['logw']))
-            ess = self._ess(st['logw'])
+            # the pool is the only stratum that can be weight-degenerate:
+            # the generative rounds are drawn from a fitted proposal and
+            # carry their own well-behaved weights
+            lw = self._pool_fit_weights(st) if key == 'pool' else st['logw']
+            wv = numpy.exp(lw - logsumexp(lw))
+            ess = self._ess(lw)
             if ess <= 0:
                 continue
             xs.append(numpy.column_stack([st['samp'][p] for p in names]))
