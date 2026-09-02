@@ -687,7 +687,10 @@ class GameSampler6(DummySampler):
         Returns (loglrs, nevaluated) with -inf at every tile never reached,
         so the caller's region cut sees only what was actually evaluated.
         """
-        with h5py.File(self.dagfile, 'r') as dag:
+        # the level structure lives in the map file itself; dagfile is only
+        # for the older split artifacts, where it was carried separately
+        src = self.dagfile or self.mapfile
+        with h5py.File(src, 'r') as dag:
             nlev = len([k for k in dag if k.startswith('level_')])
             thr, params, links = [], [], [None]
             for d in range(nlev):
@@ -775,7 +778,7 @@ class GameSampler6(DummySampler):
         cut runs over the flat map's root tiles rather than a tree depth.
         """
         start_nodes = None
-        if self.dag_cull and self.dagfile:
+        if self.dag_cull:
             loglrs, nev = self._dag_cut()
             self.meta['setup_ncalls'] = nev
             return None, loglrs

@@ -106,8 +106,9 @@ parser.add_argument('--config-file', required=True,
                          'come from; must match the banks')
 parser.add_argument('--bank-file', nargs='+', required=True,
                     help='one bank per level, COARSEST FIRST')
-parser.add_argument('--map-output', required=True)
-parser.add_argument('--tree-output', required=True)
+parser.add_argument('--output', required=True,
+                    help='one self-contained map: tiles, point clouds, and '
+                         'the multi-parent level structure')
 parser.add_argument('--sample-size', type=int, required=True)
 parser.add_argument('--block', type=int, default=200000,
                     help='draws per progress block. Nothing is created while '
@@ -313,8 +314,8 @@ meta = {'config': open(args.config_file).read(),
         'link_margin': float(args.link_margin),
         'banks': ','.join(args.bank_file)}
 
-logging.info('writing %s', args.map_output)
-with h5py.File(args.map_output, 'w') as out:
+logging.info('writing %s', args.output)
+with h5py.File(args.output, 'w') as out:
     for k_, v_ in meta.items():
         out.attrs[k_] = v_
     # the tiles the sampler cuts on are the finest bank
@@ -329,10 +330,6 @@ with h5py.File(args.map_output, 'w') as out:
         out.create_dataset('map/%i' % i, data=arr, compression='gzip',
                            shuffle=True, compression_opts=9)
 
-logging.info('writing %s', args.tree_output)
-with h5py.File(args.tree_output, 'w') as out:
-    for k_, v_ in meta.items():
-        out.attrs[k_] = v_
     # Levels and links as flat arrays. A node can have several parents, so
     # the hierarchy is an adjacency list rather than a nesting; storing it
     # as one array per level also avoids the group-per-node layout, which
