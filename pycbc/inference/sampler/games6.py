@@ -692,14 +692,23 @@ class GameSampler6(DummySampler):
             thr, params, links = [], [], [None]
             for d in range(nlev):
                 g = dag['level_%i' % d]
-                thr.append(float(g.attrs['threshold']))
+                # descent_radius, not threshold. The builder links a node to
+                # every parent within a CUMULATIVE cone, deliberately wider
+                # than the bank's own match level, and that cone is what
+                # bounds how far a node's descendants can lie. Using
+                # threshold here understates the reach and prunes nodes
+                # holding the peak: at level 1 it gave 0.97 where the real
+                # reach is 0.918, an allowance of 52 nats against a measured
+                # rise of 200.
+                thr.append(float(g.attrs.get('descent_radius',
+                                             g.attrs['threshold'])))
                 params.append({p: g['param_%s' % p][:]
                                for p in self.dtype.names})
                 if d:
                     off = g['parent_offset'][:]
                     par = g['parents'][:]
                     links.append((par, off))
-        logging.info('dag cut: %s nodes per level, thresholds %s',
+        logging.info('dag cut: %s nodes per level, descent radii %s',
                      [len(next(iter(p.values()))) for p in params], thr)
 
         alive, total, rho2 = None, 0, None
