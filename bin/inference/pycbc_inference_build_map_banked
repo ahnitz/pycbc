@@ -125,6 +125,11 @@ parser.add_argument('--link-margin', type=float, default=0.02,
 parser.add_argument('--match-below', type=float, default=0.98,
                     help='levels at or below this use time-maximized match '
                          'when grafting; above it the cheaper overlap')
+parser.add_argument('--match-precision', choices=('double', 'single'),
+    default='double',
+    help='Precision of the match FFT. single is ~4x faster and moves match '
+         'values by <1e-4, which only matters for a point sitting exactly on '
+         'a descent radius. Verify routing before using it on a new space.')
 parser.add_argument('--nprocesses', type=int, default=1)
 parser.add_argument('--seed', type=int, default=0)
 insert_psd_option_group(parser, include_data_options=False)
@@ -175,11 +180,15 @@ leaf_ang = numpy.arccos(thr[-1])
 margin = args.link_margin
 
 
+_CDTYPE = (numpy.complex64 if args.match_precision == 'single'
+           else numpy.complex128)
+
+
 def _match(A, b):
     """ time-maximized match of b against every row of A, both banded """
-    P = numpy.zeros((len(A), nfft), dtype=complex)
+    P = numpy.zeros((len(A), nfft), dtype=_CDTYPE)
     P[:, kmin:kmax] = A
-    x = numpy.zeros(nfft, dtype=complex)
+    x = numpy.zeros(nfft, dtype=_CDTYPE)
     x[kmin:kmax] = b
     return numpy.abs(numpy.fft.ifft(numpy.conj(P) * x[None, :],
                                     axis=1) * nfft).max(axis=1)
@@ -222,7 +231,20 @@ for d in range(nlev - 1, -1, -1):
         acc += numpy.arccos(thr[d - 1]) + margin
 logging.info('descent radii per level: %s',
              ['%.4f' % c for c in cum])
-_G.update(reps=reps, links=links, cum=cum, nlev=nlev,
+# invert the parent lists: for each node at level d-1, the level d nodes
+# that name it as a parent. The descent wants the children of the live
+# candidates, and finding them by scanning every node at the level costs
+# one set test per node per draw, which is what dominates the fill once the
+# leaf level is large.
+kids_of = [None]
+for d in range(1, nlev):
+    acc = [[] for _ in range(len(reps[d - 1]))]
+    for i, ps in enumerate(links[d]):
+        for q in ps:
+            acc[int(q)].append(i)
+    kids_of.append([numpy.array(x, dtype=numpy.int32) for x in acc])
+
+_G.update(reps=reps, links=links, cum=cum, nlev=nlev, kids_of=kids_of,
           kmin=kmin, kmax=kmax, nfft=nfft)
 
 
@@ -239,9 +261,10 @@ def route_multi(params):
     if not len(cand):
         cand = numpy.array([int(numpy.argmax(_match(_G['reps'][0], x)))])
     for d in range(1, _G['nlev']):
-        alive = set(cand.tolist())
-        kids = [i for i, ps in enumerate(_G['links'][d])
-                if alive.intersection(ps.tolist())]
+        ko = _G['kids_of'][d]
+        groups = [ko[int(p)] for p in cand]
+        kids = (numpy.unique(numpy.concatenate(groups)).tolist()
+                if groups else [])
         if not kids:
             return -1, -1.0
         m = _match(_G['reps'][d][kids], x)
