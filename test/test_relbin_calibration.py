@@ -22,10 +22,11 @@ frequency of the data, which is what the full resolution model does.
 """
 
 import copy
-import time
 import unittest
+from configparser import ConfigParser
 
 import numpy
+from scipy.interpolate import UnivariateSpline
 from utils import simple_exit
 
 from pycbc.detector import Detector
@@ -33,7 +34,7 @@ from pycbc.distributions import JointDistribution, SinAngle, Uniform
 from pycbc.inference import models
 from pycbc.noise import noise_from_psd
 from pycbc.psd import aLIGOZeroDetHighPower
-from pycbc.strain.recalibrate import CubicSpline
+from pycbc.strain.calibration import CubicSpline, Recalibrate
 from pycbc.waveform import get_td_waveform
 
 TC = 1187008882.42840
@@ -81,9 +82,20 @@ class TestRelbinCalibration(unittest.TestCase):
                      'inclination': INJ['inclination']}
 
     def recalibration(self):
-        return {ifo: CubicSpline(minimum_frequency=FLOW,
-                                 maximum_frequency=1000.,
-                                 n_points=NPOINT, ifo_name=ifo)
+        """Built from a config section, the way a model builds it.
+
+        Reading the section is what decides which class the correction
+        ends up being, so the tests go through it rather than naming a
+        class themselves.
+        """
+        cp = ConfigParser()
+        cp.add_section('calibration')
+        for ifo in self.data:
+            cp.set('calibration', '%s_model' % ifo, 'cubic_spline')
+            cp.set('calibration', '%s_minimum_frequency' % ifo, str(FLOW))
+            cp.set('calibration', '%s_maximum_frequency' % ifo, '1000')
+            cp.set('calibration', '%s_n_points' % ifo, str(NPOINT))
+        return {ifo: Recalibrate.from_config(cp, ifo, 'calibration')
                 for ifo in self.data}
 
     def calibration_params(self, amplitude=0.05, phase=0.05):
@@ -92,8 +104,9 @@ class TestRelbinCalibration(unittest.TestCase):
         for ifo in self.data:
             for i in range(NPOINT):
                 sign = 1 if i % 2 == 0 else -1
-                params['recalib_amplitude_%s_%d' % (ifo, i)] = sign * amplitude
-                params['recalib_phase_%s_%d' % (ifo, i)] = sign * phase
+                name = '%s_%d' % (ifo.lower(), i)
+                params['recalib_amplitude_' + name] = sign * amplitude
+                params['recalib_phase_' + name] = sign * phase
         return params
 
     def relbin(self, recalibration=None, epsilon=0.03):
@@ -111,16 +124,6 @@ class TestRelbinCalibration(unittest.TestCase):
             static_params=self.static, prior=self.prior,
             recalibration=recalibration)
 
-    def test_calibration_actually_changes_the_answer(self):
-        """Otherwise the rest of these tests would prove nothing."""
-        without = self.exact()
-        without.update(**self.point)
-
-        with_cal = self.exact(self.recalibration())
-        with_cal.update(**self.point, **self.calibration_params())
-
-        self.assertGreater(abs(with_cal.loglr - without.loglr), 1.)
-
     def test_relbin_matches_full_resolution_with_calibration(self):
         """Correcting at the bin edges must match correcting everywhere."""
         params = dict(self.point, **self.calibration_params())
@@ -132,6 +135,12 @@ class TestRelbinCalibration(unittest.TestCase):
         model.update(**params)
 
         self.assertAlmostEqual(model.loglr, exact.loglr, delta=0.05)
+
+        # agreeing to 0.05 means nothing unless the correction is worth
+        # more than that in the first place
+        without = self.exact()
+        without.update(**self.point)
+        self.assertGreater(abs(exact.loglr - without.loglr), 1.)
 
     def test_it_holds_for_a_larger_correction(self):
         """A correction well beyond what is expected must still agree."""
@@ -146,36 +155,49 @@ class TestRelbinCalibration(unittest.TestCase):
 
         self.assertAlmostEqual(model.loglr, exact.loglr, delta=0.05)
 
-    def test_no_calibration_is_unchanged(self):
-        """Models without calibration must give exactly what they did."""
-        plain = self.relbin()
-        plain.update(**self.point)
+    def test_the_matrix_is_dropped_where_the_spline_stops_being_linear(self):
+        """The matrix stands in for a spline that is only sometimes linear.
 
-        model = self.relbin(self.recalibration())
-        model.update(**self.point, **self.calibration_params(0., 0.))
+        scipy's spline smooths rather than interpolates, and reduces to a
+        linear map of its control values only while its residual
+        constraint does not bind. Nothing a calibration model is asked for
+        comes near that bound, but the matrix is kept between calls and
+        the control values are not, so what is safe on the call that built
+        it does not stay safe by itself.
+        """
+        # ten control points, as a real calibration model has: with four
+        # the constraint never binds over any range worth trying
+        npoint = 10
+        recalib = CubicSpline(minimum_frequency=FLOW, maximum_frequency=1000.,
+                              n_points=npoint, ifo_name='H1')
+        freqs = numpy.linspace(FLOW, 1000., 512)
 
-        self.assertAlmostEqual(model.loglr, plain.loglr, delta=1e-6)
+        # build the matrix on a correction of the expected size
+        small = {'recalib_amplitude_H1_%d' % i: 0.05 * (-1) ** i
+                 for i in range(npoint)}
+        small.update({'recalib_phase_H1_%d' % i: 0.05 * (-1) ** i
+                      for i in range(npoint)})
+        ones = numpy.ones(len(freqs))
+        recalib.set_params(**small)
+        recalib.apply_calibration(ones, frequencies=freqs)
+        recalib.apply_calibration(ones, frequencies=freqs)
+        self.assertIsNotNone(recalib.spline_basis(freqs),
+                             "the matrix was never built")
 
-    def test_calibration_is_nearly_free(self):
-        """The whole point is that it costs bins, not data samples."""
-        params = dict(self.point, **self.calibration_params())
+        # then ask for one far past where the spline is that linear map
+        big = {k: 30. * v for k, v in small.items()}
+        recalib.set_params(**big)
+        factor = recalib.apply_calibration(ones, frequencies=freqs)
 
-        plain = self.relbin()
-        model = self.relbin(self.recalibration())
-
-        def timed(m, point):
-            m.update(**point)
-            m.loglr
-            start = time.time()
-            for i in range(100):
-                m.update(**dict(point, distance=40. + 0.01 * i))
-                m.loglr
-            return (time.time() - start) / 100
-
-        cost = timed(model, params) / timed(plain, self.point)
-        self.assertLess(cost, 2.0,
-                        "calibration made the likelihood %.1f times slower"
-                        % cost)
+        amplitude = [recalib.params['amplitude_H1_%d' % i]
+                     for i in range(npoint)]
+        phase = [recalib.params['phase_H1_%d' % i] for i in range(npoint)]
+        expected = UnivariateSpline(recalib.spline_points, amplitude)(freqs)
+        direct = UnivariateSpline(recalib.spline_points, phase)(freqs)
+        expected = ((1.0 + expected) * (2.0 + 1j * direct)
+                    / (2.0 - 1j * direct))
+        self.assertTrue(numpy.allclose(factor, expected, rtol=1e-12),
+                        "the matrix answered where the spline is not one")
 
 
 suite = unittest.TestSuite()

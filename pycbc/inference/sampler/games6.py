@@ -502,6 +502,7 @@ class GameSampler6(DummySampler):
         # Loading on informative directions below which a parameter is
         # handed to the prior exactly. 0 disables.
         self.gen_defer = float(gen_defer)
+        self._prior_mom = None
         self.gen_defer_ratio = float(gen_defer_ratio)
         self.gen_defer_patience = int(gen_defer_patience)
         self.gen_defer_margin = float(gen_defer_margin)
@@ -1874,8 +1875,11 @@ class GameSampler6(DummySampler):
                          ', '.join(names[i] for i in model_idx))
         try:
             box = self._box() if self.gen_truncate else None
-            if box is not None and defer:
+            if box is not None:
                 box = (box[0][model_idx], box[1][model_idx])
+                if not numpy.all(numpy.isfinite(box[0])
+                                 & numpy.isfinite(box[1])):
+                    box = None
             prop = LocalCovarianceProposal(
                 centres[:, model_idx] if defer else centres,
                 self._rng, k=self.gen_local_k,
@@ -1945,6 +1949,27 @@ class GameSampler6(DummySampler):
             return out
         return _lp
 
+    def _prior_moments(self):
+        """ The prior's own centre and width for each sampled parameter.
+
+        `_defer_dimensions` measures how much each direction was
+        constrained, which only means anything in units of the prior. The
+        box width over sqrt(12) is that width for a uniform prior and for
+        nothing else: for a Gaussian calibration node truncated at five
+        sigma it is the truncation range, so a parameter the likelihood
+        said nothing about reads 0.115 rather than 1 and is kept.
+        """
+        # Drawn once, and generously: this gates a threshold decision, and
+        # 20000 draws put 0.5% of scatter on each width, which is enough to
+        # move a borderline eigenvalue between runs for no reason.
+        if self._prior_mom is None:
+            names = list(self.model.variable_params)
+            d = self.model.prior_distribution.rvs(size=200000)
+            self._prior_mom = (
+                numpy.array([float(numpy.mean(d[p])) for p in names]),
+                numpy.array([float(numpy.std(d[p])) for p in names]))
+        return self._prior_mom
+
     def _defer_dimensions(self, x, w, names):
         """ Parameters the likelihood has said nothing about, by DIRECTION.
 
@@ -1972,12 +1997,13 @@ class GameSampler6(DummySampler):
         but it is only ever changed on measured efficiency -- the old code
         changed it on this loading alone and latched, see `_defer_decide`.
         """
-        box = self._box()
-        if box is None or self.gen_defer <= 0:
+        if self.gen_defer <= 0:
             return []
-        lo, hi = box
-        psd = (hi - lo) / numpy.sqrt(12.0)
-        u = (x - 0.5 * (lo + hi)) / psd
+        mu, psd = self._prior_moments()
+        assert len(mu) == len(names), (len(mu), len(names))
+        if not numpy.all(numpy.isfinite(psd) & (psd > 0)):
+            return []
+        u = (x - mu) / psd
         try:
             lam, V = numpy.linalg.eigh(numpy.cov(u.T, aweights=w))
         except (numpy.linalg.LinAlgError, ValueError):
@@ -2022,6 +2048,24 @@ class GameSampler6(DummySampler):
         Parameters are then added ONE AT A TIME, lowest loading first, and an
         addition is kept only if it pays. A wrong guess costs one round.
         """
+        # Parameters the map does not carry are ALREADY drawn from the
+        # prior in the pool, exactly, so where they also load on nothing,
+        # modelling them in the kernel is inconsistent with the pool as
+        # well as expensive: sixty calibration nodes make a 66-dimensional
+        # local covariance carrying six parameters' worth of information,
+        # which cost 598 s a fit and returned ESS 17 in ten rounds. These
+        # go straight in. The trial machinery below is for MAPPED
+        # parameters, where the loading sits near its threshold, the
+        # estimate is noisy, and a wrong guess latches.
+        auto = {i for i, p in enumerate(names)
+                if p in self.extra_params and load[i] < self.gen_defer}
+        auto -= self._deferred
+        if auto and len(names) - len(self._deferred) - len(auto) >= 2:
+            logging.info('the map does not carry %i parameter(s) that load '
+                         'on no informative direction; deferring them to '
+                         'the prior', len(auto))
+            self._deferred |= auto
+
         # Judge the outcome of the previous trial addition before anything
         # else: a trial that did not pay is reverted, and no more are tried.
         if self._defer_trial is not None:
@@ -2128,7 +2172,14 @@ class GameSampler6(DummySampler):
 
 
     def _box(self):
-        """ Per-parameter prior bounds, or None if any is unbounded. """
+        """ Per-parameter prior bounds, infinite where there are none.
+
+        A single unbounded prior used to return None here, which switched
+        off kernel truncation for every parameter. Sixty Gaussian
+        calibration nodes alongside six bounded ones is the case that
+        showed it up. The callers subset this and check the part they are
+        going to use.
+        """
         names = list(self.model.variable_params)
         lo = numpy.full(len(names), -numpy.inf)
         hi = numpy.full(len(names), numpy.inf)
@@ -2141,8 +2192,6 @@ class GameSampler6(DummySampler):
                 if k in names:
                     i = names.index(k)
                     lo[i], hi[i] = float(v[0]), float(v[1])
-        if not numpy.all(numpy.isfinite(lo) & numpy.isfinite(hi)):
-            return None
         return lo, hi
 
     def _finalise(self, strata):
