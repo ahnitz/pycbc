@@ -390,12 +390,15 @@ class GameSampler6(DummySampler):
     gen_anneal_step : float
         Fraction of the LAST ROUND's tempered ESS a step must retain -- the
         same round and the same quantity the trigger uses, which is what
-        makes the decision self-consistent and easy to reason about. With a
-        0.20 trigger and a 0.5 floor the step lands at about 10% of the
-        round's draws: measured 411 -> 206 and 516 -> 285 of 2000 at netSNR
-        500, so the constraint binds at the floor rather than passing
-        vacuously. Steps come out around 2.5x in tau, geometric as the
-        self-similarity argument predicts.
+        makes the decision self-consistent and easy to reason about. Steps
+        come out geometric in tau, as the self-similarity argument predicts.
+
+        0.2 with a 0.2 trigger, from an 18-cell grid at netSNR 500 (see
+        results/ANNEAL_LADDER.md). Both knobs order monotonically with no
+        interior optimum, and the pair reads 2126 real ESS against 1245 for
+        the 0.5 floor it replaces. Retention 0.10 to 0.25 is a plateau the
+        grid cannot rank within, 31% wide on one injection and one seed, so
+        0.2 is a choice inside the plateau rather than a measured peak.
 
         Chosen over LOG-SPACED sizes, because one tile spans thousands of
         nats at high SNR and the first affordable step in tau is ~1e-4.
@@ -446,7 +449,7 @@ class GameSampler6(DummySampler):
                  gen_temper_seed=0,
                  gen_anneal=0,
                  gen_anneal_ess=0.20,
-                 gen_anneal_step=0.5,
+                 gen_anneal_step=0.2,
                  gen_anneal_patience=10,
                  gen_switch_patience=2,
                  gen_switch_backoff=2.0,
