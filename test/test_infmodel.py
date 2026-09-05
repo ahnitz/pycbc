@@ -27,6 +27,9 @@ These are the unittests for pycbc.inference.models
 
 import unittest
 import copy
+import os
+import shutil
+import tempfile
 from utils import simple_exit
 import numpy
 from scipy import special
@@ -37,6 +40,7 @@ from pycbc.frame import read_frame
 from pycbc.filter import highpass, resample_to_delta_t
 from pycbc.io import get_file
 from pycbc.inference import models
+from pycbc.inference.models import tools
 from pycbc.distributions import Uniform, JointDistribution, SinAngle, UniformAngle
 from pycbc.waveform.waveform import FailedWaveformError
 
@@ -493,10 +497,123 @@ class TestMarginalizedPolModels(unittest.TestCase):
         polsamples = margpol_model.pol
         self._test_models(margpol_model, orig_model, polsamples)
 
+
+class TestDistanceInterpolantCache(unittest.TestCase):
+    """ Storing the distance marginalization table instead of rebuilding it
+
+    The table costs an evaluation per grid point, which is the whole reason to
+    keep it. What these check is that it is only ever read back for the
+    configuration that produced it, and that nothing about the cache can stop
+    a run that would otherwise have worked.
+    """
+    DENSITY = (12, 12)
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        locs = numpy.linspace(10.0, 100.0, 200)
+        weights = numpy.ones(len(locs)) / len(locs)
+        self.dist_marg = (55.0 / locs, weights)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def build(self, cache=None, **kwargs):
+        kwargs.setdefault('density', self.DENSITY)
+        return tools.setup_distance_marg_interpolant(
+            self.dist_marg, cache=cache, **kwargs)
+
+    def files(self):
+        return sorted(os.listdir(self.dir))
+
+    def test_second_call_reads_what_the_first_wrote(self):
+        first = self.build(cache=self.dir)
+        self.assertEqual(len(self.files()), 1)
+        second = self.build(cache=self.dir)
+        self.assertEqual(len(self.files()), 1)
+        x = numpy.geomspace(3.0, 300.0, 50)
+        y = numpy.geomspace(3.0, 900.0, 50)
+        numpy.testing.assert_array_equal(first(x, y), second(x, y))
+
+    def test_nothing_is_stored_unless_a_directory_is_named(self):
+        self.build()
+        self.assertEqual(self.files(), [])
+
+    def test_a_different_configuration_is_a_different_table(self):
+        """ Anything that changes a value has to change the name """
+        self.build(cache=self.dir)
+        self.build(cache=self.dir, phase=True)
+        self.build(cache=self.dir, snr_range=(2, 40))
+        self.build(cache=self.dir, density=(13, 12))
+        self.assertEqual(len(self.files()), 4)
+
+        # and the distance grid itself, which the name covers in full
+        locs = numpy.linspace(10.0, 90.0, 200)
+        self.dist_marg = (55.0 / locs, numpy.ones(200) / 200)
+        self.build(cache=self.dir)
+        self.assertEqual(len(self.files()), 5)
+
+    def test_scaling_both_bounds_is_the_same_table(self):
+        """ Not a collision: the table really is the same one
+
+        It maps inner products at the reference distance, and the reference
+        scales with the bounds, so a prior of (10, 100) and one of (20, 200)
+        give an identical rescale grid and identical weights. Putting the
+        bounds themselves in the name would split these apart and rebuild the
+        same numbers twice.
+        """
+        def marg(dmin, dmax):
+            locs = numpy.linspace(dmin, dmax, 200)
+            return (0.5 * (dmin + dmax) / locs, numpy.ones(200) / 200)
+
+        near, far = marg(10.0, 100.0), marg(20.0, 200.0)
+        numpy.testing.assert_array_equal(near[0], far[0])
+        numpy.testing.assert_array_equal(near[1], far[1])
+        self.assertEqual(
+            tools.interpolant_cache_key(near, False, (1, 50), self.DENSITY),
+            tools.interpolant_cache_key(far, False, (1, 50), self.DENSITY))
+
+    def test_a_file_that_cannot_be_read_is_not_fatal(self):
+        """ An interrupted write leaves a partial file; rebuild over it """
+        self.build(cache=self.dir)
+        path = os.path.join(self.dir, self.files()[0])
+        with open(path, 'wb') as f:
+            f.write(b'not an npz')
+        with self.assertLogs(level='WARNING'):
+            interp = self.build(cache=self.dir)
+        self.assertTrue(numpy.isfinite(interp(20.0, 40.0)).all())
+        # and it put a usable table back
+        self.assertIsNotNone(tools.read_interpolant_cache(
+            path, *[numpy.load(path)[k] for k in ('shr', 'hhr')]))
+
+    def test_a_table_for_another_grid_is_ignored(self):
+        """ The name should make this unreachable, so it is belt and braces """
+        self.build(cache=self.dir)
+        path = os.path.join(self.dir, self.files()[0])
+        with numpy.load(path) as f:
+            shr, lvals = f['shr'], f['lvals']
+        numpy.savez(path, shr=shr, hhr=shr * 2.0, lvals=lvals)
+        with self.assertLogs(level='WARNING'):
+            self.assertIsNone(tools.read_interpolant_cache(
+                path, shr, shr))
+
+    def test_a_directory_that_cannot_be_written_is_not_fatal(self):
+        """ A cache that cannot be stored must not stop the run """
+        blocked = os.path.join(self.dir, 'blocked')
+        os.makedirs(blocked)
+        os.chmod(blocked, 0o500)
+        try:
+            with self.assertLogs(level='WARNING'):
+                interp = self.build(cache=blocked)
+            self.assertTrue(numpy.isfinite(interp(20.0, 40.0)).all())
+        finally:
+            os.chmod(blocked, 0o700)
+
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestModels))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestWaveformErrors))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMarginalizedPolModels))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestDistanceInterpolantCache))
 
 if __name__ == '__main__':
     from astropy.utils import iers

@@ -1,7 +1,9 @@
 """ Common utility functions for calculation of likelihoods
 """
 
+import hashlib
 import logging
+import os
 import warnings
 from distutils.util import strtobool
 
@@ -60,6 +62,7 @@ class DistMarg():
                               marginalize_distance_interpolator=False,
                               marginalize_distance_snr_range=None,
                               marginalize_distance_density=None,
+                              marginalize_distance_interpolator_cache=None,
                               marginalize_vector_params=None,
                               marginalize_vector_samples=1e3,
                               marginalize_sky_initial_samples=1e6,
@@ -91,6 +94,11 @@ class DistMarg():
             as -numpy.inf.
         marginalize_distance_density: tuple of intes, (1000, 1000)
             The dimensions of the interpolation grid over (sh, hh).
+        marginalize_distance_interpolator_cache: str, None
+            Directory to keep the interpolation table in. Building it costs a
+            evaluation per grid point, and it depends only on the distance
+            prior and the range and density asked for, so runs that share
+            those can share the table. Off unless a directory is named.
 
         Returns
         -------
@@ -226,6 +234,9 @@ class DistMarg():
                 setup_args['snr_range'] = marginalize_distance_snr_range
             if marginalize_distance_density:
                 setup_args['density'] = marginalize_distance_density
+            if marginalize_distance_interpolator_cache:
+                setup_args['cache'] = \
+                    marginalize_distance_interpolator_cache
             i = setup_distance_marg_interpolant(self.distance_marginalization,
                                                 phase=self.marginalize_phase,
                                                 **setup_args)
@@ -801,10 +812,78 @@ class DistMarg():
         return rec
 
 
+def interpolant_cache_key(dist_marg, phase, snr_range, density):
+    """ What the interpolation table depends on, as one digest
+
+    Everything that changes a value in the table belongs here. Anything left
+    out would let a table built for one configuration be loaded for another,
+    which is worse than not caching at all, so the whole distance grid goes in
+    rather than a summary of it. The pycbc version is included so a release
+    that changes the marginalized likelihood does not read back tables built
+    by an older one.
+    """
+    from pycbc import version as pycbc_version
+    dist_rescale, dist_weights = dist_marg
+    digest = hashlib.sha256()
+    for a in (dist_rescale, dist_weights):
+        digest.update(numpy.ascontiguousarray(a, dtype=numpy.float64)
+                      .tobytes())
+    digest.update(repr((bool(phase),
+                        tuple(float(v) for v in snr_range),
+                        tuple(int(v) for v in density),
+                        pycbc_version.version)).encode())
+    return digest.hexdigest()[:32]
+
+
+def read_interpolant_cache(path, shr, hhr):
+    """ The stored table, or None if there is not a usable one
+
+    A file that does not match the grid, or cannot be read at all, is treated
+    as absent: a run that would have built the table anyway can still do so,
+    which matters because an interrupted write leaves a partial file behind.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with numpy.load(path) as f:
+            stored_shr, stored_hhr, lvals = f['shr'], f['hhr'], f['lvals']
+        if (stored_shr.shape == shr.shape and stored_hhr.shape == hhr.shape
+                and numpy.allclose(stored_shr, shr)
+                and numpy.allclose(stored_hhr, hhr)):
+            return lvals
+        logging.warning("Ignoring %s, it does not match the grid asked for",
+                        path)
+    except Exception as e:
+        logging.warning("Ignoring %s, it could not be read (%s)", path, e)
+    return None
+
+
+def write_interpolant_cache(path, shr, hhr, lvals):
+    """ Store the table, and do not leave a partial one if interrupted
+
+    Written beside its destination and moved onto it, so a reader either sees
+    the previous file or the finished one. Several processes building the same
+    table at once is then safe; they each write their own and the last move
+    wins, all of them being the same table.
+    """
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    tmp = '%s.%d.tmp.npz' % (path, os.getpid())
+    try:
+        numpy.savez(tmp, shr=shr, hhr=hhr, lvals=lvals)
+        os.replace(tmp, path)
+    except OSError as e:
+        # a table that cannot be stored is not a reason to stop
+        logging.warning("Could not store the interpolation table at %s (%s)",
+                        path, e)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def setup_distance_marg_interpolant(dist_marg,
                                     phase=False,
                                     snr_range=(1, 50),
-                                    density=(1000, 1000)):
+                                    density=(1000, 1000),
+                                    cache=None):
     """ Create the interpolant for distance marginalization
 
     Parameters
@@ -817,6 +896,11 @@ def setup_distance_marg_interpolant(dist_marg,
         for.
     density: tuple of (float, float)
         The number of samples in either dimension of the 2d interpolant
+    cache: str, optional
+        Directory to keep the table in, so it is built once rather than once
+        per run. The name it is stored under covers everything the table
+        depends on, so a table is only read back for the configuration that
+        produced it.
 
     Returns
     -------
@@ -840,13 +924,28 @@ def setup_distance_marg_interpolant(dist_marg,
 
     shr = numpy.geomspace(shr_min, shr_max, density[0])
     hhr = numpy.geomspace(hhr_min, hhr_max, density[1])
-    lvals = numpy.zeros((len(shr), len(hhr)))
-    logging.info('Setup up likelihood interpolator')
-    for i, sh in enumerate(tqdm.tqdm(shr)):
-        for j, hh in enumerate(hhr):
-            lvals[i, j] = marginalize_likelihood(sh, hh,
-                                                 distance=dist_marg,
-                                                 phase=phase)
+
+    path = None
+    lvals = None
+    if cache:
+        path = os.path.join(cache, 'distance_marg_%s.npz'
+                            % interpolant_cache_key(dist_marg, phase,
+                                                    snr_range, density))
+        lvals = read_interpolant_cache(path, shr, hhr)
+        if lvals is not None:
+            logging.info('Read the likelihood interpolator from %s', path)
+
+    if lvals is None:
+        lvals = numpy.zeros((len(shr), len(hhr)))
+        logging.info('Setup up likelihood interpolator')
+        for i, sh in enumerate(tqdm.tqdm(shr)):
+            for j, hh in enumerate(hhr):
+                lvals[i, j] = marginalize_likelihood(sh, hh,
+                                                     distance=dist_marg,
+                                                     phase=phase)
+        if path is not None:
+            write_interpolant_cache(path, shr, hhr, lvals)
+
     interp = RectBivariateSpline(shr, hhr, lvals)
 
     # said once, the first time it happens
