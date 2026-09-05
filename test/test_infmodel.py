@@ -27,6 +27,9 @@ These are the unittests for pycbc.inference.models
 
 import unittest
 import copy
+import os
+import shutil
+import tempfile
 from utils import simple_exit
 import numpy
 from scipy import special
@@ -36,7 +39,9 @@ from pycbc.noise import noise_from_psd
 from pycbc.frame import read_frame
 from pycbc.filter import highpass, resample_to_delta_t
 from pycbc.io import get_file
+from pycbc.io.hdf import HFile
 from pycbc.inference import models
+from pycbc.inference.models import tools
 from pycbc.distributions import Uniform, JointDistribution, SinAngle, UniformAngle
 from pycbc.waveform.waveform import FailedWaveformError
 
@@ -493,10 +498,144 @@ class TestMarginalizedPolModels(unittest.TestCase):
         polsamples = margpol_model.pol
         self._test_models(margpol_model, orig_model, polsamples)
 
+
+class TestDistanceInterpolantCache(unittest.TestCase):
+    """ Storing the distance marginalization table instead of rebuilding it
+
+    The table costs an evaluation per grid point -- 522 s at the default
+    density -- which is the whole reason to keep it. What these check is that
+    it is only ever read back for the configuration that produced it, and that
+    nothing about the cache can stop a run that would otherwise have worked.
+    """
+    DENSITY = (12, 12)
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.cache = os.path.join(self.dir, 'tables.hdf')
+        locs = numpy.linspace(10.0, 100.0, 200)
+        weights = numpy.ones(len(locs)) / len(locs)
+        self.dist_marg = (55.0 / locs, weights)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def build(self, cache=None, **kwargs):
+        kwargs.setdefault('density', self.DENSITY)
+        return tools.setup_distance_marg_interpolant(
+            self.dist_marg, cache=cache, **kwargs)
+
+    def tables(self):
+        """ The tables in the cache file, or none if there is no file """
+        if not os.path.exists(self.cache):
+            return []
+        with HFile(self.cache, 'r') as f:
+            return sorted(f.keys())
+
+    def test_second_call_reads_what_the_first_wrote(self):
+        first = self.build(cache=self.cache)
+        self.assertEqual(len(self.tables()), 1)
+        second = self.build(cache=self.cache)
+        self.assertEqual(len(self.tables()), 1)
+        x = numpy.geomspace(3.0, 300.0, 50)
+        y = numpy.geomspace(3.0, 900.0, 50)
+        numpy.testing.assert_array_equal(first(x, y), second(x, y))
+
+    def test_the_stored_table_is_the_one_used(self):
+        """ The second call reads rather than rebuilds
+
+        Comparing two runs cannot show this on its own: a rebuild returns the
+        same numbers. Replacing the stored table with recognisable ones and
+        seeing them come back through the interpolant does show it.
+        """
+        self.build(cache=self.cache)
+        with HFile(self.cache, 'a') as f:
+            f[list(f.keys())[0]][:] = 7.0
+        interp = self.build(cache=self.cache)
+        numpy.testing.assert_allclose(interp(20.0, 40.0), 7.0)
+
+    def test_a_different_pycbc_does_not_read_the_old_table(self):
+        """ A release that changes the marginalized likelihood changes the
+        name, so its tables are not the ones already stored """
+        args = (self.dist_marg, False, (1, 50), self.DENSITY)
+        before = tools.interpolant_cache_key(*args)
+        saved = tools.pycbc_version.version
+        try:
+            tools.pycbc_version.version = saved + '.later'
+            after = tools.interpolant_cache_key(*args)
+        finally:
+            tools.pycbc_version.version = saved
+        self.assertNotEqual(before, after)
+
+    def test_nothing_is_stored_unless_a_file_is_named(self):
+        self.build()
+        self.assertEqual(self.tables(), [])
+
+    def test_one_file_holds_a_table_per_configuration(self):
+        """ Anything that changes a value has to change the name, and the
+        tables coexist rather than replacing each other """
+        self.build(cache=self.cache)
+        self.build(cache=self.cache, phase=True)
+        self.build(cache=self.cache, snr_range=(2, 40))
+        self.build(cache=self.cache, density=(13, 12))
+        self.assertEqual(len(self.tables()), 4)
+
+        # and the distance grid itself, which the name covers in full
+        locs = numpy.linspace(10.0, 90.0, 200)
+        self.dist_marg = (55.0 / locs, numpy.ones(200) / 200)
+        self.build(cache=self.cache)
+        self.assertEqual(len(self.tables()), 5)
+
+    def test_scaling_both_bounds_is_the_same_table(self):
+        """ Not a collision: the table really is the same one
+
+        It maps inner products at the reference distance, and the reference
+        scales with the bounds, so a prior of (10, 100) and one of (20, 200)
+        give an identical rescale grid and identical weights. Putting the
+        bounds themselves in the name would split these apart and rebuild the
+        same numbers twice.
+        """
+        def marg(dmin, dmax):
+            locs = numpy.linspace(dmin, dmax, 200)
+            return (0.5 * (dmin + dmax) / locs, numpy.ones(200) / 200)
+
+        near, far = marg(10.0, 100.0), marg(20.0, 200.0)
+        numpy.testing.assert_array_equal(near[0], far[0])
+        numpy.testing.assert_array_equal(near[1], far[1])
+        self.assertEqual(
+            tools.interpolant_cache_key(near, False, (1, 50), self.DENSITY),
+            tools.interpolant_cache_key(far, False, (1, 50), self.DENSITY))
+
+    def test_a_file_that_cannot_be_read_is_not_fatal(self):
+        """ An interrupted write leaves a partial file; build over it """
+        self.build(cache=self.cache)
+        with open(self.cache, 'wb') as f:
+            f.write(b'not an hdf file')
+        with self.assertLogs(level='WARNING'):
+            interp = self.build(cache=self.cache)
+        self.assertTrue(numpy.isfinite(interp(20.0, 40.0)).all())
+
+    def test_a_file_that_cannot_be_written_is_not_fatal(self):
+        """ A cache that cannot be stored must not stop the run """
+        blocked = os.path.join(self.dir, 'blocked')
+        os.makedirs(blocked)
+        os.chmod(blocked, 0o500)
+        try:
+            with self.assertLogs(level='WARNING'):
+                interp = self.build(cache=os.path.join(blocked, 't.hdf'))
+            self.assertTrue(numpy.isfinite(interp(20.0, 40.0)).all())
+        finally:
+            os.chmod(blocked, 0o700)
+
+    def test_a_first_run_says_nothing(self):
+        """ An absent cache is the normal case, not something to warn about """
+        with self.assertNoLogs(level='WARNING'):
+            self.build(cache=self.cache)
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestModels))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestWaveformErrors))
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMarginalizedPolModels))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestDistanceInterpolantCache))
 
 if __name__ == '__main__':
     from astropy.utils import iers

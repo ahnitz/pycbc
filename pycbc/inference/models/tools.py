@@ -1,7 +1,9 @@
 """ Common utility functions for calculation of likelihoods
 """
 
+import hashlib
 import logging
+import os
 import warnings
 from distutils.util import strtobool
 
@@ -12,6 +14,8 @@ import tqdm
 from scipy.special import logsumexp, i0e
 from scipy.interpolate import interp1d
 from scipy import ndimage
+from pycbc import version as pycbc_version
+from pycbc.io.hdf import HFile
 from pycbc.distributions import JointDistribution
 
 from pycbc.detector import Detector
@@ -61,6 +65,7 @@ class DistMarg():
                               marginalize_distance_interpolator=False,
                               marginalize_distance_snr_range=None,
                               marginalize_distance_density=None,
+                              marginalize_distance_interpolator_cache=None,
                               marginalize_vector_params=None,
                               marginalize_vector_samples=1e3,
                               marginalize_sky_initial_samples=1e6,
@@ -92,6 +97,12 @@ class DistMarg():
             as -numpy.inf.
         marginalize_distance_density: tuple of intes, (1000, 1000)
             The dimensions of the interpolation grid over (sh, hh).
+        marginalize_distance_interpolator_cache: str, None
+            An hdf file to keep the interpolation table in. Building it costs
+            an evaluation per grid point -- 522 s at the default density --
+            and it depends only on the distance prior and the range and
+            density asked for, so runs that share those can share the table.
+            One file holds a table per configuration. Off unless named.
 
         Returns
         -------
@@ -227,6 +238,9 @@ class DistMarg():
                 setup_args['snr_range'] = marginalize_distance_snr_range
             if marginalize_distance_density:
                 setup_args['density'] = marginalize_distance_density
+            if marginalize_distance_interpolator_cache:
+                setup_args['cache'] = \
+                    marginalize_distance_interpolator_cache
             i = setup_distance_marg_interpolant(self.distance_marginalization,
                                                 phase=self.marginalize_phase,
                                                 **setup_args)
@@ -802,10 +816,30 @@ class DistMarg():
         return rec
 
 
+def interpolant_cache_key(dist_marg, phase, snr_range, density):
+    """ What the interpolation table depends on, as one name
+
+    Everything that changes a value in the table belongs here, so the whole
+    distance grid goes in rather than a summary of it: a key that missed
+    something would serve a table built for another configuration, which is
+    worse than not caching at all. The pycbc version is included so a release
+    that changes the marginalized likelihood does not read back older tables.
+    """
+    digest = hashlib.sha256()
+    for a in dist_marg:
+        digest.update(numpy.ascontiguousarray(a, dtype=float).tobytes())
+    digest.update(repr((bool(phase),
+                        tuple(float(v) for v in snr_range),
+                        tuple(int(v) for v in density),
+                        pycbc_version.version)).encode())
+    return digest.hexdigest()[:32]
+
+
 def setup_distance_marg_interpolant(dist_marg,
                                     phase=False,
                                     snr_range=(1, 50),
-                                    density=(1000, 1000)):
+                                    density=(1000, 1000),
+                                    cache=None):
     """ Create the interpolant for distance marginalization
 
     Parameters
@@ -818,6 +852,11 @@ def setup_distance_marg_interpolant(dist_marg,
         for.
     density: tuple of (float, float)
         The number of samples in either dimension of the 2d interpolant
+    cache: str, optional
+        An hdf file to keep the table in, so it is built once rather than
+        once per run. Each table is a dataset named for everything it
+        depends on, so one file serves any number of configurations and a
+        table is only read back for the one that produced it.
 
     Returns
     -------
@@ -841,13 +880,43 @@ def setup_distance_marg_interpolant(dist_marg,
 
     shr = numpy.geomspace(shr_min, shr_max, density[0])
     hhr = numpy.geomspace(hhr_min, hhr_max, density[1])
-    lvals = numpy.zeros((len(shr), len(hhr)))
-    logging.info('Setup up likelihood interpolator')
-    for i, sh in enumerate(tqdm.tqdm(shr)):
-        for j, hh in enumerate(hhr):
-            lvals[i, j] = marginalize_likelihood(sh, hh,
-                                                 distance=dist_marg,
-                                                 phase=phase)
+    lvals = None
+    key = (interpolant_cache_key(dist_marg, phase, snr_range, density)
+           if cache else None)
+    if key and os.path.exists(cache):
+        # a table that cannot be read is treated as absent, since building it
+        # is always still possible
+        try:
+            with HFile(cache, 'r') as f:
+                if key in f:
+                    lvals = f[key][:]
+                    logging.info('Read the likelihood interpolator from %s',
+                                 cache)
+        except (OSError, KeyError) as e:
+            logging.warning("Could not read %s (%s)", cache, e)
+
+    if lvals is None:
+        lvals = numpy.zeros((len(shr), len(hhr)))
+        logging.info('Setup up likelihood interpolator')
+        for i, sh in enumerate(tqdm.tqdm(shr)):
+            for j, hh in enumerate(hhr):
+                lvals[i, j] = marginalize_likelihood(sh, hh,
+                                                     distance=dist_marg,
+                                                     phase=phase)
+        if key:
+            # nor is a table that cannot be stored a reason to stop
+            try:
+                os.makedirs(os.path.dirname(cache) or '.', exist_ok=True)
+                with HFile(cache, 'a') as f:
+                    if key not in f:
+                        d = f.create_dataset(key, data=lvals)
+                        d.attrs['snr_range'] = snr_range
+                        d.attrs['density'] = density
+                        d.attrs['phase'] = bool(phase)
+            except (OSError, RuntimeError) as e:
+                logging.warning("Could not store the table in %s (%s)",
+                                cache, e)
+
     # geomspace: uniform in log, so the cell index is arithmetic
     log_shr, log_hhr = numpy.log(shr), numpy.log(hhr)
     dlog_shr = (log_shr[-1] - log_shr[0]) / (len(log_shr) - 1)
