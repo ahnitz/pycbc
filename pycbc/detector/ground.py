@@ -33,7 +33,6 @@ import logging
 import numpy as np
 from numpy import cos, sin
 
-import lal
 from astropy import constants, coordinates, units
 from astropy.coordinates.matrix_utilities import rotation_matrix
 from astropy.units.si import sday, meter
@@ -64,6 +63,7 @@ def get_available_lal_detectors():
     updating in the future. Better if lal would expose this information
     properly.
     """
+    import lal
     ld = lal.__dict__
     known_lal_names = [j for j in ld.keys() if "DETECTOR_PREFIX" in j]
     known_prefixes = [ld[k] for k in known_lal_names]
@@ -347,7 +347,8 @@ class Detector(object):
         fcross(default) or fy or fl : float or numpy.ndarray
             The cross or vector-y or longitudnal polarization factor for this sky location / orientation
         """
-        if isinstance(t_gps, lal.LIGOTimeGPS):
+        if hasattr(t_gps, 'gpsSeconds'):
+            # a LIGOTimeGPS, which does not need lal imported to convert
             t_gps = float(t_gps)
         gha = self.gmst_estimate(t_gps) - right_ascension
 

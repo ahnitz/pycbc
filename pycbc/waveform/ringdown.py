@@ -29,7 +29,7 @@ import numpy
 
 from pycbc.libutils import import_optional
 pykerr = import_optional('pykerr')
-lal = import_optional('lal')
+from pycbc.waveform.utils import spin_weighted_spherical_harmonic
 from pycbc.types import (TimeSeries, FrequencySeries, float64, complex128,
                          zeros)
 from pycbc.waveform.waveform import get_obj_attrs
@@ -432,15 +432,10 @@ def spher_harms(harmonics='spherical', l=None, m=None, n=0,
         The harmonic of the -m mode.
     """
     if harmonics == 'spherical':
-        if lal is None:
-            raise ImportError(
-                "lal must be installed for spherical "
-                "harmonics"
-            )
-        xlm = lal.SpinWeightedSphericalHarmonic(inclination, azimuthal, -2,
-                                                l, m)
-        xlnm = lal.SpinWeightedSphericalHarmonic(inclination, azimuthal, -2,
-                                                 l, -m)
+        xlm = spin_weighted_spherical_harmonic(-2, l, m, inclination,
+                                               azimuthal)
+        xlnm = spin_weighted_spherical_harmonic(-2, l, -m, inclination,
+                                                azimuthal)
     elif harmonics == 'spheroidal':
         if spin is None:
             raise ValueError("must provide a spin for spheroidal harmonics")

@@ -27,6 +27,7 @@
 
 from math import frexp
 import numpy
+from scipy.special import comb, factorial
 
 from scipy import signal
 
@@ -523,3 +524,36 @@ def redshift_waveform(srch, z, tref=0):
         # convert back to frequency domain
         redshifted = redshifted.to_frequencyseries()
     return redshifted
+
+
+def spin_weighted_spherical_harmonic(s, l, m, theta, phi):
+    """ Spin weighted spherical harmonic sYlm(theta, phi)
+
+    Parameters
+    ----------
+    s : int
+        Spin weight.
+    l, m : int
+        Mode. Zero is returned if abs(m) or abs(s) is larger than l.
+    theta, phi : float
+        Polar and azimuthal angles, in radians.
+
+    Returns
+    -------
+    complex
+        The value of the harmonic.
+    """
+    if abs(m) > l or abs(s) > l:
+        return 0j
+    # Goldberg et al. (1967). The sum is written with explicit powers of
+    # sin and cos rather than a cotangent, which is singular at theta = 0.
+    norm = ((-1.0) ** m) * numpy.sqrt(
+        factorial(l + m) * factorial(l - m) * (2 * l + 1)
+        / (4.0 * numpy.pi * factorial(l + s) * factorial(l - s)))
+    total = 0.0
+    for r in range(max(0, m - s), min(l - s, l + m) + 1):
+        total += (comb(l - s, r) * comb(l + s, r + s - m)
+                  * ((-1.0) ** (l - r - s))
+                  * numpy.sin(theta / 2.0) ** (2 * l - 2 * r - s + m)
+                  * numpy.cos(theta / 2.0) ** (2 * r + s - m))
+    return norm * total * numpy.exp(1j * m * phi)

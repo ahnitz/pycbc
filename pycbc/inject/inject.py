@@ -29,9 +29,10 @@ import os
 import numpy as np
 import copy
 import logging
+
+from astropy import constants
 from abc import ABCMeta, abstractmethod
 
-import lal
 from igwn_ligolw import utils as ligolw_utils, ligolw, lsctables
 
 from pycbc import waveform, frame, libutils
@@ -48,6 +49,12 @@ import pycbc.io
 from pycbc.io.ligolw import LIGOLWContentHandler
 
 logger = logging.getLogger('pycbc.inject.inject')
+
+# light travel time across the Earth, used to pad the window an injection can
+# reach into. astropy's equatorial radius is the IAU nominal one, 36.6 m under
+# the IERS value lal carries, which is 0.1 us on a 21 ms pad.
+EARTH_TRAVEL_TIME = float(
+    (constants.R_earth / constants.c).to('s').value)
 
 sim = libutils.import_optional('lalsimulation')
 
@@ -226,7 +233,7 @@ class _XMLInjectionSet(object):
                     + str(strain.dtype))
 
         lalstrain = strain.lal()
-        earth_travel_time = lal.REARTH_SI / lal.C_SI
+        earth_travel_time = EARTH_TRAVEL_TIME
         t0 = float(strain.start_time) - earth_travel_time
         t1 = float(strain.end_time) + earth_travel_time
 
@@ -597,7 +604,7 @@ class CBCHDFInjectionSet(_HDFInjectionSet):
             t0 = float(strain.start_time)
             t1 = float(strain.end_time)
         else:
-            earth_travel_time = lal.REARTH_SI / lal.C_SI
+            earth_travel_time = EARTH_TRAVEL_TIME
             t0 = float(strain.start_time) - earth_travel_time
             t1 = float(strain.end_time) + earth_travel_time
 
@@ -1338,7 +1345,7 @@ class SGBurstInjectionSet(object):
 
         lalstrain = strain.lal()
         #detector = Detector(detector_name)
-        earth_travel_time = lal.REARTH_SI / lal.C_SI
+        earth_travel_time = EARTH_TRAVEL_TIME
         t0 = float(strain.start_time) - earth_travel_time
         t1 = float(strain.end_time) + earth_travel_time
 

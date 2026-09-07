@@ -24,6 +24,7 @@ import numpy
 from scipy import special
 
 from pycbc.waveform import generator
+from pycbc.waveform.utils import spin_weighted_spherical_harmonic
 from pycbc.detector import Detector
 from .gaussian_noise import (BaseGaussianNoise,
                              create_waveform_generator,
@@ -697,9 +698,8 @@ class MarginalizedHMPolPhase(BaseGaussianNoise):
                 vlmd = vlm[slc].inner(self._whitened_data[det][slc]).real
 
                 # add inclination, and pack into a complex number
-                import lal
-                glm = lal.SpinWeightedSphericalHarmonic(
-                    params['inclination'], 0, -2, l, m).real
+                glm = spin_weighted_spherical_harmonic(
+                    -2, l, m, params['inclination'], 0).real
 
                 if m not in zetas:
                     zetas[m] = 0j
