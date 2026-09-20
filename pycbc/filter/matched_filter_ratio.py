@@ -40,7 +40,9 @@ class MatchedFilterRatioControl(object):
     """
 
     def __init__(self, snr_threshold, delta_f,
-                 high_frequency_cutoff=None, fir_fft_length=4096, batch_size=64, tap_sample_rate=2048, engine_sample_rate=2048):
+                 high_frequency_cutoff=None, fir_fft_length=4096, batch_size=64,
+                 tap_sample_rate=2048, engine_sample_rate=2048,
+                 engine='pycbc', false_dismissal=1e-3, coarse_band=0):
         self.delta_f = delta_f
         self.snr_threshold = snr_threshold
         self.f_high = high_frequency_cutoff
@@ -84,10 +86,21 @@ class MatchedFilterRatioControl(object):
         # reconstructs where a detection is still possible; "flat" is the same
         # correlation with no gate, which exists to separate "apogee is faster"
         # from "the gate is working".  Off by default.
-        self._apogee_mode = os.environ.get('PYCBC_RATIO_APOGEE', '').lower()
-        if self._apogee_mode in ('hier','check') and _apogee is None:
-            raise ImportError("PYCBC_RATIO_APOGEE set but apogee is not installed")
-        self._apogee_fd = float(os.environ.get('PYCBC_RATIO_APOGEE_FD', '1e-3'))
+        # Back end for the innermost correlate/inverse/peak step.  The
+        # environment variables remain as an override, which is convenient when
+        # bisecting a behaviour change without re-plumbing a workflow, but the
+        # command line is what a run should set.
+        mode = {'pycbc': '', 'apogee': 'flat',
+                'apogee-hierarchical': 'hier'}.get(engine, engine)
+        self._apogee_mode = os.environ.get('PYCBC_RATIO_APOGEE', mode).lower()
+        if self._apogee_mode and _apogee is None:
+            raise ImportError(
+                "ratio-filter-engine=%s needs apogee, which is not installed"
+                % engine)
+        self._apogee_fd = float(os.environ.get(
+            'PYCBC_RATIO_APOGEE_FD', false_dismissal))
+        self._coarse_band = int(os.environ.get(
+            'PYCBC_RATIO_BAND', coarse_band))
         self._ap_plans = {}
         self._ap_ref = None
         self._ap_loaded = None
@@ -314,7 +327,7 @@ class MatchedFilterRatioControl(object):
             if self._apogee_mode in ('hier','check'):
                 # Band override, for checking the design table's choice against
                 # measurement rather than trusting it.
-                bd = int(os.environ.get('PYCBC_RATIO_BAND', '0'))
+                bd = self._coarse_band
                 if bd:
                     plan = _apogee.HierarchicalFilter(
                         self.fir_fft_len, ndata=ndata, ntemplates=nbatch,
