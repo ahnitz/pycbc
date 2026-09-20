@@ -86,6 +86,7 @@ class MatchedFilterRatioControl(object):
         self._ap_plans = {}
         self._ap_ref = None
         self._ap_loaded = None
+        self._ap_filters = None
         self._ap_ref_id = {}
         # One block per call.  apogee batches D x T and larger D looks better
         # in isolation, but there the same data array is reused and stays
@@ -93,6 +94,7 @@ class MatchedFilterRatioControl(object):
         # ingest is the cost and batching only adds a copy on top.  Measured:
         # D=1 0.178 s, D=8 0.257, D=64 0.260.
         self._ap_ndata = int(os.environ.get('PYCBC_RATIO_APOGEE_NDATA', '1'))
+        self._ap_series = os.environ.get('PYCBC_RATIO_SERIES', '1') != '0'
         self._chk_tot = 0
         self._chk_miss = 0
         self._chk_missed_snr = []
@@ -267,9 +269,18 @@ class MatchedFilterRatioControl(object):
         if plan is None:
             snr = float(self.snr_threshold)
             if self._apogee_mode in ('hier','check'):
-                plan = _apogee.HierarchicalFilter(
-                    self.fir_fft_len, ndata=ndata, ntemplates=nbatch,
-                    snr=snr, fd=self._apogee_fd)
+                # Band override, for checking the design table's choice against
+                # measurement rather than trusting it.
+                bd = int(os.environ.get('PYCBC_RATIO_BAND', '0'))
+                if bd:
+                    plan = _apogee.HierarchicalFilter(
+                        self.fir_fft_len, ndata=ndata, ntemplates=nbatch,
+                        snr=snr, fd=self._apogee_fd, band=bd,
+                        oversample=2, taps=8)
+                else:
+                    plan = _apogee.HierarchicalFilter(
+                        self.fir_fft_len, ndata=ndata, ntemplates=nbatch,
+                        snr=snr, fd=self._apogee_fd)
             else:
                 plan = _apogee.MatchedFilter(
                     self.fir_fft_len, ndata=ndata, ntemplates=nbatch)
@@ -306,7 +317,10 @@ class MatchedFilterRatioControl(object):
         Inner loop: Time-Blocking + Filter-Batching.
         """
         import time as _time
-        if os.environ.get('PYCBC_RATIO_CPROF') and not getattr(self, '_cp_done', False):
+        self._seg_no = getattr(self, '_seg_no', 0) + 1
+        if (os.environ.get('PYCBC_RATIO_CPROF')
+                and self._seg_no == int(os.environ.get('PYCBC_RATIO_CPROF'))
+                and not getattr(self, '_cp_done', False)):
             import cProfile, pstats, sys
             self._cp_done = True
             pr = cProfile.Profile(); pr.enable()
@@ -353,7 +367,10 @@ class MatchedFilterRatioControl(object):
             # it runs noise realisations inside apogee, which cost 21% of the
             # kernel when repeated every segment.
             self._ap_ref = self._set_apogee_reference(data)
-        self._ap_loaded = None
+        # Do NOT reset what is loaded: the filter bank does not change between
+        # segments, so re-ingesting all of it every segment is pure repetition.
+        # Keyed on the array's identity as well as the batch offset, so a
+        # genuinely different bank still reloads.
         for f_start in range(0, n_filters, self.batch_size):
 
             f_end = min(f_start + self.batch_size, n_filters)
@@ -361,14 +378,16 @@ class MatchedFilterRatioControl(object):
 
             if self._apogee_mode:
                 ap_plan = self._get_apogee_plan(actual_batch_size)
-                if self._ap_loaded != f_start:
+                tag = (f_start, id(filters_f))
+                if self._ap_loaded != tag:
                     # apogee conjugates the template itself, and only the bins
                     # the analytic kernel writes may contribute -- the rest must
                     # be zero or apogee would fold in the half pycbc leaves out.
                     tmpl = np.conj(filters_f[f_start:f_end]).copy()
                     tmpl[:, N_FFT // 2 + 1:] = 0
                     ap_plan.set_templates(tmpl)
-                    self._ap_loaded = f_start
+                    self._ap_loaded = tag
+                    self._ap_filters = filters_f
                 ifft_plan = current_mult_view = current_corr_view = None
                 if self._apogee_mode == 'check':
                     (self._chk_ifft, self._chk_mult,
@@ -398,6 +417,50 @@ class MatchedFilterRatioControl(object):
             # (they are identical except at the segment edges), and hand each
             # group over in one call.
             blocks = []
+            if self._apogee_mode == 'hier' and self._ap_series:
+                # One call per (filter batch, segment): apogee walks the block
+                # layout itself, doing each block's forward transform inline.
+                # The layout is still computed here -- apogee only executes it.
+                # Vectorised: the layout is pure arithmetic on the block index,
+                # so there is no reason to walk it in Python.
+                ts = np.arange(loop_start, n_samples, STEP, dtype=np.int64)
+                bvt0 = ts + bad_start
+                keep = (bvt0 < v_stop) & (bvt0 + N_VALID > v_start)
+                if keep.any():
+                    last = np.flatnonzero(bvt0 < v_stop)
+                    keep &= np.arange(ts.size) <= last[-1]
+                ts = ts[keep]
+                rs = np.maximum(v_start, bvt0[keep])
+                re_ = np.minimum(v_stop, bvt0[keep] + N_VALID)
+                good = re_ > rs
+                bstarts, bws, bwe = ts[good], (rs - ts)[good], (re_ - ts)[good]
+                if bstarts.size:
+                    nblocks += bstarts.size
+                    ap_plan = self._get_apogee_plan(actual_batch_size, 1)
+                    tag = (f_start, id(filters_f))
+                    if self._ap_loaded != tag:
+                        tmpl = np.conj(filters_f[f_start:f_end]).copy()
+                        tmpl[:, N_FFT // 2 + 1:] = 0
+                        ap_plan.set_templates(tmpl)
+                        self._ap_loaded = tag
+                        self._ap_filters = filters_f   # keep id() from being reused
+                    _b = _time.perf_counter()
+                    aidx, aval, _ = ap_plan.run_series(
+                        data, bstarts, bws, bwe, binsize=N_FFT,
+                        threshold=self.snr_threshold,
+                        templates=(0, actual_batch_size), raw=True)
+                    self._ph_ap = getattr(self, '_ph_ap', 0.0) + \
+                        _time.perf_counter() - _b
+                    ii = aidx[:, :, 0]
+                    bi, fi = np.nonzero(ii >= 0)
+                    if bi.size:
+                        tsa = bstarts.astype(np.int64)
+                        all_f_idxs.extend((f_start + fi).tolist())
+                        all_t_idxs.extend((tsa[bi] + ii[bi, fi]).tolist())
+                        all_snrs.extend(aval[:, :, 0][bi, fi].tolist())
+                        all_tstarts.extend(tsa[bi].tolist())
+                continue
+
             for t_start in range(loop_start, n_samples, STEP):
                 block_valid_t0 = t_start + bad_start
                 if block_valid_t0 >= v_stop:
