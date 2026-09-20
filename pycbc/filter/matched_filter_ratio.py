@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 
 from pycbc.fft import FFT, IFFT
@@ -7,6 +9,19 @@ from pycbc.filter.matchedfilter_cpu import (
     find_peaks_in_block_cython,
 )
 from pycbc.types import complex64, zeros
+
+# Optional apogee back end for the innermost product/inverse/peak step.
+# Everything else -- the reference matched filter, the filter bank FFTs, the
+# per-block forward FFT -- stays on pycbc's own FFT.
+try:
+    import apogee as _apogee
+except ImportError:
+    _apogee = None
+
+
+def apogee_available():
+    """True if the apogee back end can be used."""
+    return _apogee is not None
 
 
 class MatchedFilterRatioControl(object):
@@ -60,6 +75,29 @@ class MatchedFilterRatioControl(object):
         self._fft_plans = {}
         self._ifft_plans = {}
 
+        # apogee back end.  "hier" gates on a low-band coarse pass and only
+        # reconstructs where a detection is still possible; "flat" is the same
+        # correlation with no gate, which exists to separate "apogee is faster"
+        # from "the gate is working".  Off by default.
+        self._apogee_mode = os.environ.get('PYCBC_RATIO_APOGEE', '').lower()
+        if self._apogee_mode in ('hier','check') and _apogee is None:
+            raise ImportError("PYCBC_RATIO_APOGEE set but apogee is not installed")
+        self._apogee_fd = float(os.environ.get('PYCBC_RATIO_APOGEE_FD', '1e-3'))
+        self._ap_plans = {}
+        self._ap_ref = None
+        self._ap_loaded = None
+        self._ap_ref_id = {}
+        # One block per call.  apogee batches D x T and larger D looks better
+        # in isolation, but there the same data array is reused and stays
+        # cache-warm; here every call brings a fresh 2 MB block spectrum, so the
+        # ingest is the cost and batching only adds a copy on top.  Measured:
+        # D=1 0.178 s, D=8 0.257, D=64 0.260.
+        self._ap_ndata = int(os.environ.get('PYCBC_RATIO_APOGEE_NDATA', '1'))
+        self._chk_tot = 0
+        self._chk_miss = 0
+        self._chk_missed_snr = []
+        self._chk_detail = []
+
     def _get_plan(self, plans, cls, nbatch, size):
         key = (nbatch, size)
         cached = plans.get(key)
@@ -103,6 +141,8 @@ class MatchedFilterRatioControl(object):
         if valid_slice is None:
             valid_slice = getattr(stilde, 'analyze', None)
 
+        import time as _tm
+        _t0 = _tm.perf_counter()
         h_norm = ref_template.sigmasq(psd)
 
         snr, _, norm = matched_filter_core(
@@ -114,10 +154,33 @@ class MatchedFilterRatioControl(object):
 
         decimate = int(np.round(self.tap_sr / self.engine_sr))
         self.ref_snr = snr.numpy() * (norm * stilde.delta_t)  / decimate
+        _t1 = _tm.perf_counter()
 
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
             self.ref_snr, filters_f, n_taps, valid_slice
         )
+        _t2 = _tm.perf_counter()
+        self._ph_ref = getattr(self, '_ph_ref', 0.0) + (_t1 - _t0)
+        self._ph_ker = getattr(self, '_ph_ker', 0.0) + (_t2 - _t1)
+        if os.environ.get('PYCBC_RATIO_PHASE'):
+            import sys
+            tot = self._ph_ref + self._ph_ker
+            extra = ""
+            if self._apogee_mode == 'hier' and self._ap_plans:
+                pr = tg = 0
+                cfg = None
+                for pl in self._ap_plans.values():
+                    p_, t_ = pl.stats
+                    pr += p_; tg += t_
+                    cfg = pl.config
+                if pr:
+                    extra = ("  gate: %.1f%% of %d pair-calls triggered, band=%d U=%d K=%d"
+                             % (100.0 * tg / pr, pr, cfg[0], cfg[1], cfg[2]))
+            print("[ratio-phase] mode=%-5s reference-MF %.3f s (%.0f%%)  "
+                  "ratio-kernel %.3f s (%.0f%%)%s"
+                  % (self._apogee_mode or 'stock', self._ph_ref,
+                     100 * self._ph_ref / tot, self._ph_ker,
+                     100 * self._ph_ker / tot, extra), file=sys.stderr)
 
         if len(local_idxs) > 0:
             global_ids = indices[local_idxs]
@@ -171,6 +234,56 @@ class MatchedFilterRatioControl(object):
 
         return filters_f
 
+    def _set_apogee_reference(self, data):
+        """Reference SNR distribution for the gate.
+
+        apogee's gate needs the fraction of SNR below its band edge.  Left to
+        itself it measures that from the template, which here is a short
+        broadband ratio filter -- the wrong distribution entirely, since the
+        filter's output reconstructs the fine template's strongly
+        low-frequency SNR.  Measured on a real bank: 0.30 of the filter's own
+        power sits below 256 Hz against 0.927 of the SNR it produces.
+
+        The right distribution is the reference SNR series' own power spectrum,
+        which is exactly what this data is, and it is shared by every template
+        in the group -- so it is set once per segment rather than per template.
+        """
+        n = self.fir_fft_len
+        nblk = max(1, min(8, len(data) // n))
+        acc = np.zeros(n, dtype=np.float64)
+        for b in range(nblk):
+            seg = data[b * n:(b + 1) * n]
+            if len(seg) < n:
+                break
+            acc += np.abs(np.fft.fft(seg.astype(np.complex64))) ** 2
+        acc[n // 2 + 1:] = 0.0        # analytic: the kernel uses only these bins
+        if acc.sum() <= 0:
+            return None
+        return (acc / acc.sum()).astype(np.float32)
+
+    def _get_apogee_plan(self, nbatch, ndata=1):
+        """One plan per batch width, templates reloaded per filter batch."""
+        plan = self._ap_plans.get((nbatch, ndata))
+        if plan is None:
+            snr = float(self.snr_threshold)
+            if self._apogee_mode in ('hier','check'):
+                plan = _apogee.HierarchicalFilter(
+                    self.fir_fft_len, ndata=ndata, ntemplates=nbatch,
+                    snr=snr, fd=self._apogee_fd)
+            else:
+                plan = _apogee.MatchedFilter(
+                    self.fir_fft_len, ndata=ndata, ntemplates=nbatch)
+            self._ap_plans[(nbatch, ndata)] = plan
+        # Only when the reference actually changes.  set_reference() re-measures
+        # the recovery factors over noise realisations, which is cheap once per
+        # segment and ruinous once per filter batch -- doing the latter cost
+        # ~67 us per call and hid most of the gate's benefit.
+        if (self._apogee_mode in ('hier', 'check') and self._ap_ref is not None
+                and self._ap_ref_id.get(id(plan)) is not self._ap_ref):
+            plan.set_reference(self._ap_ref)
+            self._ap_ref_id[id(plan)] = self._ap_ref
+        return plan
+
     def _forward_block_fft(self, segment):
         """FFT one time-domain block (nbatch=1), pre-dividing by fir_fft_len.
 
@@ -192,6 +305,8 @@ class MatchedFilterRatioControl(object):
         """
         Inner loop: Time-Blocking + Filter-Batching.
         """
+        import time as _time
+        _t_enter = _time.perf_counter()
         tap_groups = 3
         nsizes = np.quantile(n_taps, np.linspace(0, 1, tap_groups+1)[1:]).astype(int)
         n_samples = len(data)
@@ -211,15 +326,34 @@ class MatchedFilterRatioControl(object):
             v_start = 0
             v_stop = n_samples
 
+        nblocks = 0
         block_f_cache = {}
+        if self._apogee_mode in ('hier','check'):
+            self._ap_ref = self._set_apogee_reference(data)
+        self._ap_loaded = None
         for f_start in range(0, n_filters, self.batch_size):
 
             f_end = min(f_start + self.batch_size, n_filters)
             actual_batch_size = f_end - f_start
 
-            ifft_plan, current_mult_view, current_corr_view = self._get_ifft_plan(
-                actual_batch_size, N_FFT
-            )
+            if self._apogee_mode:
+                ap_plan = self._get_apogee_plan(actual_batch_size)
+                if self._ap_loaded != f_start:
+                    # apogee conjugates the template itself, and only the bins
+                    # the analytic kernel writes may contribute -- the rest must
+                    # be zero or apogee would fold in the half pycbc leaves out.
+                    tmpl = np.conj(filters_f[f_start:f_end]).copy()
+                    tmpl[:, N_FFT // 2 + 1:] = 0
+                    ap_plan.set_templates(tmpl)
+                    self._ap_loaded = f_start
+                ifft_plan = current_mult_view = current_corr_view = None
+                if self._apogee_mode == 'check':
+                    (self._chk_ifft, self._chk_mult,
+                     self._chk_corr) = self._get_ifft_plan(actual_batch_size, N_FFT)
+            else:
+                ifft_plan, current_mult_view, current_corr_view = self._get_ifft_plan(
+                    actual_batch_size, N_FFT
+                )
 
             # Overlap-save: valid output samples per block.
             n_taps_max = n_taps[f_start:f_end].max()
@@ -233,53 +367,138 @@ class MatchedFilterRatioControl(object):
             first_block_idx = (v_start - bad_start) // STEP
             loop_start = first_block_idx * STEP
 
+            # apogee is a D x T engine: every block is a data segment and every
+            # filter a template.  Driving it one block at a time wastes that
+            # entirely -- 245 calls of D=1 where a handful of D=245 would do,
+            # with the per-call cost paid 245 times and the template ingest
+            # repeated.  So collect the blocks first, group them by window
+            # (they are identical except at the segment edges), and hand each
+            # group over in one call.
+            blocks = []
             for t_start in range(loop_start, n_samples, STEP):
-
                 block_valid_t0 = t_start + bad_start
-
                 if block_valid_t0 >= v_stop:
                     break
-
                 if block_valid_t0 + N_VALID <= v_start:
                     continue
-
                 roi_start = max(v_start, block_valid_t0)
                 roi_stop = min(v_stop, block_valid_t0 + N_VALID)
-
                 roi_len = roi_stop - roi_start
-
                 if roi_len <= 0:
                     continue
-
+                nblocks += 1
                 buf_slice_start = roi_start - t_start
-
                 t_end = min(t_start + N_FFT, n_samples)
                 if t_start not in block_f_cache:
-                    block_f_cache[t_start] = self._forward_block_fft(data[t_start:t_end])
+                    _a = _time.perf_counter()
+                    block_f_cache[t_start] = self._forward_block_fft(
+                        data[t_start:t_end])
+                    self._ph_fft = getattr(self, '_ph_fft', 0.0) + \
+                        _time.perf_counter() - _a
+                blocks.append((t_start, buf_slice_start, roi_len))
 
+            if self._apogee_mode in ('flat', 'hier'):
+                groups = {}
+                for t_start, bss, rl in blocks:
+                    groups.setdefault((bss, rl), []).append(t_start)
+                for (bss, rl), starts in groups.items():
+                    for chunk0 in range(0, len(starts), self._ap_ndata):
+                        chunk = starts[chunk0:chunk0 + self._ap_ndata]
+                        ap_plan = self._get_apogee_plan(actual_batch_size,
+                                                        len(chunk))
+                        if self._ap_loaded != (f_start, id(ap_plan)):
+                            tmpl = np.conj(filters_f[f_start:f_end]).copy()
+                            tmpl[:, N_FFT // 2 + 1:] = 0
+                            ap_plan.set_templates(tmpl)
+                            self._ap_loaded = (f_start, id(ap_plan))
+                        _c = _time.perf_counter()
+                        if len(chunk) == 1:
+                            # No copy: the cached block spectrum is already
+                            # contiguous complex64, so hand the view straight in.
+                            ap_plan.set_data(block_f_cache[chunk[0]][None, :])
+                        else:
+                            stack = np.empty((len(chunk), N_FFT), np.complex64)
+                            for i, ts in enumerate(chunk):
+                                stack[i] = block_f_cache[ts]
+                            ap_plan.set_data(stack)
+                        _b = _time.perf_counter()
+                        self._ph_sd = getattr(self, '_ph_sd', 0.0) + \
+                            _time.perf_counter() - _c
+                        peaks = ap_plan.run(binsize=rl,
+                                            threshold=self.snr_threshold,
+                                            window=(bss, bss + rl))
+                        self._ph_ap = getattr(self, '_ph_ap', 0.0) + \
+                            _time.perf_counter() - _b
+                        idx = peaks['index'][:, :, 0]
+                        val = peaks['value'][:, :, 0]
+                        di, fi = np.nonzero(idx >= 0)
+                        if di.size:
+                            ts_arr = np.asarray(chunk, dtype=np.int64)
+                            all_f_idxs.extend((f_start + fi).tolist())
+                            all_t_idxs.extend((ts_arr[di] + idx[di, fi]).tolist())
+                            all_snrs.extend(val[di, fi].tolist())
+                            all_tstarts.extend(ts_arr[di].tolist())
+                continue
+
+            for t_start, buf_slice_start, roi_len in blocks:
+                roi_start = t_start + buf_slice_start
                 block_f_view = block_f_cache[t_start]
                 filter_batch_f = filters_f[f_start:f_end]
 
                 fast_multiply_analytic_cython(
                     block_f_view, filter_batch_f, current_mult_view
                 )
-
                 ifft_plan.execute()
                 f_list, t_list, s_list = find_peaks_in_block_cython(
-                    current_corr_view,
-                    roi_start,
-                    roi_len,
-                    self.threshold_sq,
-                    f_start,
-                    input_offset=buf_slice_start
+                    current_corr_view, roi_start, roi_len, self.threshold_sq,
+                    f_start, input_offset=buf_slice_start
                 )
-
                 if f_list:
                     all_f_idxs.extend(f_list)
                     all_t_idxs.extend(t_list)
                     all_snrs.extend(s_list)
                     all_tstarts.extend([t_start] * len(s_list))
 
+        if self._apogee_mode == 'check' and self._chk_tot:
+            import sys
+            snrs = np.array(self._chk_missed_snr) if self._chk_missed_snr else np.zeros(0)
+            print("[apogee-check] gate dismissed %d of %d filter-block hits (%.1f%%)"
+                  % (self._chk_miss, self._chk_tot,
+                     100.0 * self._chk_miss / self._chk_tot), file=sys.stderr)
+            if len(snrs):
+                print("[apogee-check] dismissed |snr|: min %.3f med %.3f max %.3f"
+                      % (snrs.min(), np.median(snrs), snrs.max()), file=sys.stderr)
+            for full, coarse, fb, bd, rl in self._chk_detail[:4]:
+                print("[apogee-check]   full=%.3f coarse(scaled)=%.3f  f_band=%.4f "
+                      "band=%d roi=%d" % (full, coarse, fb, bd, rl), file=sys.stderr)
+            self._chk_detail = []
+            self._chk_tot = self._chk_miss = 0
+            self._chk_missed_snr = []
+        self._chk_detail = []
+        self._kernel_seconds = getattr(self, '_kernel_seconds', 0.0) + (
+            _time.perf_counter() - _t_enter)
+        self._kernel_calls = getattr(self, '_kernel_calls', 0) + 1
+        self._kernel_blocks = getattr(self, '_kernel_blocks', 0) + nblocks
+        if os.environ.get('PYCBC_RATIO_TIMING'):
+            import sys
+            print("[ratio-parts2] fft=%.3f set_data=%.3f run=%.3f  rest=%.3f s"
+                  % (getattr(self,'_ph_fft',0), getattr(self,'_ph_sd',0),
+                     getattr(self,'_ph_ap',0),
+                     self._kernel_seconds - getattr(self,'_ph_fft',0)
+                     - getattr(self,'_ph_sd',0) - getattr(self,'_ph_ap',0)),
+                  file=sys.stderr)
+            print("[ratio-parts] fft=%.3f apogee=%.3f extract=%.3f other=%.3f s"
+                  % (getattr(self,'_ph_fft',0), getattr(self,'_ph_ap',0),
+                     getattr(self,'_ph_out',0),
+                     self._kernel_seconds - getattr(self,'_ph_fft',0)
+                     - getattr(self,'_ph_ap',0) - getattr(self,'_ph_out',0)),
+                  file=sys.stderr)
+            print("[ratio-timing] mode=%-5s segments=%d filter-blocks=%d "
+                  "kernel=%.3f s (%.3f ms/filter-block)"
+                  % (self._apogee_mode or 'stock', self._kernel_calls,
+                     self._kernel_blocks, self._kernel_seconds,
+                     1e3 * self._kernel_seconds / max(self._kernel_blocks, 1)),
+                  file=sys.stderr)
         return (np.array(all_f_idxs, dtype=np.int32),
                 np.array(all_t_idxs, dtype=np.int64),
                 np.array(all_snrs, dtype=np.complex64),
