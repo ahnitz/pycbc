@@ -10,7 +10,12 @@ set -e
 
 export OMP_NUM_THREADS=1
 
+# MKL for the FFTs.  The reference matched filter is a 2^20 inverse per segment
+# and FFTW here plans at measure level 0 with no wisdom, taking 10.6 ms where
+# MKL takes 2.4 ms for the same transform.  Triggers are unchanged: 893/893
+# with the same SNRs to 2.9e-06, which is float32 rounding.
 pycbc_inspiral_fir \
+    --fft-backends mkl \
     --fir-length 4096 \
     --batch-size 64 \
     --template-normalization-method precalculated_sigma \
