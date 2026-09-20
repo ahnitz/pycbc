@@ -3,12 +3,15 @@ import os
 import numpy as np
 
 from pycbc.fft import FFT, IFFT
-from pycbc.filter.matchedfilter import matched_filter_core
+from pycbc.filter.matchedfilter import (
+    correlate, get_cutoff_indices, matched_filter_core,
+)
 from pycbc.filter.matchedfilter_cpu import (
     fast_multiply_analytic_cython,
     find_peaks_in_block_cython,
 )
-from pycbc.types import complex64, zeros
+from pycbc.fft import FFT, IFFT
+from pycbc.types import Array, complex64, zeros
 
 # Optional apogee back end for the innermost product/inverse/peak step.
 # Everything else -- the reference matched filter, the filter bank FFTs, the
@@ -74,6 +77,8 @@ class MatchedFilterRatioControl(object):
         # few smaller plans get cached alongside the dominant batch size.
         self._fft_plans = {}
         self._ifft_plans = {}
+        self._ref_plan = None
+        self._ref_direct = os.environ.get('PYCBC_RATIO_REFDIRECT', '1') != '0' 
 
         # apogee back end.  "hier" gates on a low-band coarse pass and only
         # reconstructs where a detection is still possible; "flat" is the same
@@ -147,12 +152,15 @@ class MatchedFilterRatioControl(object):
         _t0 = _tm.perf_counter()
         h_norm = ref_template.sigmasq(psd)
 
-        snr, _, norm = matched_filter_core(
-            ref_template, stilde, psd=psd,
-            low_frequency_cutoff=ref_template.f_lower,
-            high_frequency_cutoff=self.f_high,
-            h_norm=h_norm
-        )
+        if self._ref_direct:
+            snr, norm = self._reference_snr(stilde, psd, ref_template, h_norm)
+        else:
+            snr, _, norm = matched_filter_core(
+                ref_template, stilde, psd=psd,
+                low_frequency_cutoff=ref_template.f_lower,
+                high_frequency_cutoff=self.f_high,
+                h_norm=h_norm
+            )
 
         decimate = int(np.round(self.tap_sr / self.engine_sr))
         self.ref_snr = snr.numpy() * (norm * stilde.delta_t)  / decimate
@@ -235,6 +243,41 @@ class MatchedFilterRatioControl(object):
             filters_f[start:end] = np.conj(fft_sliced)
 
         return filters_f
+
+    def _reference_snr(self, stilde, psd, ref_template, h_norm):
+        """The reference SNR series, driving the class-based IFFT directly.
+
+        matched_filter_core goes through pycbc.fft's *function* API, which on
+        the MKL backend builds a DFTI descriptor, uses it once and frees it on
+        every call -- 2 ms of a 3 ms transform at 2^20.  The class API caches
+        the descriptor, which is what it is for, and the plan cache this object
+        already keeps for the block FFTs serves here too.  The buffers are
+        cached with it, so the four per-call allocations go as well.
+
+        Same arithmetic as matched_filter_core, in the same order.
+        """
+        N = (len(stilde) - 1) * 2
+        kmin, kmax = get_cutoff_indices(
+            ref_template.f_lower, self.f_high, stilde.delta_f, N)
+        plan, qt, q = self._get_ref_plan(N)
+        qt[:kmin] = 0
+        qt[kmax:] = 0
+        correlate(ref_template[kmin:kmax], stilde[kmin:kmax], qt[kmin:kmax])
+        qt[kmin:kmax] /= psd[kmin:kmax]
+        plan.execute()
+        norm = (4.0 * stilde.delta_f) / np.sqrt(h_norm)
+        return q, norm
+
+    def _get_ref_plan(self, size):
+        """Cached IFFT plan and its buffers for the reference filter."""
+        cached = self._ref_plan
+        if cached is None or cached[0] != size:
+            qt = zeros(size, dtype=complex64)
+            q = zeros(size, dtype=complex64)
+            plan = IFFT(qt, q)
+            cached = self._ref_plan = (size, plan, qt, q)
+        _, plan, qt, q = cached
+        return plan, Array(qt, copy=False), q
 
     def _set_apogee_reference(self, data):
         """Reference SNR distribution for the gate.
