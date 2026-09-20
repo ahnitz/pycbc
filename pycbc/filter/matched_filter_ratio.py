@@ -306,6 +306,20 @@ class MatchedFilterRatioControl(object):
         Inner loop: Time-Blocking + Filter-Batching.
         """
         import time as _time
+        if os.environ.get('PYCBC_RATIO_CPROF') and not getattr(self, '_cp_done', False):
+            import cProfile, pstats, sys
+            self._cp_done = True
+            pr = cProfile.Profile(); pr.enable()
+            try:
+                self._cp_done = True
+                return self._execute_blocked_kernel(
+                    data, filters_f, n_taps, valid_slice)
+            finally:
+                pr.disable()
+                st = pstats.Stats(pr, stream=sys.stderr).sort_stats('tottime')
+                print("[cprof] one segment of _execute_blocked_kernel",
+                      file=sys.stderr)
+                st.print_stats(12)
         _t_enter = _time.perf_counter()
         tap_groups = 3
         nsizes = np.quantile(n_taps, np.linspace(0, 1, tap_groups+1)[1:]).astype(int)
@@ -326,9 +340,18 @@ class MatchedFilterRatioControl(object):
             v_start = 0
             v_stop = n_samples
 
+        if os.environ.get('PYCBC_RATIO_DTYPE'):
+            import sys
+            print("[dtype] ref_snr %s  filters_f %s  n=%d"
+                  % (data.dtype, filters_f.dtype, len(data)), file=sys.stderr)
         nblocks = 0
         block_f_cache = {}
-        if self._apogee_mode in ('hier','check'):
+        if self._apogee_mode in ('hier', 'check') and self._ap_ref is None:
+            # Once, not per segment.  The reference is the SNR distribution of
+            # the group's coarse template under this PSD -- a property of the
+            # bank, not of the stretch of data being filtered -- and measuring
+            # it runs noise realisations inside apogee, which cost 21% of the
+            # kernel when repeated every segment.
             self._ap_ref = self._set_apogee_reference(data)
         self._ap_loaded = None
         for f_start in range(0, n_filters, self.batch_size):
@@ -475,6 +498,7 @@ class MatchedFilterRatioControl(object):
             self._chk_tot = self._chk_miss = 0
             self._chk_missed_snr = []
         self._chk_detail = []
+        self._ebk_ret = None
         self._kernel_seconds = getattr(self, '_kernel_seconds', 0.0) + (
             _time.perf_counter() - _t_enter)
         self._kernel_calls = getattr(self, '_kernel_calls', 0) + 1
