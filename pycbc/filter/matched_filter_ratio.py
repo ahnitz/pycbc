@@ -294,12 +294,7 @@ class MatchedFilterRatioControl(object):
         qt[:kmin] = 0
         # stilde arrives overwhitened (see pycbc_inspiral_fir), so there is
         # no PSD division on this path at all.
-        # numpy rather than pycbc's correlate(): measured 0.15 ms against
-        # 2.85 ms for the same 514k-element conj-multiply, because slicing
-        # pycbc Arrays per call costs far more than the arithmetic.  Same
-        # operation, conj(h)*d, written straight onto the plan's input buffer.
-        _h = ref_template.numpy(); _d = stilde.numpy(); _q = qt.data
-        np.multiply(np.conj(_h[kmin:kmax]), _d[kmin:kmax], out=_q[kmin:kmax])
+        correlate(ref_template[kmin:kmax], stilde[kmin:kmax], qt[kmin:kmax])
         plan.execute()
         norm = (4.0 * stilde.delta_f) / np.sqrt(h_norm)
         return q, norm
