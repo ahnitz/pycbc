@@ -13,18 +13,18 @@ from pycbc.filter.matchedfilter_cpu import (
 from pycbc.fft import FFT, IFFT
 from pycbc.types import Array, complex64, zeros
 
-# Optional apogee back end for the innermost product/inverse/peak step.
+# Optional matchedfilter back end for the innermost product/inverse/peak step.
 # Everything else -- the reference matched filter, the filter bank FFTs, the
 # per-block forward FFT -- stays on pycbc's own FFT.
 try:
-    import apogee as _apogee
+    import matchedfilter as _mf
 except ImportError:
-    _apogee = None
+    _mf = None
 
 
-def apogee_available():
-    """True if the apogee back end can be used."""
-    return _apogee is not None
+def matchedfilter_available():
+    """True if the matchedfilter back end can be used."""
+    return _mf is not None
 
 
 class MatchedFilterRatioControl(object):
@@ -82,36 +82,36 @@ class MatchedFilterRatioControl(object):
         self._ref_plan = None
         self._ref_direct = os.environ.get('PYCBC_RATIO_REFDIRECT', '1') != '0' 
 
-        # apogee back end.  "hier" gates on a low-band coarse pass and only
+        # matchedfilter back end.  "hier" gates on a low-band coarse pass and only
         # reconstructs where a detection is still possible; "flat" is the same
-        # correlation with no gate, which exists to separate "apogee is faster"
+        # correlation with no gate, which exists to separate "matchedfilter is faster"
         # from "the gate is working".  Off by default.
         # Back end for the innermost correlate/inverse/peak step.  The
         # environment variables remain as an override, which is convenient when
         # bisecting a behaviour change without re-plumbing a workflow, but the
         # command line is what a run should set.
-        mode = {'pycbc': '', 'apogee': 'flat',
-                'apogee-hierarchical': 'hier'}.get(engine, engine)
-        self._apogee_mode = os.environ.get('PYCBC_RATIO_APOGEE', mode).lower()
-        if self._apogee_mode and _apogee is None:
+        mode = {'pycbc': '', 'matchedfilter': 'flat',
+                'matchedfilter-hierarchical': 'hier'}.get(engine, engine)
+        self._engine_mode = os.environ.get('PYCBC_RATIO_ENGINE', mode).lower()
+        if self._engine_mode and _mf is None:
             raise ImportError(
-                "ratio-filter-engine=%s needs apogee, which is not installed"
+                "ratio-filter-engine=%s needs matchedfilter, which is not installed"
                 % engine)
-        self._apogee_fd = float(os.environ.get(
-            'PYCBC_RATIO_APOGEE_FD', false_dismissal))
+        self._engine_fd = float(os.environ.get(
+            'PYCBC_RATIO_ENGINE_FD', false_dismissal))
         self._coarse_band = int(os.environ.get(
             'PYCBC_RATIO_BAND', coarse_band))
-        self._ap_plans = {}
+        self._engine_plans = {}
         self._ap_ref = None
         self._ap_loaded = None
         self._ap_filters = None
         self._ap_ref_id = {}
-        # One block per call.  apogee batches D x T and larger D looks better
+        # One block per call.  matchedfilter batches D x T and larger D looks better
         # in isolation, but there the same data array is reused and stays
         # cache-warm; here every call brings a fresh 2 MB block spectrum, so the
         # ingest is the cost and batching only adds a copy on top.  Measured:
         # D=1 0.178 s, D=8 0.257, D=64 0.260.
-        self._ap_ndata = int(os.environ.get('PYCBC_RATIO_APOGEE_NDATA', '1'))
+        self._ap_ndata = int(os.environ.get('PYCBC_RATIO_ENGINE_NDATA', '1'))
         self._ap_series = os.environ.get('PYCBC_RATIO_SERIES', '1') != '0'
         self._chk_tot = 0
         self._chk_miss = 0
@@ -189,10 +189,10 @@ class MatchedFilterRatioControl(object):
             import sys
             tot = self._ph_ref + self._ph_ker
             extra = ""
-            if self._apogee_mode == 'hier' and self._ap_plans:
+            if self._engine_mode == 'hier' and self._engine_plans:
                 pr = tg = 0
                 cfg = None
-                for pl in self._ap_plans.values():
+                for pl in self._engine_plans.values():
                     p_, t_ = pl.stats
                     pr += p_; tg += t_
                     cfg = pl.config
@@ -201,7 +201,7 @@ class MatchedFilterRatioControl(object):
                              % (100.0 * tg / pr, pr, cfg[0], cfg[1], cfg[2]))
             print("[ratio-phase] mode=%-5s reference-MF %.3f s (%.0f%%)  "
                   "ratio-kernel %.3f s (%.0f%%)%s"
-                  % (self._apogee_mode or 'stock', self._ph_ref,
+                  % (self._engine_mode or 'stock', self._ph_ref,
                      100 * self._ph_ref / tot, self._ph_ker,
                      100 * self._ph_ker / tot, extra), file=sys.stderr)
 
@@ -292,10 +292,10 @@ class MatchedFilterRatioControl(object):
         _, plan, qt, q = cached
         return plan, Array(qt, copy=False), q
 
-    def _set_apogee_reference(self, data):
+    def _set_engine_reference(self, data):
         """Reference SNR distribution for the gate.
 
-        apogee's gate needs the fraction of SNR below its band edge.  Left to
+        matchedfilter's gate needs the fraction of SNR below its band edge.  Left to
         itself it measures that from the template, which here is a short
         broadband ratio filter -- the wrong distribution entirely, since the
         filter's output reconstructs the fine template's strongly
@@ -319,33 +319,33 @@ class MatchedFilterRatioControl(object):
             return None
         return (acc / acc.sum()).astype(np.float32)
 
-    def _get_apogee_plan(self, nbatch, ndata=1):
+    def _get_engine_plan(self, nbatch, ndata=1):
         """One plan per batch width, templates reloaded per filter batch."""
-        plan = self._ap_plans.get((nbatch, ndata))
+        plan = self._engine_plans.get((nbatch, ndata))
         if plan is None:
             snr = float(self.snr_threshold)
-            if self._apogee_mode in ('hier','check'):
+            if self._engine_mode in ('hier','check'):
                 # Band override, for checking the design table's choice against
                 # measurement rather than trusting it.
                 bd = self._coarse_band
                 if bd:
-                    plan = _apogee.HierarchicalFilter(
+                    plan = _mf.HierarchicalFilter(
                         self.fir_fft_len, ndata=ndata, ntemplates=nbatch,
-                        snr=snr, fd=self._apogee_fd, band=bd,
+                        snr=snr, fd=self._engine_fd, band=bd,
                         oversample=2, taps=8)
                 else:
-                    plan = _apogee.HierarchicalFilter(
+                    plan = _mf.HierarchicalFilter(
                         self.fir_fft_len, ndata=ndata, ntemplates=nbatch,
-                        snr=snr, fd=self._apogee_fd)
+                        snr=snr, fd=self._engine_fd)
             else:
-                plan = _apogee.MatchedFilter(
+                plan = _mf.MatchedFilter(
                     self.fir_fft_len, ndata=ndata, ntemplates=nbatch)
-            self._ap_plans[(nbatch, ndata)] = plan
+            self._engine_plans[(nbatch, ndata)] = plan
         # Only when the reference actually changes.  set_reference() re-measures
         # the recovery factors over noise realisations, which is cheap once per
         # segment and ruinous once per filter batch -- doing the latter cost
         # ~67 us per call and hid most of the gate's benefit.
-        if (self._apogee_mode in ('hier', 'check') and self._ap_ref is not None
+        if (self._engine_mode in ('hier', 'check') and self._ap_ref is not None
                 and self._ap_ref_id.get(id(plan)) is not self._ap_ref):
             plan.set_reference(self._ap_ref)
             self._ap_ref_id[id(plan)] = self._ap_ref
@@ -416,13 +416,13 @@ class MatchedFilterRatioControl(object):
                   % (data.dtype, filters_f.dtype, len(data)), file=sys.stderr)
         nblocks = 0
         block_f_cache = {}
-        if self._apogee_mode in ('hier', 'check') and self._ap_ref is None:
+        if self._engine_mode in ('hier', 'check') and self._ap_ref is None:
             # Once, not per segment.  The reference is the SNR distribution of
             # the group's coarse template under this PSD -- a property of the
             # bank, not of the stretch of data being filtered -- and measuring
-            # it runs noise realisations inside apogee, which cost 21% of the
+            # it runs noise realisations inside matchedfilter, which cost 21% of the
             # kernel when repeated every segment.
-            self._ap_ref = self._set_apogee_reference(data)
+            self._ap_ref = self._set_engine_reference(data)
         # Do NOT reset what is loaded: the filter bank does not change between
         # segments, so re-ingesting all of it every segment is pure repetition.
         # Keyed on the array's identity as well as the batch offset, so a
@@ -432,20 +432,20 @@ class MatchedFilterRatioControl(object):
             f_end = min(f_start + self.batch_size, n_filters)
             actual_batch_size = f_end - f_start
 
-            if self._apogee_mode:
-                ap_plan = self._get_apogee_plan(actual_batch_size)
+            if self._engine_mode:
+                ap_plan = self._get_engine_plan(actual_batch_size)
                 tag = (f_start, id(filters_f))
                 if self._ap_loaded != tag:
-                    # apogee conjugates the template itself, and only the bins
+                    # matchedfilter conjugates the template itself, and only the bins
                     # the analytic kernel writes may contribute -- the rest must
-                    # be zero or apogee would fold in the half pycbc leaves out.
+                    # be zero or matchedfilter would fold in the half pycbc leaves out.
                     tmpl = np.conj(filters_f[f_start:f_end]).copy()
                     tmpl[:, N_FFT // 2 + 1:] = 0
                     ap_plan.set_templates(tmpl)
                     self._ap_loaded = tag
                     self._ap_filters = filters_f
                 ifft_plan = current_mult_view = current_corr_view = None
-                if self._apogee_mode == 'check':
+                if self._engine_mode == 'check':
                     (self._chk_ifft, self._chk_mult,
                      self._chk_corr) = self._get_ifft_plan(actual_batch_size, N_FFT)
             else:
@@ -465,7 +465,7 @@ class MatchedFilterRatioControl(object):
             first_block_idx = (v_start - bad_start) // STEP
             loop_start = first_block_idx * STEP
 
-            # apogee is a D x T engine: every block is a data segment and every
+            # matchedfilter is a D x T engine: every block is a data segment and every
             # filter a template.  Driving it one block at a time wastes that
             # entirely -- 245 calls of D=1 where a handful of D=245 would do,
             # with the per-call cost paid 245 times and the template ingest
@@ -473,10 +473,10 @@ class MatchedFilterRatioControl(object):
             # (they are identical except at the segment edges), and hand each
             # group over in one call.
             blocks = []
-            if self._apogee_mode == 'hier' and self._ap_series:
-                # One call per (filter batch, segment): apogee walks the block
+            if self._engine_mode == 'hier' and self._ap_series:
+                # One call per (filter batch, segment): matchedfilter walks the block
                 # layout itself, doing each block's forward transform inline.
-                # The layout is still computed here -- apogee only executes it.
+                # The layout is still computed here -- matchedfilter only executes it.
                 # Vectorised: the layout is pure arithmetic on the block index,
                 # so there is no reason to walk it in Python.
                 ts = np.arange(loop_start, n_samples, STEP, dtype=np.int64)
@@ -492,7 +492,7 @@ class MatchedFilterRatioControl(object):
                 bstarts, bws, bwe = ts[good], (rs - ts)[good], (re_ - ts)[good]
                 if bstarts.size:
                     nblocks += bstarts.size
-                    ap_plan = self._get_apogee_plan(actual_batch_size, 1)
+                    ap_plan = self._get_engine_plan(actual_batch_size, 1)
                     tag = (f_start, id(filters_f))
                     if self._ap_loaded != tag:
                         tmpl = np.conj(filters_f[f_start:f_end]).copy()
@@ -539,14 +539,14 @@ class MatchedFilterRatioControl(object):
                         _time.perf_counter() - _a
                 blocks.append((t_start, buf_slice_start, roi_len))
 
-            if self._apogee_mode in ('flat', 'hier'):
+            if self._engine_mode in ('flat', 'hier'):
                 groups = {}
                 for t_start, bss, rl in blocks:
                     groups.setdefault((bss, rl), []).append(t_start)
                 for (bss, rl), starts in groups.items():
                     for chunk0 in range(0, len(starts), self._ap_ndata):
                         chunk = starts[chunk0:chunk0 + self._ap_ndata]
-                        ap_plan = self._get_apogee_plan(actual_batch_size,
+                        ap_plan = self._get_engine_plan(actual_batch_size,
                                                         len(chunk))
                         if self._ap_loaded != (f_start, id(ap_plan)):
                             tmpl = np.conj(filters_f[f_start:f_end]).copy()
@@ -601,17 +601,17 @@ class MatchedFilterRatioControl(object):
                     all_snrs.extend(s_list)
                     all_tstarts.extend([t_start] * len(s_list))
 
-        if self._apogee_mode == 'check' and self._chk_tot:
+        if self._engine_mode == 'check' and self._chk_tot:
             import sys
             snrs = np.array(self._chk_missed_snr) if self._chk_missed_snr else np.zeros(0)
-            print("[apogee-check] gate dismissed %d of %d filter-block hits (%.1f%%)"
+            print("[matchedfilter-check] gate dismissed %d of %d filter-block hits (%.1f%%)"
                   % (self._chk_miss, self._chk_tot,
                      100.0 * self._chk_miss / self._chk_tot), file=sys.stderr)
             if len(snrs):
-                print("[apogee-check] dismissed |snr|: min %.3f med %.3f max %.3f"
+                print("[matchedfilter-check] dismissed |snr|: min %.3f med %.3f max %.3f"
                       % (snrs.min(), np.median(snrs), snrs.max()), file=sys.stderr)
             for full, coarse, fb, bd, rl in self._chk_detail[:4]:
-                print("[apogee-check]   full=%.3f coarse(scaled)=%.3f  f_band=%.4f "
+                print("[matchedfilter-check]   full=%.3f coarse(scaled)=%.3f  f_band=%.4f "
                       "band=%d roi=%d" % (full, coarse, fb, bd, rl), file=sys.stderr)
             self._chk_detail = []
             self._chk_tot = self._chk_miss = 0
@@ -630,7 +630,7 @@ class MatchedFilterRatioControl(object):
                      self._kernel_seconds - getattr(self,'_ph_fft',0)
                      - getattr(self,'_ph_sd',0) - getattr(self,'_ph_ap',0)),
                   file=sys.stderr)
-            print("[ratio-parts] fft=%.3f apogee=%.3f extract=%.3f other=%.3f s"
+            print("[ratio-parts] fft=%.3f matchedfilter=%.3f extract=%.3f other=%.3f s"
                   % (getattr(self,'_ph_fft',0), getattr(self,'_ph_ap',0),
                      getattr(self,'_ph_out',0),
                      self._kernel_seconds - getattr(self,'_ph_fft',0)
@@ -638,7 +638,7 @@ class MatchedFilterRatioControl(object):
                   file=sys.stderr)
             print("[ratio-timing] mode=%-5s segments=%d filter-blocks=%d "
                   "kernel=%.3f s (%.3f ms/filter-block)"
-                  % (self._apogee_mode or 'stock', self._kernel_calls,
+                  % (self._engine_mode or 'stock', self._kernel_calls,
                      self._kernel_blocks, self._kernel_seconds,
                      1e3 * self._kernel_seconds / max(self._kernel_blocks, 1)),
                   file=sys.stderr)

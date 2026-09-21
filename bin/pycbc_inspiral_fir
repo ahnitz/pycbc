@@ -231,11 +231,11 @@ def get_args():
                             " FIR filter (and the ratio bank's frequency"
                             " resolution).")
     group.add_argument('--ratio-filter-engine', default='pycbc',
-                       choices=('pycbc', 'apogee', 'apogee-hierarchical'),
+                       choices=('pycbc', 'matchedfilter', 'matchedfilter-hierarchical'),
                        help="Which back end runs the innermost correlate,"
                             " inverse and peak search. 'pycbc' is the built-in"
-                            " kernel. 'apogee' does the same correlation in one"
-                            " fused call. 'apogee-hierarchical' additionally"
+                            " kernel. 'matchedfilter' does the same correlation in one"
+                            " fused call. 'matchedfilter-hierarchical' additionally"
                             " gates on a low-band pass and reconstructs at full"
                             " resolution only where a detection is still"
                             " possible -- faster, but it can MISS triggers at"
@@ -243,10 +243,10 @@ def get_args():
     group.add_argument('--ratio-filter-false-dismissal', type=float,
                        default=1e-3, metavar='PROB',
                        help="Tolerated probability of missing a signal at the"
-                            " SNR threshold, for 'apogee-hierarchical'. Lower"
+                            " SNR threshold, for 'matchedfilter-hierarchical'. Lower"
                             " is safer and slower. Note the realised rate can"
                             " exceed this at low SNR; see"
-                            " docs/hierarchical.md in apogee.")
+                            " docs/hierarchical.md in matchedfilter.")
     group.add_argument('--ratio-filter-band', type=int, default=0,
                        metavar='BINS',
                        help="Override the coarse band the design table picks,"
