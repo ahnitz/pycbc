@@ -150,6 +150,13 @@ class MatchedFilterRatioControl(object):
 
         n_taps_max = int(np.max(tap_counts))
 
+        # Overlap-save group boundaries.  These depend only on the bank, so
+        # computing them here rather than per segment takes a quantile over
+        # the whole tap-count array off the hot path.
+        tap_groups = 3
+        self._tap_sizes = np.quantile(
+            tap_counts, np.linspace(0, 1, tap_groups + 1)[1:]).astype(int)
+
         filters_f = self._fft_all_filters(fir_taps, tap_counts)
         return filters_f, n_taps_max
 
@@ -175,8 +182,13 @@ class MatchedFilterRatioControl(object):
                 h_norm=h_norm
             )
 
-        decimate = int(np.round(self.tap_sr / self.engine_sr))
-        self.ref_snr = snr.numpy() * (norm * stilde.delta_t)  / decimate
+        # Scale in place.  Written as snr.numpy() * a / b this built two
+        # full-length temporaries per segment -- 8 MB each at 2^20 -- for a
+        # scaling by two constants.  q is the cached IFFT output buffer and is
+        # fully overwritten by the next plan.execute(), so mutating it here is
+        # safe.  decimation_factor is computed and validated in __init__.
+        self.ref_snr = snr.numpy()
+        self.ref_snr *= (norm * stilde.delta_t) / self.decimation_factor
         _t1 = _tm.perf_counter()
 
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
@@ -391,8 +403,7 @@ class MatchedFilterRatioControl(object):
                       file=sys.stderr)
                 st.print_stats(12)
         _t_enter = _time.perf_counter()
-        tap_groups = 3
-        nsizes = np.quantile(n_taps, np.linspace(0, 1, tap_groups+1)[1:]).astype(int)
+        nsizes = self._tap_sizes
         n_samples = len(data)
         n_filters = len(filters_f)
 
