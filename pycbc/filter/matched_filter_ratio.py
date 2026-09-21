@@ -287,8 +287,9 @@ class MatchedFilterRatioControl(object):
         plan, qt, q = self._get_ref_plan(N)
         qt[:kmin] = 0
         qt[kmax:] = 0
+        # stilde arrives overwhitened (see pycbc_inspiral_fir), so there is
+        # no PSD division on this path at all.
         correlate(ref_template[kmin:kmax], stilde[kmin:kmax], qt[kmin:kmax])
-        qt[kmin:kmax] /= psd[kmin:kmax]
         plan.execute()
         norm = (4.0 * stilde.delta_f) / np.sqrt(h_norm)
         return q, norm

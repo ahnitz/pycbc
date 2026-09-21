@@ -128,7 +128,8 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
                 template.params = ratio_filter.params
                 template.f_lower = ref_template.f_lower
 
-                corr = template.conj() * stilde / stilde.psd * (4 * stilde.delta_f / h_norm ** 0.5 / rescale)
+                # stilde is already overwhitened; do not divide again.
+                corr = template.conj() * stilde * (4 * stilde.delta_f / h_norm ** 0.5 / rescale)
                 corr.resize((len(stilde) - 1)*2)
 
                 psd = stilde.psd.copy()
@@ -391,6 +392,16 @@ def main():
 
         pycbc.psd.associate_psds_to_segments(args, segments, gwstrain, flen, delta_f,
                   flow, dyn_range_factor=pycbc.DYN_RANGE_FAC, precision='single')
+
+        # Overwhiten once, here, rather than dividing by the PSD inside every
+        # filter call.  Each segment is filtered once per coarse template, so
+        # the division was repeated n_coarse times for a result that depends
+        # only on the segment.  Everything downstream that reads stilde must
+        # now treat it as already divided: the reference matched filter, and
+        # the chisq correlation below.  stilde.psd is kept for the template
+        # norms and for whitening templates, which are unaffected.
+        for seg in segments:
+            seg[:] = seg / seg.psd
 
         # psd_var uses its own internal PSD estimation windows, independent
         # of the PSD each matched-filter segment (associated above) uses.
