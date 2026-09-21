@@ -103,7 +103,7 @@ class MatchedFilterRatioControl(object):
             'PYCBC_RATIO_BAND', coarse_band))
         self._engine_plans = {}
         self._ap_ref = None
-        self._ap_loaded = None
+        self._ap_loaded = {}     # id(plan) -> which filter batch it holds
         self._ap_filters = None
         self._ap_ref_id = {}
         # One block per call.  matchedfilter batches D x T and larger D looks better
@@ -294,7 +294,12 @@ class MatchedFilterRatioControl(object):
         qt[:kmin] = 0
         # stilde arrives overwhitened (see pycbc_inspiral_fir), so there is
         # no PSD division on this path at all.
-        correlate(ref_template[kmin:kmax], stilde[kmin:kmax], qt[kmin:kmax])
+        # numpy rather than pycbc's correlate(): measured 0.15 ms against
+        # 2.85 ms for the same 514k-element conj-multiply, because slicing
+        # pycbc Arrays per call costs far more than the arithmetic.  Same
+        # operation, conj(h)*d, written straight onto the plan's input buffer.
+        _h = ref_template.numpy(); _d = stilde.numpy(); _q = qt.data
+        np.multiply(np.conj(_h[kmin:kmax]), _d[kmin:kmax], out=_q[kmin:kmax])
         plan.execute()
         norm = (4.0 * stilde.delta_f) / np.sqrt(h_norm)
         return q, norm
@@ -342,6 +347,28 @@ class MatchedFilterRatioControl(object):
         if acc.sum() <= 0:
             return None
         return (acc / acc.sum()).astype(np.float32)
+
+    def _ensure_templates(self, ap_plan, filters_f, f_start, f_end, n_fft):
+        """Upload this filter batch unless the plan already holds it.
+
+        The filter bank does not change between segments, so re-ingesting a
+        batch every segment repeats the conjugate-and-transpose that
+        matchedfilter does at ingest -- 13 times over here.  Keyed on the plan
+        rather than on one slot: batches of different widths get different
+        plans and alternate within a segment, so a single slot thrashes and
+        never hits.
+        """
+        tag = (f_start, id(filters_f))
+        if self._ap_loaded.get(id(ap_plan)) == tag:
+            return
+        # matchedfilter conjugates the template itself, and only the bins the
+        # analytic kernel writes may contribute -- the rest must be zero or
+        # matchedfilter would fold in the half pycbc leaves out.
+        tmpl = np.conj(filters_f[f_start:f_end]).copy()
+        tmpl[:, n_fft // 2 + 1:] = 0
+        ap_plan.set_templates(tmpl)
+        self._ap_loaded[id(ap_plan)] = tag
+        self._ap_filters = filters_f      # keep id() from being reused
 
     def _get_engine_plan(self, nbatch, ndata=1):
         """One plan per batch width, templates reloaded per filter batch."""
@@ -457,16 +484,7 @@ class MatchedFilterRatioControl(object):
 
             if self._engine_mode:
                 ap_plan = self._get_engine_plan(actual_batch_size)
-                tag = (f_start, id(filters_f))
-                if self._ap_loaded != tag:
-                    # matchedfilter conjugates the template itself, and only the bins
-                    # the analytic kernel writes may contribute -- the rest must
-                    # be zero or matchedfilter would fold in the half pycbc leaves out.
-                    tmpl = np.conj(filters_f[f_start:f_end]).copy()
-                    tmpl[:, N_FFT // 2 + 1:] = 0
-                    ap_plan.set_templates(tmpl)
-                    self._ap_loaded = tag
-                    self._ap_filters = filters_f
+                self._ensure_templates(ap_plan, filters_f, f_start, f_end, N_FFT)
                 ifft_plan = current_mult_view = current_corr_view = None
                 if self._engine_mode == 'check':
                     (self._chk_ifft, self._chk_mult,
@@ -516,13 +534,7 @@ class MatchedFilterRatioControl(object):
                 if bstarts.size:
                     nblocks += bstarts.size
                     ap_plan = self._get_engine_plan(actual_batch_size, 1)
-                    tag = (f_start, id(filters_f))
-                    if self._ap_loaded != tag:
-                        tmpl = np.conj(filters_f[f_start:f_end]).copy()
-                        tmpl[:, N_FFT // 2 + 1:] = 0
-                        ap_plan.set_templates(tmpl)
-                        self._ap_loaded = tag
-                        self._ap_filters = filters_f   # keep id() from being reused
+                    self._ensure_templates(ap_plan, filters_f, f_start, f_end, N_FFT)
                     _b = _time.perf_counter()
                     aidx, aval, _ = ap_plan.run_series(
                         data, bstarts, bws, bwe, binsize=N_FFT,
@@ -571,11 +583,7 @@ class MatchedFilterRatioControl(object):
                         chunk = starts[chunk0:chunk0 + self._ap_ndata]
                         ap_plan = self._get_engine_plan(actual_batch_size,
                                                         len(chunk))
-                        if self._ap_loaded != (f_start, id(ap_plan)):
-                            tmpl = np.conj(filters_f[f_start:f_end]).copy()
-                            tmpl[:, N_FFT // 2 + 1:] = 0
-                            ap_plan.set_templates(tmpl)
-                            self._ap_loaded = (f_start, id(ap_plan))
+                        self._ensure_templates(ap_plan, filters_f, f_start, f_end, N_FFT)
                         _c = _time.perf_counter()
                         if len(chunk) == 1:
                             # No copy: the cached block spectrum is already
