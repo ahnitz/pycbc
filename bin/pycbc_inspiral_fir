@@ -248,11 +248,23 @@ def get_args():
                             " is safer and slower. Note the realised rate can"
                             " exceed this at low SNR; see"
                             " docs/hierarchical.md in matchedfilter.")
-    group.add_argument('--ratio-filter-band', type=int, default=0,
-                       metavar='BINS',
-                       help="Override the coarse band the design table picks,"
-                            " in bins. 0 uses the table. For testing that"
-                            " choice against measurement.")
+    group.add_argument('--ratio-filter-band', type=float, default=0,
+                       metavar='HZ',
+                       help="Width of the band the first stage filters, in Hz."
+                            " 0 uses the design table's choice. Must be below"
+                            " the Nyquist frequency of the ratio filter"
+                            " (engine sample rate / 2): asking for Nyquist"
+                            " means filtering the whole band, which is not a"
+                            " cheap first pass at all.")
+    group.add_argument('--ratio-filter-first-stage-snr', type=float, default=0,
+                       metavar='SNR',
+                       help="SNR the first stage is calibrated against."
+                            " Final triggers are still cut at"
+                            " --snr-threshold; this only sets where the cheap"
+                            " first pass calls for a full reconstruction."
+                            " Lower is safer and slower. 0 uses the design"
+                            " table, whose choice is not reliable everywhere"
+                            " -- see docs/hierarchical.md in matchedfilter.")
 
     # power chisq related
     parser.add_argument("--chisq-snr-threshold", type=float,
@@ -353,7 +365,8 @@ def main():
             engine_sample_rate=args.sample_rate,
             engine=args.ratio_filter_engine,
             false_dismissal=args.ratio_filter_false_dismissal,
-            coarse_band=args.ratio_filter_band,
+            coarse_band_hz=args.ratio_filter_band,
+            first_stage_snr=args.ratio_filter_first_stage_snr,
             )
 
         power_chisq = pycbc.vetoes.SingleDetPowerChisq(args.chisq_bins,

@@ -42,7 +42,8 @@ class MatchedFilterRatioControl(object):
     def __init__(self, snr_threshold, delta_f,
                  high_frequency_cutoff=None, fir_fft_length=4096, batch_size=64,
                  tap_sample_rate=2048, engine_sample_rate=2048,
-                 engine='pycbc', false_dismissal=1e-3, coarse_band=0):
+                 engine='pycbc', false_dismissal=1e-3, coarse_band_hz=0,
+                 first_stage_snr=0):
         self.delta_f = delta_f
         self.snr_threshold = snr_threshold
         self.f_high = high_frequency_cutoff
@@ -99,8 +100,20 @@ class MatchedFilterRatioControl(object):
                 % engine)
         self._engine_fd = float(os.environ.get(
             'PYCBC_RATIO_ENGINE_FD', false_dismissal))
-        self._coarse_band = int(os.environ.get(
-            'PYCBC_RATIO_BAND', coarse_band))
+        # The band is given in Hz, which is what a reader of this search
+        # thinks in; matchedfilter wants bins.  delta_f is set by the ratio
+        # filter's own transform, not by the data segments.
+        band_hz = float(os.environ.get('PYCBC_RATIO_BAND_HZ', coarse_band_hz))
+        delta_f = self.engine_sr / float(self.fir_fft_len)
+        nyquist = self.engine_sr / 2.0
+        if band_hz and band_hz >= nyquist:
+            raise ValueError(
+                "--ratio-filter-band %g Hz is at or above the ratio filter's "
+                "Nyquist frequency (%g Hz); that filters the whole band and "
+                "is not a first pass" % (band_hz, nyquist))
+        self._coarse_band = int(round(band_hz / delta_f)) if band_hz else 0
+        self._first_stage_snr = float(os.environ.get(
+            'PYCBC_RATIO_FIRST_STAGE_SNR', first_stage_snr))
         self._engine_plans = {}
         self._ap_ref = None
         self._ap_loaded = {}     # id(plan) -> which filter batch it holds
@@ -365,6 +378,16 @@ class MatchedFilterRatioControl(object):
         self._ap_loaded[id(ap_plan)] = tag
         self._ap_filters = filters_f      # keep id() from being reused
 
+    def _apply_first_stage(self, plan):
+        """Override the first-stage level if the caller asked for one.
+
+        The design table supplies a default from (snr, fd); it is a
+        suggestion, and wrong in at least one cell.  Setting this moves only
+        the level -- band, oversample and taps stay as the plan was built.
+        """
+        if self._first_stage_snr > 0 and hasattr(plan, 'set_first_stage'):
+            plan.set_first_stage(self._first_stage_snr)
+
     def _get_engine_plan(self, nbatch, ndata=1):
         """One plan per batch width, templates reloaded per filter batch."""
         plan = self._engine_plans.get((nbatch, ndata))
@@ -379,10 +402,12 @@ class MatchedFilterRatioControl(object):
                         self.fir_fft_len, ndata=ndata, ntemplates=nbatch,
                         snr=snr, fd=self._engine_fd, band=bd,
                         oversample=2, taps=8)
+                    self._apply_first_stage(plan)
                 else:
                     plan = _mf.HierarchicalFilter(
                         self.fir_fft_len, ndata=ndata, ntemplates=nbatch,
                         snr=snr, fd=self._engine_fd)
+                    self._apply_first_stage(plan)
             else:
                 plan = _mf.MatchedFilter(
                     self.fir_fft_len, ndata=ndata, ntemplates=nbatch)
