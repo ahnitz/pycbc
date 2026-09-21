@@ -284,9 +284,14 @@ class MatchedFilterRatioControl(object):
         N = (len(stilde) - 1) * 2
         kmin, kmax = get_cutoff_indices(
             ref_template.f_lower, self.f_high, stilde.delta_f, N)
-        plan, qt, q = self._get_ref_plan(N)
+        plan, qt, q = self._get_ref_plan(N, kmax)
+        # Only the low strip is cleared per call.  correlate writes solely
+        # [kmin:kmax] and execute() reads qt and writes q, so nothing ever
+        # dirties the region above kmax -- and kmax derives from self.f_high,
+        # an engine attribute, so it is fixed for the whole run.  Clearing it
+        # once with the buffer removes 4 MB of stores per segment.  kmin comes
+        # from the template's f_lower and does vary, so that strip stays.
         qt[:kmin] = 0
-        qt[kmax:] = 0
         # stilde arrives overwhitened (see pycbc_inspiral_fir), so there is
         # no PSD division on this path at all.
         correlate(ref_template[kmin:kmax], stilde[kmin:kmax], qt[kmin:kmax])
@@ -294,14 +299,20 @@ class MatchedFilterRatioControl(object):
         norm = (4.0 * stilde.delta_f) / np.sqrt(h_norm)
         return q, norm
 
-    def _get_ref_plan(self, size):
-        """Cached IFFT plan and its buffers for the reference filter."""
+    def _get_ref_plan(self, size, kmax):
+        """Cached IFFT plan and its buffers for the reference filter.
+
+        Keyed on kmax as well as size: zeros() hands back a cleared buffer,
+        which is what lets _reference_snr skip clearing above kmax on every
+        call.  If the upper cutoff ever did change, this reallocates rather
+        than leaving a stale band in the transform.
+        """
         cached = self._ref_plan
-        if cached is None or cached[0] != size:
+        if cached is None or cached[0] != (size, kmax):
             qt = zeros(size, dtype=complex64)
             q = zeros(size, dtype=complex64)
             plan = IFFT(qt, q)
-            cached = self._ref_plan = (size, plan, qt, q)
+            cached = self._ref_plan = ((size, kmax), plan, qt, q)
         _, plan, qt, q = cached
         return plan, Array(qt, copy=False), q
 
