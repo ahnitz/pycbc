@@ -19,6 +19,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 pycbc.add_common_pycbc_options(parser)
 parser.add_argument('--trigger-file', required=True,
                     help="Combined single detector hdf trigger file")
+parser.add_argument('--ifo', default=None, type=str,
+                    help="Optional, specify IFO if multi-ifo file is provided")
 parser.add_argument('--veto-file',
                     help="segment xml file, indicates which triggers to ignore")
 parser.add_argument('--segment-name',
@@ -49,7 +51,7 @@ pycbc.init_logging(args.verbose)
 
 # read trigger file to determine IFO
 f = pycbc.io.HFile(args.trigger_file, 'r')
-ifo = tuple(f.keys())[0]
+ifo = args.ifo if args.ifo is not None else tuple(f.keys())[0]
 
 # Apply presort if we can; if we can't, load everything but it may be
 # inefficient

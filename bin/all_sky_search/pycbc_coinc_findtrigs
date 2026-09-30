@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-import copy, argparse, logging, numpy, numpy.random
+import copy, argparse, logging, numpy, numpy.random, h5py
 import shutil, uuid, os.path, atexit
 from igwn_segments import infinity
 import pycbc
@@ -119,23 +119,38 @@ atexit.register(exit_cleaning)
 # coincs: so, track which templates contain triggers in all ifos
 tids_with_trigs = None
 
+file_ifo_pairs = []
 for i in range(len(args.trigger_files)):
+    src_file = args.trigger_files[i]
     if args.stage_input:
         dest = os.path.join(args.stage_input_dir, str(uuid.uuid4()) + '.hdf')
-        logging.info("Moving %s to shared memory as %s",
-                     args.trigger_files[i], dest)
+        logging.info("Moving %s to shared memory as %s", src_file, dest)
         cleanup_files.append(dest)
-        shutil.copyfile(args.trigger_files[i], dest)
+        shutil.copyfile(src_file, dest)
     else:
-        dest = args.trigger_files[i]
+        dest = src_file
 
-    logging.info('Opening trigger file %s: %s' % (i, dest))
+    with HFile(dest, 'r') as probe_f:
+        present_ifos = [
+            k for k in probe_f.keys()
+            if isinstance(probe_f[k], h5py.Group) and (
+                'search' in probe_f[k] or 'template_id' in probe_f[k] or 'template_hash' in probe_f[k]
+            )
+        ]
+        matched_ifos = [ifo for ifo in [args.pivot_ifo, args.fixed_ifo] if ifo in present_ifos]
+        if not matched_ifos:
+            matched_ifos = sorted(present_ifos)
+        for ifo in matched_ifos:
+            file_ifo_pairs.append((dest, ifo))
+
+for dest, ifo in file_ifo_pairs:
+    logging.info('Opening trigger file for %s: %s' % (ifo, dest))
     reader = ReadByTemplate(dest,
                             args.template_bank,
                             args.segment_name,
                             args.veto_files,
-                            args.gating_veto_windows)
-    ifo = reader.ifo
+                            args.gating_veto_windows,
+                            ifo=ifo)
     trigs.ifos.append(ifo)
 
     # We don't have that many triggers, see if we can skip some templates
@@ -525,11 +540,13 @@ f['segments/%s/start' % key], f['segments/%s/end' % key] = trigs.singles[0].vali
 
 f.attrs['timeslide_interval'] = args.timeslide_interval
 f.attrs['coinc_time'] = abs(coinc_segs)
-f.attrs['num_of_ifos'] = len(args.trigger_files)
+f.attrs['num_of_ifos'] = len(trigs.ifos)
 f.attrs['pivot'] = args.pivot_ifo
 f.attrs['fixed'] = args.fixed_ifo
 for i, sngl in zip(trigs.ifos, trigs.singles):
     f.attrs['%s_foreground_time' % i] = abs(sngl.segs)
+    if '%s/search/non_threshold_time' % i in sngl.file:
+        f.attrs['%s_non_threshold_time' % i] = float(sngl.file['%s/search/non_threshold_time' % i][()])
 f.attrs['ifos'] = ' '.join(sorted(trigs.ifos))
 
 # What does this code actually calculate?

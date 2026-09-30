@@ -1422,10 +1422,10 @@ class ForegroundTriggers(object):
 class ReadByTemplate(object):
     # Default assignment to {} is OK for a variable used only in __init__
     def __init__(self, filename, bank=None, segment_name=None, veto_files=None,
-                 gating_veto_windows={}):
+                 gating_veto_windows={}, ifo=None):
         self.filename = filename
         self.file = HFile(filename, 'r')
-        self.ifo = tuple(self.file.keys())[0]
+        self.ifo = ifo if ifo is not None else tuple(self.file.keys())[0]
         self.valid = None
         self.bank = HFile(bank, 'r') if bank else {}
 

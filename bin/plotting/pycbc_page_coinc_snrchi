@@ -30,6 +30,8 @@ parser.add_argument('--coinc-statistic-file', required=True,
 parser.add_argument('--single-trigger-file', required=True,
                     help='Single detector trigger files from the zero lag run.'
                          ' Required')
+parser.add_argument('--ifo', default=None, type=str,
+                    help='Optional, specify IFO if multi-ifo file is provided')
 parser.add_argument('--newsnr-contours', nargs='*', default=[],
                     help="List of newsnr values to draw contours. Optional")
 parser.add_argument('--background-front', action='store_true', default=False,
@@ -49,7 +51,7 @@ args = parser.parse_args()
 init_logging(args.verbose)
 # First - check the IFO being used
 with HFile(args.single_trigger_file, 'r') as stf:
-    ifo = tuple(stf.keys())[0]
+    ifo = args.ifo if args.ifo is not None else tuple(stf.keys())[0]
 
 # Add the background triggers
 with HFile(args.coinc_statistic_file, 'r') as csf:

@@ -222,10 +222,28 @@ maxtime_exc = max(0.0, maxtime - veto_time)
 mintime_exc = max(0.0, mintime - veto_time)
 
 ts_interval = all_trigs.attrs.get('timeslide_interval', 1.0)
-background_time = int(maxtime / ts_interval) * mintime
 coinc_time = float(all_trigs.attrs.get('coinc_time', 0.0))
 
-background_time_exc = int(maxtime_exc / ts_interval) * mintime_exc
+has_nothresh = (
+    len(ifos) == 2 and
+    ('%s_non_threshold_time' % ifos[0]) in all_trigs.attrs and
+    ('%s_non_threshold_time' % ifos[1]) in all_trigs.attrs
+)
+
+if has_nothresh:
+    t_obs1 = float(all_trigs.attrs['%s_foreground_time' % ifos[0]])
+    t_obs2 = float(all_trigs.attrs['%s_foreground_time' % ifos[1]])
+    t_nothresh1 = float(all_trigs.attrs['%s_non_threshold_time' % ifos[0]])
+    t_nothresh2 = float(all_trigs.attrs['%s_non_threshold_time' % ifos[1]])
+    background_time = (t_obs1 * t_nothresh2 + t_obs2 * t_nothresh1) / ts_interval
+    if coinc_time > 0 and veto_time > 0:
+        frac_exc = max(0.0, 1.0 - veto_time / coinc_time)
+        background_time_exc = background_time * frac_exc
+    else:
+        background_time_exc = background_time
+else:
+    background_time = int(maxtime / ts_interval) * mintime
+    background_time_exc = int(maxtime_exc / ts_interval) * mintime_exc
 coinc_time_exc = coinc_time - veto_time
 
 f.attrs['background_time'] = background_time
@@ -439,7 +457,10 @@ while numpy.any(ifar_foreground >= background_time):
         if all_trigs.attrs['%s_foreground_time' % ifo] < mintime:
             mintime = all_trigs.attrs['%s_foreground_time' % ifo]
 
-    background_time = int(maxtime / all_trigs.attrs['timeslide_interval']) * mintime
+    if has_nothresh:
+        background_time = (t_obs1 * t_nothresh2 + t_obs2 * t_nothresh1) / all_trigs.attrs['timeslide_interval']
+    else:
+        background_time = int(maxtime / all_trigs.attrs['timeslide_interval']) * mintime
     coinc_time = float(all_trigs.attrs['coinc_time'])
 
     logging.info("Calculating FAN from background statistic values")

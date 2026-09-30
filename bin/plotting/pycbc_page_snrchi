@@ -15,6 +15,8 @@ from pycbc.io import (
 parser = argparse.ArgumentParser()
 pycbc.add_common_pycbc_options(parser)
 parser.add_argument('--trigger-file', help='Single ifo trigger file')
+parser.add_argument('--ifo', default=None, type=str,
+                    help='Optional, ifo name if multi-ifo trigger file is given')
 parser.add_argument('--veto-file',
                     help='Optional, file of veto segments to remove triggers')
 parser.add_argument('--segment-name', default=None, type=str,
@@ -48,7 +50,7 @@ args.newsnr_contours = \
 
 # First - get the IFO from the file
 with HFile(args.trigger_file, 'r') as f:
-    ifo = tuple(f.keys())[0]
+    ifo = args.ifo if args.ifo is not None else tuple(f.keys())[0]
     n_triggers = f[ifo]['snr'].size
 
 logging.info(
