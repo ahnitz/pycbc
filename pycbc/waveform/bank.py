@@ -1148,24 +1148,103 @@ class RatioFilterBank(FilterBank):
         )
 
         # Load metadata attributes
-        self.n_taps = self.fir_group.attrs.get('n_taps', None)
-        self.sample_rate = self.fir_group.attrs.get('sample_rate', None)
+        self.num_levels = self.fir_group.attrs.get('num_levels', None)
+        if self.num_levels is not None:
+            self.num_levels = int(self.num_levels)
+            self.sample_rate = float(self.fir_group.attrs.get('sample_rate', 2048.0))
+            self.n_taps = self.fir_group.attrs.get('n_taps', None)
+            
+            # Level 1 holds the fine groups
+            self.level1_group = self.fir_group['level_1']
+            self.coarse_keys = [k for k in self.level1_group.keys() if k.isdigit()]
+            self.coarse_indices = np.array(sorted(int(k) for k in self.coarse_keys), dtype=int)
+            
+            # Top level holds the reference waveforms
+            top_grp = self.fir_group[f'level_{self.num_levels}']
+            self.top_indices = np.array(sorted(
+                int(k) for k in top_grp.keys() if k.isdigit()), dtype=int)
+            self.top_bank = FilterBank(
+                filename, filter_length, delta_f, dtype,
+                approximant=approximant,
+                group_key=f'fir_data/level_{self.num_levels}/params',
+                file_handler=self.filehandler, **kwds)
+            self.upper_group = None
+            self.middle_top_map = {}
+        else:
+            self.level1_group = self.fir_group
+            self.n_taps = self.fir_group.attrs.get('n_taps', None)
+            self.sample_rate = self.fir_group.attrs.get('sample_rate', None)
 
-        # Cache valid coarse keys (directories like "0", "1") for iteration
-        # These keys correspond to indices in the coarse_bank
-        self.coarse_keys = [k for k in self.fir_group.keys() if k.isdigit()]
+            # Cache valid coarse keys (directories like "0", "1") for iteration
+            # These keys correspond to indices in the coarse_bank
+            self.coarse_keys = [k for k in self.fir_group.keys() if k.isdigit()]
 
-        # Convert to sorted integers for deterministic iteration order
-        self.coarse_indices = np.array([int(k) for k in self.coarse_keys], dtype=int)
-        self.coarse_indices.sort()
+            # Convert to sorted integers for deterministic iteration order
+            self.coarse_indices = np.array([int(k) for k in self.coarse_keys], dtype=int)
+            self.coarse_indices.sort()
+
+            # Version 2 adds a top->middle edge while leaving the existing
+            # middle->fine groups in place. The search still opens one HDF file.
+            self.upper_group = self.fir_group.get('upper')
+            self.top_bank = None
+            self.top_indices = np.array([], dtype=int)
+            self.middle_top_map = {}
+            if self.upper_group is not None:
+                self.top_bank = FilterBank(
+                    filename, filter_length, delta_f, dtype,
+                    approximant=approximant,
+                    group_key='fir_data/upper/top_bank_params',
+                    file_handler=self.filehandler, **kwds)
+                self.top_indices = np.array(sorted(
+                    int(k) for k in self.upper_group.keys() if k.isdigit()),
+                    dtype=int)
+                for top_id in self.top_indices:
+                    if top_id < 0 or top_id >= len(self.top_bank):
+                        raise ValueError('top FIR index outside top bank')
+                    group = self.upper_group[str(top_id)]
+                    indices = group['fine_bank_index'][:]
+                    counts = group['actual_tap_count'][:]
+                    if len(indices) != len(counts) or len(counts) != len(group['taps']):
+                        raise ValueError('upper FIR group has inconsistent row counts')
+                    if np.any(counts < 1) or np.any(counts > group['taps'].shape[1]):
+                        raise ValueError('upper FIR tap count outside stored width')
+                    for middle_id in indices:
+                        middle_id = int(middle_id)
+                        if middle_id < 0 or middle_id >= len(self.coarse_bank):
+                            raise ValueError('upper FIR points outside middle bank')
+                        if middle_id in self.middle_top_map:
+                            raise ValueError('middle template has multiple top parents')
+                        self.middle_top_map[middle_id] = int(top_id)
+                if set(self.middle_top_map) != set(map(int, self.coarse_indices)):
+                    raise ValueError('upper FIRs do not cover every middle reference')
+                if self.upper_group.attrs.get('sample_rate') != self.sample_rate:
+                    raise ValueError('upper and lower FIR sample rates disagree')
+                fine_seen = set()
+                for middle_id in self.coarse_indices:
+                    group = self.fir_group[str(middle_id)]
+                    indices = group['fine_bank_index'][:]
+                    counts = group['actual_tap_count'][:]
+                    if len(indices) != len(counts) or len(counts) != len(group['taps']):
+                        raise ValueError('lower FIR group has inconsistent row counts')
+                    if np.any(counts < 1) or np.any(counts > group['taps'].shape[1]):
+                        raise ValueError('lower FIR tap count outside stored width')
+                    for fine_id in indices:
+                        fine_id = int(fine_id)
+                        if fine_id < 0 or fine_id >= len(self.table):
+                            raise ValueError('lower FIR points outside fine bank')
+                        if fine_id in fine_seen:
+                            raise ValueError('fine template has multiple middle parents')
+                        fine_seen.add(fine_id)
+                if len(fine_seen) != len(self.table):
+                    raise ValueError('lower FIRs do not cover every fine template')
 
         # Setup a mapping from the fine template index to the coarse index
         self.fine_coarse_map = np.zeros((len(self.table), 2), dtype=int) - 1
         for coarse_id in self.coarse_keys:
-            fine_indices = self.fir_group[coarse_id]['fine_bank_index'][:]
+            fine_indices = self.level1_group[coarse_id]['fine_bank_index'][:]
             if len(fine_indices) > 0:
                 mapback = np.column_stack([np.ones(len(fine_indices)) * int(coarse_id),
-                                     np.arange(len(fine_indices))])
+                                           np.arange(len(fine_indices))])
                 self.fine_coarse_map[fine_indices] = mapback
 
     def template_thinning(self, inj_filter_rejector):
@@ -1219,6 +1298,21 @@ class RatioFilterBank(FilterBank):
         """
         return self.coarse_bank[coarse_index]
 
+    def get_top_template(self, top_index):
+        if self.top_bank is None:
+            raise ValueError('bank has no upper FIR level')
+        return self.top_bank[top_index]
+
+    def get_upper_firs(self, top_index):
+        """Return top->middle taps, tap counts and middle-bank indices."""
+        if self.upper_group is None:
+            raise ValueError('bank has no upper FIR level')
+        group = self.upper_group[str(top_index)]
+        counts = group['actual_tap_count'][:]
+        order = np.argsort(counts)
+        return (group['taps'][:][order], counts[order],
+                group['fine_bank_index'][:][order])
+
     def setup_mchirp_norm(self):
         """Build the mchirp-ratio SNR/sigma rescaling used by snr_rescale
         and sigma_rescale when method='mchirp'. Idempotent but not cheap;
@@ -1248,7 +1342,7 @@ class RatioFilterBank(FilterBank):
         self.sigma_sigma_rescale = np.ones(len(self.table))
         for coarse_id in self.coarse_indices:
             coarse_id = str(coarse_id)
-            c_group = self.fir_group[coarse_id]
+            c_group = self.level1_group[coarse_id]
             fine_indices = c_group['fine_bank_index'][:]
             sigmas = c_group['sigmas'][:]
             if len(fine_indices) > 0:
@@ -1305,8 +1399,9 @@ class RatioFilterBank(FilterBank):
         search time -- the two must stay in sync.
         """
         coarse, local = self.fine_coarse_map[fine_index]
-        taps = self.fir_group[str(coarse)]['taps'][local]
-        size = self.fir_group[str(coarse)]['actual_tap_count'][local]
+        grp = self.level1_group[str(coarse)]
+        taps = grp['taps'][local]
+        size = grp['actual_tap_count'][local]
 
         tlen = int(self.sample_rate / delta_f)
         ts = np.zeros(tlen)
@@ -1319,38 +1414,53 @@ class RatioFilterBank(FilterBank):
         fs.params = self.table[fine_index]
         return fs
 
-    def get_firs(self, coarse_index):
-        """Retrieve the FIR tap information for the batch of fine templates
-        associated with a specific coarse reference.
+    def get_level_firs(self, level, parent_index):
+        """Retrieve FIR taps, tap counts, child indices, and sigmas for
+        a specific parent at a given hierarchy level (1-indexed).
 
         Parameters
         ----------
-        coarse_index : int
-            The index of the coarse template.
+        level : int
+            Hierarchy level (e.g. 1 to num_levels).
+        parent_index : int
+            Seed / parent template index at this level.
 
         Returns
         -------
         taps : np.ndarray
-            2D array of FIR taps (shape: [N_fine_in_group, N_taps]).
-        actual_tap_counts : np.ndarray
-             1D array containing the valid number of taps for each filter
-             (since 'taps' might be zero-padded).
-        fine_indices : np.ndarray
-             1D array of indices pointing to `self.table` (the fine bank)
-             that these filters correspond to.
+            Sorted FIR taps for children.
+        counts : np.ndarray
+            Sorted valid tap counts.
+        child_indices : np.ndarray
+            Sorted child indices in the level below.
+        sigmas : np.ndarray
+            (N, 3) sigma array: [ref_sigma, rec_sigma, target_sigma].
+        """
+        lvl_grp = self.fir_group[f'level_{level}']
+        p_grp = lvl_grp[str(parent_index)]
+        taps = p_grp['taps'][:]
+        counts = p_grp['actual_tap_count'][:]
+        child_indices = p_grp['fine_bank_index'][:]
+        sigmas = p_grp['sigmas'][:] if 'sigmas' in p_grp else None
+        sort_idx = np.argsort(counts)
+        sigmas_sorted = sigmas[sort_idx] if sigmas is not None else None
+        return taps[sort_idx], counts[sort_idx], child_indices[sort_idx], sigmas_sorted
+
+    def get_firs(self, coarse_index):
+        """Retrieve the FIR tap information for the batch of fine templates
+        associated with a specific coarse reference.
         """
         group_key = str(coarse_index)
-        if group_key not in self.fir_group:
+        grp = self.level1_group
+        if group_key not in grp:
             raise ValueError(f"Coarse index {coarse_index} not found in FIR data.")
 
-        c_group = self.fir_group[group_key]
+        c_group = grp[group_key]
 
         taps = c_group['taps'][:]
         actual_tap_counts = c_group['actual_tap_count'][:]
         fine_indices = c_group['fine_bank_index'][:]
 
-        # Sorted by tap count so the engine's batches group similarly-sized
-        # filters together (see _execute_blocked_kernel's tap_groups).
         sort_idx = np.argsort(actual_tap_counts)
         return taps[sort_idx], actual_tap_counts[sort_idx], fine_indices[sort_idx]
 
