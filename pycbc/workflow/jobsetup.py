@@ -554,7 +554,11 @@ class PyCBCInspiralExecutable(Executable):
                 for ifo in self.ifo_list:
                     ffiles = self.cp.get_opt_tags("workflow", "%s-frame-files" % ifo.lower(), "")
                     if ffiles:
-                        frame_files.extend(ffiles.split())
+                        for f in ffiles.split():
+                            if ':' not in f:
+                                frame_files.append(f"{ifo}:{f}")
+                            else:
+                                frame_files.append(f)
                 if frame_files:
                     node.add_opt("--frame-files", " ".join(frame_files))
         else:
