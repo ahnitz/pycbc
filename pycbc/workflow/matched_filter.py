@@ -292,6 +292,96 @@ def setup_matchedfltr_dax_generated_multi(workflow, science_segs, datafind_outs,
             multi_ifo_coherent_job_setup(workflow, inspiral_outs, job_instance,
                                          science_segs, datafind_outs,
                                          output_dir, parents=tmplt_banks)
+    elif match_fltr_exe in ['pycbc_inspiral_fir', 'pycbc_inspiral']:
+        exe_class = select_matchedfilter_class(match_fltr_exe)
+
+        coincident_only = cp.has_option('workflow-matchedfilter', 'coincident-only')
+        if coincident_only:
+            analysis_segs = science_segs[ifos[0]]
+            for ifo in ifos[1:]:
+                analysis_segs = analysis_segs & science_segs[ifo]
+        else:
+            from igwn_segments import segmentlist
+            analysis_segs = segmentlist([])
+            for ifo in ifos:
+                analysis_segs.extend(science_segs[ifo])
+            analysis_segs.coalesce()
+
+        if cp.has_option('workflow-matchedfilter', 'target-job-duration'):
+            target_duration = int(cp.get('workflow-matchedfilter', 'target-job-duration'))
+        else:
+            target_duration = 2048
+
+        if cp.has_option('workflow-matchedfilter', 'min-analysis-length'):
+            min_analysis_length = int(cp.get('workflow-matchedfilter', 'min-analysis-length'))
+        else:
+            min_analysis_length = 0
+
+        pad_data = 8
+        if cp.has_option('inspiral', 'pad-data'):
+            pad_data = int(cp.get('inspiral', 'pad-data'))
+
+        from igwn_segments import segment
+
+        job_instances = {}
+        def get_job_instance(active_ifos):
+            key = tuple(active_ifos)
+            if key not in job_instances:
+                job_instances[key] = exe_class(
+                    workflow.cp, 'inspiral',
+                    ifo=active_ifos if len(active_ifos) > 1 else active_ifos[0],
+                    out_dir=output_dir,
+                    injection_file=injection_file,
+                    tags=tags
+                )
+            return job_instances[key]
+
+        for curr_seg in analysis_segs:
+            seg_len = abs(curr_seg)
+            if min_analysis_length and seg_len < min_analysis_length:
+                continue
+
+            num_jobs = max(1, int(round(seg_len / float(target_duration))))
+            job_dur = seg_len / float(num_jobs)
+
+            for job_idx in range(num_jobs):
+                v_start = int(round(curr_seg[0] + job_idx * job_dur))
+                v_end = int(round(curr_seg[0] + (job_idx + 1) * job_dur))
+                if job_idx == num_jobs - 1:
+                    v_end = int(curr_seg[1])
+
+                valid_seg = segment([v_start, v_end])
+                data_seg = segment([v_start - pad_data, v_end + pad_data])
+
+                if coincident_only:
+                    job_ifos = list(ifos)
+                else:
+                    job_ifos = [ifo for ifo in ifos if science_segs[ifo].intersects_segment(valid_seg)]
+                    if not job_ifos:
+                        job_ifos = list(ifos)
+
+                curr_job = get_job_instance(job_ifos)
+
+                curr_dfouts = FileList([])
+                if datafind_outs:
+                    for ifo in job_ifos:
+                        df = datafind_outs.find_all_output_in_range(ifo, data_seg, useSplitLists=True)
+                        if df:
+                            curr_dfouts.extend(df)
+
+                for split_bank in tmplt_banks:
+                    tag = list(tags)
+                    if len(tmplt_banks) > 1 and hasattr(split_bank, 'tag_str') and split_bank.tag_str:
+                        tag.append(split_bank.tag_str)
+                    node = curr_job.create_node(
+                        data_seg, valid_seg,
+                        parent=split_bank,
+                        df_parents=curr_dfouts if curr_dfouts else None,
+                        tags=tag
+                    )
+                    workflow.add_node(node)
+                    curr_out_files = [i for i in node.output_files if 'PSD_FILE' not in i.tags]
+                    inspiral_outs.extend(curr_out_files)
     else:
         # Select the appropriate class
         raise ValueError("Not currently supported.")

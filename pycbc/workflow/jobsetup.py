@@ -537,8 +537,21 @@ class PyCBCInspiralExecutable(Executable):
         data_seg = segments.segment([int(data_seg[0]), int(data_seg[1])])
         fil.add_metadata('data_seg', data_seg)
         node.add_input_opt('--bank-file', parent)
-        if df_parents is not None:
-            node.add_input_list_opt('--frame-files', df_parents)
+        if self.ifo_list and len(self.ifo_list) > 1:
+            node.add_opt('--instruments', ' '.join(self.ifo_list))
+            if not self.has_opt('channel-name') and '--channel-name' not in node._options:
+                channel_names = []
+                for ifo in self.ifo_list:
+                    cname = self.cp.get_opt_tags("workflow", "%s-channel-name" % ifo.lower(), "")
+                    if cname:
+                        channel_names.append(cname)
+                if channel_names:
+                    node.add_opt("--channel-name", " ".join(channel_names))
+            if df_parents is not None:
+                node.add_multiifo_input_list_opt('--frame-files', df_parents)
+        else:
+            if df_parents is not None:
+                node.add_input_list_opt('--frame-files', df_parents)
 
         return node
 

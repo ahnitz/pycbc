@@ -1340,6 +1340,9 @@ class StrainSegments(object):
         segment_group.add_argument("--filter-inj-only", action='store_true',
                                    help="Analyze only segments that contain "
                                         "an injection.")
+        segment_group.add_argument("--injection-window", default=None,
+                    type=float, metavar='WINDOW',
+                    help="Window to analyze in seconds around an injection.")
 
     required_opts_list = ['--segment-length',
                    '--segment-start-pad',
