@@ -1154,7 +1154,8 @@ class StrainSegments(object):
         trig_start_idx = (trigger_start - int(strain.start_time)) * strain.sample_rate
         trig_end_idx = (trigger_end - int(strain.start_time)) * strain.sample_rate
 
-        if filter_inj_only and hasattr(strain, 'injections'):
+        filter_injections = (filter_inj_only or injection_window is not None) and hasattr(strain, 'injections')
+        if filter_injections:
             end_times = strain.injections.end_times()
             end_times = [time for time in end_times if float(time) < trigger_end and float(time) > trigger_start]
             inj_idx = [(float(time) - float(strain.start_time)) * strain.sample_rate for time in end_times]
@@ -1173,16 +1174,26 @@ class StrainSegments(object):
             if trig_end_idx < cum_end:
                 stop -= (cum_end - trig_end_idx)
 
-            if filter_inj_only and hasattr(strain, 'injections'):
+            if filter_injections:
                 analyze_this = False
-                inj_window = strain.sample_rate * 8
+                inj_pad = int((injection_window if injection_window is not None else 8) * strain.sample_rate)
+                matching_injs = []
                 for inj_id in inj_idx:
-                    if inj_id < (cum_end + inj_window) and \
-                            inj_id > (cum_start - inj_window):
+                    if (cum_start - inj_pad) < inj_id < (cum_end + inj_pad):
                         analyze_this = True
+                        matching_injs.append(inj_id)
 
                 if not analyze_this:
                     continue
+
+                if injection_window is not None and matching_injs:
+                    win_points = int(injection_window * strain.sample_rate)
+                    min_inj = min(matching_injs) - seg.start
+                    max_inj = max(matching_injs) - seg.start
+                    inj_start = max(start, int(min_inj - win_points))
+                    inj_end = min(stop, int(max_inj + win_points))
+                    start = inj_start
+                    stop = inj_end
 
             if start < stop:
                 segment_slices_red.append(seg)
@@ -1283,6 +1294,7 @@ class StrainSegments(object):
                    trigger_start=opt.trig_start_time[ifo],
                    trigger_end=opt.trig_end_time[ifo],
                    filter_inj_only=opt.filter_inj_only,
+                   injection_window=opt.injection_window,
                    allow_zero_padding=opt.allow_zero_padding)
 
     @classmethod
