@@ -390,12 +390,15 @@ def get_single_template_params(curr_idx, times, bank_data,
 
     """
     params = {}
+    curr_idx = int(curr_idx)
+    bank_id = int(bank_id)
     for ifo in times:
         params['%s_end_time' % ifo] = times[ifo][curr_idx]
         try:
             # Only present for precessing, so may not exist
+            tid = int(tids[ifo][curr_idx])
             params['u_vals_%s' % ifo] = \
-                                 fsdt[ifo][ifo]['u_vals'][tids[ifo][curr_idx]]
+                                 fsdt[ifo][ifo]['u_vals'][tid]
         except:
             pass
 

@@ -168,7 +168,7 @@ while event_count < num_events and curr_idx < (events_to_read - 1):
             # Use mean time instead and don't plot special trigger
             plottime = mtime
         else:  # Do plot special trigger
-            ifo_tids_strings += ['%s:%s' % (ifo, tids[ifo][curr_idx])]
+            ifo_tids_strings += ['%s:%d' % (ifo, int(tids[ifo][curr_idx]))]
         ifo_times_strings += ['%s:%s' % (ifo, plottime)]
 
         # For background do not want to follow up 10 background coincs with the
@@ -200,7 +200,7 @@ while event_count < num_events and curr_idx < (events_to_read - 1):
                         tags=[f'SKIP_{event_count}']),)
         skipped_data = []
 
-    bank_id = bank_ids[curr_idx]
+    bank_id = int(bank_ids[curr_idx])
 
     layouts += (mini.make_coinc_info(workflow, single_triggers, tmpltbank_file,
                               coinc_file, args.output_dir, n_loudest=curr_idx,

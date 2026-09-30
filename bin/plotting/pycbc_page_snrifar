@@ -201,40 +201,45 @@ logging.info('Found %s background (exclusive zerolag) triggers' % len(cstat_back
 
 # We'll use the background far for the ylimits if closed box, foreground
 # otherwise
-if args.ymin is not None:
-    plot_ymin = args.ymin
-elif args.closed_box or cstat_fore is None:
-    plot_ymin = far_back_exc.min()/10.
+if len(far_back_exc) == 0 and (cstat_fore is None or len(cstat_fore) == 0):
+    plot_ymin = args.ymin if args.ymin is not None else 1e-4
+    plot_ymax = args.ymax if args.ymax is not None else 1.0
+    plot_xmin = args.xmin if args.xmin is not None else 0.0
+    plot_xmax = args.xmax if args.xmax is not None else 10.0
 else:
-    plot_ymin = far_back.min()/10.
-
-if args.ymax is not None:
-    plot_ymax = args.ymax
-elif args.closed_box or cstat_fore is None:
-    plot_ymax = far_back_exc.max()
-else:
-    plot_ymax = far_back.max()
-
-# We'll use the background for the xlimits if closed box, foreground
-# otherwise.
-if args.xmin is not None:
-    plot_xmin = args.xmin
-elif args.closed_box or cstat_fore is None:
-    plot_xmin = cstat_back_exc.min()
-else:
-    plot_xmin = cstat_fore.min()
-
-if args.xmax is not None:
-    plot_xmax = args.xmax
-
-else:
-    # Otherwise, make the furthest point to the right be ~1/10 of the width
-    # of the plot from the right axis.
-    if args.closed_box or cstat_fore is None:
-        plot_xmax = cstat_back_exc.max()
+    if args.ymin is not None:
+        plot_ymin = args.ymin
+    elif args.closed_box or cstat_fore is None or len(far_back) == 0:
+        plot_ymin = far_back_exc.min()/10. if len(far_back_exc) > 0 else 1e-4
     else:
-        plot_xmax = max(cstat_back.max(), cstat_fore.max())
-    plot_xmax += (plot_xmax - plot_xmin)/10.
+        plot_ymin = far_back.min()/10.
+
+    if args.ymax is not None:
+        plot_ymax = args.ymax
+    elif args.closed_box or cstat_fore is None or len(far_back) == 0:
+        plot_ymax = far_back_exc.max() if len(far_back_exc) > 0 else 1.0
+    else:
+        plot_ymax = far_back.max()
+
+    # We'll use the background for the xlimits if closed box, foreground
+    # otherwise.
+    if args.xmin is not None:
+        plot_xmin = args.xmin
+    elif args.closed_box or cstat_fore is None or len(cstat_fore) == 0:
+        plot_xmin = cstat_back_exc.min() if len(cstat_back_exc) > 0 else 0.0
+    else:
+        plot_xmin = cstat_fore.min()
+
+    if args.xmax is not None:
+        plot_xmax = args.xmax
+    else:
+        # Otherwise, make the furthest point to the right be ~1/10 of the width
+        # of the plot from the right axis.
+        if args.closed_box or cstat_fore is None or len(cstat_fore) == 0:
+            plot_xmax = cstat_back_exc.max() if len(cstat_back_exc) > 0 else 10.0
+        else:
+            plot_xmax = max(cstat_back.max() if len(cstat_back) > 0 else 0, cstat_fore.max())
+        plot_xmax += (plot_xmax - plot_xmin)/10.
 
 fig = plt.figure(1)
 back_marker = 'x'
@@ -272,7 +277,7 @@ if not args.closed_box:
                       marker=args.fg_marker, label='Foreground', zorder=100,
                       linewidth=0.5, edgecolors='white')
 
-        if args.not_cumulative:
+        if args.not_cumulative and len(cstat_back) > 0:
             # add arrows to any points > the loudest background
             louder_pts = numpy.where(cstat_fore > cstat_back.max())[0] 
             for ii in louder_pts:
@@ -292,7 +297,8 @@ if not args.closed_box:
                 for ii in louder_pts:
                     r = cstat_fore_h_rm[ii]
                     arr_start = cstat_rate_h_rm[ii]
-                    if arr_start > far_back_exc.min():
+                    min_exc = far_back_exc.min() if len(far_back_exc) > 0 else 0
+                    if arr_start > min_exc:
                         continue
                     # make the arrow length 1/15 the height of the plot
                     arr_end = arr_start * (plot_ymin / plot_ymax) ** (1./15)
@@ -304,6 +310,7 @@ if not args.closed_box:
                                  edgecolors='white', lw=0.5, s=40, zorder=98)
 
 if not args.cumulative:
+    max_bg_far = far_back.max() if len(far_back) > 0 else (plot_ymax if plot_ymax > 0 else 1.0)
     # add second y-axis for probabilities, sigmas
     sigmas = numpy.arange(6)+1
     ax1 = plt.gca()
@@ -320,15 +327,15 @@ if not args.cumulative:
     sigps = p_from_sigma(sigmas)
     for ii,p in enumerate(sigps[:-1]):
         nextp = sigps[ii+1]
-        plt.axhspan(far_from_p(nextp, foreground_livetime, far_back.max()),
-                      far_from_p(p, foreground_livetime, far_back.max()),
+        plt.axhspan(far_from_p(nextp, foreground_livetime, max_bg_far),
+                      far_from_p(p, foreground_livetime, max_bg_far),
                       linewidth=0,
                       color=plt.cm.Blues(float(sigmas[ii+1]) / sigmas.size),
                       alpha=0.3, zorder=-1) 
             # add sigma label
-        plt.annotate('%1.0f$\sigma$' % sigmas[ii],
+        plt.annotate(r'%1.0f$\sigma$' % sigmas[ii],
                        (anntx, far_from_p(p, foreground_livetime,
-                       far_back.max())), zorder=100)
+                       max_bg_far)), zorder=100)
         ax2.plot([],[])
     plt.sca(ax1)
 
@@ -366,7 +373,7 @@ else:
     # Tick ranges
     pticks = numpy.arange(tick_min, tick_max+1)
     # Convert back to FAR
-    fticks = far_from_p(10**pticks, foreground_livetime, far_back.max())
+    fticks = far_from_p(10**pticks, foreground_livetime, max_bg_far)
     ax2.yaxis.set_major_locator(plt.NullLocator())
     ax2.set_yticks(fticks)
     # Set the labels

@@ -123,35 +123,45 @@ logging.info('Found %s background (exclusive zerolag) triggers' % len(bstat_exc)
 
 fig = plt.figure()
 
-if fstat is not None:
+if (bstat is None or len(bstat) == 0) and (bstat_exc is None or len(bstat_exc) == 0) and (fstat is None or len(fstat) == 0):
+    minimum = 0.0
+    maximum = 10.0
+elif fstat is not None and len(fstat) > 0 and len(bstat) > 0:
     minimum = min(fstat.min(), bstat.min())
     maximum = max(fstat.max(), bstat.max())
+elif fstat is not None and len(fstat) > 0:
+    minimum = fstat.min()
+    maximum = fstat.max()
 elif args.closed_box:
-    minimum = bstat_exc.min()
-    maximum = bstat_exc.max()
+    minimum = bstat_exc.min() if len(bstat_exc) > 0 else 0.0
+    maximum = bstat_exc.max() if len(bstat_exc) > 0 else 10.0
 else:
-    minimum = bstat.min()
-    maximum = bstat.max()
+    minimum = bstat.min() if len(bstat) > 0 else 0.0
+    maximum = bstat.max() if len(bstat) > 0 else 10.0
 
 bin_size = args.bin_size if args.bin_size else (maximum - minimum) / 100.
+if bin_size <= 0:
+    bin_size = 0.1
 
 bins = numpy.arange(minimum, maximum + bin_size, bin_size)
 
 # plot background minus foreground
-exc_binweights = dec_exc / conv.sec_to_year(f.attrs['background_time_exc'])
+bg_time_exc = conv.sec_to_year(f.attrs.get('background_time_exc', 0.0))
+exc_binweights = (dec_exc / bg_time_exc) if bg_time_exc > 0 else dec_exc
 exc_binvals = plt.hist(bstat_exc, bins=bins, histtype='step',
                          linewidth=2,
                          color='grey', log=True,
                          label= 'Background Uncorrelated with Foreground',
                          weights=exc_binweights)
 
-histpeak = bins[exc_binvals[0].argmax()]
+histpeak = bins[exc_binvals[0].argmax()] if len(exc_binvals[0]) > 0 else minimum
 
 # plot full background
 if not args.closed_box:
     bg_key = 'background_time' if h_inc_back_num == 0 \
         else 'background_time_h%s' % h_inc_back_num
-    binweights = dec / conv.sec_to_year(f.attrs[bg_key])
+    bg_time_full = conv.sec_to_year(f.attrs.get(bg_key, 0.0))
+    binweights = (dec / bg_time_full) if bg_time_full > 0 else dec
     plt.hist(
         bstat,
         bins=bins,
@@ -216,13 +226,14 @@ if args.x_min is not None:
     plt.xlim(xmin=args.x_min)
 else:
     plt.xlim(xmin=numpy.floor(histpeak))
-plt.ylim(ymin=0.5 / conv.sec_to_year(f.attrs['background_time_exc']))
+bg_time_exc = conv.sec_to_year(f.attrs.get('background_time_exc', 0.0))
+ymin_val = (0.5 / bg_time_exc) if bg_time_exc > 0 else 1e-4
+plt.ylim(ymin=ymin_val)
 plt.grid()
 leg = plt.legend(fontsize=9)
 
-end = sigma_from_p(fap.min() * args.trials_factor)
-
-if not args.closed_box:
+if not args.closed_box and len(fap) > 0 and len(bstat) > 0:
+    end = sigma_from_p(fap.min() * args.trials_factor)
     sigmas = [1, 2, 3, 4, end]
     for ii, sig in enumerate(sigmas[:-1]):
         next_sig = sigmas[ii + 1]

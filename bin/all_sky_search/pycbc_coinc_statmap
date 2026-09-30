@@ -199,11 +199,6 @@ else:
 # List of locations that is background.
 back_locs = all_trigs.timeslide_id != 0
 
-if (back_locs.sum()) == 0:
-    logging.warning("There were no background events, so we could not "
-                    "assign any statistic values")
-    sys.exit()
-
 logging.info("Dumping background triggers (inclusive of zerolag)")
 for k in all_trigs.data:
     f['background/' + k] = all_trigs.data[k][back_locs]
@@ -212,25 +207,44 @@ logging.info("Dumping background triggers (exclusive of zerolag)")
 for k in exc_zero_trigs.data:
     f['background_exc/' + k] = exc_zero_trigs.data[k]
 
-maxtime = all_trigs.attrs['%s_foreground_time' % f.attrs['pivot']]
+maxtime = all_trigs.attrs.get('%s_foreground_time' % f.attrs['pivot'], 0)
 for ifo in ifos:
-    if all_trigs.attrs['%s_foreground_time' % ifo] > maxtime:
-        maxtime = all_trigs.attrs['%s_foreground_time' % ifo]
+    if all_trigs.attrs.get('%s_foreground_time' % ifo, 0) > maxtime:
+        maxtime = all_trigs.attrs.get('%s_foreground_time' % ifo, 0)
 
-mintime = all_trigs.attrs['%s_foreground_time' % f.attrs['pivot']]
+mintime = all_trigs.attrs.get('%s_foreground_time' % f.attrs['pivot'], 0)
 for ifo in ifos:
-    if all_trigs.attrs['%s_foreground_time' % ifo] < mintime:
-        mintime = all_trigs.attrs['%s_foreground_time' % ifo]
+    if all_trigs.attrs.get('%s_foreground_time' % ifo, 0) < mintime:
+        mintime = all_trigs.attrs.get('%s_foreground_time' % ifo, 0)
 
-maxtime_exc = maxtime - veto_time
-mintime_exc = mintime - veto_time
+veto_time = float(veto_time) if 'veto_time' in locals() else 0.0
+maxtime_exc = max(0.0, maxtime - veto_time)
+mintime_exc = max(0.0, mintime - veto_time)
 
-background_time = int(maxtime / all_trigs.attrs['timeslide_interval']) * mintime
-coinc_time = float(all_trigs.attrs['coinc_time'])
+ts_interval = all_trigs.attrs.get('timeslide_interval', 1.0)
+background_time = int(maxtime / ts_interval) * mintime
+coinc_time = float(all_trigs.attrs.get('coinc_time', 0.0))
 
-background_time_exc = int(maxtime_exc / all_trigs.attrs['timeslide_interval']) \
-                          * mintime_exc
+background_time_exc = int(maxtime_exc / ts_interval) * mintime_exc
 coinc_time_exc = coinc_time - veto_time
+
+f.attrs['background_time'] = background_time
+f.attrs['foreground_time'] = coinc_time
+f.attrs['background_time_exc'] = background_time_exc
+f.attrs['foreground_time_exc'] = coinc_time_exc
+
+if (back_locs.sum()) == 0:
+    logging.warning("There were no background events, so we could not "
+                    "assign any statistic values")
+    f['background/ifar'] = numpy.array([])
+    f['background_exc/ifar'] = numpy.array([])
+    f['foreground/ifar'] = numpy.array([])
+    f['foreground/fap'] = numpy.array([])
+    f['foreground/ifar_exc'] = numpy.array([])
+    f['foreground/fap_exc'] = numpy.array([])
+    if 'name' in all_trigs.attrs:
+        f.attrs['name'] = all_trigs.attrs['name']
+    sys.exit()
 
 logging.info("Calculating FAN from background statistic values")
 # Ranking statistic of foreground and background

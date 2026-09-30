@@ -283,6 +283,8 @@ class DictArray(object):
             for k in self.data:
                 if not len(self.data[k]) == 0:
                     self.data[k] = np.concatenate(self.data[k])
+                else:
+                    self.data[k] = np.array([])
 
         for k in self.data:
             setattr(self, k, self.data[k])
@@ -699,7 +701,10 @@ class SingleDetTriggers(object):
         """
         if self.mask is None:
             self.mask = np.zeros(self.ntriggers, dtype=bool)
-            self.mask[logic_mask] = True
+            if hasattr(logic_mask, 'dtype') and logic_mask.dtype == bool:
+                self.mask = np.array(logic_mask, dtype=bool)
+            else:
+                self.mask[np.asarray(logic_mask, dtype=int)] = True
         elif hasattr(self.mask, 'dtype') and (self.mask.dtype == 'bool'):
             if hasattr(logic_mask, 'dtype') and (logic_mask.dtype == 'bool'):
                 # So both new and old masks are boolean, numpy slice assignment
@@ -710,7 +715,7 @@ class SingleDetTriggers(object):
                 # This case is a little tricksy, so we begin by converting the
                 # list/array to a boolean, and then do what we did above.
                 new_logic_mask = np.zeros(np.sum(self.mask), dtype=bool)
-                new_logic_mask[logic_mask] = True
+                new_logic_mask[np.asarray(logic_mask, dtype=int)] = True
                 self.mask[self.mask] = new_logic_mask
         else:
             self.mask = list(np.array(self.mask)[logic_mask])
@@ -1071,9 +1076,12 @@ class ForegroundTriggers(object):
     def get_snglfile_array_dict(self, variable):
         return_dict = {}
         for ifo in self.ifos:
+            if len(self.trig_id[ifo]) == 0:
+                return_dict[ifo] = (np.array([]), np.array([], dtype=bool))
+                continue
             try:
                 # Make sure we don't change the internal cached trig_id array
-                tid = np.copy(self.trig_id[ifo])
+                tid = np.copy(self.trig_id[ifo]).astype(int)
                 # Put in *some* value for the invalid points to avoid failure
                 lgc = tid == -1
                 tid[lgc] = 0

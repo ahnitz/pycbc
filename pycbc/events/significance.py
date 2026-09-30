@@ -58,6 +58,15 @@ def count_n_louder(bstat, fstat, dec,
     {} : (empty) dictionary
         Ensure we return the same tuple of objects as n_louder_from_fit()
     """
+    if len(bstat) == 0:
+        if isinstance(fstat, np.ndarray):
+            fore_n_louder = np.zeros(len(fstat), dtype=float)
+        elif hasattr(fstat, '__len__'):
+            fore_n_louder = np.zeros(len(fstat), dtype=float)
+        else:
+            fore_n_louder = 0.0
+        return np.array([], dtype=float), fore_n_louder, {}
+
     sort = bstat.argsort()
     bstat = copy.deepcopy(bstat)[sort]
     dec = copy.deepcopy(dec)[sort]
@@ -124,6 +133,14 @@ def n_louder_from_fit(back_stat, fore_stat, dec_facs,
     sig_info : a dictionary
         Information regarding the significance fit
     """
+    if len(back_stat) == 0:
+        if isinstance(fore_stat, np.ndarray):
+            fg_n_louder = np.zeros(len(fore_stat), dtype=float)
+        elif hasattr(fore_stat, '__len__'):
+            fg_n_louder = np.zeros(len(fore_stat), dtype=float)
+        else:
+            fg_n_louder = 0.0
+        return np.array([], dtype=float), fg_n_louder, {}
 
     # Calculate the fitting factor of the ranking statistic distribution
     alpha, sig_alpha = trstats.fit_above_thresh(
@@ -256,11 +273,15 @@ def get_far(back_stat, fore_stat, dec_facs,
         bg_n_louder += 1
         fg_n_louder += 1
 
-    bg_far = bg_n_louder / background_time
-    fg_far = fg_n_louder / background_time
+    if background_time == 0:
+        bg_far = np.zeros_like(bg_n_louder, dtype=float)
+        fg_far = np.zeros_like(fg_n_louder, dtype=float)
+    else:
+        bg_far = bg_n_louder / background_time
+        fg_far = fg_n_louder / background_time
 
     if "n_above" in significance_info:
-        significance_info["rate_above"] = significance_info["n_above"] / background_time
+        significance_info["rate_above"] = (significance_info["n_above"] / background_time) if background_time != 0 else 0.0
 
     return bg_far, fg_far, significance_info
 

@@ -72,12 +72,17 @@ else:
     if args.single_trigger_files:
         for ifo in args.single_trigger_files:
             f = HFile(args.single_trigger_files[ifo], 'r')[ifo]
-            ids_ifo = np.array(ids[ifo])
-            ids_na = np.argwhere(ids_ifo == -1)
-            snr_vals = f['snr'][:][ids_ifo]
-            snr_vals[ids_ifo == -1] = np.nan
-            chisq_vals = f['chisq'][:][ids_ifo] / (2 * f['chisq_dof'][:][ids_ifo] - 2)
-            chisq_vals[ids_ifo == -1] = np.nan
+            ids_ifo = np.array(ids[ifo], dtype=int)
+            snr_vals = np.full(len(ids_ifo), np.nan)
+            chisq_vals = np.full(len(ids_ifo), np.nan)
+            if len(ids_ifo) > 0 and len(f['snr']) > 0:
+                valid = (ids_ifo >= 0) & (ids_ifo < len(f['snr']))
+                if valid.any():
+                    valid_ids = ids_ifo[valid]
+                    snr_vals[valid] = f['snr'][:][valid_ids]
+                    chisq_raw = f['chisq'][:][valid_ids]
+                    chisq_dof = f['chisq_dof'][:][valid_ids]
+                    chisq_vals[valid] = chisq_raw / (2 * chisq_dof - 2)
             newsnr_vals = pycbc.events.ranking.newsnr(snr_vals, chisq_vals)
             snr = ['%.2f' % s if not np.isnan(s) else ' ' for s in snr_vals]
             chisq = ['%.2f' % c if not np.isnan(c) else ' ' for c in chisq_vals]

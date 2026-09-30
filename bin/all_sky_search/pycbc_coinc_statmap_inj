@@ -26,6 +26,10 @@ parser.add_argument('--veto-window', type=float, default=.1,
 parser.add_argument('--ifos', nargs='+',
                     help='List of ifos used in these coincidence files')
 significance.insert_significance_option_group(parser)
+parser.add_argument('--max-hierarchical-removal', type=int, default=0,
+                    help='Dummy option for workflow compatibility')
+parser.add_argument('--hierarchical-removal-against', type=str, default='none',
+                    help='Dummy option for workflow compatibility')
 parser.add_argument('--output-file')
 args = parser.parse_args()
 

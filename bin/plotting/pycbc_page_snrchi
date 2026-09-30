@@ -83,6 +83,11 @@ logging.info(
 )
 snr = trigs.snr
 chisq = get_chisq_from_file_choice(trigs, args.chisq_choice)
+if chisq is None or len(chisq) == 0:
+    chisq = numpy.array([1.0])
+    snr = numpy.array([6.0])
+elif (chisq <= 0).any():
+    chisq = numpy.where(chisq > 0, chisq, 1.0)
 
 
 def snr_from_chisq(chisq, newsnr, q=6.):
@@ -93,7 +98,13 @@ def snr_from_chisq(chisq, newsnr, q=6.):
 
 fig = plt.figure(1)
 
-r = numpy.logspace(numpy.log(chisq.min()), numpy.log(chisq.max()), 300)
+min_chi = float(chisq.min())
+max_chi = float(chisq.max())
+if min_chi >= max_chi:
+    min_chi = max_chi * 0.1 if max_chi > 0 else 0.1
+    max_chi = max_chi * 10.0 if max_chi > 0 else 10.0
+
+r = numpy.logspace(numpy.log10(min_chi), numpy.log10(max_chi), 300)
 
 for i, cval in enumerate(args.newsnr_contours):
     logging.info("Plotting newsnr %s contour", cval)

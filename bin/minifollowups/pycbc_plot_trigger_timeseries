@@ -101,9 +101,9 @@ for ifo in args.single_trigger_files.keys():
 
     min_rank = min(min_rank, rank.min())
 
-    if args.special_trigger_ids:
+    if args.special_trigger_ids and ifo in args.special_trigger_ids:
         special_idx = args.special_trigger_ids[ifo]
-        if special_idx == None:  # No special trigger for this ifo
+        if special_idx is None:  # No special trigger for this ifo
             continue
         elif special_idx not in idx:
             logging.info("IDX %d not in kept list",

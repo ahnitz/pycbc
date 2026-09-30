@@ -49,8 +49,12 @@ for k in keys:
 logging.info("Collating foreground times from other coinc types")
 all_fg_times = []
 for f in f_others:
+    if 'foreground/ifar' not in f or len(f['foreground/ifar']) == 0:
+        continue
     ifar_above_thresh = np.nonzero(f['foreground/ifar'][:] > \
                                        args.censor_ifar_threshold)[0]
+    if len(ifar_above_thresh) == 0:
+        continue
     mean_times = np.mean([f['foreground/%s/time' % ifo][:]
                           for ifo in f.attrs['ifos'].split(' ')], axis=0)
     all_fg_times += list(mean_times[ifar_above_thresh])
@@ -62,55 +66,90 @@ groups = ['decimation_factor', 'stat', 'template_id', 'timeslide_id', 'ifar']
 for ifo in all_ifos:
     groups += ['%s/time' % ifo]
     groups += ['%s/trigger_id' % ifo]
-data = {g: f_in['background_exc/%s' % g] for g in groups}
-all_trigs = pycbc.io.DictArray(data=data)
 
-n_triggers = f_in['background_exc/%s/time' % all_ifos[0]].size
+has_bg = ('background_exc' in f_in and '%s/time' % all_ifos[0] in f_in['background_exc'])
+n_triggers = f_in['background_exc/%s/time' % all_ifos[0]].size if has_bg else 0
 logging.info('%d background_exc triggers' % n_triggers)
 
-logging.info('Finding background_exc triggers within {}s of any '
-             'foreground triggers'.format(args.veto_window))
-remove_start_time = all_fg_times - args.veto_window
-remove_end_time = all_fg_times + args.veto_window
-all_vetoed_idx = []
-for ifo in all_ifos:
-    fg_veto_ids = veto.indices_within_times(
-                       f_in['background_exc/%s/time' % ifo][:],
-                       remove_start_time, remove_end_time)
-    all_vetoed_idx += list(fg_veto_ids)
-all_vetoed_idx = np.unique(all_vetoed_idx)
+if has_bg and n_triggers > 0:
+    data = {g: f_in['background_exc/%s' % g][:] for g in groups}
+    all_trigs = pycbc.io.DictArray(data=data)
+else:
+    data = {g: np.array([]) for g in groups}
+    all_trigs = pycbc.io.DictArray(data=data)
 
-logging.info('Removing {} background_exc triggers close to foreground'
-             ' coincs'.format(len(all_vetoed_idx)))
-filtered_trigs = all_trigs.remove(all_vetoed_idx)
+if n_triggers > 0 and len(all_fg_times) > 0:
+    logging.info('Finding background_exc triggers within {}s of any '
+                 'foreground triggers'.format(args.veto_window))
+    remove_start_time = all_fg_times - args.veto_window
+    remove_end_time = all_fg_times + args.veto_window
+    all_vetoed_idx = []
+    for ifo in all_ifos:
+        fg_veto_ids = veto.indices_within_times(
+                           f_in['background_exc/%s/time' % ifo][:],
+                           remove_start_time, remove_end_time)
+        all_vetoed_idx += list(fg_veto_ids)
+    all_vetoed_idx = np.unique(all_vetoed_idx)
+
+    logging.info('Removing {} background_exc triggers close to foreground'
+                 ' coincs'.format(len(all_vetoed_idx)))
+    filtered_trigs = all_trigs.remove(all_vetoed_idx)
+else:
+    filtered_trigs = all_trigs
+
 n_triggers_new = len(filtered_trigs.data['stat'])
 logging.info('%d triggers remaining' % n_triggers_new)
 
 logging.info('Writing updated background_exc to file')
 for k in filtered_trigs.data:
+    if 'background_exc/%s' % k in f_out:
+        del f_out['background_exc/%s' % k]
     f_out['background_exc/%s' % k] = filtered_trigs.data[k]
 
 logging.info('Recalculating IFARs')
-bg_far, fg_far, sig_info = significance.get_far(
-    filtered_trigs.data['stat'],
-    f_in['foreground/stat'][:],
-    filtered_trigs.data['decimation_factor'],
-    f_in.attrs['background_time_exc'],
-    **significance_dict[all_ifo_key])
+fg_stat = f_in['foreground/stat'][:] if 'foreground/stat' in f_in else np.array([])
+if n_triggers_new > 0 or len(fg_stat) > 0:
+    bg_far, fg_far, sig_info = significance.get_far(
+        filtered_trigs.data['stat'],
+        fg_stat,
+        filtered_trigs.data['decimation_factor'],
+        f_in.attrs.get('background_time_exc', 0),
+        **significance_dict[all_ifo_key])
 
-fg_far = significance.apply_far_limit(fg_far, significance_dict, combo=all_ifo_key)
-bg_far = significance.apply_far_limit(bg_far, significance_dict, combo=all_ifo_key)
+    fg_far = significance.apply_far_limit(fg_far, significance_dict, combo=all_ifo_key)
+    bg_far = significance.apply_far_limit(bg_far, significance_dict, combo=all_ifo_key)
 
-fg_ifar_exc = 1. / fg_far
-bg_ifar_exc = 1. / bg_far
+    fg_ifar_exc = 1. / fg_far
+    bg_ifar_exc = 1. / bg_far
+else:
+    fg_ifar_exc = np.array([], dtype=np.float64)
+    bg_ifar_exc = np.array([], dtype=np.float64)
+    sig_info = {}
 
 logging.info('Writing updated ifars to file')
-f_out['foreground/ifar_exc'][:] = conv.sec_to_year(fg_ifar_exc)
-f_out['background_exc/ifar'][:] = conv.sec_to_year(bg_ifar_exc)
-for key, value in sig_info.items():
-    f_out['foreground'].attrs[key + '_exc'] = value
+if 'foreground/ifar_exc' in f_out:
+    f_out['foreground/ifar_exc'][:] = conv.sec_to_year(fg_ifar_exc)
+else:
+    f_out['foreground/ifar_exc'] = conv.sec_to_year(fg_ifar_exc)
 
-fg_time_exc = conv.sec_to_year(f_in.attrs['foreground_time_exc'])
-f_out['foreground/fap_exc'][:] = 1 - np.exp(-fg_time_exc / fg_ifar_exc)
+if 'background_exc/ifar' in f_out:
+    f_out['background_exc/ifar'][:] = conv.sec_to_year(bg_ifar_exc)
+else:
+    f_out['background_exc/ifar'] = conv.sec_to_year(bg_ifar_exc)
+
+if 'foreground' in f_out:
+    for key, value in sig_info.items():
+        f_out['foreground'].attrs[key + '_exc'] = value
+
+fg_time_exc = conv.sec_to_year(f_in.attrs.get('foreground_time_exc', 0.0))
+if len(fg_ifar_exc) > 0:
+    val = 1 - np.exp(-fg_time_exc / fg_ifar_exc)
+else:
+    val = np.array([], dtype=np.float64)
+
+if 'foreground/fap_exc' in f_out:
+    f_out['foreground/fap_exc'][:] = val
+else:
+    f_out['foreground/fap_exc'] = val
 
 logging.info("Done!")

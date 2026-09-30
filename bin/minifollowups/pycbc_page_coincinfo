@@ -167,8 +167,8 @@ for ifo in files.keys():
 
     row_labels.append(ifo)
     d = files[ifo]
-    i = idx[ifo]
-    tid = d['template_id'][i]
+    i = int(idx[ifo])
+    tid = int(d['template_id'][i])
     rchisq =  d['chisq'][i] / (d['chisq_dof'][i] * 2 - 2)
     mchirp = (pycbc.pnutils.mass1_mass2_to_mchirp_eta(bank['mass1'][tid],
                                                       bank['mass2'][tid]))[0]
