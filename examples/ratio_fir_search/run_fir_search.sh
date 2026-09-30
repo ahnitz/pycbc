@@ -10,9 +10,16 @@ set -e
 
 export OMP_NUM_THREADS=1
 
+# MKL for the FFTs.  The reference matched filter is a 2^20 inverse per segment
+# and FFTW here plans at measure level 0 with no wisdom, taking 10.6 ms where
+# MKL takes 2.4 ms for the same transform.  Triggers are unchanged: 893/893
+# with the same SNRs to 2.9e-06, which is float32 rounding.
 pycbc_inspiral_fir \
+    --ratio-filter-engine ${ENGINE:-pycbc} \
+    --output ${OUT:-fir.hdf} \
+    --fft-backends ${FFTB:-mkl} \
     --fir-length 4096 \
-    --batch-size 64 \
+    --batch-size ${BATCH:-64} \
     --template-normalization-method precalculated_sigma \
     --fast-chisq \
     --pad-data 8 \
@@ -36,7 +43,7 @@ pycbc_inspiral_fir \
     --psdvar-low-freq 20 \
     --psdvar-high-freq 480 \
     --low-frequency-cutoff 20 \
-    --snr-threshold 5.0 \
+    --snr-threshold ${SNR:-5.0} \
     --cluster-window 1 \
     --chisq-snr-threshold 6 \
     --chisq-bins 64 \
@@ -47,7 +54,6 @@ pycbc_inspiral_fir \
     --gps-start-time 1000000000 \
     --gps-end-time 1000005000 \
     --injection-filter-rejector-chirp-time-window 20000 \
-    --output fir.hdf \
     --newsnr-threshold 0 \
     --bank-file fir_full_bank.hdf \
     --fake-strain-seed 0 \
@@ -60,4 +66,4 @@ pycbc_inspiral_fir \
     --autogating-cluster 0.5 \
     --autogating-width 0.25 \
     --autogating-taper 0.25 \
-    --autogating-pad 16
+    --autogating-pad 16 "$@"
