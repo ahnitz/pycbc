@@ -547,8 +547,16 @@ class PyCBCInspiralExecutable(Executable):
                         channel_names.append(cname)
                 if channel_names:
                     node.add_opt("--channel-name", " ".join(channel_names))
-            if df_parents is not None:
+            if df_parents is not None and len(df_parents) > 0:
                 node.add_multiifo_input_list_opt('--frame-files', df_parents)
+            elif not self.has_opt('frame-files') and '--frame-files' not in node._options:
+                frame_files = []
+                for ifo in self.ifo_list:
+                    ffiles = self.cp.get_opt_tags("workflow", "%s-frame-files" % ifo.lower(), "")
+                    if ffiles:
+                        frame_files.extend(ffiles.split())
+                if frame_files:
+                    node.add_opt("--frame-files", " ".join(frame_files))
         else:
             if df_parents is not None:
                 node.add_input_list_opt('--frame-files', df_parents)
