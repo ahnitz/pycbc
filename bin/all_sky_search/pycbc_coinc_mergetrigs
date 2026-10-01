@@ -140,7 +140,8 @@ for ifo in ifos_to_process:
                 rtime = numpy.append(rtime, ifo_data['search/run_time'][:])
             if 'non_threshold_time' in ifo_data['search'].keys():
                 has_non_thresh = True
-                non_thresh_dur += float(numpy.sum(ifo_data['search/non_threshold_time'][:]))
+                val = float(numpy.max(ifo_data['search/non_threshold_time'][:]))
+                non_thresh_dur = max(non_thresh_dur, val)
 
             if 'gating' in ifo_data:
                 gating_keys = []

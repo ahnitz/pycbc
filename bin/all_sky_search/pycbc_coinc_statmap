@@ -159,23 +159,29 @@ for ifo in ifos:
 
 if fg_veto_list:
     combined_veto_ids = numpy.unique(numpy.concatenate(fg_veto_list))
-    exc_zero_trigs = all_trigs.remove(combined_veto_ids)
+    del fg_veto_list
 else:
-    exc_zero_trigs = all_trigs
+    combined_veto_ids = None
 
 logging.info("Clustering coinc triggers (inclusive of zerolag)")
-all_trigs = all_trigs.cluster(args.cluster_window)
+all_trigs_clustered = all_trigs.cluster(args.cluster_window)
 
 # Return an array of true or false if the trigger has not been time-slid
-fore_locs = all_trigs.timeslide_id == 0
+fore_locs = all_trigs_clustered.timeslide_id == 0
 logging.info("%s clustered foreground triggers" % fore_locs.sum())
 
-if exc_zero_trigs is all_trigs:
+if combined_veto_ids is None or len(combined_veto_ids) == 0:
     logging.info("Reusing clustered triggers for exclusive background (zero vetoed triggers)")
-    exc_zero_trigs = all_trigs
+    exc_zero_trigs = all_trigs_clustered
 else:
     logging.info("Clustering coinc triggers (exclusive of zerolag)")
+    exc_zero_trigs = all_trigs.remove(combined_veto_ids)
+    del all_trigs
+    import gc
+    gc.collect()
     exc_zero_trigs = exc_zero_trigs.cluster(args.cluster_window)
+
+all_trigs = all_trigs_clustered
 
 logging.info("Dumping foreground triggers")
 f = fw(args.output_file)
@@ -241,21 +247,18 @@ has_nothresh = (
     ('%s_non_threshold_time' % ifos[1]) in all_trigs.attrs
 )
 
+coinc_time_exc = max(0.0, coinc_time - veto_time)
+
 if has_nothresh:
-    t_obs1 = float(all_trigs.attrs['%s_foreground_time' % ifos[0]])
-    t_obs2 = float(all_trigs.attrs['%s_foreground_time' % ifos[1]])
-    t_nothresh1 = float(all_trigs.attrs['%s_non_threshold_time' % ifos[0]])
-    t_nothresh2 = float(all_trigs.attrs['%s_non_threshold_time' % ifos[1]])
-    background_time = (t_obs1 * t_nothresh2 + t_obs2 * t_nothresh1) / ts_interval
-    if coinc_time > 0 and veto_time > 0:
-        frac_exc = max(0.0, 1.0 - veto_time / coinc_time)
-        background_time_exc = background_time * frac_exc
-    else:
-        background_time_exc = background_time
+    t_followup1 = float(all_trigs.attrs['%s_non_threshold_time' % ifos[0]])
+    t_followup2 = float(all_trigs.attrs['%s_non_threshold_time' % ifos[1]])
+    t_followup = max(t_followup1, t_followup2)
+    n_slides = t_followup / ts_interval
+    background_time = coinc_time * n_slides
+    background_time_exc = coinc_time_exc * n_slides
 else:
     background_time = int(maxtime / ts_interval) * mintime
     background_time_exc = int(maxtime_exc / ts_interval) * mintime_exc
-coinc_time_exc = coinc_time - veto_time
 
 f.attrs['background_time'] = background_time
 f.attrs['foreground_time'] = coinc_time
@@ -469,7 +472,7 @@ while numpy.any(ifar_foreground >= background_time):
             mintime = all_trigs.attrs['%s_foreground_time' % ifo]
 
     if has_nothresh:
-        background_time = (t_obs1 * t_nothresh2 + t_obs2 * t_nothresh1) / all_trigs.attrs['timeslide_interval']
+        background_time = coinc_time * n_slides
     else:
         background_time = int(maxtime / all_trigs.attrs['timeslide_interval']) * mintime
     coinc_time = float(all_trigs.attrs['coinc_time'])

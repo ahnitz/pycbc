@@ -1487,10 +1487,15 @@ def main():
             ifo_opts = get_ifo_opts(args, ifo)
 
             if non_threshold_intervals[ifo]:
-                seg_list = segmentlist([segment(s, e) for s, e in non_threshold_intervals[ifo]])
-                seg_list.coalesce()
-                ifo_mgr.non_threshold_time = float(abs(seg_list))
-                logging.info("[%s] Total non-threshold time: %.2f seconds (%d raw intervals)",
+                # In asymmetric followup, non_threshold_time is the duration of the
+                # local followup window per primary trigger (W = asym_num_bins * asym_bin_width)
+                if bool(getattr(args, 'asym_windowing', False)):
+                    ifo_mgr.non_threshold_time = float(args.asym_num_bins * args.asym_bin_width)
+                else:
+                    seg_list = segmentlist([segment(s, e) for s, e in non_threshold_intervals[ifo]])
+                    seg_list.coalesce()
+                    ifo_mgr.non_threshold_time = float(abs(seg_list))
+                logging.info("[%s] Non-threshold followup window: %.2f seconds (%d raw intervals)",
                              ifo, ifo_mgr.non_threshold_time, len(non_threshold_intervals[ifo]))
             else:
                 ifo_mgr.non_threshold_time = 0.0
