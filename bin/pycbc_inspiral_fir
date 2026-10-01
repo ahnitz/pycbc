@@ -871,176 +871,198 @@ def main():
 
                 logging.info(f"Top template {top_step+1}/{n_top} (id={top_idx}) with {len(active_parents[1])} L1 groups ({n_fine_top} fine templates)")
 
+                cached_series = None
+                cached_norm = None
+                cached_l1_inputs = None
+                last_seg_slices = None
+
                 for s_num in range(num_segs):
                     active_ifos = [ifo for ifo in instruments if s_num < len(segments[ifo])]
                     if not active_ifos:
                         continue
 
                     t_seg_start = time.time()
-                    t0 = time.perf_counter()
-                    series = {}
-                    norm = {}
-                    for ifo in active_ifos:
-                        stilde = segments[ifo][s_num]
-                        series[ifo], norm[ifo] = engine.make_reference_series(
-                            stilde, stilde.psd, top_template)
-                    upper_ref_seconds += time.perf_counter() - t0
+                    cur_seg_slices = tuple(
+                        (ifo, getattr(segments[ifo][s_num], 'seg_slice', None).start, getattr(segments[ifo][s_num], 'seg_slice', None).stop)
+                        if getattr(segments[ifo][s_num], 'seg_slice', None) is not None else (ifo, s_num)
+                        for ifo in active_ifos
+                    )
+
+                    if cur_seg_slices == last_seg_slices and cached_series is not None and cached_l1_inputs is not None:
+                        series = cached_series
+                        norm = cached_norm
+                        l1_inputs = cached_l1_inputs
+                    else:
+                        t0 = time.perf_counter()
+                        series = {}
+                        norm = {}
+                        for ifo in active_ifos:
+                            stilde = segments[ifo][s_num]
+                            series[ifo], norm[ifo] = engine.make_reference_series(
+                                stilde, stilde.psd, top_template)
+                        upper_ref_seconds += time.perf_counter() - t0
+                        cached_series = series
+                        cached_norm = norm
+
+                        l1_inputs = {}
+                        def traverse_prep(level, p_id, p_series, p_norm):
+                            nonlocal upper_fir_seconds
+                            if level > 1:
+                                t_fir_0 = time.perf_counter()
+                                batch, child_ids, scales, s_ratios = tree_batches[level][p_id]
+                                child_series_map = {}
+                                for ifo in active_ifos:
+                                    child_series_map[ifo] = batch.run(p_series[ifo], p_norm[ifo], scales, bank.sample_rate)
+                                upper_fir_seconds += time.perf_counter() - t_fir_0
+                                for row, c_id in enumerate(child_ids):
+                                    c_series = {ifo: child_series_map[ifo][c_id] for ifo in active_ifos}
+                                    c_norm = {ifo: p_norm[ifo] * s_ratios[row] for ifo in active_ifos}
+                                    traverse_prep(level - 1, int(c_id), c_series, c_norm)
+                            else:
+                                l1_inputs[p_id] = (p_series, p_norm)
+
+                        traverse_prep(n_levels, top_idx, series, norm)
+                        cached_l1_inputs = l1_inputs
+                        last_seg_slices = cur_seg_slices
 
                     block_f_cache_by_ifo = {ifo: {} for ifo in active_ifos}
 
-                    def traverse(level, p_id, p_series, p_norm):
-                        nonlocal upper_fir_seconds
-                        if level > 1:
-                            t_fir_0 = time.perf_counter()
-                            batch, child_ids, scales, s_ratios = tree_batches[level][p_id]
-                            child_series_map = {}
-                            for ifo in active_ifos:
-                                child_series_map[ifo] = batch.run(p_series[ifo], p_norm[ifo], scales, bank.sample_rate)
-                            upper_fir_seconds += time.perf_counter() - t_fir_0
-                            for row, c_id in enumerate(child_ids):
-                                c_series = {ifo: child_series_map[ifo][c_id] for ifo in active_ifos}
-                                c_norm = {ifo: p_norm[ifo] * s_ratios[row] for ifo in active_ifos}
-                                traverse(level - 1, int(c_id), c_series, c_norm)
-                        else:
-                            coarse_idx = p_id
-                            group_engine, filters_f, tap_sizes, fine_indices, counts = l1_engines[coarse_idx]
-                            group_engine._tap_sizes = tap_sizes
+                    for coarse_idx, (p_series, p_norm) in l1_inputs.items():
+                        group_engine, filters_f, tap_sizes, fine_indices, counts = l1_engines[coarse_idx]
+                        group_engine._tap_sizes = tap_sizes
 
-                            std_trigs = {}
-                            for ifo in active_ifos:
-                                stilde = segments[ifo][s_num]
-                                h_norm = p_norm[ifo]
-                                ref_snr = p_series[ifo]
-                                ids_local, t_idxs, snrs, tstarts, _ = group_engine.process_segment(
-                                    stilde, stilde.psd, h_norm, filters_f, counts,
-                                    np.arange(len(fine_indices)),
-                                    valid_slice=stilde.analyze,
-                                    reference_series=ref_snr,
-                                    profile_template=top_template,
-                                )
-                                std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
-                                if len(ids_local) > 0:
-                                    if do_chisq and np.any(abs(snrs) >= cthresh):
-                                        chisq_ref = bank.get_coarse_template(coarse_idx)
-                                        chi, chi_dof = compute_batch_chisq(
-                                            ids_local, t_idxs, snrs, h_norm,
-                                            fine_indices, tstarts, stilde, bank, power_chisq,
-                                            ref_snr, filters_f, chisq_ref, args)
-                                    else:
-                                        chi = np.zeros(len(ids_local), dtype=float32)
-                                        chi_dof = np.zeros(len(ids_local), dtype=np.int32) - 100
+                        std_trigs = {}
+                        for ifo in active_ifos:
+                            stilde = segments[ifo][s_num]
+                            h_norm = p_norm[ifo]
+                            ref_snr = p_series[ifo]
+                            ids_local, t_idxs, snrs, tstarts, _ = group_engine.process_segment(
+                                stilde, stilde.psd, h_norm, filters_f, counts,
+                                np.arange(len(fine_indices)),
+                                valid_slice=stilde.analyze,
+                                reference_series=ref_snr,
+                                profile_template=top_template,
+                            )
+                            std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
+                            if len(ids_local) > 0:
+                                if do_chisq and np.any(abs(snrs) >= cthresh):
+                                    chisq_ref = bank.get_coarse_template(coarse_idx)
+                                    chi, chi_dof = compute_batch_chisq(
+                                        ids_local, t_idxs, snrs, h_norm,
+                                        fine_indices, tstarts, stilde, bank, power_chisq,
+                                        ref_snr, filters_f, chisq_ref, args)
+                                else:
+                                    chi = np.zeros(len(ids_local), dtype=float32)
+                                    chi_dof = np.zeros(len(ids_local), dtype=np.int32) - 100
 
-                                    collected_batches[ifo].append({
-                                        's_num': s_num,
-                                        'top_idx': top_idx,
-                                        'coarse_idx': coarse_idx,
-                                        'gids': fine_indices[ids_local],
-                                        'ids_local': ids_local,
-                                        't_idxs': t_idxs,
-                                        'time_index': t_idxs + (-stilde.analyze.start + stilde.cumulative_index),
-                                        'snrs': snrs,
-                                        'tstarts': tstarts,
-                                        'h_norm': h_norm,
-                                        'chisq': chi,
-                                        'chisq_dof': chi_dof,
-                                        'is_asym': False,
-                                    })
+                                collected_batches[ifo].append({
+                                    's_num': s_num,
+                                    'top_idx': top_idx,
+                                    'coarse_idx': coarse_idx,
+                                    'gids': fine_indices[ids_local],
+                                    'ids_local': ids_local,
+                                    't_idxs': t_idxs,
+                                    'time_index': t_idxs + (-stilde.analyze.start + stilde.cumulative_index),
+                                    'snrs': snrs,
+                                    'tstarts': tstarts,
+                                    'h_norm': h_norm,
+                                    'chisq': chi,
+                                    'chisq_dof': chi_dof,
+                                    'is_asym': False,
+                                })
 
-                            if args.asym_windowing and len(active_ifos) > 1:
-                                corr_cache_by_ifo = {ifo: {} for ifo in active_ifos}
-                                for ifo_A in active_ifos:
-                                    a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
-                                    if len(a_ids) == 0:
+                        if args.asym_windowing and len(active_ifos) > 1:
+                            corr_cache_by_ifo = {ifo: {} for ifo in active_ifos}
+                            for ifo_A in active_ifos:
+                                a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
+                                if len(a_ids) == 0:
+                                    continue
+                                cand_mask = (abs(a_snrs) >= args.asym_snr_threshold)
+                                if not np.any(cand_mask):
+                                    continue
+                                cand_indices = np.flatnonzero(cand_mask)
+                                if len(cand_indices) > 1:
+                                    half_win_samp = int(round(args.asym_bin_width * effective_asym_num_bins * 0.5 * sample_rate))
+                                    unique_lids = np.unique(a_ids[cand_indices])
+                                    pruned = []
+                                    for uid in unique_lids:
+                                        u_cands = cand_indices[a_ids[cand_indices] == uid]
+                                        if len(u_cands) == 1:
+                                            pruned.append(u_cands[0])
+                                        else:
+                                            order = np.argsort(abs(a_snrs[u_cands]))[::-1]
+                                            kept_t = []
+                                            for ci in u_cands[order]:
+                                                ct = a_tidxs[ci]
+                                                if not any(abs(ct - kt) < half_win_samp for kt in kept_t):
+                                                    kept_t.append(ct)
+                                                    pruned.append(ci)
+                                    cand_indices = np.array(pruned, dtype=np.int64)
+
+                                for ifo_B in active_ifos:
+                                    if ifo_B == ifo_A:
                                         continue
-                                    cand_mask = (abs(a_snrs) >= args.asym_snr_threshold)
-                                    if not np.any(cand_mask):
-                                        continue
-                                    cand_indices = np.flatnonzero(cand_mask)
-                                    if len(cand_indices) > 1:
-                                        half_win_samp = int(round(args.asym_bin_width * effective_asym_num_bins * 0.5 * sample_rate))
-                                        unique_lids = np.unique(a_ids[cand_indices])
-                                        pruned = []
-                                        for uid in unique_lids:
-                                            u_cands = cand_indices[a_ids[cand_indices] == uid]
-                                            if len(u_cands) == 1:
-                                                pruned.append(u_cands[0])
+                                    stilde_B = segments[ifo_B][s_num]
+                                    h_norm_B = p_norm[ifo_B]
+                                    ref_snr_B = p_series[ifo_B]
+                                    for k in cand_indices:
+                                        cand_lid = a_ids[k]
+                                        cand_tcenter = a_tidxs[k]
+                                        cand_count = counts[cand_lid]
+
+                                        asym_ids, asym_t_idxs, asym_snrs, asym_tstarts, searched_intervals = sample_asym_bins(
+                                            group_engine=group_engine,
+                                            ref_snr=ref_snr_B,
+                                            filters_f=filters_f,
+                                            local_id=cand_lid,
+                                            n_taps_count=cand_count,
+                                            t_center=cand_tcenter,
+                                            sample_rate=args.sample_rate[ifo_B] if isinstance(args.sample_rate, dict) else args.sample_rate,
+                                            bin_width=args.asym_bin_width,
+                                            num_bins=effective_asym_num_bins,
+                                            valid_slice=stilde_B.analyze,
+                                            block_f_cache=block_f_cache_by_ifo[ifo_B],
+                                            corr_cache=corr_cache_by_ifo[ifo_B],
+                                            stilde=stilde_B,
+                                            gps_start_time=args.gps_start_time[ifo_B] if isinstance(args.gps_start_time, dict) else args.gps_start_time,
+                                        )
+
+                                        if searched_intervals:
+                                            non_threshold_intervals[ifo_B].extend(searched_intervals)
+
+                                        asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = filter_secondary_asym_triggers(
+                                            asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
+                                            primary_snr=a_snrs[k],
+                                            secondary_snr_threshold=args.asym_secondary_snr_threshold,
+                                            network_snr_threshold=args.asym_network_snr_threshold,
+                                        )
+
+                                        if len(asym_ids) > 0:
+                                            if do_chisq and np.any(abs(asym_snrs) >= cthresh):
+                                                chisq_ref = bank.get_coarse_template(coarse_idx)
+                                                chi, chi_dof = compute_batch_chisq(
+                                                    asym_ids, asym_t_idxs, asym_snrs, h_norm_B,
+                                                    fine_indices, asym_tstarts, stilde_B, bank, power_chisq,
+                                                    ref_snr_B, filters_f, chisq_ref, args)
                                             else:
-                                                order = np.argsort(abs(a_snrs[u_cands]))[::-1]
-                                                kept_t = []
-                                                for ci in u_cands[order]:
-                                                    ct = a_tidxs[ci]
-                                                    if not any(abs(ct - kt) < half_win_samp for kt in kept_t):
-                                                        kept_t.append(ct)
-                                                        pruned.append(ci)
-                                        cand_indices = np.array(pruned, dtype=np.int64)
+                                                chi = np.zeros(len(asym_ids), dtype=float32)
+                                                chi_dof = np.zeros(len(asym_ids), dtype=np.int32) - 100
 
-                                    for ifo_B in active_ifos:
-                                        if ifo_B == ifo_A:
-                                            continue
-                                        stilde_B = segments[ifo_B][s_num]
-                                        h_norm_B = p_norm[ifo_B]
-                                        ref_snr_B = p_series[ifo_B]
-                                        for k in cand_indices:
-                                            cand_lid = a_ids[k]
-                                            cand_tcenter = a_tidxs[k]
-                                            cand_count = counts[cand_lid]
-
-                                            asym_ids, asym_t_idxs, asym_snrs, asym_tstarts, searched_intervals = sample_asym_bins(
-                                                group_engine=group_engine,
-                                                ref_snr=ref_snr_B,
-                                                filters_f=filters_f,
-                                                local_id=cand_lid,
-                                                n_taps_count=cand_count,
-                                                t_center=cand_tcenter,
-                                                sample_rate=args.sample_rate[ifo_B] if isinstance(args.sample_rate, dict) else args.sample_rate,
-                                                bin_width=args.asym_bin_width,
-                                                num_bins=effective_asym_num_bins,
-                                                valid_slice=stilde_B.analyze,
-                                                block_f_cache=block_f_cache_by_ifo[ifo_B],
-                                                corr_cache=corr_cache_by_ifo[ifo_B],
-                                                stilde=stilde_B,
-                                                gps_start_time=args.gps_start_time[ifo_B] if isinstance(args.gps_start_time, dict) else args.gps_start_time,
-                                            )
-
-                                            if searched_intervals:
-                                                non_threshold_intervals[ifo_B].extend(searched_intervals)
-
-                                            asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = filter_secondary_asym_triggers(
-                                                asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
-                                                primary_snr=a_snrs[k],
-                                                secondary_snr_threshold=args.asym_secondary_snr_threshold,
-                                                network_snr_threshold=args.asym_network_snr_threshold,
-                                            )
-
-                                            if len(asym_ids) > 0:
-                                                if do_chisq and np.any(abs(asym_snrs) >= cthresh):
-                                                    chisq_ref = bank.get_coarse_template(coarse_idx)
-                                                    chi, chi_dof = compute_batch_chisq(
-                                                        asym_ids, asym_t_idxs, asym_snrs, h_norm_B,
-                                                        fine_indices, asym_tstarts, stilde_B, bank, power_chisq,
-                                                        ref_snr_B, filters_f, chisq_ref, args)
-                                                else:
-                                                    chi = np.zeros(len(asym_ids), dtype=float32)
-                                                    chi_dof = np.zeros(len(asym_ids), dtype=np.int32) - 100
-
-                                                collected_batches[ifo_B].append({
-                                                    's_num': s_num,
-                                                    'top_idx': top_idx,
-                                                    'coarse_idx': coarse_idx,
-                                                    'gids': fine_indices[asym_ids],
-                                                    'ids_local': asym_ids,
-                                                    't_idxs': asym_t_idxs,
-                                                    'time_index': asym_t_idxs + (-stilde_B.analyze.start + stilde_B.cumulative_index),
-                                                    'snrs': asym_snrs,
-                                                    'tstarts': asym_tstarts,
-                                                    'h_norm': h_norm_B,
-                                                    'chisq': chi,
-                                                    'chisq_dof': chi_dof,
-                                                    'is_asym': True,
-                                                })
-
-
-                    traverse(n_levels, top_idx, series, norm)
+                                            collected_batches[ifo_B].append({
+                                                's_num': s_num,
+                                                'top_idx': top_idx,
+                                                'coarse_idx': coarse_idx,
+                                                'gids': fine_indices[asym_ids],
+                                                'ids_local': asym_ids,
+                                                't_idxs': asym_t_idxs,
+                                                'time_index': asym_t_idxs + (-stilde_B.analyze.start + stilde_B.cumulative_index),
+                                                'snrs': asym_snrs,
+                                                'tstarts': asym_tstarts,
+                                                'h_norm': h_norm_B,
+                                                'chisq': chi,
+                                                'chisq_dof': chi_dof,
+                                                'is_asym': True,
+                                            })
 
                     t_seg_dur = max(time.time() - t_seg_start, 1e-6)
                     stilde_ref = segments[active_ifos[0]][s_num]

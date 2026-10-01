@@ -1214,12 +1214,31 @@ class StrainSegments(object):
 
                 if injection_window is not None and matching_injs:
                     win_points = int(injection_window * strain.sample_rate)
-                    min_inj = min(matching_injs) - seg.start
-                    max_inj = max(matching_injs) - seg.start
-                    inj_start = max(start, int(min_inj - win_points))
-                    inj_end = min(stop, int(max_inj + win_points))
-                    start = inj_start
-                    stop = inj_end
+                    windows = []
+                    for inj_id in matching_injs:
+                        inj_pos = int(inj_id - seg.start)
+                        w_start = max(start, inj_pos - win_points)
+                        w_stop = min(stop, inj_pos + win_points)
+                        if w_start < w_stop:
+                            windows.append([w_start, w_stop])
+
+                    if not windows:
+                        continue
+
+                    # Merge overlapping windows
+                    windows.sort(key=lambda x: x[0])
+                    merged_windows = [windows[0]]
+                    for cur in windows[1:]:
+                        prev = merged_windows[-1]
+                        if cur[0] <= prev[1]:
+                            prev[1] = max(prev[1], cur[1])
+                        else:
+                            merged_windows.append(cur)
+
+                    for w_start, w_stop in merged_windows:
+                        segment_slices_red.append(seg)
+                        analyze_slices_red.append(slice(w_start, w_stop))
+                    continue
 
             if start < stop:
                 segment_slices_red.append(seg)
@@ -1238,19 +1257,27 @@ class StrainSegments(object):
         """
         if not self._fourier_segments:
             self._fourier_segments = []
+            cached_freq_segs = {}
             for seg_slice, ana in zip(self.segment_slices, self.analyze_slices):
-                if seg_slice.start >= 0 and seg_slice.stop <= len(self.strain):
-                    freq_seg = make_frequency_series(self.strain[seg_slice])
-                # Assume that we cannot have a case where we both zero-pad on
-                # both sides
-                elif seg_slice.start < 0:
-                    strain_chunk = self.strain[:seg_slice.stop]
-                    strain_chunk.prepend_zeros(-seg_slice.start)
-                    freq_seg = make_frequency_series(strain_chunk)
-                elif seg_slice.stop > len(self.strain):
-                    strain_chunk = self.strain[seg_slice.start:]
-                    strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
-                    freq_seg = make_frequency_series(strain_chunk)
+                key = (seg_slice.start, seg_slice.stop)
+                if key in cached_freq_segs:
+                    freq_seg = cached_freq_segs[key].copy()
+                else:
+                    if seg_slice.start >= 0 and seg_slice.stop <= len(self.strain):
+                        base_seg = make_frequency_series(self.strain[seg_slice])
+                    # Assume that we cannot have a case where we both zero-pad on
+                    # both sides
+                    elif seg_slice.start < 0:
+                        strain_chunk = self.strain[:seg_slice.stop]
+                        strain_chunk.prepend_zeros(-seg_slice.start)
+                        base_seg = make_frequency_series(strain_chunk)
+                    elif seg_slice.stop > len(self.strain):
+                        strain_chunk = self.strain[seg_slice.start:]
+                        strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
+                        base_seg = make_frequency_series(strain_chunk)
+                    cached_freq_segs[key] = base_seg
+                    freq_seg = base_seg.copy()
+
                 freq_seg.analyze = ana
                 freq_seg.cumulative_index = seg_slice.start + ana.start
                 freq_seg.seg_slice = seg_slice
