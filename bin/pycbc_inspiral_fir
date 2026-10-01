@@ -298,7 +298,7 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
 
             # Determine which points we should use the same chisq value for
             window_mask = (abs(t_idxs - t_idx) <= chisq_window_samp)
-            update_mask = window_mask & (~assigned_mask)
+            update_mask = window_mask & (~assigned_mask) & (snr_amp >= cthresh)
 
             chisq_vals[update_mask] = chi
             chisq_dof_vals[update_mask] = dof
@@ -735,6 +735,11 @@ def main():
         non_threshold_intervals = {ifo: [] for ifo in instruments}
         num_segs = max(len(segments[ifo]) for ifo in instruments)
 
+        # For injections, only the 100ms foreground slice (1 bin of 0.1s) is required
+        # because injections are evaluated strictly against background from the full search.
+        is_injection_run = bool(getattr(args, 'injection_file', None))
+        effective_asym_num_bins = 1 if is_injection_run else args.asym_num_bins
+
         tsetup = time.time() - tstart
 
         upper_ref_seconds = 0.0
@@ -902,7 +907,7 @@ def main():
                                         continue
                                     cand_indices = np.flatnonzero(cand_mask)
                                     if len(cand_indices) > 1:
-                                        half_win_samp = int(round(args.asym_bin_width * args.asym_num_bins * 0.5 * sample_rate))
+                                        half_win_samp = int(round(args.asym_bin_width * effective_asym_num_bins * 0.5 * sample_rate))
                                         unique_lids = np.unique(a_ids[cand_indices])
                                         pruned = []
                                         for uid in unique_lids:
@@ -939,7 +944,7 @@ def main():
                                                 t_center=cand_tcenter,
                                                 sample_rate=args.sample_rate[ifo_B] if isinstance(args.sample_rate, dict) else args.sample_rate,
                                                 bin_width=args.asym_bin_width,
-                                                num_bins=args.asym_num_bins,
+                                                num_bins=effective_asym_num_bins,
                                                 valid_slice=stilde_B.analyze,
                                                 block_f_cache=block_f_cache_by_ifo[ifo_B],
                                                 corr_cache=corr_cache_by_ifo[ifo_B],
@@ -1159,7 +1164,7 @@ def main():
                                         continue
                                     cand_indices = np.flatnonzero(cand_mask)
                                     if len(cand_indices) > 1:
-                                        half_win_samp = int(round(args.asym_bin_width * args.asym_num_bins * 0.5 * sample_rate))
+                                        half_win_samp = int(round(args.asym_bin_width * effective_asym_num_bins * 0.5 * sample_rate))
                                         unique_lids = np.unique(a_ids[cand_indices])
                                         pruned = []
                                         for uid in unique_lids:
@@ -1196,7 +1201,7 @@ def main():
                                                 t_center=cand_tcenter,
                                                 sample_rate=args.sample_rate[ifo_B] if isinstance(args.sample_rate, dict) else args.sample_rate,
                                                 bin_width=args.asym_bin_width,
-                                                num_bins=args.asym_num_bins,
+                                                num_bins=effective_asym_num_bins,
                                                 valid_slice=stilde_B.analyze,
                                                 block_f_cache=block_f_cache_by_ifo[ifo_B],
                                                 corr_cache=corr_cache_by_ifo[ifo_B],
@@ -1319,7 +1324,7 @@ def main():
                                 continue
                             cand_indices = np.flatnonzero(cand_mask)
                             if len(cand_indices) > 1:
-                                half_win_samp = int(round(args.asym_bin_width * args.asym_num_bins * 0.5 * sample_rate))
+                                half_win_samp = int(round(args.asym_bin_width * effective_asym_num_bins * 0.5 * sample_rate))
                                 unique_lids = np.unique(a_ids[cand_indices])
                                 pruned = []
                                 for uid in unique_lids:
@@ -1356,7 +1361,7 @@ def main():
                                         t_center=cand_tcenter,
                                         sample_rate=args.sample_rate[ifo_B] if isinstance(args.sample_rate, dict) else args.sample_rate,
                                         bin_width=args.asym_bin_width,
-                                        num_bins=args.asym_num_bins,
+                                        num_bins=effective_asym_num_bins,
                                         valid_slice=stilde_B.analyze,
                                         block_f_cache=block_f_cache_by_ifo[ifo_B],
                                         corr_cache=corr_cache_by_ifo[ifo_B],
