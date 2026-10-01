@@ -70,6 +70,9 @@ parser.add_argument('--additional-event-times', type=float, nargs="+",
                     help="Additional event times which will be removed from "
                          "both inclusive and exclusive background "
                           "(gps seconds)")
+parser.add_argument('--max-timeslide-offset', type=float, default=None,
+                    help="Maximum timeslide time offset in seconds. Coincidences with "
+                         "timeslide offset larger than this are culled/discarded.")
 significance.insert_significance_option_group(parser)
 parser.add_argument('--output-file')
 args = parser.parse_args()
@@ -125,6 +128,32 @@ if args.additional_event_times:
     all_trigs = all_trigs.remove(manual_rm_idx)
 
 logging.info("%s triggers remain" % len(all_trigs.stat))
+
+ts_interval = all_trigs.attrs.get('timeslide_interval', 1.0)
+t_followup = 0.0
+for ifo in ifos:
+    if ('%s_non_threshold_time' % ifo) in all_trigs.attrs:
+        t_followup = max(t_followup, float(all_trigs.attrs['%s_non_threshold_time' % ifo]))
+
+max_slide = None
+if args.max_timeslide_offset is not None and ts_interval > 0:
+    max_slide = int(round(args.max_timeslide_offset / ts_interval))
+    logging.info("Enforcing explicit timeslide limit |slide| <= %d (offset <= %.3fs)",
+                 max_slide, args.max_timeslide_offset)
+elif 'max_timeslide_id' in all_trigs.attrs:
+    max_slide = int(all_trigs.attrs['max_timeslide_id'])
+    logging.info("Detected max_timeslide_id=%d in coinc attributes: enforcing timeslide limit", max_slide)
+elif t_followup > 0 and ts_interval > 0:
+    max_slide = int(round((t_followup / 2.0) / ts_interval))
+    logging.info("Detected local followup window %.2fs: enforcing timeslide limit |slide| <= %d",
+                 t_followup, max_slide)
+
+if max_slide is not None:
+    keep_mask = (all_trigs.timeslide_id == 0) | (numpy.abs(all_trigs.timeslide_id) <= max_slide)
+    logging.info("Culling coinc triggers to |timeslide_id| <= %d: keeping %d of %d triggers",
+                 max_slide, keep_mask.sum(), len(all_trigs.stat))
+    all_trigs = all_trigs.select(keep_mask)
+
 fore_locs = all_trigs.timeslide_id == 0
 
 # Foreground trigger times for ifos
@@ -243,20 +272,22 @@ coinc_time = float(all_trigs.attrs.get('coinc_time', 0.0))
 
 has_nothresh = (
     len(ifos) == 2 and
-    ('%s_non_threshold_time' % ifos[0]) in all_trigs.attrs and
-    ('%s_non_threshold_time' % ifos[1]) in all_trigs.attrs
+    (('%s_non_threshold_time' % ifos[0]) in all_trigs.attrs or
+     ('%s_non_threshold_time' % ifos[1]) in all_trigs.attrs)
 )
 
 coinc_time_exc = max(0.0, coinc_time - veto_time)
 
-if has_nothresh:
-    t_followup1 = float(all_trigs.attrs['%s_non_threshold_time' % ifos[0]])
-    t_followup2 = float(all_trigs.attrs['%s_non_threshold_time' % ifos[1]])
-    t_followup = max(t_followup1, t_followup2)
+if max_slide is not None:
+    n_slides = max_slide * 2
+    background_time = coinc_time * n_slides
+    background_time_exc = coinc_time_exc * n_slides
+elif has_nothresh and t_followup > 0:
     n_slides = t_followup / ts_interval
     background_time = coinc_time * n_slides
     background_time_exc = coinc_time_exc * n_slides
 else:
+    n_slides = int(maxtime / ts_interval)
     background_time = int(maxtime / ts_interval) * mintime
     background_time_exc = int(maxtime_exc / ts_interval) * mintime_exc
 
@@ -264,6 +295,9 @@ f.attrs['background_time'] = background_time
 f.attrs['foreground_time'] = coinc_time
 f.attrs['background_time_exc'] = background_time_exc
 f.attrs['foreground_time_exc'] = coinc_time_exc
+f.attrs['num_slides'] = n_slides
+if max_slide is not None:
+    f.attrs['max_timeslide_id'] = max_slide
 
 if (back_locs.sum()) == 0:
     logging.warning("There were no background events, so we could not "
