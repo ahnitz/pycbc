@@ -1948,7 +1948,8 @@ def get_statistic(stat):
         raise RuntimeError("%s is not an available detection statistic" % stat)
 
 
-def insert_statistic_option_group(parser, default_ranking_statistic=None):
+def insert_statistic_option_group(parser, default_ranking_statistic=None,
+                                  default_sngl_ranking='newsnr_sgveto_psdvar'):
     """
     Add ranking statistic options to the optparser object.
 
@@ -1958,13 +1959,16 @@ def insert_statistic_option_group(parser, default_ranking_statistic=None):
     -----------
     parser : object
         OptionParser instance.
-    default_ranking_statisic : str
+    default_ranking_statistic : str
         Allows setting a default statistic for the '--ranking-statistic'
         option. The option is no longer required if a default is provided.
+    default_sngl_ranking : str
+        Allows setting a default single-detector ranking for the
+        '--sngl-ranking' option. Defaults to 'newsnr_sgveto_psdvar'.
 
     Returns
     --------
-    strain_opt_group : optparser.argument_group
+    statistic_opt_group : optparser.argument_group
         The argument group that is added to the parser.
     """
     statistic_opt_group = parser.add_argument_group(
@@ -1982,9 +1986,11 @@ def insert_statistic_option_group(parser, default_ranking_statistic=None):
 
     statistic_opt_group.add_argument(
         "--sngl-ranking",
+        default=default_sngl_ranking,
         choices=ranking.sngls_ranking_function_dict.keys(),
-        required=True,
-        help="The single-detector trigger ranking to use.",
+        required=True if default_sngl_ranking is None else False,
+        help="The single-detector trigger ranking to use. Default is "
+             "%(default)s.",
     )
 
     statistic_opt_group.add_argument(

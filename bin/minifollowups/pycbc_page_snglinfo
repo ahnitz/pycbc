@@ -68,10 +68,13 @@ parser.add_argument('--significance-file',
 parser.add_argument('--max-columns', type=int,
     help="Optional. Set a maximum number of columns to be used in the output table")
 pystat.insert_statistic_option_group(parser,
-    default_ranking_statistic='single_ranking_only')
+    default_ranking_statistic='single_ranking_only',
+    default_sngl_ranking='newsnr_sgveto_psdvar')
 
 
 args = parser.parse_args()
+if getattr(args, 'sngl_ranking', None) is None:
+    args.sngl_ranking = 'newsnr_sgveto_psdvar'
 
 init_logging(args.verbose)
 
