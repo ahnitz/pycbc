@@ -317,7 +317,7 @@ class EventManager(object):
         nsnrs = ranking.newsnr(abs(self.events['snr']),
                                self.events['chisq'] / self.events['chisq_dof'])
         mask = (nsnrs >= threshold)
-        if 'chisq_dof' in self.events:
+        if 'chisq_dof' in self.events.dtype.names:
             mask = mask | (self.events['chisq_dof'] < 0)
         self.cut_events_via_mask(mask)
 
