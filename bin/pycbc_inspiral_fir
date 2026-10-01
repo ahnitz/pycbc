@@ -19,7 +19,6 @@ except Exception:
 
 
 import numpy as np
-from scipy.fft import fft, ifft
 
 import pycbc
 import pycbc.events
@@ -341,157 +340,75 @@ def sample_asym_bins(
 ):
     """Sample peak SNR in each bin across an asymmetric window around t_center.
 
-    Parameters
-    ----------
-    group_engine : MatchedFilterRatioControl
-        The engine controlling FFT block size and plans.
-    ref_snr : array of complex64
-        The reference SNR series for the detector being sampled.
-    filters_f : array of complex64
-        Frequency-domain ratio filters for the current coarse template.
-    local_id : int
-        Index of the fine template in filters_f.
-    n_taps_count : int
-        Tap count of the fine template.
-    t_center : int
-        Sample index of the primary trigger.
-    sample_rate : float
-        Data sample rate in Hz.
-    bin_width : float
-        Duration of each bin in seconds (default 0.1).
-    num_bins : int
-        Number of bins in the window (default 100).
-    valid_slice : slice
-        Valid analysis slice in samples (stilde.analyze).
-    block_f_cache : dict
-        Cache mapping block start sample -> forward block FFT.
-    corr_cache : dict
-        Cache mapping (block start, local_id) -> time-domain correlation block.
-    stilde : FrequencySeries
-        Segment frequency series for time-index metadata.
-    gps_start_time : float
-        GPS start time of the segment / analysis.
-
-    Returns
-    -------
-    out_ids : array of int32
-        Local filter IDs (repeated for each valid bin).
-    out_t_idxs : array of int64
-        Sample indices of the peak trigger in each valid bin.
-    out_snrs : array of complex64
-        Complex SNR at each peak.
-    out_tstarts : array of int32
-        Block start sample index for each peak.
-    searched_intervals : list of tuple
-        (gps_start, gps_end) for each bin searched, for livetime accumulation.
+    Uses matchedfilter library natively with zero external FFT calls.
     """
-    if block_f_cache is None:
-        block_f_cache = {}
-    if corr_cache is None:
-        corr_cache = {}
-
-    N_FFT = group_engine.fir_fft_len
-    n_taps_max = int(n_taps_count)
-    if hasattr(group_engine, '_tap_sizes'):
-        nsizes = group_engine._tap_sizes
-        i = np.searchsorted(nsizes, n_taps_max)
-        if i < len(nsizes):
-            n_taps_max = nsizes[i]
-
-    N_VALID = N_FFT - n_taps_max + 1
-    bad_start = n_taps_max // 2
-    STEP = N_VALID
-
     half_window_samp = int(round(0.5 * bin_width * num_bins * sample_rate))
     win_start_samp = t_center - half_window_samp
+    win_end_samp = t_center + half_window_samp
 
     v_start = 0 if valid_slice is None else valid_slice.start
     v_stop = len(ref_snr) if valid_slice is None else valid_slice.stop
 
-    out_ids = []
-    out_t_idxs = []
-    out_snrs = []
-    out_tstarts = []
-    searched_intervals = []
+    asym_start = max(win_start_samp, v_start)
+    asym_stop = min(win_end_samp, v_stop)
+
+    if asym_start >= asym_stop:
+        return (
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.complex64),
+            np.empty(0, dtype=np.int32),
+            []
+        )
 
     cum_idx = getattr(stilde, 'cumulative_index', 0) if stilde is not None else 0
     an_start = valid_slice.start if valid_slice is not None else 0
+    gps_s = (asym_start - an_start + cum_idx) / float(sample_rate) + gps_start_time
+    gps_e = (asym_stop - an_start + cum_idx) / float(sample_rate) + gps_start_time
+    searched_intervals = [(gps_s, gps_e)]
 
-    for k in range(num_bins):
-        bs = win_start_samp + int(round(k * bin_width * sample_rate))
-        be = win_start_samp + int(round((k + 1) * bin_width * sample_rate))
-        cs = max(bs, v_start)
-        ce = min(be, v_stop)
-        if cs >= ce:
-            continue
+    bs = int(round(bin_width * sample_rate))
 
-        gps_s = (cs - an_start + cum_idx) / float(sample_rate) + gps_start_time
-        gps_e = (ce - an_start + cum_idx) / float(sample_rate) + gps_start_time
-        searched_intervals.append((gps_s, gps_e))
+    if hasattr(group_engine, '_td_bank'):
+        res = group_engine._td_bank.filter_series(
+            ref_snr,
+            valid_slice=slice(asym_start, asym_stop),
+            binsize=bs,
+            threshold=0.0,
+            template_index=local_id
+        )
+        return (
+            res.template_indices.astype(np.int32),
+            res.sample_indices.astype(np.int64),
+            res.snr.astype(np.complex64),
+            res.block_starts.astype(np.int32),
+            searched_intervals
+        )
 
-        t_start_first = ((cs - bad_start) // STEP) * STEP
-        t_start_last = ((ce - 1 - bad_start) // STEP) * STEP
-
-        best_snr_amp = -1.0
-        best_t_idx = -1
-        best_snr = 0.0
-        best_tstart = -1
-
-        for t_start in range(t_start_first, t_start_last + 1, STEP):
-            if t_start < 0 or t_start + bad_start >= len(ref_snr):
-                continue
-            b_valid_0 = t_start + bad_start
-            b_valid_1 = t_start + bad_start + STEP
-            roi_s = max(cs, b_valid_0)
-            roi_e = min(ce, b_valid_1)
-            if roi_s >= roi_e:
-                continue
-
-            cache_key = (t_start, local_id)
-            if cache_key not in corr_cache:
-                if t_start not in block_f_cache:
-                    t_end = min(t_start + N_FFT, len(ref_snr))
-                    seg_data = ref_snr[t_start:t_end]
-                    if len(seg_data) < N_FFT:
-                        seg_padded = np.zeros(N_FFT, dtype=np.complex64)
-                        seg_padded[:len(seg_data)] = seg_data
-                        block_f_cache[t_start] = fft(seg_padded) / N_FFT
-                    else:
-                        block_f_cache[t_start] = fft(seg_data) / N_FFT
-                block_f = np.ascontiguousarray(block_f_cache[t_start], dtype=np.complex64)
-                if isinstance(filters_f, list):
-                    filt_1 = np.ascontiguousarray([filters_f[local_id]], dtype=np.complex64)
-                else:
-                    filt_1 = np.ascontiguousarray(filters_f[local_id:local_id+1], dtype=np.complex64)
-                mult_view = np.zeros((1, N_FFT), dtype=np.complex64)
-                fast_multiply_analytic_cython(block_f, filt_1, mult_view)
-                corr_cache[cache_key] = (ifft(mult_view[0]) * N_FFT).astype(np.complex64)
-
-            corr_data = corr_cache[cache_key]
-            idx_0 = roi_s - t_start
-            idx_1 = roi_e - t_start
-            sub_corr = corr_data[idx_0:idx_1]
-            sub_max_idx = np.argmax(np.abs(sub_corr))
-            sub_peak_t = roi_s + sub_max_idx
-            sub_peak_snr = sub_corr[sub_max_idx]
-
-            if abs(sub_peak_snr) > best_snr_amp:
-                best_snr_amp = abs(sub_peak_snr)
-                best_t_idx = sub_peak_t
-                best_snr = sub_peak_snr
-                best_tstart = t_start
-
-        if best_t_idx >= 0:
-            out_ids.append(local_id)
-            out_t_idxs.append(best_t_idx)
-            out_snrs.append(best_snr)
-            out_tstarts.append(best_tstart)
-
+    # Fallback to matchedfilter.MatchedFilter if _td_bank is not attached
+    import matchedfilter as _mf
+    N_FFT = group_engine.fir_fft_len
+    filt = _mf.MatchedFilter(N_FFT, ndata=1, ntemplates=1)
+    if isinstance(filters_f, list):
+        spec = np.ascontiguousarray([filters_f[local_id]], dtype=np.complex64)
+    else:
+        spec = np.ascontiguousarray(filters_f[local_id:local_id+1], dtype=np.complex64)
+    filt.set_templates(np.conj(spec))
+    pk = filt.run_series(
+        ref_snr,
+        win_start=np.array([asym_start], dtype=np.int64),
+        win_end=np.array([asym_stop], dtype=np.int64),
+        binsize=bs,
+        threshold=0.0
+    )
+    p_idx = pk['index'].ravel()
+    p_val = pk['value'].ravel()
+    valid = p_idx >= 0
     return (
-        np.array(out_ids, dtype=np.int32),
-        np.array(out_t_idxs, dtype=np.int64),
-        np.array(out_snrs, dtype=np.complex64),
-        np.array(out_tstarts, dtype=np.int32),
+        np.full(np.count_nonzero(valid), local_id, dtype=np.int32),
+        p_idx[valid].astype(np.int64),
+        p_val[valid].astype(np.complex64),
+        np.full(np.count_nonzero(valid), asym_start, dtype=np.int32),
         searched_intervals
     )
 
