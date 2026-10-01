@@ -396,8 +396,9 @@ def sample_asym_bins(
     filt.set_templates(np.conj(spec))
     pk = filt.run_series(
         ref_snr,
-        win_start=np.array([asym_start], dtype=np.int64),
-        win_end=np.array([asym_stop], dtype=np.int64),
+        starts=np.array([asym_start], dtype=np.int64),
+        win_start=np.array([0], dtype=np.int64),
+        win_end=np.array([asym_stop - asym_start], dtype=np.int64),
         binsize=bs,
         threshold=0.0
     )
