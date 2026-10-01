@@ -414,6 +414,49 @@ def sample_asym_bins(
     )
 
 
+def filter_secondary_asym_triggers(
+    asym_ids,
+    asym_t_idxs,
+    asym_snrs,
+    asym_tstarts,
+    primary_snr,
+    secondary_snr_threshold=None,
+    network_snr_threshold=None,
+):
+    """Filter secondary triggers based on secondary SNR and network SNR thresholds.
+
+    A secondary trigger is kept if EITHER:
+    (1) |rho_secondary| >= secondary_snr_threshold, OR
+    (2) rho_net = sqrt(|rho_primary|^2 + |rho_secondary|^2) >= network_snr_threshold.
+    """
+    if len(asym_ids) == 0:
+        return asym_ids, asym_t_idxs, asym_snrs, asym_tstarts
+
+    has_sec = (secondary_snr_threshold is not None) and (secondary_snr_threshold > 0.0)
+    has_net = (network_snr_threshold is not None) and (network_snr_threshold > 0.0)
+
+    if not has_sec and not has_net:
+        return asym_ids, asym_t_idxs, asym_snrs, asym_tstarts
+
+    rho_sec = np.abs(asym_snrs)
+    keep_mask = np.zeros(len(asym_ids), dtype=bool)
+
+    if has_sec:
+        keep_mask |= (rho_sec >= secondary_snr_threshold)
+
+    if has_net:
+        rho_prim = abs(primary_snr)
+        rho_net = np.sqrt(rho_prim ** 2 + rho_sec ** 2)
+        keep_mask |= (rho_net >= network_snr_threshold)
+
+    return (
+        asym_ids[keep_mask],
+        asym_t_idxs[keep_mask],
+        asym_snrs[keep_mask],
+        asym_tstarts[keep_mask],
+    )
+
+
 def get_args():
     parser = argparse.ArgumentParser(description=__doc__)
     pycbc.add_common_pycbc_options(parser)
@@ -435,6 +478,12 @@ def get_args():
                             help="Enable asymmetric windowing across detectors.")
     asym_group.add_argument("--asym-snr-threshold", type=float, default=6.0,
                             help="SNR threshold in primary detector to trigger asymmetric windowing in other detectors.")
+    asym_group.add_argument("--asym-secondary-snr-threshold", type=float, default=None,
+                            help="Secondary detector SNR threshold for asymmetric triggers (e.g. 4.0). "
+                                 "Triggers below this are discarded unless network SNR threshold is exceeded.")
+    asym_group.add_argument("--asym-network-snr-threshold", type=float, default=None,
+                            help="Network SNR threshold with primary trigger (e.g. 8.0). "
+                                 "Secondary triggers with network SNR >= threshold are kept unconditionally.")
     asym_group.add_argument("--asym-bin-width", type=float, default=0.1,
                             help="Width in seconds of each bin in the asymmetric window (default 0.1s).")
     asym_group.add_argument("--asym-num-bins", type=int, default=100,
@@ -956,6 +1005,13 @@ def main():
                                             if searched_intervals:
                                                 non_threshold_intervals[ifo_B].extend(searched_intervals)
 
+                                            asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = filter_secondary_asym_triggers(
+                                                asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
+                                                primary_snr=a_snrs[k],
+                                                secondary_snr_threshold=args.asym_secondary_snr_threshold,
+                                                network_snr_threshold=args.asym_network_snr_threshold,
+                                            )
+
                                             if len(asym_ids) > 0:
                                                 if do_chisq and np.any(abs(asym_snrs) >= cthresh):
                                                     chisq_ref = bank.get_coarse_template(coarse_idx)
@@ -1213,6 +1269,13 @@ def main():
                                             if searched_intervals:
                                                 non_threshold_intervals[ifo_B].extend(searched_intervals)
 
+                                            asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = filter_secondary_asym_triggers(
+                                                asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
+                                                primary_snr=a_snrs[k],
+                                                secondary_snr_threshold=args.asym_secondary_snr_threshold,
+                                                network_snr_threshold=args.asym_network_snr_threshold,
+                                            )
+
                                             if len(asym_ids) > 0:
                                                 if do_chisq and np.any(abs(asym_snrs) >= cthresh):
                                                     chi, chi_dof = compute_batch_chisq(
@@ -1372,6 +1435,13 @@ def main():
 
                                     if searched_intervals:
                                         non_threshold_intervals[ifo_B].extend(searched_intervals)
+
+                                    asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = filter_secondary_asym_triggers(
+                                        asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
+                                        primary_snr=a_snrs[k],
+                                        secondary_snr_threshold=args.asym_secondary_snr_threshold,
+                                        network_snr_threshold=args.asym_network_snr_threshold,
+                                    )
 
                                     if len(asym_ids) > 0:
                                         if do_chisq and np.any(abs(asym_snrs) >= cthresh):
