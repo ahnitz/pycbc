@@ -738,7 +738,7 @@ def main():
         # For injections, only the 100ms foreground slice (1 bin of 0.1s) is required
         # because injections are evaluated strictly against background from the full search.
         is_injection_run = bool(getattr(args, 'injection_file', None))
-        effective_asym_num_bins = 1 if is_injection_run else args.asym_num_bins
+        effective_asym_num_bins = 10 if is_injection_run else args.asym_num_bins
 
         tsetup = time.time() - tstart
 

@@ -316,7 +316,10 @@ class EventManager(object):
 
         nsnrs = ranking.newsnr(abs(self.events['snr']),
                                self.events['chisq'] / self.events['chisq_dof'])
-        self.cut_events_via_mask(nsnrs >= threshold)
+        mask = (nsnrs >= threshold)
+        if 'chisq_dof' in self.events:
+            mask = mask | (self.events['chisq_dof'] < 0)
+        self.cut_events_via_mask(mask)
 
     def keep_near_injection(self, window, injections):
         from pycbc.events.veto import indices_within_times
