@@ -71,7 +71,7 @@ class UpperReferenceBatch:
             count = int(count)
             centered = np.zeros(self.n, dtype=np.float32)
             centered[(np.arange(count) - count // 2) % self.n] = taps[row, :count]
-            spectra[row] = fft(centered)
+            spectra[row] = np.fft.fft(centered).astype(np.complex64)
         self.plan.set_templates(spectra)
         self._scales_cache = {}
 
@@ -122,7 +122,7 @@ def upper_filter_spectrum(taps, n):
     if count >= n:
         raise ValueError('upper FIR must be shorter than the data segment')
     centered[(np.arange(count) - count // 2) % n] = taps
-    return np.conj(fft(centered))
+    return np.conj(np.fft.fft(centered).astype(np.complex64))
 
 
 def effective_middle_template(top_template, upper_spectrum, tap_sample_rate):
