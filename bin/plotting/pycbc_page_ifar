@@ -209,12 +209,15 @@ else:
     min_tsid = numpy.rint(min_tsid) // opts.decimation_factor
     max_tsid = numpy.rint(max_tsid) // opts.decimation_factor
 
-    if len(back_tsid) > 0 and (back_tsid.max() - back_tsid.min() < (max_tsid - min_tsid) / 2):
-        u_tsids = numpy.unique(back_tsid)
-        tsids = u_tsids[u_tsids != 0]
+    if 'background_time' in fp.attrs and 'foreground_time' in fp.attrs and fp.attrs['foreground_time'] > 0:
+        ratio = fp.attrs['background_time'] / fp.attrs['foreground_time']
+        if ratio < (max_tsid - min_tsid) / 2:
+            n_half = int(round(ratio / 2.0))
+            tsids = numpy.arange(-n_half, n_half + 1, 1).astype(numpy.int64) * opts.decimation_factor
+        else:
+            tsids = numpy.arange(min_tsid, max_tsid, 1).astype(numpy.int64) * opts.decimation_factor
     else:
-        tsids = numpy.arange(min_tsid, max_tsid, 1).astype(numpy.int64) * \
-                             opts.decimation_factor
+        tsids = numpy.arange(min_tsid, max_tsid, 1).astype(numpy.int64) * opts.decimation_factor
 
 allbkg_dur = 0
 allbkg_ifars = []
