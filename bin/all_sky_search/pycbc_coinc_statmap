@@ -149,12 +149,19 @@ veto_time = abs(veto.start_end_to_segments(remove_start_time,
 
 # Veto indices from list of triggers in the windowed times around fg triggers
 # This gives exclusive background triggers
-exc_zero_trigs = all_trigs.remove([])  # Start by copying existing triggers
+fg_veto_list = []
 for ifo in ifos:
     fg_veto_ids = veto.indices_within_times(
-                       exc_zero_trigs.data['%s/time' % ifo],
+                       all_trigs.data['%s/time' % ifo],
                        remove_start_time, remove_end_time)
-    exc_zero_trigs = exc_zero_trigs.remove(fg_veto_ids)
+    if len(fg_veto_ids) > 0:
+        fg_veto_list.append(fg_veto_ids)
+
+if fg_veto_list:
+    combined_veto_ids = numpy.unique(numpy.concatenate(fg_veto_list))
+    exc_zero_trigs = all_trigs.remove(combined_veto_ids)
+else:
+    exc_zero_trigs = all_trigs
 
 logging.info("Clustering coinc triggers (inclusive of zerolag)")
 all_trigs = all_trigs.cluster(args.cluster_window)
@@ -163,8 +170,12 @@ all_trigs = all_trigs.cluster(args.cluster_window)
 fore_locs = all_trigs.timeslide_id == 0
 logging.info("%s clustered foreground triggers" % fore_locs.sum())
 
-logging.info("Clustering coinc triggers (exclusive of zerolag)")
-exc_zero_trigs = exc_zero_trigs.cluster(args.cluster_window)
+if exc_zero_trigs is all_trigs:
+    logging.info("Reusing clustered triggers for exclusive background (zero vetoed triggers)")
+    exc_zero_trigs = all_trigs
+else:
+    logging.info("Clustering coinc triggers (exclusive of zerolag)")
+    exc_zero_trigs = exc_zero_trigs.cluster(args.cluster_window)
 
 logging.info("Dumping foreground triggers")
 f = fw(args.output_file)
