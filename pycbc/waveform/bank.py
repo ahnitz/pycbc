@@ -1278,10 +1278,31 @@ class RatioFilterBank(FilterBank):
 
         if len(indices) > 0:
             indices_combined = np.concatenate(indices)
-            indices_unique= np.unique(indices_combined)
+            indices_unique = np.unique(indices_combined)
             self.coarse_indices = indices_unique
         else:
             self.coarse_indices = []
+
+        if getattr(self, 'top_bank', None) is not None and len(self.top_indices) > 0:
+            coarse_set = set(self.coarse_indices)
+            kept_top = []
+            if self.upper_group is not None:
+                for top_id in self.top_indices:
+                    mid_idx = self.upper_group[str(top_id)]['fine_bank_index'][:]
+                    if any(mid in coarse_set for mid in mid_idx):
+                        kept_top.append(top_id)
+            elif getattr(self, 'num_levels', None) is not None:
+                for top_id in self.top_indices:
+                    cur_level_nodes = [top_id]
+                    for lvl in range(self.num_levels, 1, -1):
+                        next_nodes = []
+                        for pid in cur_level_nodes:
+                            _, _, child_ids, _ = self.get_level_firs(lvl, pid)
+                            next_nodes.extend(child_ids)
+                        cur_level_nodes = next_nodes
+                    if any(cid in coarse_set for cid in cur_level_nodes):
+                        kept_top.append(top_id)
+            self.top_indices = np.array(kept_top, dtype=int)
 
     def get_coarse_template(self, coarse_index):
         """Wrapper to get the frequency-domain waveform from the internal coarse bank.

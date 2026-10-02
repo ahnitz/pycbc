@@ -361,13 +361,22 @@ def sample_asym_bins(
             []
         )
 
+    if sample_rate is None and stilde is not None:
+        sample_rate = getattr(stilde, 'sample_rate', 2048.0)
+    sample_rate_val = float(sample_rate or 2048.0)
+
+    if gps_start_time is None:
+        gps_start_val = float(getattr(stilde, 'start_time', getattr(stilde, 'epoch', 0.0)))
+    else:
+        gps_start_val = float(gps_start_time)
+
     cum_idx = getattr(stilde, 'cumulative_index', 0) if stilde is not None else 0
     an_start = valid_slice.start if valid_slice is not None else 0
-    gps_s = (asym_start - an_start + cum_idx) / float(sample_rate) + gps_start_time
-    gps_e = (asym_stop - an_start + cum_idx) / float(sample_rate) + gps_start_time
+    gps_s = (asym_start - an_start + cum_idx) / sample_rate_val + gps_start_val
+    gps_e = (asym_stop - an_start + cum_idx) / sample_rate_val + gps_start_val
     searched_intervals = [(gps_s, gps_e)]
 
-    bs = int(round(bin_width * sample_rate))
+    bs = int(round(bin_width * sample_rate_val))
 
     if hasattr(group_engine, '_td_bank'):
         res = group_engine._td_bank.filter_series(
@@ -414,6 +423,88 @@ def sample_asym_bins(
     )
 
 
+def select_primary_asym_candidates(
+    a_ids,
+    a_tidxs,
+    a_snrs,
+    sample_rate,
+    asym_snr_threshold,
+    bin_width,
+    num_bins,
+    max_primary_per_group_sec=1,
+    stilde=None,
+    gps_start_time=None,
+):
+    """Select candidate primary triggers to instigate secondary followup windowing.
+
+    Applies:
+    1. Primary SNR threshold (rho_A >= asym_snr_threshold, e.g. 6.0).
+    2. Per-template within-window pruning: within each template in the fine group,
+       suppress triggers within half_win_samp of a louder trigger.
+    3. Heuristic 2 (Primary Followup Throttling per Fine Group):
+       Within each 1-second interval and within each fine template group,
+       only allow the loudest Y (max_primary_per_group_sec) primary triggers
+       to instigate secondary followup windowing (set 0 to disable).
+    """
+    if len(a_ids) == 0:
+        return np.empty(0, dtype=np.int64)
+
+    cand_mask = (abs(a_snrs) >= asym_snr_threshold)
+    if not np.any(cand_mask):
+        return np.empty(0, dtype=np.int64)
+
+    cand_indices = np.flatnonzero(cand_mask)
+    if len(cand_indices) <= 1:
+        return cand_indices
+
+    if sample_rate is None and stilde is not None:
+        sample_rate = getattr(stilde, 'sample_rate', 2048.0)
+    sample_rate_val = float(sample_rate or 2048.0)
+
+    # 1. Per-template pruning across the followup half-window
+    half_win_samp = int(round(bin_width * num_bins * 0.5 * sample_rate_val))
+    unique_lids = np.unique(a_ids[cand_indices])
+    pruned = []
+    for uid in unique_lids:
+        u_cands = cand_indices[a_ids[cand_indices] == uid]
+        if len(u_cands) == 1:
+            pruned.append(u_cands[0])
+        else:
+            order = np.argsort(-abs(a_snrs[u_cands]), kind='stable')
+            kept_t = []
+            for ci in u_cands[order]:
+                ct = a_tidxs[ci]
+                if not any(abs(ct - kt) < half_win_samp for kt in kept_t):
+                    kept_t.append(ct)
+                    pruned.append(ci)
+    cand_indices = np.array(pruned, dtype=np.int64)
+
+    # 2. Heuristic 2: Primary Followup Throttling per Fine Group per 1-second interval
+    if max_primary_per_group_sec is not None and max_primary_per_group_sec > 0 and len(cand_indices) > max_primary_per_group_sec:
+        cum_idx = getattr(stilde, 'cumulative_index', 0) if stilde is not None else 0
+        an_start = stilde.analyze.start if (stilde is not None and hasattr(stilde, 'analyze') and stilde.analyze is not None) else 0
+        if gps_start_time is None:
+            gps_start_val = float(getattr(stilde, 'start_time', getattr(stilde, 'epoch', 0.0)))
+        else:
+            gps_start_val = float(gps_start_time)
+        gps_times = gps_start_val + (a_tidxs[cand_indices] - an_start + cum_idx) / sample_rate_val
+        sec_bins = np.floor(gps_times).astype(np.int64)
+
+        unique_secs = np.unique(sec_bins)
+        throttled = []
+        for s in unique_secs:
+            s_mask = (sec_bins == s)
+            s_cands = cand_indices[s_mask]
+            if len(s_cands) <= max_primary_per_group_sec:
+                throttled.extend(s_cands)
+            else:
+                s_order = np.argsort(-abs(a_snrs[s_cands]), kind='stable')
+                throttled.extend(s_cands[s_order[:max_primary_per_group_sec]])
+        cand_indices = np.array(sorted(throttled), dtype=np.int64)
+
+    return cand_indices
+
+
 def filter_secondary_asym_triggers(
     asym_ids,
     asym_t_idxs,
@@ -422,12 +513,18 @@ def filter_secondary_asym_triggers(
     primary_snr,
     secondary_snr_threshold=None,
     network_snr_threshold=None,
+    max_followup_bins=0,
 ):
-    """Filter secondary triggers based on secondary SNR and network SNR thresholds.
+    """Filter secondary triggers based on secondary SNR, network SNR, and loudest bins.
 
     A secondary trigger is kept if EITHER:
     (1) |rho_secondary| >= secondary_snr_threshold, OR
     (2) rho_net = sqrt(|rho_primary|^2 + |rho_secondary|^2) >= network_snr_threshold.
+
+    Heuristic 1: If max_followup_bins > 0 and more than max_followup_bins bins pass
+    the thresholds, only the top max_followup_bins loudest bins (ranked by network SNR
+    rho_net = sqrt(rho_A^2 + rho_B^2), which is monotonic with rho_B) are kept.
+    Set max_followup_bins=0 to keep all passing bins.
     """
     if len(asym_ids) == 0:
         return asym_ids, asym_t_idxs, asym_snrs, asym_tstarts
@@ -435,25 +532,38 @@ def filter_secondary_asym_triggers(
     has_sec = (secondary_snr_threshold is not None) and (secondary_snr_threshold > 0.0)
     has_net = (network_snr_threshold is not None) and (network_snr_threshold > 0.0)
 
-    if not has_sec and not has_net:
-        return asym_ids, asym_t_idxs, asym_snrs, asym_tstarts
-
     rho_sec = np.abs(asym_snrs)
-    keep_mask = np.zeros(len(asym_ids), dtype=bool)
 
-    if has_sec:
-        keep_mask |= (rho_sec >= secondary_snr_threshold)
+    if has_sec or has_net:
+        keep_mask = np.zeros(len(asym_ids), dtype=bool)
+        if has_sec:
+            keep_mask |= (rho_sec >= secondary_snr_threshold)
+        if has_net:
+            rho_prim = abs(primary_snr)
+            rho_net = np.sqrt(rho_prim ** 2 + rho_sec ** 2)
+            keep_mask |= (rho_net >= network_snr_threshold)
+        passing_indices = np.flatnonzero(keep_mask)
+    else:
+        passing_indices = np.arange(len(asym_ids))
 
-    if has_net:
-        rho_prim = abs(primary_snr)
-        rho_net = np.sqrt(rho_prim ** 2 + rho_sec ** 2)
-        keep_mask |= (rho_net >= network_snr_threshold)
+    if len(passing_indices) == 0:
+        return (
+            asym_ids[:0],
+            asym_t_idxs[:0],
+            asym_snrs[:0],
+            asym_tstarts[:0],
+        )
+
+    if max_followup_bins is not None and max_followup_bins > 0 and len(passing_indices) > max_followup_bins:
+        order = np.argsort(-rho_sec[passing_indices], kind='stable')
+        passing_indices = passing_indices[order[:max_followup_bins]]
+        passing_indices = np.sort(passing_indices)
 
     return (
-        asym_ids[keep_mask],
-        asym_t_idxs[keep_mask],
-        asym_snrs[keep_mask],
-        asym_tstarts[keep_mask],
+        asym_ids[passing_indices],
+        asym_t_idxs[passing_indices],
+        asym_snrs[passing_indices],
+        asym_tstarts[passing_indices],
     )
 
 
@@ -484,6 +594,12 @@ def get_args():
     asym_group.add_argument("--asym-network-snr-threshold", type=float, default=None,
                             help="Network SNR threshold with primary trigger (e.g. 8.0). "
                                  "Secondary triggers with network SNR >= threshold are kept unconditionally.")
+    asym_group.add_argument("--asym-max-followup-bins", type=int, default=2,
+                            help="Maximum number of loudest followup bins to keep per primary candidate trigger "
+                                 "(default: 2, set 0 to keep all passing bins).")
+    asym_group.add_argument("--asym-max-primary-per-group-sec", type=int, default=1,
+                            help="Maximum number of primary triggers per 1-second interval within each fine "
+                                 "template group to instigate secondary followup windowing (default: 1, set 0 to disable).")
     asym_group.add_argument("--asym-bin-width", type=float, default=0.1,
                             help="Width in seconds of each bin in the asymmetric window (default 0.1s).")
     asym_group.add_argument("--asym-num-bins", type=int, default=100,
@@ -977,27 +1093,20 @@ def main():
                                 a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
                                 if len(a_ids) == 0:
                                     continue
-                                cand_mask = (abs(a_snrs) >= args.asym_snr_threshold)
-                                if not np.any(cand_mask):
+                                cand_indices = select_primary_asym_candidates(
+                                    a_ids=a_ids,
+                                    a_tidxs=a_tidxs,
+                                    a_snrs=a_snrs,
+                                    sample_rate=args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate,
+                                    asym_snr_threshold=args.asym_snr_threshold,
+                                    bin_width=args.asym_bin_width,
+                                    num_bins=effective_asym_num_bins,
+                                    max_primary_per_group_sec=args.asym_max_primary_per_group_sec,
+                                    stilde=segments[ifo_A][s_num],
+                                    gps_start_time=args.gps_start_time[ifo_A] if isinstance(args.gps_start_time, dict) else args.gps_start_time,
+                                )
+                                if len(cand_indices) == 0:
                                     continue
-                                cand_indices = np.flatnonzero(cand_mask)
-                                if len(cand_indices) > 1:
-                                    half_win_samp = int(round(args.asym_bin_width * effective_asym_num_bins * 0.5 * sample_rate))
-                                    unique_lids = np.unique(a_ids[cand_indices])
-                                    pruned = []
-                                    for uid in unique_lids:
-                                        u_cands = cand_indices[a_ids[cand_indices] == uid]
-                                        if len(u_cands) == 1:
-                                            pruned.append(u_cands[0])
-                                        else:
-                                            order = np.argsort(abs(a_snrs[u_cands]))[::-1]
-                                            kept_t = []
-                                            for ci in u_cands[order]:
-                                                ct = a_tidxs[ci]
-                                                if not any(abs(ct - kt) < half_win_samp for kt in kept_t):
-                                                    kept_t.append(ct)
-                                                    pruned.append(ci)
-                                    cand_indices = np.array(pruned, dtype=np.int64)
 
                                 for ifo_B in active_ifos:
                                     if ifo_B == ifo_A:
@@ -1035,6 +1144,7 @@ def main():
                                             primary_snr=a_snrs[k],
                                             secondary_snr_threshold=args.asym_secondary_snr_threshold,
                                             network_snr_threshold=args.asym_network_snr_threshold,
+                                            max_followup_bins=args.asym_max_followup_bins,
                                         )
 
                                         if len(asym_ids) > 0:
@@ -1126,13 +1236,17 @@ def main():
                 logging.info(f"Top template {top_step+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups (chunked {chunk_size}/chunk)")
 
                 t0 = time.perf_counter()
-                ref_by_seg = {
-                    ifo: [
-                        engine.make_reference_series(stilde, stilde.psd, top_template)
-                        for stilde in segments[ifo]
-                    ]
-                    for ifo in instruments
-                }
+                ref_by_seg = {}
+                for ifo in instruments:
+                    cached_ref = {}
+                    ifo_refs = []
+                    for stilde in segments[ifo]:
+                        s_slice = getattr(stilde, 'seg_slice', None)
+                        k = (s_slice.start, s_slice.stop) if s_slice is not None else id(stilde)
+                        if k not in cached_ref:
+                            cached_ref[k] = engine.make_reference_series(stilde, stilde.psd, top_template)
+                        ifo_refs.append(cached_ref[k])
+                    ref_by_seg[ifo] = ifo_refs
                 upper_ref_seconds += time.perf_counter() - t0
 
                 for chunk_start in range(0, len(middle_ids), chunk_size):
@@ -1169,21 +1283,37 @@ def main():
                                              group_engine, filters_f, group_engine._tap_sizes.copy(),
                                              chisq_ref_template))
 
+                    last_middle_series = None
+                    last_norms = None
+                    last_seg_slices = None
                     for s_num in range(num_segs):
                         active_ifos = [ifo for ifo in instruments if s_num < len(segments[ifo])]
                         if not active_ifos:
                             continue
 
-                        middle_series = {}
-                        norms = {}
-                        t_upper_start = time.perf_counter()
-                        t0 = time.perf_counter()
-                        for ifo in active_ifos:
-                            series, norm = ref_by_seg[ifo][s_num]
-                            norms[ifo] = norm
-                            middle_series[ifo] = upper_chunk.run(series, norm, chunk_scales, bank.sample_rate)
-                        upper_fir_seconds += time.perf_counter() - t0
-                        upper_total_seconds += time.perf_counter() - t_upper_start
+                        cur_seg_slices = tuple(
+                            (ifo, getattr(segments[ifo][s_num], 'seg_slice', None).start, getattr(segments[ifo][s_num], 'seg_slice', None).stop)
+                            if getattr(segments[ifo][s_num], 'seg_slice', None) is not None else (ifo, s_num)
+                            for ifo in active_ifos
+                        )
+
+                        if cur_seg_slices == last_seg_slices and last_middle_series is not None:
+                            middle_series = last_middle_series
+                            norms = last_norms
+                        else:
+                            middle_series = {}
+                            norms = {}
+                            t_upper_start = time.perf_counter()
+                            t0 = time.perf_counter()
+                            for ifo in active_ifos:
+                                series, norm = ref_by_seg[ifo][s_num]
+                                norms[ifo] = norm
+                                middle_series[ifo] = upper_chunk.run(series, norm, chunk_scales, bank.sample_rate)
+                            upper_fir_seconds += time.perf_counter() - t0
+                            upper_total_seconds += time.perf_counter() - t_upper_start
+                            last_middle_series = middle_series
+                            last_norms = norms
+                            last_seg_slices = cur_seg_slices
 
                         block_f_cache_by_ifo = {ifo: {} for ifo in active_ifos}
 
@@ -1238,27 +1368,20 @@ def main():
                                     a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
                                     if len(a_ids) == 0:
                                         continue
-                                    cand_mask = (abs(a_snrs) >= args.asym_snr_threshold)
-                                    if not np.any(cand_mask):
+                                    cand_indices = select_primary_asym_candidates(
+                                        a_ids=a_ids,
+                                        a_tidxs=a_tidxs,
+                                        a_snrs=a_snrs,
+                                        sample_rate=args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate,
+                                        asym_snr_threshold=args.asym_snr_threshold,
+                                        bin_width=args.asym_bin_width,
+                                        num_bins=effective_asym_num_bins,
+                                        max_primary_per_group_sec=args.asym_max_primary_per_group_sec,
+                                        stilde=segments[ifo_A][s_num],
+                                        gps_start_time=args.gps_start_time[ifo_A] if isinstance(args.gps_start_time, dict) else args.gps_start_time,
+                                    )
+                                    if len(cand_indices) == 0:
                                         continue
-                                    cand_indices = np.flatnonzero(cand_mask)
-                                    if len(cand_indices) > 1:
-                                        half_win_samp = int(round(args.asym_bin_width * effective_asym_num_bins * 0.5 * sample_rate))
-                                        unique_lids = np.unique(a_ids[cand_indices])
-                                        pruned = []
-                                        for uid in unique_lids:
-                                            u_cands = cand_indices[a_ids[cand_indices] == uid]
-                                            if len(u_cands) == 1:
-                                                pruned.append(u_cands[0])
-                                            else:
-                                                order = np.argsort(abs(a_snrs[u_cands]))[::-1]
-                                                kept_t = []
-                                                for ci in u_cands[order]:
-                                                    ct = a_tidxs[ci]
-                                                    if not any(abs(ct - kt) < half_win_samp for kt in kept_t):
-                                                        kept_t.append(ct)
-                                                        pruned.append(ci)
-                                        cand_indices = np.array(pruned, dtype=np.int64)
 
                                     for ifo_B in active_ifos:
                                         if ifo_B == ifo_A:
@@ -1296,6 +1419,7 @@ def main():
                                                 primary_snr=a_snrs[k],
                                                 secondary_snr_threshold=args.asym_secondary_snr_threshold,
                                                 network_snr_threshold=args.asym_network_snr_threshold,
+                                                max_followup_bins=args.asym_max_followup_bins,
                                             )
 
                                             if len(asym_ids) > 0:
@@ -1330,8 +1454,8 @@ def main():
                         stilde_ref = segments[active_ifos[0]][s_num]
                         tperf_seg = (stilde_ref.analyze.stop - stilde_ref.analyze.start) * stilde_ref.delta_t / t_seg_dur * n_tmpl_seg
                         logging.info(f"Top {top_step+1}/{n_top} (chunk {chunk_start//chunk_size+1}) Seg {s_num+1}/{num_segs}: {len(chunk_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s)")
-                        del middle_series
-
+                    del last_middle_series
+                    del last_norms
                     del chunk_groups
                     del upper_chunk
 
@@ -1405,27 +1529,20 @@ def main():
                             a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
                             if len(a_ids) == 0:
                                 continue
-                            cand_mask = (abs(a_snrs) >= args.asym_snr_threshold)
-                            if not np.any(cand_mask):
+                            cand_indices = select_primary_asym_candidates(
+                                a_ids=a_ids,
+                                a_tidxs=a_tidxs,
+                                a_snrs=a_snrs,
+                                sample_rate=args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate,
+                                asym_snr_threshold=args.asym_snr_threshold,
+                                bin_width=args.asym_bin_width,
+                                num_bins=effective_asym_num_bins,
+                                max_primary_per_group_sec=args.asym_max_primary_per_group_sec,
+                                stilde=segments[ifo_A][s_num],
+                                gps_start_time=args.gps_start_time[ifo_A] if isinstance(args.gps_start_time, dict) else args.gps_start_time,
+                            )
+                            if len(cand_indices) == 0:
                                 continue
-                            cand_indices = np.flatnonzero(cand_mask)
-                            if len(cand_indices) > 1:
-                                half_win_samp = int(round(args.asym_bin_width * effective_asym_num_bins * 0.5 * sample_rate))
-                                unique_lids = np.unique(a_ids[cand_indices])
-                                pruned = []
-                                for uid in unique_lids:
-                                    u_cands = cand_indices[a_ids[cand_indices] == uid]
-                                    if len(u_cands) == 1:
-                                        pruned.append(u_cands[0])
-                                    else:
-                                        order = np.argsort(abs(a_snrs[u_cands]))[::-1]
-                                        kept_t = []
-                                        for ci in u_cands[order]:
-                                            ct = a_tidxs[ci]
-                                            if not any(abs(ct - kt) < half_win_samp for kt in kept_t):
-                                                kept_t.append(ct)
-                                                pruned.append(ci)
-                                cand_indices = np.array(pruned, dtype=np.int64)
 
                             for ifo_B in active_ifos:
                                 if ifo_B == ifo_A:
@@ -1463,6 +1580,7 @@ def main():
                                         primary_snr=a_snrs[k],
                                         secondary_snr_threshold=args.asym_secondary_snr_threshold,
                                         network_snr_threshold=args.asym_network_snr_threshold,
+                                        max_followup_bins=args.asym_max_followup_bins,
                                     )
 
                                     if len(asym_ids) > 0:
