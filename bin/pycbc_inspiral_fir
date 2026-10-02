@@ -614,8 +614,9 @@ def get_args():
     parser.add_argument("--bank-file", type=str, required=True,
                         help="Path to the HDF5 Ratio Bank file.")
 
-    parser.add_argument('--snr-threshold', type=float, default=5.5,
-                       help="SNR threshold for trigger generation.")
+    parser.add_argument('--snr-threshold', type=float, default=None,
+                       help="SNR threshold for trigger generation (used in symmetric search; "
+                            "in asymmetric mode, --asym-snr-threshold is used for the primary detector).")
     parser.add_argument("--newsnr-threshold", type=float, metavar='THRESHOLD',
                             help="Cut triggers with NewSNR less than THRESHOLD")
     parser.add_argument("--low-frequency-cutoff", type=float,
@@ -627,10 +628,9 @@ def get_args():
                        help="High frequency cutoff (defaults to Nyquist).")
     group.add_argument('--batch-size', type=int, default=64,
                        help="Number of filters to process in one FFT batch.")
-    group.add_argument('--fir-length', type=int, default=4096,
+    group.add_argument('--fir-length', type=int, default=None,
                        help="Length in samples of the FFT block used for the"
-                            " FIR filter (and the ratio bank's frequency"
-                            " resolution).")
+                            " FIR filter (defaults to bank.fir_fft_length).")
     group.add_argument('--ratio-filter-engine', default='pycbc',
                        choices=('pycbc', 'matchedfilter', 'matchedfilter-hierarchical'),
                        help="Which back end runs the innermost correlate,"
@@ -793,12 +793,21 @@ def main():
             if inj_filter_rejector.get(ifo) is not None:
                 bank.template_thinning(inj_filter_rejector[ifo])
 
+        if args.asym_windowing:
+            primary_snr_threshold = args.asym_snr_threshold if args.asym_snr_threshold is not None else (args.snr_threshold if args.snr_threshold is not None else 6.0)
+        else:
+            primary_snr_threshold = args.snr_threshold if args.snr_threshold is not None else 5.5
+        logging.info("Primary SNR threshold: %.2f (asym_windowing=%s)", primary_snr_threshold, args.asym_windowing)
+
+        fir_length = args.fir_length if args.fir_length is not None else getattr(bank, 'fir_fft_length', 4096)
+        logging.info("FIR FFT length: %d (explicit=%s)", fir_length, args.fir_length is not None)
+
         logging.info("Initializing Ratio Filter Engine...")
         engine = MatchedFilterRatioControl(
-            snr_threshold=args.snr_threshold,
+            snr_threshold=primary_snr_threshold,
             delta_f=delta_f,
             high_frequency_cutoff=args.high_frequency_cutoff,
-            fir_fft_length=args.fir_length,
+            fir_fft_length=fir_length,
             batch_size=args.batch_size,
             tap_sample_rate=bank.sample_rate,
             engine_sample_rate=sample_rate,
@@ -1028,10 +1037,10 @@ def main():
                         if len(fine_indices) == 0:
                             continue
                         group_engine = MatchedFilterRatioControl(
-                            snr_threshold=args.snr_threshold,
+                            snr_threshold=primary_snr_threshold,
                             delta_f=delta_f,
                             high_frequency_cutoff=args.high_frequency_cutoff,
-                            fir_fft_length=args.fir_length,
+                            fir_fft_length=fir_length,
                             batch_size=args.batch_size,
                             tap_sample_rate=bank.sample_rate,
                             engine_sample_rate=sample_rate,
@@ -1153,7 +1162,7 @@ def main():
                                         a_tidxs=a_tidxs,
                                         a_snrs=a_snrs,
                                         sample_rate=args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate,
-                                        asym_snr_threshold=args.asym_snr_threshold,
+                                        asym_snr_threshold=primary_snr_threshold,
                                         bin_width=args.asym_bin_width,
                                         num_bins=effective_asym_num_bins,
                                         max_primary_per_group_sec=args.asym_max_primary_per_group_sec,

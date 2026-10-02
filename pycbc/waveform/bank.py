@@ -1247,6 +1247,15 @@ class RatioFilterBank(FilterBank):
                                            np.arange(len(fine_indices))])
                 self.fine_coarse_map[fine_indices] = mapback
 
+    @property
+    def fir_fft_length(self):
+        """Block length in samples of the FIR filter FFT, derived from
+        the bank's sample rate and frequency resolution delta_f."""
+        df = self.fir_group.attrs.get('delta_f', None)
+        if df is not None and float(df) > 0:
+            return int(round(self.sample_rate / float(df)))
+        return 4096
+
     def template_thinning(self, inj_filter_rejector):
         """Remove templates from bank that are far from all injections."""
         if not inj_filter_rejector.enabled or \
