@@ -123,22 +123,6 @@ class UpperReferenceBatch:
         return dict(zip(self.middle_ids, scaled_series))
 
 
-def upper_filter_spectrum(taps, n):
-    """Return the correlation response of a centered upper FIR."""
-    centered = np.zeros(n, dtype=np.float32)
-    count = len(taps)
-    if count >= n:
-        raise ValueError('upper FIR must be shorter than the data segment')
-    centered[(np.arange(count) - count // 2) % n] = taps
-    return np.conj(np.fft.fft(centered).astype(np.complex64))
-
-
-def effective_middle_template(top_template, upper_spectrum, tap_sample_rate):
-    """Waveform used by chi-square after the upper FIR."""
-    result = top_template.copy()
-    result.numpy()[:] *= np.conj(upper_spectrum[:len(result)]) / tap_sample_rate
-    result.f_lower = top_template.f_lower
-    return result
 
 def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
                         fine_indices, tstarts, stilde, bank, chisq_estimator, engine,
@@ -203,6 +187,7 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
     chisq_dof_vals = np.zeros(num_trigs, dtype=np.int32) - 100
     assigned_mask = np.zeros(num_trigs, dtype=bool)
 
+
     _ref_weights = {}
 
     cthresh = 0 if args.chisq_snr_threshold is None else args.chisq_snr_threshold
@@ -232,77 +217,52 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
             snrvs = np.array([snrv], ndmin=1) / rescale
             tids = np.array([t_idx], ndmin=1)
 
-            if not args.fast_chisq: # Slow chisq
-                logging.info('regenerating template')
-                ratio_filter = bank.get_fd_fir(target_global_id, len(stilde),
-                                               delta_f=stilde.delta_f)
-                logging.info('finished template regeneration')
-                template = ratio_filter * ref_template
-                template.params = ratio_filter.params
-                template.f_lower = ref_template.f_lower
+            # Fast chisq
+            # Reconstruct template (decimated)
+            logging.info('regenerating chisq inputs')
+            # refine > 1 is not currently supported.
+            refine = 1
+            ratio = filters_f[local_id]
+            block_len = len(ratio)
+            df = stilde.sample_rate / block_len
 
-                # stilde is already overwhitened; do not divide again.
-                corr = template.conj() * stilde * (4 * stilde.delta_f / h_norm ** 0.5 / rescale)
-                corr.resize((len(stilde) - 1)*2)
+            dfr = df / refine
 
-                psd = stilde.psd.copy()
-                psd[:] = 1
-                template = template / stilde.psd ** 0.5
-                template[:] = abs(template)
-                template.params = ratio_filter.params
-                template.f_lower = ref_template.f_lower
+            # _ref_weights depends only on the coarse reference template
+            # and psd, both fixed for the whole batch, keyed by block_len.
+            if block_len not in _ref_weights:
+                dec = int(dfr / stilde.delta_f)
+                w = ref_template[::dec] / stilde.psd[::dec] ** 0.5
+                newf = np.arange(0, block_len) * dfr
+                _ref_weights[block_len] = np.interp(newf, w.sample_frequencies, w)
+            _ref_weight = _ref_weights[block_len]
 
-                logging.info('done')
-                chi, dof = chisq_estimator.values(corr, snrvs, 1, psd, tids, template)
+            template2 = FrequencySeries(ratio * _ref_weight, delta_f=dfr, dtype=stilde.dtype)
+            template2[:] = abs(template2) / stilde.sample_rate
+            template2.params = bank.table[target_global_id]
+            template2.f_lower = float(getattr(ref_template, 'f_lower', 20.0))
 
-            else: # Fast chisq
-                # Reconstruct template (decimated)
-                logging.info('regenerating chisq inputs')
-                # refine > 1 is not currently supported.
-                refine = 1
-                ratio = filters_f[local_id]
-                block_len = len(ratio)
-                df = stilde.sample_rate / block_len
+            psd2 = FrequencySeries(np.ones(len(ratio), dtype=np.float32), delta_f=dfr)
 
-                dfr = df / refine
+            # Reconstruct fd correlation vector
+            if isinstance(engine, dict):
+                ref = engine.get((tstart, block_len), engine.get(tstart))
+            elif hasattr(engine, 'ref_snr'):
+                ref = engine.ref_snr[tstart:tstart+block_len]
+            else:
+                ref = engine[tstart:tstart+block_len]
+            ref = ref[:block_len]
+            if len(ref) < block_len:
+                ref = np.pad(ref, (0, block_len - len(ref)))
+            ref_f = zeros(len(ref), dtype=complex64)
+            pycbc.fft.FFT(Array(ref, dtype=complex64), ref_f).execute()
 
-                # _ref_weights depends only on the coarse reference template
-                # and psd, both fixed for the whole batch, keyed by block_len.
-                if block_len not in _ref_weights:
-                    dec = int(dfr / stilde.delta_f)
-                    w = ref_template[::dec] / stilde.psd[::dec] ** 0.5
-                    newf = np.arange(0, block_len) * dfr
-                    _ref_weights[block_len] = np.interp(newf, w.sample_frequencies, w)
-                _ref_weight = _ref_weights[block_len]
+            corr2 = FrequencySeries(ratio * ref_f.numpy(), delta_f=df) / rescale / block_len
+            corr2 = corr2.to_timeseries().to_frequencyseries(delta_f=dfr) / refine
 
-                template2 = FrequencySeries(ratio * _ref_weight, delta_f=dfr, dtype=stilde.dtype)
-                template2[:] = abs(template2) / stilde.sample_rate
-                template2.params = bank.table[target_global_id]
-                template2.f_lower = ref_template.f_lower
-
-
-                psd2 = FrequencySeries(np.ones(len(ratio), dtype=np.float32), delta_f=dfr)
-
-                # Reconstruct fd correlation vector
-                if isinstance(engine, dict):
-                    ref = engine.get((tstart, block_len), engine.get(tstart))
-                elif hasattr(engine, 'ref_snr'):
-                    ref = engine.ref_snr[tstart:tstart+block_len]
-                else:
-                    ref = engine[tstart:tstart+block_len]
-                ref = ref[:block_len]
-                if len(ref) < block_len:
-                    ref = np.pad(ref, (0, block_len - len(ref)))
-                ref_f = zeros(len(ref), dtype=complex64)
-                pycbc.fft.FFT(Array(ref, dtype=complex64), ref_f).execute()
-
-
-                corr2 = FrequencySeries(ratio * ref_f.numpy(), delta_f=df) / rescale / block_len
-                corr2 = corr2.to_timeseries().to_frequencyseries(delta_f=dfr) / refine
-
-                tids2 = tids - tstart
-                logging.info('...done')
-                chi, dof = chisq_estimator.values(corr2, snrvs, 1, psd2, tids2, template2)
+            tids2 = tids - tstart
+            logging.info('...done')
+            chi, dof = chisq_estimator.values(corr2, snrvs, 1, psd2, tids2, template2)
 
             # Determine which points we should use the same chisq value for
             window_mask = (abs(t_idxs - t_idx) <= chisq_window_samp)
@@ -1434,8 +1394,7 @@ def main():
                                 if len(ids_local) > 0:
                                     if do_chisq and np.any(abs(snrs) >= cthresh):
                                         if g_entry[7] is None:
-                                            spec = upper_filter_spectrum(mid_tap_arr, (len(top_template) - 1) * 2)
-                                            g_entry[7] = effective_middle_template(top_template, spec, bank.sample_rate)
+                                            g_entry[7] = bank.get_coarse_template(coarse_idx)
                                         chi, chi_dof = compute_batch_chisq(
                                             ids_local, t_idxs, snrs, h_norm,
                                             fine_indices, tstarts, stilde, bank, power_chisq,
@@ -1532,8 +1491,7 @@ def main():
                                             if len(asym_ids) > 0:
                                                 if do_chisq and np.any(abs(asym_snrs) >= cthresh):
                                                     if g_entry[7] is None:
-                                                        spec = upper_filter_spectrum(mid_tap_arr, (len(top_template) - 1) * 2)
-                                                        g_entry[7] = effective_middle_template(top_template, spec, bank.sample_rate)
+                                                        g_entry[7] = bank.get_coarse_template(coarse_idx)
                                                     chi, chi_dof = compute_batch_chisq(
                                                         asym_ids, asym_t_idxs, asym_snrs, h_norm_B,
                                                         fine_indices, asym_tstarts, stilde_B, bank, power_chisq,
