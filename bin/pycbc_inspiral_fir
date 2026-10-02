@@ -689,12 +689,6 @@ def get_args():
     # Clustering & Event Handling
     parser.add_argument("--cluster-window", type=float, default=0,
                        help="Length of clustering window in seconds.")
-    parser.add_argument("--cluster-function", choices=["findchirp", "symmetric"],
-                        default="findchirp",
-                        help="How to cluster together triggers within a window.")
-    parser.add_argument("--enable-bank-start-frequency", action='store_true',
-                        help="Read the starting frequency of template waveforms"
-                             " from the template bank.")
     parser.add_argument("--finalize-events-template-rate", default=None,
                         type=int, metavar="NUM TEMPLATES",
                         help="After NUM TEMPLATES perform event consolidation.")
@@ -782,7 +776,7 @@ def main():
                 assert delta_f == strain_segments[ifo].delta_f, f"Delta f mismatch for {ifo}"
 
         flow = args.low_frequency_cutoff
-        if flow is None and args.enable_bank_start_frequency:
+        if flow is None:
             with h5py.File(args.bank_file, 'r') as f:
                 if 'f_lower' in f:
                     flow = float(np.min(f['f_lower'][:]))
