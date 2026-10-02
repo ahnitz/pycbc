@@ -97,7 +97,10 @@ class UpperReferenceBatch:
             raise ValueError('top reference length changed between segments')
         t0 = time.perf_counter()
         if valid_slice is not None:
-            pad = 1024
+            # When an explicit valid_slice is requested (e.g. narrow injection windowing),
+            # pad by the maximum lower-stage FIR tap half-width so the lower-stage convolution
+            # has full continuous support across the valid interval without hitting a zero cliff.
+            pad = 512
             v_start = max(0, valid_slice.start - pad)
             v_stop = min(self.series_length, valid_slice.stop + pad)
             ext_slice = slice(v_start, v_stop)
@@ -1377,7 +1380,13 @@ def main():
                                 series, norm = ref_by_seg[ifo][s_num]
                                 norms[ifo] = norm
                                 stilde_cur = segments[ifo][s_num]
-                                v_slice = getattr(stilde_cur, 'analyze', None)
+                                # Only slice the upper filter for injection-only windowing.
+                                # Full data segments have generous 32s/16s throwaway padding;
+                                # evaluating the full buffer leaves all edge effects deep in the pad.
+                                if getattr(args, 'filter_inj_only', False):
+                                    v_slice = getattr(stilde_cur, 'analyze', None)
+                                else:
+                                    v_slice = None
                                 middle_series[ifo] = upper_chunk.run(
                                     series, norm, chunk_scales, bank.sample_rate,
                                     valid_slice=v_slice)
@@ -1415,8 +1424,7 @@ def main():
                                     )
                                 ana = getattr(stilde, 'analyze', None)
                                 if ana is not None and len(ids_local) > 0:
-                                    margin_pts = 64
-                                    in_bounds = (t_idxs >= ana.start + margin_pts) & (t_idxs <= ana.stop - margin_pts)
+                                    in_bounds = (t_idxs >= ana.start) & (t_idxs < ana.stop)
                                     if not np.all(in_bounds):
                                         ids_local = ids_local[in_bounds]
                                         t_idxs = t_idxs[in_bounds]
@@ -1515,8 +1523,7 @@ def main():
                                             if len(asym_ids) > 0:
                                                 ana_B = getattr(stilde_B, 'analyze', None)
                                                 if ana_B is not None:
-                                                    margin_pts = 64
-                                                    in_b = (asym_t_idxs >= ana_B.start + margin_pts) & (asym_t_idxs <= ana_B.stop - margin_pts)
+                                                    in_b = (asym_t_idxs >= ana_B.start) & (asym_t_idxs < ana_B.stop)
                                                     if not np.all(in_b):
                                                         asym_ids = asym_ids[in_b]
                                                         asym_t_idxs = asym_t_idxs[in_b]
