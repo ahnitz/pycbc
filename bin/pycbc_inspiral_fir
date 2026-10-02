@@ -1447,11 +1447,14 @@ def main():
     if os.path.exists(args.output):
         os.remove(args.output)
 
+    total_cores = getattr(args, 'cores', 1) or 1
+    cores_per_ifo = float(total_cores) / len(instruments)
+
     for ifo in instruments:
         ifo_mgr = event_mgr[ifo]
         ifo_strain = gwstrain[ifo]
         ifo_opts = get_ifo_opts(args, ifo)
-        ifo_mgr.save_performance(1, len(segments[ifo]), len(bank), run_time, tsetup)
+        ifo_mgr.save_performance(cores_per_ifo, len(segments[ifo]), len(bank), run_time, tsetup)
         logging.info("Consolidating and writing events for %s...", ifo)
         ifo_mgr.consolidate_events(ifo_opts, gwstrain=ifo_strain)
         ifo_mgr.finalize_events()
