@@ -1542,7 +1542,15 @@ class RatioFilterBank(FilterBank):
         self._firs_cache[coarse_key] = res
         return res
 
+    def preload_firs(self, indices=None):
+        """Pre-populate the FIR cache for given or all coarse indices."""
+        if indices is None:
+            indices = self.coarse_indices
+        for idx in indices:
+            self.get_firs(idx)
+
     @property
+
     def coarse_size(self):
         """The number of templates in the coarse reference bank."""
         return len(self.coarse_bank)

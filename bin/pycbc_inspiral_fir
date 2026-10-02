@@ -793,6 +793,13 @@ def main():
             if inj_filter_rejector.get(ifo) is not None:
                 bank.template_thinning(inj_filter_rejector[ifo])
 
+        preload_thread = None
+        if hasattr(bank, 'preload_firs'):
+            import threading
+            preload_thread = threading.Thread(target=bank.preload_firs, daemon=True)
+            preload_thread.start()
+            logging.info("Started background preloading of FIR filter bank...")
+
         if args.asym_windowing:
             primary_snr_threshold = args.asym_snr_threshold if args.asym_snr_threshold is not None else (args.snr_threshold if args.snr_threshold is not None else 6.0)
         else:
@@ -958,10 +965,14 @@ def main():
             raise ValueError("pycbc_inspiral_fir requires a hierarchical bank with top_bank.")
 
         if bank.top_bank is not None:
-            max_upper_taps = max(int(c) for top_idx in bank.top_indices
-                                 for c in bank.get_upper_firs(int(top_idx))[1])
-            max_lower_taps = max(int(c) for middle_idx in bank.coarse_indices
-                                 for c in bank.get_firs(int(middle_idx))[1])
+            max_upper_taps = int(bank.upper_group.attrs.get('max_taps', 0)) if getattr(bank, 'upper_group', None) is not None else 0
+            if max_upper_taps == 0:
+                max_upper_taps = max(int(c) for top_idx in bank.top_indices
+                                     for c in bank.get_upper_firs(int(top_idx))[1])
+            max_lower_taps = int(bank.fir_group.attrs.get('max_taps', 0)) if getattr(bank, 'fir_group', None) is not None else 0
+            if max_lower_taps == 0:
+                max_lower_taps = max(int(c) for middle_idx in bank.coarse_indices
+                                     for c in bank.get_firs(int(middle_idx))[1])
             edge_margin = (max_upper_taps + max_lower_taps) // 2
             for ifo in instruments:
                 for stilde in segments[ifo]:
@@ -973,7 +984,11 @@ def main():
 
             coarse_keep = set(bank.coarse_indices) if len(bank.coarse_indices) < len(bank.coarse_keys) else None
 
-            chunk_size = 8
+            if preload_thread is not None:
+                preload_thread.join()
+                logging.info("Background preloading of FIR filter bank complete.")
+
+            chunk_size = 64
             n_top = len(bank.top_indices)
             for top_step, top_idx in enumerate(bank.top_indices):
                 top_idx = int(top_idx)
