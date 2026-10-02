@@ -688,9 +688,10 @@ def fit_upper_level(args, middle_bank, psd, flen, output):
             fmin = float(getattr(tmplt, 'f_lower', args.f_low))
             kmax = int(np.nonzero(abs(h.numpy()))[0][-1])
             sp = np.array([fmin, kmax * upper_df], dtype=np.float64)
+            interp = getattr(args, 'compressed_top_waveforms_interpolation', 'inline_quadratic')
             hc = compress.compress_waveform(
                 h, sp, args.compressed_top_waveforms_tolerance,
-                'inline_quartic', 'single', psd=None
+                interp, 'single', psd=None
             )
             hc.write_to_hdf(top_group, thash)
             logging.info("Compressed top %d/%d (hash=%s, points=%d, mismatch=%.2e)",
@@ -767,8 +768,11 @@ def main():
     parser.add_argument('--no-compressed-top-waveforms', action='store_false',
                         dest='store_compressed_top_waveforms',
                         help="Do not store compressed top waveforms in the bank.")
-    parser.add_argument('--compressed-top-waveforms-tolerance', type=float, default=1e-4,
-                        help="Accuracy target / tolerance for compressed top waveforms (default: 1e-4).")
+    parser.add_argument('--compressed-top-waveforms-tolerance', type=float, default=1e-5,
+                        help="Accuracy target / tolerance for compressed top waveforms mismatch (default: 1e-5, for >= 0.99999 match).")
+    parser.add_argument('--compressed-top-waveforms-interpolation', default='inline_quadratic',
+                        choices=('inline_quadratic', 'inline_linear', 'inline_cubic', 'inline_quartic'),
+                        help="Interpolation method to use for compressed top waveforms (default: inline_quadratic).")
     pycbc.psd.insert_psd_option_group(parser)
     args = parser.parse_args()
     if args.top_bank is not None and (args.upper_delta_f is None or
