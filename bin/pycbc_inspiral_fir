@@ -621,6 +621,11 @@ def get_args():
                             help="Cut triggers with NewSNR less than THRESHOLD")
     parser.add_argument("--low-frequency-cutoff", type=float,
                         help="The low frequency cutoff to use for filtering (Hz)")
+    parser.add_argument("--enable-compressed-waveforms", action="store_true", default=True,
+                        help="Enable use of compressed top waveforms if present in the bank (default: True).")
+    parser.add_argument("--disable-compressed-waveforms", action="store_false",
+                        dest="enable_compressed_waveforms",
+                        help="Disable use of compressed waveforms and regenerate waveforms on the fly.")
 
     # --- Ratio Specific ---
     group = parser.add_argument_group("Ratio Filter Options")
@@ -788,6 +793,7 @@ def main():
             filter_length=flen,
             delta_f=delta_f,
             dtype=np.complex64,
+            enable_compressed_waveforms=args.enable_compressed_waveforms,
         )
         for ifo in instruments:
             if inj_filter_rejector.get(ifo) is not None:

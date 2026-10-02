@@ -666,9 +666,35 @@ def fit_upper_level(args, middle_bank, psd, flen, output):
         raise ValueError('upper FIR fits below %.9f for middle indices %s' %
                          (upper.min_match, failed))
 
+    top_bank.ensure_hash()
     top_bank.write_to_hdf(args.output_file, file_handler=output,
                           group_key='fir_data/upper/top_bank_params',
                           write_compressed_waveforms=True)
+    if getattr(args, 'store_compressed_top_waveforms', True):
+        import pycbc.waveform.compress as compress
+        logging.info("Compressing %d top waveforms (tolerance=%.1e)...",
+                     len(top_bank), args.compressed_top_waveforms_tolerance)
+        top_group = output.require_group('fir_data/upper/top_bank_params')
+        if 'template_hash' not in top_group:
+            top_group.create_dataset('template_hash', data=top_bank.table.template_hash)
+        else:
+            top_group['template_hash'][:] = top_bank.table.template_hash
+        if 'compressed_waveforms' in top_group:
+            del top_group['compressed_waveforms']
+        for i in range(len(top_bank)):
+            h = top_waveforms[i]
+            tmplt = top_bank.table[i]
+            thash = str(tmplt.template_hash)
+            fmin = float(getattr(tmplt, 'f_lower', args.f_low))
+            kmax = int(np.nonzero(abs(h.numpy()))[0][-1])
+            sp = np.array([fmin, kmax * upper_df], dtype=np.float64)
+            hc = compress.compress_waveform(
+                h, sp, args.compressed_top_waveforms_tolerance,
+                'inline_quartic', 'single', psd=None
+            )
+            hc.write_to_hdf(top_group, thash)
+            logging.info("Compressed top %d/%d (hash=%s, points=%d, mismatch=%.2e)",
+                         i + 1, len(top_bank), thash, len(hc.sample_points), hc.mismatch)
     group = output.require_group('fir_data/upper')
     for name in ('sample_rate', 'delta_f', 'n_taps', 'max_taps', 'tap_step',
                  'min_match', 'search_depth', 'regularization_magnitude',
@@ -736,6 +762,13 @@ def main():
                              "relative to a typical in-band fit row.")
     parser.add_argument('--peak-max-passes', default=3, type=int,
                         help="Maximum number of fit/detect/constrain refinement passes for peak suppression.")
+    parser.add_argument('--store-compressed-top-waveforms', action='store_true', default=True,
+                        help="Store compressed top waveforms in the bank to eliminate runtime waveform generation (default: True).")
+    parser.add_argument('--no-compressed-top-waveforms', action='store_false',
+                        dest='store_compressed_top_waveforms',
+                        help="Do not store compressed top waveforms in the bank.")
+    parser.add_argument('--compressed-top-waveforms-tolerance', type=float, default=1e-4,
+                        help="Accuracy target / tolerance for compressed top waveforms (default: 1e-4).")
     pycbc.psd.insert_psd_option_group(parser)
     args = parser.parse_args()
     if args.top_bank is not None and (args.upper_delta_f is None or
