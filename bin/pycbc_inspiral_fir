@@ -37,9 +37,8 @@ from pycbc.filter.matched_filter_ratio import MatchedFilterRatioControl
 from pycbc.types import Array, FrequencySeries, complex64, float32, zeros
 from pycbc.vetoes.chisq import (
     power_chisq_at_points_from_precomputed,
-    power_chisq_bins_from_sigmasq_series,
+    power_chisq_bins,
 )
-from pycbc.waveform.spa_tmplt import spa_tmplt_norm
 from pycbc.vetoes.sgchisq import SingleDetSGChisq
 from pycbc.waveform.bank import RatioFilterBank
 from igwn_segments import segment, segmentlist
@@ -129,66 +128,65 @@ class UpperReferenceBatch:
 
 
 
-def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
+def compute_batch_chisq(ids_local, t_idxs, snrs,
                         fine_indices, tstarts, stilde, bank,
-                        *extra_args, **kwargs):
-    """Compute power chisq for triggers exceeding chisq_snr_threshold.
-
-    Uses SPA cumulative power bin boundaries mapped directly to the block length,
-    avoiding template waveform generation and round-trip FFTs.
-    Evaluates cleanly per trigger with no cross-template broadcasting.
-    Supports both legacy and refactored positional argument signatures.
-    """
-    if len(extra_args) == 3:
-        ref_snr, filters_f, args = extra_args
-    elif len(extra_args) == 4:
-        if hasattr(extra_args[0], 'values') or hasattr(extra_args[0], 'cached_chisq_bins'):
-            _, ref_snr, filters_f, args = extra_args
-        else:
-            ref_snr, filters_f, _, args = extra_args
-    elif len(extra_args) == 5:
-        _, ref_snr, filters_f, _, args = extra_args
-    elif len(extra_args) == 0:
-        ref_snr = kwargs.get('ref_snr') if 'ref_snr' in kwargs else kwargs.get('engine')
-        filters_f = kwargs.get('filters_f')
-        args = kwargs.get('args')
-    else:
-        raise TypeError(f"compute_batch_chisq takes 11 to 13 positional arguments, got {8 + len(extra_args)}")
-
+                        ref_snr, filters_f, args,
+                        top_template=None, upper_f=None):
+    """Compute power chisq for triggers using standard power_chisq_bins on the
+    reconstructed decimated waveform, with descending-SNR time clustering."""
     global_ids = fine_indices[ids_local]
     snr_amp = abs(snrs)
     num_trigs = len(snrs)
     chisq_vals = np.zeros(num_trigs, dtype=float32)
     chisq_dof_vals = np.zeros(num_trigs, dtype=np.int32) - 100
+    assigned_mask = np.zeros(num_trigs, dtype=bool)
 
     cthresh = 0 if args.chisq_snr_threshold is None else args.chisq_snr_threshold
     above_thresh = np.flatnonzero(snr_amp >= cthresh)
     if len(above_thresh) == 0:
         return chisq_vals, chisq_dof_vals
 
+    chisq_window_samp = int(args.chisq_window * stilde.sample_rate)
     max_iterations = getattr(args, 'chisq_iterations', None)
-    if max_iterations is not None and len(above_thresh) > max_iterations:
-        order = np.argsort(snr_amp[above_thresh])[::-1]
-        above_thresh = above_thresh[order[:max_iterations]]
+    sort_order = np.argsort(snr_amp)[::-1]
 
-    # Ensure physical chisq frequency bins are precomputed for this segment / PSD
-    chisq_bins_hz = getattr(stilde, 'chisq_bins_hz', None)
-    if chisq_bins_hz is None:
-        flow = getattr(args, 'low_frequency_cutoff', 20.0)
-        f_final = getattr(args, 'high_frequency_cutoff', None) or (
-            float(bank.table['f_final'].max()) if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0
-        )
-        kmin = int(flow / stilde.delta_f)
-        kmax = min(int(f_final / stilde.delta_f), len(stilde.psd))
-        norm_vec = spa_tmplt_norm(stilde.psd, len(stilde.psd), stilde.delta_f, flow)
-        chisq_bins_hz = power_chisq_bins_from_sigmasq_series(
-            norm_vec, int(args.chisq_bins), kmin, kmax) * stilde.delta_f
-        stilde.chisq_bins_hz = chisq_bins_hz
+    flow = float(getattr(args, 'low_frequency_cutoff', 20.0))
+    f_final = float(getattr(args, 'high_frequency_cutoff', None) or (
+        bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0
+    ))
+
+    # Reconstruct decimated coarse reference waveform / sqrt(PSD)
+    sample_rate = float(stilde.sample_rate)
+    block_len = len(filters_f[ids_local[0]])
+    df = sample_rate / block_len
+    dec = int(df / stilde.delta_f)
+    n_half = block_len // 2 + 1
+
+    psd_dec = stilde.psd[::dec][:n_half]
+    if top_template is not None:
+        top_dec = top_template[::dec][:n_half]
+        if upper_f is not None:
+            coarse_dec = (top_dec * upper_f[:n_half]) / bank.sample_rate
+        else:
+            coarse_dec = top_dec
+        w = coarse_dec / np.sqrt(psd_dec)
+    else:
+        w = None
+
+    psd2 = FrequencySeries(np.ones(n_half, dtype=np.float32), delta_f=df)
 
     ref_f_cache = {}
-    block_bins_cache = {}
+    bins_cache = {}
+    iterations = 0
 
-    for idx in above_thresh:
+    for idx in sort_order:
+        if max_iterations is not None and iterations >= max_iterations:
+            break
+        if snr_amp[idx] < cthresh:
+            break
+        if assigned_mask[idx]:
+            continue
+
         snrv = snrs[idx]
         t_idx = t_idxs[idx]
         target_global_id = global_ids[idx]
@@ -201,18 +199,35 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
         tids2 = np.array([t_idx - tstart], ndmin=1, dtype=np.int32)
 
         ratio = filters_f[local_id]
-        block_len = len(ratio)
-        df = stilde.sample_rate / block_len
+        if len(ratio) != block_len:
+            block_len = len(ratio)
+            df = sample_rate / block_len
+            dec = int(df / stilde.delta_f)
+            n_half = block_len // 2 + 1
+            psd_dec = stilde.psd[::dec][:n_half]
+            if top_template is not None:
+                top_dec = top_template[::dec][:n_half]
+                if upper_f is not None:
+                    coarse_dec = (top_dec * upper_f[:n_half]) / bank.sample_rate
+                else:
+                    coarse_dec = top_dec
+                w = coarse_dec / np.sqrt(psd_dec)
+            psd2 = FrequencySeries(np.ones(n_half, dtype=np.float32), delta_f=df)
 
-        if block_len not in block_bins_cache:
-            bb = np.round(chisq_bins_hz / df).astype(np.int32)
-            # Enforce strictly monotonically increasing bin boundaries
-            for b_i in range(1, len(bb)):
-                if bb[b_i] <= bb[b_i - 1]:
-                    bb[b_i] = bb[b_i - 1] + 1
-            block_bins_cache[block_len] = bb
-        block_bins = block_bins_cache[block_len]
-        dof = (len(block_bins) - 1) * 2 - 2
+        if local_id not in bins_cache:
+            if w is not None:
+                fine_dec = abs(w * np.conj(ratio[:n_half])) / bank.sample_rate
+                t2 = FrequencySeries(fine_dec, delta_f=df)
+                bins = power_chisq_bins(t2, int(args.chisq_bins), psd2,
+                                        low_frequency_cutoff=flow,
+                                        high_frequency_cutoff=f_final)
+            else:
+                kmin = int(flow / df)
+                kmax = min(int(f_final / df), n_half)
+                bins = np.linspace(kmin, kmax, int(args.chisq_bins) + 1).astype(np.int32)
+            bins_cache[local_id] = bins
+        bins = bins_cache[local_id]
+        dof = (len(bins) - 1) * 2 - 2
 
         cache_key = (tstart, block_len)
         if cache_key not in ref_f_cache:
@@ -233,10 +248,15 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
         ref_f = ref_f_cache[cache_key]
 
         corr2 = FrequencySeries(ratio * ref_f.numpy(), delta_f=df) / rescale / block_len
-        chi = power_chisq_at_points_from_precomputed(corr2, snrvs, 1.0, block_bins, tids2)
+        chi = power_chisq_at_points_from_precomputed(corr2, snrvs, 1.0, bins, tids2)
 
-        chisq_vals[idx] = float(chi[0])
-        chisq_dof_vals[idx] = dof
+        # Descending SNR assignment across cluster within chisq_window
+        window_mask = (abs(t_idxs - t_idx) <= chisq_window_samp)
+        update_mask = window_mask & (~assigned_mask) & (snr_amp >= cthresh)
+        chisq_vals[update_mask] = float(abs(chi[0]))
+        chisq_dof_vals[update_mask] = dof
+        assigned_mask[update_mask] = True
+        iterations += 1
 
     return chisq_vals, chisq_dof_vals
 
@@ -246,7 +266,8 @@ def process_and_record_triggers(
     stilde, h_norm, coarse_idx, fine_indices,
     filters_f, ref_snr, bank,
     s_num, top_idx, ifo, collected_batches,
-    args, do_chisq, cthresh, is_asym=False
+    args, do_chisq, cthresh, is_asym=False,
+    top_template=None, upper_f=None,
 ):
     """Filter triggers for analysis boundary, evaluate chisq, and append batch record."""
     if len(ids_local) > 0:
@@ -262,9 +283,10 @@ def process_and_record_triggers(
     if len(ids_local) > 0:
         if do_chisq and np.any(abs(snrs) >= cthresh):
             chi, chi_dof = compute_batch_chisq(
-                ids_local, t_idxs, snrs, h_norm,
+                ids_local, t_idxs, snrs,
                 fine_indices, tstarts, stilde, bank,
-                ref_snr, filters_f, args)
+                ref_snr, filters_f, args,
+                top_template=top_template, upper_f=upper_f)
         else:
             chi = np.zeros(len(ids_local), dtype=float32)
             chi_dof = np.zeros(len(ids_local), dtype=np.int32) - 100
@@ -914,18 +936,6 @@ def main():
         n_coarse = len(bank.coarse_indices)
         cthresh = args.chisq_snr_threshold
         do_chisq = bool(args.chisq_bins and (cthresh is not None))
-        if do_chisq:
-            flow_chisq = getattr(args, 'low_frequency_cutoff', 20.0)
-            f_final_chisq = getattr(args, 'high_frequency_cutoff', None) or (
-                float(bank.table['f_final'].max()) if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0
-            )
-            for ifo in instruments:
-                for seg in segments[ifo]:
-                    kmin = int(flow_chisq / seg.delta_f)
-                    kmax = min(int(f_final_chisq / seg.delta_f), len(seg.psd))
-                    norm_vec = spa_tmplt_norm(seg.psd, len(seg.psd), seg.delta_f, flow_chisq)
-                    seg.chisq_bins_hz = power_chisq_bins_from_sigmasq_series(
-                        norm_vec, int(args.chisq_bins), kmin, kmax) * seg.delta_f
         collected_batches = {ifo: [] for ifo in instruments}
         non_threshold_intervals = {ifo: [] for ifo in instruments}
         num_segs = max(len(segments[ifo]) for ifo in instruments)
@@ -1037,9 +1047,16 @@ def main():
                             first_stage_snr=args.ratio_filter_first_stage_snr)
                         filters_f, _ = group_engine.prepare_filters(taps, counts)
                         mid_tap_arr = chunk_taps[row_c, :chunk_counts[row_c]]
+                        upper_f = None
+                        if do_chisq and len(filters_f) > 0 and len(mid_tap_arr) > 0:
+                            blen = len(filters_f[0])
+                            buf_u = np.zeros(blen, dtype=np.float32)
+                            cnt_u = len(mid_tap_arr)
+                            buf_u[(np.arange(cnt_u) - cnt_u // 2) % blen] = mid_tap_arr
+                            upper_f = np.fft.rfft(buf_u).astype(np.complex64)
                         chunk_groups.append([coarse_idx, counts, fine_indices,
                                              group_engine, filters_f, group_engine._tap_sizes.copy(),
-                                             mid_tap_arr, None])
+                                             mid_tap_arr, upper_f])
 
                     if not chunk_groups:
                         continue
@@ -1100,7 +1117,7 @@ def main():
 
                         t_seg_start = time.time()
                         for i, g_entry in enumerate(chunk_groups):
-                            coarse_idx, counts, fine_indices, group_engine, filters_f, tap_sizes, mid_tap_arr, _ = g_entry
+                            coarse_idx, counts, fine_indices, group_engine, filters_f, tap_sizes, mid_tap_arr, upper_f = g_entry
                             if seg_inj_tau0 and s_num in seg_inj_tau0 and coarse_tau0_all is not None:
                                 s_injs = seg_inj_tau0[s_num]
                                 if len(s_injs) > 0:
@@ -1127,7 +1144,8 @@ def main():
                                     stilde, h_norm, coarse_idx, fine_indices,
                                     filters_f, ref_snr, bank,
                                     s_num, top_idx, ifo, collected_batches,
-                                    args, do_chisq, cthresh, is_asym=False
+                                    args, do_chisq, cthresh, is_asym=False,
+                                    top_template=top_template, upper_f=upper_f,
                                 )
 
                             if args.asym_windowing and len(active_ifos) > 1:
@@ -1195,7 +1213,8 @@ def main():
                                                 stilde_B, h_norm_B, coarse_idx, fine_indices,
                                                 filters_f, ref_snr_B, bank,
                                                 s_num, top_idx, ifo_B, collected_batches,
-                                                args, do_chisq, cthresh, is_asym=True
+                                                args, do_chisq, cthresh, is_asym=True,
+                                                top_template=top_template, upper_f=upper_f,
                                             )
 
 
