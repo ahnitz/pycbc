@@ -1239,7 +1239,8 @@ def main():
                         t_seg_dur = max(time.time() - t_seg_start, 1e-6)
                         n_tmpl_seg = sum(len(g[2]) for g in chunk_groups)
                         stilde_ref = segments[active_ifos[0]][s_num]
-                        tperf_seg = (stilde_ref.analyze.stop - stilde_ref.analyze.start) * stilde_ref.delta_t / t_seg_dur * n_tmpl_seg
+                        total_analyzed_dur = len(active_ifos) * (stilde_ref.analyze.stop - stilde_ref.analyze.start) * stilde_ref.delta_t
+                        tperf_seg = total_analyzed_dur / t_seg_dur * n_tmpl_seg
                         logging.info(f"Top {top_step+1}/{n_top} (chunk {chunk_start//chunk_size+1}) Seg {s_num+1}/{num_segs}: {len(chunk_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s)")
                     del last_middle_series
                     del last_norms
@@ -1483,6 +1484,16 @@ def main():
         ifo_mgr.consolidate_events(ifo_opts, gwstrain=ifo_strain)
         ifo_mgr.finalize_events()
         ifo_mgr.write_events(args.output)
+
+    total_analyzed_det_sec = sum(
+        sum((segments[ifo][s].analyze.stop - segments[ifo][s].analyze.start) * segments[ifo][s].delta_t
+            for s in range(len(segments[ifo])))
+        for ifo in instruments
+    )
+    total_tmpl_sec = total_analyzed_det_sec * len(bank.table)
+    overall_throughput = total_tmpl_sec / max(run_time, 1e-6)
+    logging.info("Overall search throughput: %.0f template-s/core-s (%.2f M templates/core-s) over %.2f s run time",
+                 overall_throughput, overall_throughput / 1e6, run_time)
 
     logging.info("Finished.")
 
