@@ -381,7 +381,7 @@ def cluster_coincs(stat, time1, time2, timeslide_id, slide, window, **kwargs):
     """
     if len(time1) == 0 or len(time2) == 0:
         logger.info('No coinc triggers in one, or both, ifos.')
-        return numpy.array([])
+        return numpy.array([], dtype=int)
 
     if numpy.isfinite(slide):
         # for a time shifted coinc, time1 is greater than time2 by approximately timeslide_id*slide
@@ -427,7 +427,7 @@ def cluster_coincs_multiifo(stat, time_coincs, timeslide_id, slide, window,
     time_coinc_zip = list(zip(*time_coincs))
     if len(time_coinc_zip) == 0:
         logger.info('No coincident triggers.')
-        return numpy.array([])
+        return numpy.array([], dtype=int)
 
     time_avg_num = []
     #find number of ifos and mean time over participating ifos for each coinc

@@ -91,14 +91,19 @@ class UpperReferenceBatch:
             self._scales_cache[key] = scales
         return scales
 
-    def run(self, top_series, top_norm, middle_norms_or_scales, tap_sample_rate):
+    def run(self, top_series, top_norm, middle_norms_or_scales, tap_sample_rate, valid_slice=None):
         """Return middle-id to SNR series, scaled like direct middle filtering."""
         if len(top_series) != self.series_length:
             raise ValueError('top reference length changed between segments')
         t0 = time.perf_counter()
-        # The library writes only valid overlap-save lags directly into a
-        # reused continuous buffer, including the clipped final block.
-        series = self.plan.run_series(top_series)
+        if valid_slice is not None:
+            pad = 1024
+            v_start = max(0, valid_slice.start - pad)
+            v_stop = min(self.series_length, valid_slice.stop + pad)
+            ext_slice = slice(v_start, v_stop)
+        else:
+            ext_slice = None
+        series = self.plan.run_series(top_series, valid_slice=ext_slice)
         t1 = time.perf_counter()
         if (isinstance(middle_norms_or_scales, np.ndarray)
                 and middle_norms_or_scales.ndim == 1
@@ -109,7 +114,7 @@ class UpperReferenceBatch:
             scales = np.asarray(
                 np.sqrt(top_norm / np.asarray(middle_norms_or_scales)) / tap_sample_rate,
                 dtype=np.float32)
-        scaled_series = (series * scales[:, None]).copy()
+        scaled_series = series * scales[:, None]
         self.last_library_seconds = t1 - t0
         self.last_scale_seconds = time.perf_counter() - t1
         return dict(zip(self.middle_ids, scaled_series))
@@ -300,7 +305,7 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
             window_mask = (abs(t_idxs - t_idx) <= chisq_window_samp)
             update_mask = window_mask & (~assigned_mask) & (snr_amp >= cthresh)
 
-            chisq_vals[update_mask] = chi
+            chisq_vals[update_mask] = abs(chi) if chi is not None else chi
             chisq_dof_vals[update_mask] = dof
             assigned_mask[update_mask] = True
             num_assigned = update_mask.sum()
@@ -853,6 +858,45 @@ def main():
             for ifo in instruments
         }
 
+        # Precompute segment-level injection chirp times if filter-inj-only is enabled
+        seg_inj_tau0 = {}
+        coarse_tau0_all = None
+        inj_chirp_win = 5.0
+        if getattr(args, 'filter_inj_only', False) and any(inj_filter_rejector.get(ifo) is not None and getattr(inj_filter_rejector[ifo], 'injection_params', None) is not None for ifo in instruments):
+            ref_ifo = instruments[0]
+            ref_rejector = inj_filter_rejector.get(ref_ifo)
+            if ref_rejector is not None and getattr(ref_rejector, 'injection_params', None) is not None:
+                inj_tab = ref_rejector.injection_params.table
+                f_l = ref_rejector.f_lower if ref_rejector.f_lower is not None else flow
+                inj_chirp_win = ref_rejector.chirp_time_window if ref_rejector.chirp_time_window is not None else 5.0
+                all_inj_m1 = inj_tab['mass1']
+                all_inj_m2 = inj_tab['mass2']
+                all_inj_tau0, _ = pycbc.pnutils.mass1_mass2_to_tau0_tau3(all_inj_m1, all_inj_m2, f_l)
+                if hasattr(inj_tab, 'dtype') and inj_tab.dtype.names and 'tc' in inj_tab.dtype.names:
+                    all_inj_tc = inj_tab['tc']
+                else:
+                    all_inj_tc = np.array([float(getattr(x, 'tc', getattr(x, 'geocent_end_time', 0.0))) for x in inj_tab])
+
+                m1_c = bank.coarse_bank.table['mass1']
+                m2_c = bank.coarse_bank.table['mass2']
+                coarse_tau0_all, _ = pycbc.pnutils.mass1_mass2_to_tau0_tau3(m1_c, m2_c, f_l)
+
+                num_segs = max(len(segments[ifo]) for ifo in instruments)
+                for s_num in range(num_segs):
+                    seg_inj_tau0[s_num] = []
+                    for ifo in instruments:
+                        if s_num < len(segments[ifo]):
+                            st = segments[ifo][s_num]
+                            c_idx = getattr(st, 'cumulative_index', 0)
+                            a_sl = getattr(st, 'analyze', None)
+                            if a_sl is not None:
+                                t_start = float(gwstrain[ifo].start_time) + c_idx / sample_rate
+                                t_stop = float(gwstrain[ifo].start_time) + (c_idx + (a_sl.stop - a_sl.start)) / sample_rate
+                                m = (all_inj_tc >= t_start - 5.0) & (all_inj_tc <= t_stop + 5.0)
+                                if np.any(m):
+                                    seg_inj_tau0[s_num].extend(all_inj_tau0[m])
+                    seg_inj_tau0[s_num] = np.array(seg_inj_tau0[s_num])
+
         if all(len(segments[ifo]) == 0 for ifo in instruments):
             logging.info("No segments to analyze. Exiting.")
             if os.path.exists(args.output):
@@ -969,6 +1013,8 @@ def main():
                 n_fine_top = 0
                 for coarse_idx in active_parents[1]:
                     taps, counts, fine_indices = bank.get_firs(coarse_idx)
+                    if len(fine_indices) == 0:
+                        continue
                     group_engine = MatchedFilterRatioControl(
                         snr_threshold=args.snr_threshold,
                         delta_f=delta_f,
@@ -999,8 +1045,11 @@ def main():
 
                     t_seg_start = time.time()
                     cur_seg_slices = tuple(
-                        (ifo, getattr(segments[ifo][s_num], 'seg_slice', None).start, getattr(segments[ifo][s_num], 'seg_slice', None).stop)
-                        if getattr(segments[ifo][s_num], 'seg_slice', None) is not None else (ifo, s_num)
+                        (ifo,
+                         getattr(segments[ifo][s_num], 'seg_slice', None).start if getattr(segments[ifo][s_num], 'seg_slice', None) is not None else s_num,
+                         getattr(segments[ifo][s_num], 'seg_slice', None).stop if getattr(segments[ifo][s_num], 'seg_slice', None) is not None else s_num,
+                         getattr(segments[ifo][s_num], 'analyze', None).start if getattr(segments[ifo][s_num], 'analyze', None) is not None else None,
+                         getattr(segments[ifo][s_num], 'analyze', None).stop if getattr(segments[ifo][s_num], 'analyze', None) is not None else None)
                         for ifo in active_ifos
                     )
 
@@ -1044,6 +1093,12 @@ def main():
                     block_f_cache_by_ifo = {ifo: {} for ifo in active_ifos}
 
                     for coarse_idx, (p_series, p_norm) in l1_inputs.items():
+                        if seg_inj_tau0 and s_num in seg_inj_tau0 and coarse_tau0_all is not None:
+                            s_injs = seg_inj_tau0[s_num]
+                            if len(s_injs) > 0:
+                                c_t0 = coarse_tau0_all[coarse_idx]
+                                if not np.any(np.abs(s_injs - c_t0) <= inj_chirp_win):
+                                    continue
                         group_engine, filters_f, tap_sizes, fine_indices, counts = l1_engines[coarse_idx]
                         group_engine._tap_sizes = tap_sizes
 
@@ -1263,6 +1318,8 @@ def main():
                     for row_c, mid in enumerate(chunk_mids):
                         coarse_idx = int(mid)
                         taps, counts, fine_indices = bank.get_firs(coarse_idx)
+                        if len(fine_indices) == 0:
+                            continue
                         group_engine = MatchedFilterRatioControl(
                             snr_threshold=args.snr_threshold,
                             delta_f=delta_f,
@@ -1277,11 +1334,12 @@ def main():
                             first_stage_snr=args.ratio_filter_first_stage_snr)
                         filters_f, _ = group_engine.prepare_filters(taps, counts)
                         mid_tap_arr = chunk_taps[row_c, :chunk_counts[row_c]]
-                        spec = upper_filter_spectrum(mid_tap_arr, (len(top_template) - 1) * 2)
-                        chisq_ref_template = effective_middle_template(top_template, spec, bank.sample_rate)
-                        chunk_groups.append((coarse_idx, counts, fine_indices,
+                        chunk_groups.append([coarse_idx, counts, fine_indices,
                                              group_engine, filters_f, group_engine._tap_sizes.copy(),
-                                             chisq_ref_template))
+                                             mid_tap_arr, None])
+
+                    if not chunk_groups:
+                        continue
 
                     last_middle_series = None
                     last_norms = None
@@ -1292,10 +1350,20 @@ def main():
                             continue
 
                         cur_seg_slices = tuple(
-                            (ifo, getattr(segments[ifo][s_num], 'seg_slice', None).start, getattr(segments[ifo][s_num], 'seg_slice', None).stop)
-                            if getattr(segments[ifo][s_num], 'seg_slice', None) is not None else (ifo, s_num)
+                            (ifo,
+                             getattr(segments[ifo][s_num], 'seg_slice', None).start if getattr(segments[ifo][s_num], 'seg_slice', None) is not None else s_num,
+                             getattr(segments[ifo][s_num], 'seg_slice', None).stop if getattr(segments[ifo][s_num], 'seg_slice', None) is not None else s_num,
+                             getattr(segments[ifo][s_num], 'analyze', None).start if getattr(segments[ifo][s_num], 'analyze', None) is not None else None,
+                             getattr(segments[ifo][s_num], 'analyze', None).stop if getattr(segments[ifo][s_num], 'analyze', None) is not None else None)
                             for ifo in active_ifos
                         )
+
+                        if seg_inj_tau0 and s_num in seg_inj_tau0 and coarse_tau0_all is not None:
+                            s_injs = seg_inj_tau0[s_num]
+                            if len(s_injs) > 0:
+                                chunk_c_indices = [g[0] for g in chunk_groups]
+                                if not any(np.any(np.abs(s_injs - coarse_tau0_all[cid]) <= inj_chirp_win) for cid in chunk_c_indices):
+                                    continue
 
                         if cur_seg_slices == last_seg_slices and last_middle_series is not None:
                             middle_series = last_middle_series
@@ -1308,7 +1376,11 @@ def main():
                             for ifo in active_ifos:
                                 series, norm = ref_by_seg[ifo][s_num]
                                 norms[ifo] = norm
-                                middle_series[ifo] = upper_chunk.run(series, norm, chunk_scales, bank.sample_rate)
+                                stilde_cur = segments[ifo][s_num]
+                                v_slice = getattr(stilde_cur, 'analyze', None)
+                                middle_series[ifo] = upper_chunk.run(
+                                    series, norm, chunk_scales, bank.sample_rate,
+                                    valid_slice=v_slice)
                             upper_fir_seconds += time.perf_counter() - t0
                             upper_total_seconds += time.perf_counter() - t_upper_start
                             last_middle_series = middle_series
@@ -1318,8 +1390,14 @@ def main():
                         block_f_cache_by_ifo = {ifo: {} for ifo in active_ifos}
 
                         t_seg_start = time.time()
-                        for i, (coarse_idx, counts, fine_indices,
-                                group_engine, filters_f, tap_sizes, chisq_ref_template) in enumerate(chunk_groups):
+                        for i, g_entry in enumerate(chunk_groups):
+                            coarse_idx, counts, fine_indices, group_engine, filters_f, tap_sizes, mid_tap_arr, _ = g_entry
+                            if seg_inj_tau0 and s_num in seg_inj_tau0 and coarse_tau0_all is not None:
+                                s_injs = seg_inj_tau0[s_num]
+                                if len(s_injs) > 0:
+                                    c_t0 = coarse_tau0_all[coarse_idx]
+                                    if not np.any(np.abs(s_injs - c_t0) <= inj_chirp_win):
+                                        continue
                             group_engine._tap_sizes = tap_sizes
                             std_trigs = {}
                             h_norms = {}
@@ -1334,14 +1412,26 @@ def main():
                                     valid_slice=stilde.analyze,
                                     reference_series=ref_snr,
                                     profile_template=top_template,
-                                )
+                                    )
+                                ana = getattr(stilde, 'analyze', None)
+                                if ana is not None and len(ids_local) > 0:
+                                    margin_pts = 64
+                                    in_bounds = (t_idxs >= ana.start + margin_pts) & (t_idxs <= ana.stop - margin_pts)
+                                    if not np.all(in_bounds):
+                                        ids_local = ids_local[in_bounds]
+                                        t_idxs = t_idxs[in_bounds]
+                                        snrs = snrs[in_bounds]
+                                        tstarts = tstarts[in_bounds]
                                 std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
                                 if len(ids_local) > 0:
                                     if do_chisq and np.any(abs(snrs) >= cthresh):
+                                        if g_entry[7] is None:
+                                            spec = upper_filter_spectrum(mid_tap_arr, (len(top_template) - 1) * 2)
+                                            g_entry[7] = effective_middle_template(top_template, spec, bank.sample_rate)
                                         chi, chi_dof = compute_batch_chisq(
                                             ids_local, t_idxs, snrs, h_norm,
                                             fine_indices, tstarts, stilde, bank, power_chisq,
-                                            ref_snr, filters_f, chisq_ref_template, args)
+                                            ref_snr, filters_f, g_entry[7], args)
                                     else:
                                         chi = np.zeros(len(ids_local), dtype=float32)
                                         chi_dof = np.zeros(len(ids_local), dtype=np.int32) - 100
@@ -1423,11 +1513,24 @@ def main():
                                             )
 
                                             if len(asym_ids) > 0:
+                                                ana_B = getattr(stilde_B, 'analyze', None)
+                                                if ana_B is not None:
+                                                    margin_pts = 64
+                                                    in_b = (asym_t_idxs >= ana_B.start + margin_pts) & (asym_t_idxs <= ana_B.stop - margin_pts)
+                                                    if not np.all(in_b):
+                                                        asym_ids = asym_ids[in_b]
+                                                        asym_t_idxs = asym_t_idxs[in_b]
+                                                        asym_snrs = asym_snrs[in_b]
+                                                        asym_tstarts = asym_tstarts[in_b]
+                                            if len(asym_ids) > 0:
                                                 if do_chisq and np.any(abs(asym_snrs) >= cthresh):
+                                                    if g_entry[7] is None:
+                                                        spec = upper_filter_spectrum(mid_tap_arr, (len(top_template) - 1) * 2)
+                                                        g_entry[7] = effective_middle_template(top_template, spec, bank.sample_rate)
                                                     chi, chi_dof = compute_batch_chisq(
                                                         asym_ids, asym_t_idxs, asym_snrs, h_norm_B,
                                                         fine_indices, asym_tstarts, stilde_B, bank, power_chisq,
-                                                        ref_snr_B, filters_f, chisq_ref_template, args)
+                                                        ref_snr_B, filters_f, g_entry[7], args)
                                                 else:
                                                     chi = np.zeros(len(asym_ids), dtype=float32)
                                                     chi_dof = np.zeros(len(asym_ids), dtype=np.int32) - 100
@@ -1461,7 +1564,6 @@ def main():
 
                 del ref_by_seg
                 del top_template
-                gc.collect()
                 if libc is not None:
                     libc.malloc_trim(0)
 

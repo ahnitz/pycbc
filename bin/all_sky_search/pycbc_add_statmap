@@ -253,6 +253,7 @@ cidx = pycbc.events.cluster_coincs_multiifo(f[f'foreground/{args.cluster_stat}']
                                             fg_times,
                                             np.zeros(n_triggers), 0,
                                             args.cluster_window)
+cidx = np.asarray(cidx, dtype=int)
 
 del fg_times
 

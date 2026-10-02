@@ -1281,7 +1281,37 @@ class RatioFilterBank(FilterBank):
             indices_unique = np.unique(indices_combined)
             self.coarse_indices = indices_unique
         else:
-            self.coarse_indices = []
+            self.coarse_indices = np.array([], dtype=int)
+
+        # Also thin the fine template bank
+        m1_fine = self.table['mass1']
+        m2_fine = self.table['mass2']
+        tau0_fine, _ = pycbc.pnutils.mass1_mass2_to_tau0_tau3(m1_fine, m2_fine, fref)
+        sort_fine = tau0_fine.argsort()
+        tau0_fine_sorted = tau0_fine[sort_fine]
+
+        fine_matches = []
+        for inj in injection_parameters:
+            tau0_inj, _ = \
+                pycbc.pnutils.mass1_mass2_to_tau0_tau3(inj.mass1, inj.mass2, fref)
+            lid = np.searchsorted(tau0_fine_sorted, tau0_inj - threshold)
+            rid = np.searchsorted(tau0_fine_sorted, tau0_inj + threshold)
+            fine_matches.append(sort_fine[lid:rid])
+
+        if len(fine_matches) > 0:
+            self.fine_keep = set(np.unique(np.concatenate(fine_matches)))
+        else:
+            self.fine_keep = set()
+
+        if hasattr(self, 'fine_coarse_map') and len(self.fine_keep) > 0:
+            active_coarse = set()
+            for fid in self.fine_keep:
+                cid = self.fine_coarse_map[fid, 0]
+                if cid >= 0:
+                    active_coarse.add(cid)
+            self.coarse_indices = np.array(sorted(list(set(self.coarse_indices) & active_coarse)), dtype=int)
+        elif len(self.fine_keep) == 0:
+            self.coarse_indices = np.array([], dtype=int)
 
         if getattr(self, 'top_bank', None) is not None and len(self.top_indices) > 0:
             coarse_set = set(self.coarse_indices)
@@ -1471,6 +1501,13 @@ class RatioFilterBank(FilterBank):
         """Retrieve the FIR tap information for the batch of fine templates
         associated with a specific coarse reference.
         """
+        coarse_key = int(coarse_index)
+        if not hasattr(self, '_firs_cache'):
+            self._firs_cache = {}
+        cached = self._firs_cache.get(coarse_key)
+        if cached is not None:
+            return cached
+
         group_key = str(coarse_index)
         grp = self.level1_group
         if group_key not in grp:
@@ -1482,8 +1519,19 @@ class RatioFilterBank(FilterBank):
         actual_tap_counts = c_group['actual_tap_count'][:]
         fine_indices = c_group['fine_bank_index'][:]
 
-        sort_idx = np.argsort(actual_tap_counts)
-        return taps[sort_idx], actual_tap_counts[sort_idx], fine_indices[sort_idx]
+        if getattr(self, 'fine_keep', None) is not None:
+            fine_mask = np.isin(fine_indices, list(self.fine_keep))
+            taps = taps[fine_mask]
+            actual_tap_counts = actual_tap_counts[fine_mask]
+            fine_indices = fine_indices[fine_mask]
+
+        if len(fine_indices) > 0:
+            sort_idx = np.argsort(actual_tap_counts)
+            res = (taps[sort_idx], actual_tap_counts[sort_idx], fine_indices[sort_idx])
+        else:
+            res = (taps[:0], actual_tap_counts[:0], fine_indices[:0])
+        self._firs_cache[coarse_key] = res
+        return res
 
     @property
     def coarse_size(self):

@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 """Associate coincident triggers with injections listed in one or more LIGOLW
 files.
 """
@@ -194,19 +194,19 @@ for trigger_file, injection_file in zip(args.trigger_files,
         vetoed_all = vetoid_unique[(len(ifo_list) - count_vetoid)
                                    < args.min_required_ifos]
         found_after_vetoes = numpy.array([i for i in found_within_time
-                                          if i not in vetoed_all])
+                                          if i not in vetoed_all], dtype=int)
         missed_after_vetoes = numpy.array([i for i in missed_within_time
                                           if i not in vetoed_all]).astype(int)
         logging.info('Found: %s, Missed: %s' %
                      (len(found_after_vetoes), len(missed_after_vetoes)))
     else:
         veto_dict = {ifo: [] for ifo in ifo_list}
-        found_after_vetoes = found_within_time
+        found_after_vetoes = numpy.array(found_within_time, dtype=int)
         missed_after_vetoes = missed_within_time.astype(int)
 
 
-    found_fore = numpy.arange(0, len(stat), 1)[left[found]]
-    found_fore_v = numpy.arange(0, len(stat), 1)[left[found_after_vetoes]]
+    found_fore = numpy.arange(0, len(stat), 1)[left[numpy.asarray(found, dtype=int)]]
+    found_fore_v = numpy.arange(0, len(stat), 1)[left[numpy.asarray(found_after_vetoes, dtype=int)]]
 
     logging.info('Saving injection information')
     if '.xml' in injection_file or '.xml.gz' in injection_file:
