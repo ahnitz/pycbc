@@ -131,13 +131,30 @@ class UpperReferenceBatch:
 
 def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
                         fine_indices, tstarts, stilde, bank,
-                        ref_snr, filters_f, args, **kwargs):
+                        *extra_args, **kwargs):
     """Compute power chisq for triggers exceeding chisq_snr_threshold.
 
     Uses SPA cumulative power bin boundaries mapped directly to the block length,
     avoiding template waveform generation and round-trip FFTs.
     Evaluates cleanly per trigger with no cross-template broadcasting.
+    Supports both legacy and refactored positional argument signatures.
     """
+    if len(extra_args) == 3:
+        ref_snr, filters_f, args = extra_args
+    elif len(extra_args) == 4:
+        if hasattr(extra_args[0], 'values') or hasattr(extra_args[0], 'cached_chisq_bins'):
+            _, ref_snr, filters_f, args = extra_args
+        else:
+            ref_snr, filters_f, _, args = extra_args
+    elif len(extra_args) == 5:
+        _, ref_snr, filters_f, _, args = extra_args
+    elif len(extra_args) == 0:
+        ref_snr = kwargs.get('ref_snr') if 'ref_snr' in kwargs else kwargs.get('engine')
+        filters_f = kwargs.get('filters_f')
+        args = kwargs.get('args')
+    else:
+        raise TypeError(f"compute_batch_chisq takes 11 to 13 positional arguments, got {8 + len(extra_args)}")
+
     global_ids = fine_indices[ids_local]
     snr_amp = abs(snrs)
     num_trigs = len(snrs)
@@ -158,7 +175,9 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
     chisq_bins_hz = getattr(stilde, 'chisq_bins_hz', None)
     if chisq_bins_hz is None:
         flow = getattr(args, 'low_frequency_cutoff', 20.0)
-        f_final = getattr(args, 'high_frequency_cutoff', None) or 800.0
+        f_final = getattr(args, 'high_frequency_cutoff', None) or (
+            float(bank.table['f_final'].max()) if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0
+        )
         kmin = int(flow / stilde.delta_f)
         kmax = min(int(f_final / stilde.delta_f), len(stilde.psd))
         norm_vec = spa_tmplt_norm(stilde.psd, len(stilde.psd), stilde.delta_f, flow)
@@ -186,7 +205,12 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
         df = stilde.sample_rate / block_len
 
         if block_len not in block_bins_cache:
-            block_bins_cache[block_len] = np.round(chisq_bins_hz / df).astype(np.int32)
+            bb = np.round(chisq_bins_hz / df).astype(np.int32)
+            # Enforce strictly monotonically increasing bin boundaries
+            for b_i in range(1, len(bb)):
+                if bb[b_i] <= bb[b_i - 1]:
+                    bb[b_i] = bb[b_i - 1] + 1
+            block_bins_cache[block_len] = bb
         block_bins = block_bins_cache[block_len]
         dof = (len(block_bins) - 1) * 2 - 2
 
@@ -198,6 +222,8 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
                 ref = ref_snr.ref_snr[tstart:tstart+block_len]
             else:
                 ref = ref_snr[tstart:tstart+block_len]
+            if ref is None:
+                continue
             ref = ref[:block_len]
             if len(ref) < block_len:
                 ref = np.pad(ref, (0, block_len - len(ref)))
@@ -766,8 +792,6 @@ def main():
             first_stage_snr=args.ratio_filter_first_stage_snr,
         )
 
-        power_chisq = pycbc.vetoes.SingleDetPowerChisq(args.chisq_bins,
-                                                       args.chisq_snr_threshold)
         sg_chisq = SingleDetSGChisq.from_cli(args, bank, str(args.chisq_bins))
 
         # --- 5. Event Manager Setup ---
@@ -892,7 +916,9 @@ def main():
         do_chisq = bool(args.chisq_bins and (cthresh is not None))
         if do_chisq:
             flow_chisq = getattr(args, 'low_frequency_cutoff', 20.0)
-            f_final_chisq = getattr(args, 'high_frequency_cutoff', None) or 800.0
+            f_final_chisq = getattr(args, 'high_frequency_cutoff', None) or (
+                float(bank.table['f_final'].max()) if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0
+            )
             for ifo in instruments:
                 for seg in segments[ifo]:
                     kmin = int(flow_chisq / seg.delta_f)
@@ -914,6 +940,9 @@ def main():
         upper_ref_seconds = 0.0
         upper_fir_seconds = 0.0
         upper_total_seconds = 0.0
+
+        if bank.top_bank is None:
+            raise ValueError("pycbc_inspiral_fir requires a hierarchical bank with top_bank.")
 
         if bank.top_bank is not None:
             max_upper_taps = max(int(c) for top_idx in bank.top_indices
