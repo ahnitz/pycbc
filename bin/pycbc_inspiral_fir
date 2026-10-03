@@ -19,8 +19,12 @@ if "MF_GATE_CACHE_FILE" not in os.environ:
     if os.path.exists(_mtest_cache):
         os.environ["MF_GATE_CACHE_FILE"] = _mtest_cache
 
+os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "65536")
+os.environ.setdefault("MALLOC_ARENA_MAX", "1")
 try:
     libc = ctypes.CDLL('libc.so.6')
+    libc.mallopt(-3, 65536)  # M_MMAP_THRESHOLD = 64 KB
+    libc.mallopt(-8, 1)      # M_ARENA_MAX = 1
 except Exception:
     libc = None
 
@@ -69,6 +73,16 @@ def is_valid_segment(seg):
         return False
     return True
 
+
+def get_mem_mb():
+    try:
+        with open('/proc/self/status') as f:
+            lines = f.readlines()
+            rss = next(int(l.split()[1]) for l in lines if l.startswith('VmRSS:')) / 1024.0
+            hwm = next(int(l.split()[1]) for l in lines if l.startswith('VmHWM:')) / 1024.0
+            return rss, hwm
+    except Exception:
+        return 0.0, 0.0
 
 
 class UpperReferenceBatch:
@@ -756,6 +770,8 @@ def get_args():
                             " Lower is safer and slower. 0 uses the design"
                             " table, whose choice is not reliable everywhere"
                             " -- see docs/hierarchical.md in matchedfilter.")
+    group.add_argument('--chunk-size', type=int, default=16,
+                       help="Number of middle templates to process per chunk in upper synthesis (default: 16).")
 
     # power chisq related
     parser.add_argument("--chisq-snr-threshold", type=float,
@@ -845,6 +861,9 @@ def main():
         gwstrain = pycbc.strain.from_cli_multi_ifos(args, instruments,
                                                     inj_filter_rejector_dict=inj_filter_rejector,
                                                     dyn_range_fac=pycbc.DYN_RANGE_FAC)
+        gc.collect()
+        if libc is not None:
+            libc.malloc_trim(0)
 
         strain_segments = pycbc.strain.StrainSegments.from_cli_multi_ifos(args, gwstrain, instruments)
 
@@ -945,6 +964,10 @@ def main():
             for ifo in instruments
         }
         del strain_segments
+        gc.collect()
+        if libc is not None:
+            libc.malloc_trim(0)
+        logging.info("After segments creation: RSS=%.1f MB, HWM=%.1f MB", *get_mem_mb())
 
         # Precompute segment-level injection chirp times if filter-inj-only is enabled
         seg_inj_tau0 = {}
@@ -1106,7 +1129,7 @@ def main():
                 preload_thread.join()
                 logging.info("Background preloading of FIR filter bank complete.")
 
-            chunk_size = 64
+            chunk_size = getattr(args, 'chunk_size', 16) or 16
             total_valid_segs = sum(sum(1 for s in segments[ifo] if is_valid_segment(s)) for ifo in instruments)
             if total_valid_segs == 0:
                 logging.info("Zero valid segments to analyze across all instruments. Skipping filtering.")
@@ -1145,9 +1168,8 @@ def main():
                     for row, mid in enumerate(middle_ids)
                 }
 
-                logging.info(f"Top template {top_step+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups (chunked {chunk_size}/chunk)")
+                logging.info(f"Top template {top_step+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups (chunked {chunk_size}/chunk) [RSS={get_mem_mb()[0]:.1f} MB, HWM={get_mem_mb()[1]:.1f} MB]")
 
-                chunks_data = []
                 for chunk_start in range(0, len(middle_ids), chunk_size):
                     chunk_slice = slice(chunk_start, chunk_start + chunk_size)
                     chunk_mids = middle_ids[chunk_slice]
@@ -1186,6 +1208,7 @@ def main():
                                              group_engine, filters_f, shifts])
 
                     if not chunk_groups:
+                        del upper_chunk
                         continue
 
                     chunk_pad = max(
@@ -1196,36 +1219,30 @@ def main():
                             for g in g_entry[3]._td_bank._groups
                         ]
                     )
-                    chunks_data.append((chunk_start, upper_chunk, chunk_groups, chunk_scales, chunk_pad))
 
-                if not chunks_data:
-                    del top_template
-                    continue
+                    for s_num in range(num_segs):
+                        active_ifos = [ifo for ifo in instruments
+                                       if s_num < len(segments[ifo]) and is_valid_segment(segments[ifo][s_num])]
+                        if not active_ifos:
+                            continue
 
-                for s_num in range(num_segs):
-                    active_ifos = [ifo for ifo in instruments
-                                   if s_num < len(segments[ifo]) and is_valid_segment(segments[ifo][s_num])]
-                    if not active_ifos:
-                        continue
+                        can_asym_seg = can_asym_by_seg.get(s_num, False)
 
-                    can_asym_seg = can_asym_by_seg.get(s_num, False)
-
-                    t_ref0 = time.perf_counter()
-                    ref_cur = {}
-                    for ifo in active_ifos:
-                        st = segments[ifo][s_num]
-                        ref_cur[ifo] = engine.make_reference_series(st, st.psd, top_template)
-                    t_ref_dur = time.perf_counter() - t_ref0
-                    upper_ref_seconds += t_ref_dur
-                    TIMERS['upper_ref'] += t_ref_dur
-
-                    for chunk_start, upper_chunk, chunk_groups, chunk_scales, chunk_pad in chunks_data:
                         if seg_inj_tau0 and s_num in seg_inj_tau0 and coarse_tau0_all is not None:
                             s_injs = seg_inj_tau0[s_num]
                             if len(s_injs) > 0:
                                 chunk_c_indices = [g[0] for g in chunk_groups]
                                 if not any(np.any(np.abs(s_injs - coarse_tau0_all[cid]) <= inj_chirp_win) for cid in chunk_c_indices):
                                     continue
+
+                        t_ref0 = time.perf_counter()
+                        ref_cur = {}
+                        for ifo in active_ifos:
+                            st = segments[ifo][s_num]
+                            ref_cur[ifo] = engine.make_reference_series(st, st.psd, top_template)
+                        t_ref_dur = time.perf_counter() - t_ref0
+                        upper_ref_seconds += t_ref_dur
+                        TIMERS['upper_ref'] += t_ref_dur
 
                         middle_series = {}
                         norms = {}
@@ -1239,6 +1256,7 @@ def main():
                             middle_series[ifo] = upper_chunk.run(
                                 series, norm, chunk_scales, bank.sample_rate,
                                 valid_slice=v_slice, ifo=ifo, pad=chunk_pad)
+                        del ref_cur
                         upper_fir_seconds += time.perf_counter() - t0
                         upper_total_seconds += time.perf_counter() - t_upper_start
                         TIMERS['upper_fir'] += time.perf_counter() - t0
@@ -1256,16 +1274,13 @@ def main():
                                     if not np.any(np.abs(s_injs - c_t0) <= inj_chirp_win):
                                         continue
                             std_trigs = {}
-                            h_norms = {}
+                            h_norms = {ifo: norms[ifo] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
 
                             def record_triggers(ifo_key, ids, tidxs, s_vals, starts, is_asym=False):
-                                st = segments[ifo_key][s_num]
-                                hn = h_norms[ifo_key] if ifo_key in h_norms else norms[ifo_key] * sigmasq_ratio_by_middle[coarse_idx]
-                                rs = middle_series[ifo_key][coarse_idx]
                                 return process_and_record_triggers(
                                     ids, tidxs, s_vals, starts,
-                                    st, hn, coarse_idx, fine_indices,
-                                    filters_f, rs, bank,
+                                    segments[ifo_key][s_num], h_norms[ifo_key], coarse_idx, fine_indices,
+                                    filters_f, middle_series[ifo_key][coarse_idx], bank,
                                     s_num, top_idx, ifo_key, collected_batches,
                                     args, do_chisq, cthresh, is_asym=is_asym,
                                     shifts=shifts,
@@ -1273,8 +1288,7 @@ def main():
 
                             for ifo in active_ifos:
                                 stilde = segments[ifo][s_num]
-                                h_norm = norms[ifo] * sigmasq_ratio_by_middle[coarse_idx]
-                                h_norms[ifo] = h_norm
+                                h_norm = h_norms[ifo]
                                 ref_snr = middle_series[ifo][coarse_idx]
                                 t_fine0 = time.perf_counter()
                                 ids_local, t_idxs, snrs, tstarts, _ = group_engine.process_segment(
@@ -1368,7 +1382,7 @@ def main():
                                             record_triggers(
                                                 ifo_B, asym_ids, asym_t_idxs, asym_snrs, asym_tstarts, is_asym=True
                                             )
-                                TIMERS['asym_followup'] += (time.perf_counter() - t_asym0) - (TIMERS['power_chisq'] - chi_asym_before)
+                                    TIMERS['asym_followup'] += (time.perf_counter() - t_asym0) - (TIMERS['power_chisq'] - chi_asym_before)
 
                         t_seg_dur = max(time.time() - t_seg_start, 1e-6)
                         n_tmpl_seg = sum(len(g[2]) for g in chunk_groups)
@@ -1382,7 +1396,8 @@ def main():
                         del middle_series
                         del norms
 
-                    del ref_cur
+                    del chunk_groups
+                    del upper_chunk
                     try:
                         import matchedfilter.time_domain as td_mod
                         if hasattr(td_mod, '_REF_PROFILE_CACHE'):
@@ -1391,8 +1406,10 @@ def main():
                             td_mod._REF_BINNED_CACHE.clear()
                     except Exception:
                         pass
+                    gc.collect()
+                    if libc is not None:
+                        libc.malloc_trim(0)
 
-                del chunks_data
                 del top_template
                 global _CHISQ_CTX
                 if _CHISQ_CTX is not None and 'ratio_cache' in _CHISQ_CTX:
@@ -1404,9 +1421,11 @@ def main():
         if bank.top_bank is not None:
             logging.info('Upper synthesis time: direct-reference %.3f s, FIR %.3f s, total %.3f s',
                          upper_ref_seconds, upper_fir_seconds, upper_total_seconds)
+        logging.info("After all top templates: RSS=%.1f MB, HWM=%.1f MB", *get_mem_mb())
 
         # --- Veto Processing Complete & Trigger Ingestion ---
         for ifo in instruments:
+            logging.info("[%s] Trigger ingestion start: RSS=%.1f MB, HWM=%.1f MB", ifo, *get_mem_mb())
             ifo_batches = collected_batches[ifo]
             ifo_mgr = event_mgr[ifo]
             ifo_strain = gwstrain[ifo]
