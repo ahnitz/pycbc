@@ -295,17 +295,33 @@ def setup_matchedfltr_dax_generated_multi(workflow, science_segs, datafind_outs,
     elif match_fltr_exe in ['pycbc_inspiral_fir', 'pycbc_inspiral']:
         exe_class = select_matchedfilter_class(match_fltr_exe)
 
+        from igwn_segments import segment, segmentlist
+
         coincident_only = cp.has_option('workflow-matchedfilter', 'coincident-only')
         if coincident_only:
             analysis_segs = science_segs[ifos[0]]
             for ifo in ifos[1:]:
                 analysis_segs = analysis_segs & science_segs[ifo]
+            seg_active_map = [(seg, tuple(ifos)) for seg in analysis_segs]
         else:
-            from igwn_segments import segmentlist
-            analysis_segs = segmentlist([])
-            for ifo in ifos:
-                analysis_segs.extend(science_segs[ifo])
-            analysis_segs.coalesce()
+            bounds = set()
+            for s_list in science_segs.values():
+                for seg in s_list:
+                    bounds.add(seg[0])
+                    bounds.add(seg[1])
+            sorted_bounds = sorted(bounds)
+            raw_slices = []
+            for s, e in zip(sorted_bounds[:-1], sorted_bounds[1:]):
+                seg = segment([s, e])
+                active = tuple(sorted(ifo for ifo in ifos if science_segs[ifo].intersects_segment(seg)))
+                if active:
+                    raw_slices.append((seg, active))
+            seg_active_map = []
+            for seg, active in raw_slices:
+                if seg_active_map and seg_active_map[-1][1] == active and seg_active_map[-1][0][1] == seg[0]:
+                    seg_active_map[-1] = (segment([seg_active_map[-1][0][0], seg[1]]), active)
+                else:
+                    seg_active_map.append((seg, active))
 
         if cp.has_option('workflow-matchedfilter', 'target-job-duration'):
             target_duration = int(cp.get('workflow-matchedfilter', 'target-job-duration'))
@@ -329,8 +345,6 @@ def setup_matchedfltr_dax_generated_multi(workflow, science_segs, datafind_outs,
         if cp.has_option('inspiral', 'segment-end-pad'):
             end_pad = int(cp.get('inspiral', 'segment-end-pad'))
 
-        from igwn_segments import segment
-
         job_instances = {}
         def get_job_instance(active_ifos):
             key = tuple(active_ifos)
@@ -344,33 +358,33 @@ def setup_matchedfltr_dax_generated_multi(workflow, science_segs, datafind_outs,
                 )
             return job_instances[key]
 
-        for curr_seg in analysis_segs:
+        for curr_seg, active_ifos in seg_active_map:
             seg_len = abs(curr_seg)
+            throwaway = start_pad + end_pad + 2 * pad_data
             if min_analysis_length and seg_len < min_analysis_length:
                 continue
+            if seg_len <= throwaway:
+                continue
 
-            num_jobs = max(1, int(round(seg_len / float(target_duration))))
-            job_dur = seg_len / float(num_jobs)
+            ana_start = curr_seg[0] + start_pad + pad_data
+            ana_end = curr_seg[1] - end_pad - pad_data
+            ana_len = ana_end - ana_start
+
+            num_jobs = max(1, int(round(ana_len / float(target_duration))))
+            job_dur = ana_len / float(num_jobs)
 
             for job_idx in range(num_jobs):
-                v_start = int(round(curr_seg[0] + job_idx * job_dur))
-                v_end = int(round(curr_seg[0] + (job_idx + 1) * job_dur))
+                v_start = int(round(ana_start + job_idx * job_dur))
+                v_end = int(round(ana_start + (job_idx + 1) * job_dur))
                 if job_idx == num_jobs - 1:
-                    v_end = int(curr_seg[1])
+                    v_end = int(ana_end)
 
                 valid_seg = segment([v_start, v_end])
-                # Ensure each job reads sufficient data padding (start_pad and end_pad)
-                # before and after its valid trigger window to prevent zero-padding
-                # corruption of incoming waveforms at inter-job boundaries.
-                data_seg = segment([v_start - start_pad - pad_data, v_end + end_pad + pad_data])
+                d_start = curr_seg[0] if job_idx == 0 else int(round(v_start - start_pad - pad_data))
+                d_end = curr_seg[1] if job_idx == num_jobs - 1 else int(round(v_end + end_pad + pad_data))
+                data_seg = segment([d_start, d_end])
 
-                if coincident_only:
-                    job_ifos = list(ifos)
-                else:
-                    job_ifos = [ifo for ifo in ifos if science_segs[ifo].intersects_segment(valid_seg)]
-                    if not job_ifos:
-                        job_ifos = list(ifos)
-
+                job_ifos = list(active_ifos)
                 curr_job = get_job_instance(job_ifos)
 
                 curr_dfouts = FileList([])
