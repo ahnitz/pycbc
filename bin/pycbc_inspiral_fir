@@ -1269,6 +1269,7 @@ def main():
                 libc.malloc_trim(0)
 
             t_ingest_start = time.time()
+            sg_dur = 0.0
             logging.info("[%s] Grouping triggers by template...", ifo)
             if n_candidates > 0:
                 all_gids = []
