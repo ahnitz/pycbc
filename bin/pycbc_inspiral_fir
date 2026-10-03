@@ -51,6 +51,23 @@ tstart = time.time()
 TIMERS = collections.defaultdict(float)
 
 
+def is_valid_segment(seg):
+    """Check whether a Fourier segment contains valid (non-NaN, finite) strain and PSD."""
+    if seg is None or getattr(seg, 'psd', None) is None:
+        return False
+    p_arr = seg.psd.numpy()
+    if len(p_arr) == 0:
+        return False
+    mid = len(p_arr) // 2
+    if np.isnan(p_arr[mid]) or p_arr[mid] <= 0 or np.isinf(p_arr[mid]):
+        return False
+    s_arr = seg.numpy()
+    if len(s_arr) == 0 or np.isnan(s_arr[0]) or np.isnan(s_arr[mid]):
+        return False
+    return True
+
+
+
 class UpperReferenceBatch:
     """Expand one top SNR series into all middle series in one library call."""
 
@@ -895,7 +912,8 @@ def main():
 
         for ifo in instruments:
             for seg in segments[ifo]:
-                seg[:] = seg / seg.psd
+                if is_valid_segment(seg):
+                    seg[:] = seg / seg.psd
 
         psd_var = {}
         if args.psdvar_segment is not None:
@@ -943,11 +961,12 @@ def main():
             edge_margin = (max_upper_taps + max_lower_taps) // 2
             for ifo in instruments:
                 for stilde in segments[ifo]:
-                    if (stilde.analyze.start < edge_margin or
-                            (len(stilde) - 1) * 2 - stilde.analyze.stop < edge_margin):
-                        raise ValueError(
-                            'analysis window needs %d samples of padding for the '
-                            'composed upper and lower FIRs' % edge_margin)
+                    if is_valid_segment(stilde):
+                        if (stilde.analyze.start < edge_margin or
+                                (len(stilde) - 1) * 2 - stilde.analyze.stop < edge_margin):
+                            raise ValueError(
+                                'analysis window needs %d samples of padding for the '
+                                'composed upper and lower FIRs' % edge_margin)
 
             coarse_keep = set(bank.coarse_indices) if len(bank.coarse_indices) < len(bank.coarse_keys) else None
 
@@ -956,9 +975,9 @@ def main():
                 logging.info("Background preloading of FIR filter bank complete.")
 
             chunk_size = 64
-            total_segs = sum(len(segments[ifo]) for ifo in instruments)
-            if total_segs == 0:
-                logging.info("Zero segments to analyze across all instruments. Skipping filtering.")
+            total_valid_segs = sum(sum(1 for s in segments[ifo] if is_valid_segment(s)) for ifo in instruments)
+            if total_valid_segs == 0:
+                logging.info("Zero valid segments to analyze across all instruments. Skipping filtering.")
                 bank_top_indices = []
             else:
                 bank_top_indices = bank.top_indices
@@ -1004,6 +1023,9 @@ def main():
                     for stilde in segments[ifo]:
                         s_slice = getattr(stilde, 'seg_slice', None)
                         k = (s_slice.start, s_slice.stop) if s_slice is not None else id(stilde)
+                        if not is_valid_segment(stilde):
+                            ifo_refs.append((None, 0.0))
+                            continue
                         if k not in cached_ref:
                             cached_ref[k] = engine.make_reference_series(stilde, stilde.psd, top_template)
                         ifo_refs.append(cached_ref[k])
@@ -1019,7 +1041,8 @@ def main():
                     chunk_scales = all_scales[chunk_slice]
 
                     t_up_prep = time.perf_counter()
-                    any_seg = next(segments[i][0] for i in instruments if len(segments[i]) > 0)
+                    any_seg = next((s for i in instruments for s in segments[i] if is_valid_segment(s)),
+                                   next(segments[i][0] for i in instruments if len(segments[i]) > 0))
                     upper_chunk = UpperReferenceBatch(
                         chunk_taps, chunk_counts, chunk_mids, (len(any_seg) - 1) * 2)
                     TIMERS['upper_prep'] += time.perf_counter() - t_up_prep
@@ -1056,7 +1079,8 @@ def main():
                     last_norms = None
                     last_seg_slices = None
                     for s_num in range(num_segs):
-                        active_ifos = [ifo for ifo in instruments if s_num < len(segments[ifo])]
+                        active_ifos = [ifo for ifo in instruments
+                                       if s_num < len(segments[ifo]) and is_valid_segment(segments[ifo][s_num])]
                         if not active_ifos:
                             continue
 
@@ -1534,7 +1558,7 @@ def main():
 
     total_analyzed_det_sec = sum(
         sum((segments[ifo][s].analyze.stop - segments[ifo][s].analyze.start) * segments[ifo][s].delta_t
-            for s in range(len(segments[ifo])))
+            for s in range(len(segments[ifo])) if is_valid_segment(segments[ifo][s]))
         for ifo in instruments
     )
     total_tmpl_sec = total_analyzed_det_sec * len(bank.table)
