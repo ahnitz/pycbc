@@ -361,9 +361,19 @@ def sample_asym_bins(
 
     Uses matchedfilter library natively with zero external FFT calls.
     """
-    half_window_samp = int(round(0.5 * bin_width * num_bins * sample_rate))
-    win_start_samp = t_center - half_window_samp
-    win_end_samp = t_center + half_window_samp
+    if sample_rate is None and stilde is not None:
+        sample_rate = getattr(stilde, 'sample_rate', 2048.0)
+    sample_rate_val = float(sample_rate or 2048.0)
+
+    bs = int(round(bin_width * sample_rate_val))
+
+    if num_bins <= 1:
+        win_start_samp = t_center - bs // 2
+        win_end_samp = win_start_samp + bs
+    else:
+        half_bins = num_bins // 2
+        win_start_samp = (t_center - bs // 2) - half_bins * bs
+        win_end_samp = win_start_samp + num_bins * bs
 
     v_start = 0 if valid_slice is None else valid_slice.start
     v_stop = len(ref_snr) if valid_slice is None else valid_slice.stop
@@ -380,10 +390,6 @@ def sample_asym_bins(
             []
         )
 
-    if sample_rate is None and stilde is not None:
-        sample_rate = getattr(stilde, 'sample_rate', 2048.0)
-    sample_rate_val = float(sample_rate or 2048.0)
-
     if gps_start_time is None:
         gps_start_val = float(getattr(stilde, 'start_time', getattr(stilde, 'epoch', 0.0)))
     else:
@@ -394,8 +400,6 @@ def sample_asym_bins(
     gps_s = (asym_start - an_start + cum_idx) / sample_rate_val + gps_start_val
     gps_e = (asym_stop - an_start + cum_idx) / sample_rate_val + gps_start_val
     searched_intervals = [(gps_s, gps_e)]
-
-    bs = int(round(bin_width * sample_rate_val))
 
     res = group_engine._td_bank.filter_series(
         ref_snr,
@@ -504,6 +508,7 @@ def filter_secondary_asym_triggers(
     secondary_snr_threshold=None,
     network_snr_threshold=None,
     max_followup_bins=0,
+    **kwargs,
 ):
     """Filter secondary triggers based on secondary SNR, network SNR, and loudest bins.
 
@@ -512,9 +517,9 @@ def filter_secondary_asym_triggers(
     (2) rho_net = sqrt(|rho_primary|^2 + |rho_secondary|^2) >= network_snr_threshold.
 
     Heuristic 1: If max_followup_bins > 0 and more than max_followup_bins bins pass
-    the thresholds, only the top max_followup_bins loudest bins (ranked by network SNR
-    rho_net = sqrt(rho_A^2 + rho_B^2), which is monotonic with rho_B) are kept.
-    Set max_followup_bins=0 to keep all passing bins.
+    the thresholds, only the top max_followup_bins loudest bins (ranked by secondary SNR)
+    are kept. Set max_followup_bins=0 to keep all passing bins. All bins are treated
+    identically to preserve completely unbiased background estimation.
     """
     if len(asym_ids) == 0:
         return asym_ids, asym_t_idxs, asym_snrs, asym_tstarts
@@ -937,7 +942,7 @@ def main():
         # For injections, only the 100ms foreground slice (1 bin of 0.1s) is required
         # because injections are evaluated strictly against background from the full search.
         is_injection_run = bool(getattr(args, 'injection_file', None))
-        effective_asym_num_bins = 10 if is_injection_run else args.asym_num_bins
+        effective_asym_num_bins = 1 if is_injection_run else args.asym_num_bins
 
         tsetup = time.time() - tstart
         TIMERS['data_setup'] = tsetup
@@ -1282,6 +1287,8 @@ def main():
                                                 secondary_snr_threshold=args.asym_secondary_snr_threshold,
                                                 network_snr_threshold=args.asym_network_snr_threshold,
                                                 max_followup_bins=args.asym_max_followup_bins,
+                                                t_center=cand_tcenter,
+                                                bin_width_samp=int(round(args.asym_bin_width * sr_B)),
                                             )
 
                                             process_and_record_triggers(

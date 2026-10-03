@@ -602,25 +602,25 @@ def write_fir_groups(parent_group, all_results, match_dtype='float32'):
         max_taps = max(len(row[3]) for row in results)
         taps = group.create_dataset(
             'taps', (n_group, max_taps), dtype='float32',
-            chunks=(1, max_taps), compression='gzip', compression_opts=4)
+            chunks=(n_group, max_taps), shuffle=True, compression='gzip', compression_opts=9)
         counts = group.create_dataset(
             'actual_tap_count', (n_group,), dtype='int32',
-            chunks=True, compression='gzip', compression_opts=4)
+            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
         indices = group.create_dataset(
             'fine_bank_index', (n_group,), dtype='int32',
-            chunks=True, compression='gzip', compression_opts=4)
+            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
         fits = group.create_dataset(
             'filter_match', (n_group,), dtype=match_dtype,
-            chunks=True, compression='gzip', compression_opts=4)
+            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
         parent_matches = group.create_dataset(
             'coarse_match', (n_group,), dtype='float32',
-            chunks=True, compression='gzip', compression_opts=4)
+            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
         sigmas = group.create_dataset(
             'sigmas', (n_group, 3), dtype='float32',
-            chunks=True, compression='gzip', compression_opts=4)
+            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
         shifts = group.create_dataset(
             'sample_shift', (n_group,), dtype='int32',
-            chunks=True, compression='gzip', compression_opts=4)
+            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
         for j, res_row in enumerate(results):
             parent_match = res_row[0]
             fit = res_row[2]
