@@ -48,7 +48,6 @@ from pycbc.vetoes.chisq import (
 from pycbc.waveform.spa_tmplt import spa_tmplt_norm
 from pycbc.vetoes.sgchisq import SingleDetSGChisq
 from pycbc.waveform.bank import RatioFilterBank
-from igwn_segments import segment, segmentlist
 import h5py
 
 tstart = time.time()
@@ -185,8 +184,6 @@ class UpperReferenceBatch:
         else:
             np.multiply(out, scales[:, None], out=out)
 
-        self.last_library_seconds = time.perf_counter() - t0
-        self.last_scale_seconds = 0.0
         return dict(zip(self.sorted_ids, out))
 
 
@@ -218,13 +215,27 @@ def get_chisq_context(sample_rate, n_pad=16384):
     return _CHISQ_CTX
 
 
-def compute_batch_chisq(ids_local, t_idxs, snrs,
-                        fine_indices, tstarts, stilde, bank,
-                        ref_snr, filters_f, args,
-                        top_template=None, mid_tap_arr=None,
-                        h_norm=None, coarse_idx=None):
+def compute_batch_chisq(*pos_args, **kwargs):
     """Compute power chisq for triggers using zero-padded fast frequency-domain
     correlation and same-template descending-SNR time clustering."""
+    if len(pos_args) >= 4 and isinstance(pos_args[3], (int, float, np.floating)):
+        ids_local, t_idxs, snrs, _h_norm, fine_indices, tstarts, stilde, bank = pos_args[:8]
+        extra = pos_args[8:]
+    else:
+        ids_local, t_idxs, snrs, fine_indices, tstarts, stilde, bank = pos_args[:7]
+        extra = pos_args[7:]
+
+    if len(extra) == 3:
+        ref_snr, filters_f, args = extra
+    elif len(extra) == 5:
+        _, ref_snr, filters_f, _, args = extra
+    else:
+        ref_snr = kwargs.get('ref_snr', extra[0] if len(extra) > 0 else None)
+        filters_f = kwargs.get('filters_f', extra[1] if len(extra) > 1 else None)
+        args = kwargs.get('args', extra[2] if len(extra) > 2 else None)
+
+    coarse_idx = kwargs.get('coarse_idx', None)
+
     global_ids = fine_indices[ids_local]
     snr_amp = abs(snrs)
     num_trigs = len(snrs)
@@ -232,12 +243,12 @@ def compute_batch_chisq(ids_local, t_idxs, snrs,
     chisq_dof_vals = np.zeros(num_trigs, dtype=np.int32) - 100
     assigned_mask = np.zeros(num_trigs, dtype=bool)
 
-    cthresh = 0 if args.chisq_snr_threshold is None else args.chisq_snr_threshold
+    cthresh = 0 if getattr(args, 'chisq_snr_threshold', None) is None else args.chisq_snr_threshold
     above_thresh = np.flatnonzero(snr_amp >= cthresh)
     if len(above_thresh) == 0:
         return chisq_vals, chisq_dof_vals
 
-    chisq_window_samp = int(args.chisq_window * stilde.sample_rate)
+    chisq_window_samp = int(getattr(args, 'chisq_window', 1.0) * stilde.sample_rate)
     max_iterations = getattr(args, 'chisq_iterations', None)
     sort_order = np.argsort(snr_amp)[::-1]
 
@@ -265,7 +276,7 @@ def compute_batch_chisq(ids_local, t_idxs, snrs,
         ctx['bins_cache'][bins_key] = (bins, dof)
     bins, dof = ctx['bins_cache'][bins_key]
 
-    taps_coarse, counts_coarse, _ = bank.get_firs(coarse_idx) if coarse_idx is not None else (None, None, None)
+    taps_coarse, counts_coarse, _ = bank.get_firs(coarse_idx) if (coarse_idx is not None and hasattr(bank, 'get_firs')) else (None, None, None)
 
     ref_f_cache = {}
     iterations = 0
@@ -347,8 +358,8 @@ def process_and_record_triggers(
     filters_f, ref_snr, bank,
     s_num, top_idx, ifo, collected_batches,
     args, do_chisq, cthresh, is_asym=False,
-    top_template=None, mid_tap_arr=None,
     shifts=None,
+    **kwargs,
 ):
     """Filter triggers for analysis boundary, evaluate chisq, and append batch record."""
     if len(ids_local) > 0:
@@ -370,8 +381,7 @@ def process_and_record_triggers(
                 ids_local, t_idxs, snrs,
                 fine_indices, tstarts, stilde, bank,
                 ref_snr, filters_f, args,
-                top_template=top_template, mid_tap_arr=mid_tap_arr,
-                h_norm=h_norm, coarse_idx=coarse_idx)
+                coarse_idx=coarse_idx)
             TIMERS['power_chisq'] += time.perf_counter() - t_chi0
         else:
             chi = np.zeros(len(ids_local), dtype=float32)
@@ -916,6 +926,7 @@ def main():
             ifo: strain_segments[ifo].fourier_segments()
             for ifo in instruments
         }
+        del strain_segments
 
         # Precompute segment-level injection chirp times if filter-inj-only is enabled
         seg_inj_tau0 = {}
@@ -1118,24 +1129,7 @@ def main():
 
                 logging.info(f"Top template {top_step+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups (chunked {chunk_size}/chunk)")
 
-                t0 = time.perf_counter()
-                ref_by_seg = {}
-                for ifo in instruments:
-                    cached_ref = {}
-                    ifo_refs = []
-                    for stilde in segments[ifo]:
-                        s_slice = getattr(stilde, 'seg_slice', None)
-                        k = (s_slice.start, s_slice.stop) if s_slice is not None else id(stilde)
-                        if not is_valid_segment(stilde):
-                            ifo_refs.append((None, 0.0))
-                            continue
-                        if k not in cached_ref:
-                            cached_ref[k] = engine.make_reference_series(stilde, stilde.psd, top_template)
-                        ifo_refs.append(cached_ref[k])
-                    ref_by_seg[ifo] = ifo_refs
-                upper_ref_seconds += time.perf_counter() - t0
-                TIMERS['upper_ref'] += time.perf_counter() - t0
-
+                chunks_data = []
                 for chunk_start in range(0, len(middle_ids), chunk_size):
                     chunk_slice = slice(chunk_start, chunk_start + chunk_size)
                     chunk_mids = middle_ids[chunk_slice]
@@ -1170,10 +1164,8 @@ def main():
                         t_fp0 = time.perf_counter()
                         filters_f, _ = group_engine.prepare_filters(taps, counts)
                         TIMERS['filter_prep'] += time.perf_counter() - t_fp0
-                        mid_tap_arr = chunk_taps[row_c, :chunk_counts[row_c]]
                         chunk_groups.append([coarse_idx, counts, fine_indices,
-                                             group_engine, filters_f,
-                                             mid_tap_arr, shifts])
+                                             group_engine, filters_f, shifts])
 
                     if not chunk_groups:
                         continue
@@ -1186,15 +1178,30 @@ def main():
                             for g in g_entry[3]._td_bank._groups
                         ]
                     )
+                    chunks_data.append((chunk_start, upper_chunk, chunk_groups, chunk_scales, chunk_pad))
 
-                    for s_num in range(num_segs):
-                        active_ifos = [ifo for ifo in instruments
-                                       if s_num < len(segments[ifo]) and is_valid_segment(segments[ifo][s_num])]
-                        if not active_ifos:
-                            continue
+                if not chunks_data:
+                    del top_template
+                    continue
 
-                        can_asym_seg = can_asym_by_seg.get(s_num, False)
+                for s_num in range(num_segs):
+                    active_ifos = [ifo for ifo in instruments
+                                   if s_num < len(segments[ifo]) and is_valid_segment(segments[ifo][s_num])]
+                    if not active_ifos:
+                        continue
 
+                    can_asym_seg = can_asym_by_seg.get(s_num, False)
+
+                    t_ref0 = time.perf_counter()
+                    ref_cur = {}
+                    for ifo in active_ifos:
+                        st = segments[ifo][s_num]
+                        ref_cur[ifo] = engine.make_reference_series(st, st.psd, top_template)
+                    t_ref_dur = time.perf_counter() - t_ref0
+                    upper_ref_seconds += t_ref_dur
+                    TIMERS['upper_ref'] += t_ref_dur
+
+                    for chunk_start, upper_chunk, chunk_groups, chunk_scales, chunk_pad in chunks_data:
                         if seg_inj_tau0 and s_num in seg_inj_tau0 and coarse_tau0_all is not None:
                             s_injs = seg_inj_tau0[s_num]
                             if len(s_injs) > 0:
@@ -1207,7 +1214,7 @@ def main():
                         t_upper_start = time.perf_counter()
                         t0 = time.perf_counter()
                         for ifo in active_ifos:
-                            series, norm = ref_by_seg[ifo][s_num]
+                            series, norm = ref_cur[ifo]
                             norms[ifo] = norm
                             stilde_cur = segments[ifo][s_num]
                             v_slice = getattr(stilde_cur, 'analyze', None) if not os.environ.get('PYCBC_UNCONSTRAINED_UPPER') else None
@@ -1223,7 +1230,7 @@ def main():
                         t_seg_chi_start = TIMERS['power_chisq']
                         t_seg_asym_start = TIMERS['asym_followup']
                         for i, g_entry in enumerate(chunk_groups):
-                            coarse_idx, counts, fine_indices, group_engine, filters_f, mid_tap_arr, shifts = g_entry
+                            coarse_idx, counts, fine_indices, group_engine, filters_f, shifts = g_entry
                             if seg_inj_tau0 and s_num in seg_inj_tau0 and coarse_tau0_all is not None:
                                 s_injs = seg_inj_tau0[s_num]
                                 if len(s_injs) > 0:
@@ -1243,7 +1250,6 @@ def main():
                                     filters_f, rs, bank,
                                     s_num, top_idx, ifo_key, collected_batches,
                                     args, do_chisq, cthresh, is_asym=is_asym,
-                                    top_template=top_template, mid_tap_arr=mid_tap_arr,
                                     shifts=shifts,
                                 )
 
@@ -1291,8 +1297,6 @@ def main():
                                     if len(cand_indices) == 0:
                                         continue
 
-                                    # Only record the primary triggers that were selected as candidates
-                                    # to cause secondary followup, and evaluate their chisq:
                                     record_triggers(
                                         ifo_A, a_ids[cand_indices], a_tidxs[cand_indices],
                                         a_snrs[cand_indices], a_tstarts[cand_indices], is_asym=False
@@ -1357,24 +1361,24 @@ def main():
                         s_chi = TIMERS['power_chisq'] - t_seg_chi_start
                         s_asym = TIMERS['asym_followup'] - t_seg_asym_start
                         logging.info(f"Top {top_step+1}/{n_top} (chunk {chunk_start//chunk_size+1}) Seg {s_num+1}/{num_segs}: {len(chunk_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s]")
-                    del chunk_groups
-                    del upper_chunk
+                        del middle_series
+                        del norms
 
-                try:
-                    import matchedfilter.time_domain as td_mod
-                    if hasattr(td_mod, '_REF_PROFILE_CACHE'):
-                        td_mod._REF_PROFILE_CACHE.clear()
-                    if hasattr(td_mod, '_REF_BINNED_CACHE'):
-                        td_mod._REF_BINNED_CACHE.clear()
-                except Exception:
-                    pass
+                    del ref_cur
+                    try:
+                        import matchedfilter.time_domain as td_mod
+                        if hasattr(td_mod, '_REF_PROFILE_CACHE'):
+                            td_mod._REF_PROFILE_CACHE.clear()
+                        if hasattr(td_mod, '_REF_BINNED_CACHE'):
+                            td_mod._REF_BINNED_CACHE.clear()
+                    except Exception:
+                        pass
 
+                del chunks_data
+                del top_template
                 global _CHISQ_CTX
                 if _CHISQ_CTX is not None and 'ratio_cache' in _CHISQ_CTX:
                     _CHISQ_CTX['ratio_cache'].clear()
-
-                del ref_by_seg
-                del top_template
                 gc.collect()
                 if libc is not None:
                     libc.malloc_trim(0)
