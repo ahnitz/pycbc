@@ -19,12 +19,8 @@ if "MF_GATE_CACHE_FILE" not in os.environ:
     if os.path.exists(_mtest_cache):
         os.environ["MF_GATE_CACHE_FILE"] = _mtest_cache
 
-os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "65536")
-os.environ.setdefault("MALLOC_ARENA_MAX", "1")
 try:
     libc = ctypes.CDLL('libc.so.6')
-    libc.mallopt(-3, 65536)  # M_MMAP_THRESHOLD = 64 KB
-    libc.mallopt(-8, 1)      # M_ARENA_MAX = 1
 except Exception:
     libc = None
 
@@ -1094,7 +1090,7 @@ def main():
 
             coarse_keep = set(bank.coarse_indices) if len(bank.coarse_indices) < len(bank.coarse_keys) else None
 
-            chunk_size = getattr(args, 'chunk_size', 16) or 16
+            chunk_size = getattr(args, 'chunk_size', 64) or 64
             total_valid_segs = sum(sum(1 for s in segments[ifo] if is_valid_segment(s)) for ifo in instruments)
             if total_valid_segs == 0:
                 logging.info("Zero valid segments to analyze across all instruments. Skipping filtering.")
