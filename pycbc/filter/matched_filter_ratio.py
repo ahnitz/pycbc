@@ -26,7 +26,7 @@ class MatchedFilterRatioControl(object):
     """
 
     def __init__(self, snr_threshold, delta_f,
-                 high_frequency_cutoff=None, batch_size=64,
+                 high_frequency_cutoff=None, batch_size=None,
                  tap_sample_rate=2048, engine_sample_rate=2048,
                  engine='matchedfilter-hierarchical', false_dismissal=1e-3,
                  coarse_band_hz=0, first_stage_snr=0, **kwargs):

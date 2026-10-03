@@ -596,8 +596,8 @@ def get_args():
     group = parser.add_argument_group("Ratio Filter Options")
     group.add_argument('--high-frequency-cutoff', type=float,
                        help="High frequency cutoff (defaults to Nyquist).")
-    group.add_argument('--batch-size', type=int, default=64,
-                       help="Number of filters to process in one FFT batch.")
+    group.add_argument('--batch-size', type=int, default=None,
+                       help="Number of filters to process in one FFT batch (default: auto-sized based on L2 cache).")
     group.add_argument('--fir-length', type=int, default=None,
                        help=argparse.SUPPRESS)  # Deprecated and ignored; block sizes are chosen dynamically by TimeDomainFilterBank
     group.add_argument('--ratio-filter-engine', default='matchedfilter-hierarchical',
@@ -952,8 +952,14 @@ def main():
                 logging.info("Background preloading of FIR filter bank complete.")
 
             chunk_size = 64
-            n_top = len(bank.top_indices)
-            for top_step, top_idx in enumerate(bank.top_indices):
+            total_segs = sum(len(segments[ifo]) for ifo in instruments)
+            if total_segs == 0:
+                logging.info("Zero segments to analyze across all instruments. Skipping filtering.")
+                bank_top_indices = []
+            else:
+                bank_top_indices = bank.top_indices
+            n_top = len(bank_top_indices)
+            for top_step, top_idx in enumerate(bank_top_indices):
                 top_idx = int(top_idx)
                 group_u = bank.upper_group[str(top_idx)]
                 counts_raw = group_u['actual_tap_count'][:]
