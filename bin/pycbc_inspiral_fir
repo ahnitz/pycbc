@@ -1122,14 +1122,26 @@ def main():
                                     profile_template=top_template,
                                     )
                                 TIMERS['fine_fir'] += time.perf_counter() - t_fine0
-                                std_trigs[ifo] = process_and_record_triggers(
-                                    ids_local, t_idxs, snrs, tstarts,
-                                    stilde, h_norm, coarse_idx, fine_indices,
-                                    filters_f, ref_snr, bank,
-                                    s_num, top_idx, ifo, collected_batches,
-                                    args, do_chisq, cthresh, is_asym=False,
-                                    top_template=top_template, mid_tap_arr=mid_tap_arr,
+                                if len(ids_local) > 0 and getattr(stilde, 'analyze', None) is not None:
+                                    ana = stilde.analyze
+                                    in_bounds = (t_idxs >= ana.start) & (t_idxs < ana.stop)
+                                    if not np.all(in_bounds):
+                                        ids_local = ids_local[in_bounds]
+                                        t_idxs = t_idxs[in_bounds]
+                                        snrs = snrs[in_bounds]
+                                        tstarts = tstarts[in_bounds]
+
+                                if not (args.asym_windowing and len(active_ifos) > 1):
+                                    std_trigs[ifo] = process_and_record_triggers(
+                                        ids_local, t_idxs, snrs, tstarts,
+                                        stilde, h_norm, coarse_idx, fine_indices,
+                                        filters_f, ref_snr, bank,
+                                        s_num, top_idx, ifo, collected_batches,
+                                        args, do_chisq, cthresh, is_asym=False,
+                                        top_template=top_template, mid_tap_arr=mid_tap_arr,
                                     )
+                                else:
+                                    std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
 
                             if args.asym_windowing and len(active_ifos) > 1:
                                 t_asym0 = time.perf_counter()
@@ -1152,6 +1164,20 @@ def main():
                                     )
                                     if len(cand_indices) == 0:
                                         continue
+
+                                    # Only record the primary triggers that were selected as candidates
+                                    # to cause secondary followup, and evaluate their chisq:
+                                    stilde_A = segments[ifo_A][s_num]
+                                    h_norm_A = h_norms[ifo_A]
+                                    ref_snr_A = middle_series[ifo_A][coarse_idx]
+                                    process_and_record_triggers(
+                                        a_ids[cand_indices], a_tidxs[cand_indices], a_snrs[cand_indices], a_tstarts[cand_indices],
+                                        stilde_A, h_norm_A, coarse_idx, fine_indices,
+                                        filters_f, ref_snr_A, bank,
+                                        s_num, top_idx, ifo_A, collected_batches,
+                                        args, do_chisq, cthresh, is_asym=False,
+                                        top_template=top_template, mid_tap_arr=mid_tap_arr,
+                                    )
 
                                     for ifo_B in active_ifos:
                                         if ifo_B == ifo_A:
