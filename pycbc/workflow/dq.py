@@ -96,9 +96,9 @@ def setup_dq_reranking(workflow, insps, bank,
         dq_tags = tags + [dq_label]
 
         # get triggers for this ifo
-        ifo_insp = [insp for insp in insps if (insp.ifo == ifo)]
-        assert len(ifo_insp) == 1, \
-            f"Received more than one inspiral file for {ifo}"
+        ifo_insp = insps.find_output_with_ifo(ifo)
+        assert len(ifo_insp) >= 1, \
+            f"Received no inspiral file for {ifo}"
         ifo_insp = ifo_insp[0]
 
         # calculate template bins for this ifo

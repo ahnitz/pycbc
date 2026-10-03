@@ -229,16 +229,24 @@ class Node(ProfileShortcuts):
     def _add_input(self, inp):
         """ Add as source of input data
         """
-        self._inputs += [inp]
-        self._dax_node.add_inputs(inp)
+        if inp not in self._inputs:
+            self._inputs += [inp]
+        try:
+            self._dax_node.add_inputs(inp)
+        except dax.errors.DuplicateError:
+            pass
 
     def _add_output(self, out):
         """ Add as destination of output data
         """
-        self._outputs += [out]
+        if out not in self._outputs:
+            self._outputs += [out]
         out.node = self
         stage_out = out.storage_path is not None
-        self._dax_node.add_outputs(out, stage_out=stage_out)
+        try:
+            self._dax_node.add_outputs(out, stage_out=stage_out)
+        except dax.errors.DuplicateError:
+            pass
 
     # public functions to add options, arguments with or without data sources
     def add_input(self, inp):
@@ -751,6 +759,20 @@ class SubWorkflow(dax.SubWorkflow):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.pycbc_planner_args = {}
+
+    def add_inputs(self, *input_files, **kwargs):
+        for f in input_files:
+            try:
+                super().add_inputs(f, **kwargs)
+            except dax.errors.DuplicateError:
+                pass
+
+    def add_outputs(self, *output_files, **kwargs):
+        for f in output_files:
+            try:
+                super().add_outputs(f, **kwargs)
+            except dax.errors.DuplicateError:
+                pass
 
     def add_into_workflow(self, container_wflow):
         """Add this Job into a container Workflow

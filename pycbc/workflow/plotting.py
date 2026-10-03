@@ -204,17 +204,20 @@ def make_coinc_snrchi_plot(workflow, inj_file, inj_trig, stat_file, trig_file,
     secs = excludestr(secs, workflow.ifo_combinations)
     files = FileList([])
     for tag in secs:
-        exe = PlotExecutable(workflow.cp, 'plot_coinc_snrchi',
-                             ifos=inj_trig.ifo_list,
-                             out_dir=out_dir, tags=[tag] + tags)
-        node = exe.create_node()
-        node.add_input_opt('--found-injection-file', inj_file)
-        node.add_input_opt('--single-injection-file', inj_trig)
-        node.add_input_opt('--coinc-statistic-file', stat_file)
-        node.add_input_opt('--single-trigger-file', trig_file)
-        node.new_output_file_opt(inj_file.segment, '.png', '--output-file')
-        workflow += node
-        files += node.output_files
+        target_ifos = inj_trig.ifo_list if (hasattr(inj_trig, 'ifo_list') and len(inj_trig.ifo_list) > 1) else [inj_trig.ifo]
+        for curr_ifo in target_ifos:
+            exe = PlotExecutable(workflow.cp, 'plot_coinc_snrchi',
+                                 ifos=curr_ifo,
+                                 out_dir=out_dir, tags=[tag] + tags)
+            node = exe.create_node()
+            node.add_input_opt('--found-injection-file', inj_file)
+            node.add_input_opt('--single-injection-file', inj_trig)
+            node.add_input_opt('--coinc-statistic-file', stat_file)
+            node.add_input_opt('--single-trigger-file', trig_file)
+            node.add_opt('--ifo', curr_ifo)
+            node.new_output_file_opt(inj_file.segment, '.png', '--output-file')
+            workflow += node
+            files += node.output_files
     return files
 
 
@@ -363,20 +366,23 @@ def make_snrchi_plot(workflow, trig_files, veto_file, veto_name,
     files = FileList([])
     for tag in secs:
         for trig_file in trig_files:
-            exe = PlotExecutable(workflow.cp, 'plot_snrchi',
-                                 ifos=trig_file.ifo_list,
-                                 out_dir=out_dir,
-                                 tags=[tag] + tags)
-            node = exe.create_node()
+            target_ifos = trig_file.ifo_list if (hasattr(trig_file, 'ifo_list') and len(trig_file.ifo_list) > 1) else [trig_file.ifo]
+            for curr_ifo in target_ifos:
+                exe = PlotExecutable(workflow.cp, 'plot_snrchi',
+                                     ifos=curr_ifo,
+                                     out_dir=out_dir,
+                                     tags=[tag] + tags)
+                node = exe.create_node()
 
-            node.set_memory(15000)
-            node.add_input_opt('--trigger-file', trig_file)
-            if veto_file is not None:
-                node.add_input_opt('--veto-file', veto_file)
-                node.add_opt('--segment-name', veto_name)
-            node.new_output_file_opt(trig_file.segment, '.png', '--output-file')
-            workflow += node
-            files += node.output_files
+                node.set_memory(15000)
+                node.add_input_opt('--trigger-file', trig_file)
+                node.add_opt('--ifo', curr_ifo)
+                if veto_file is not None:
+                    node.add_input_opt('--veto-file', veto_file)
+                    node.add_opt('--segment-name', veto_name)
+                node.new_output_file_opt(trig_file.segment, '.png', '--output-file')
+                workflow += node
+                files += node.output_files
     return files
 
 
@@ -477,22 +483,24 @@ def make_results_web_page(workflow, results_dir, template='orange',
 
 def make_single_hist(workflow, trig_file, veto_file, veto_name,
                      out_dir, bank_file=None, exclude=None,
-                     require=None, tags=None):
+                     require=None, tags=None, ifo=None):
     tags = [] if tags is None else tags
     makedir(out_dir)
     secs = requirestr(workflow.cp.get_subsections('plot_hist'), require)
     secs = excludestr(secs, exclude)
     secs = excludestr(secs, workflow.ifo_combinations)
     files = FileList([])
+    curr_ifo = ifo if ifo is not None else (trig_file.ifo if len(trig_file.ifo_list) == 1 else trig_file.ifo_list[0])
     for tag in secs:
         node = PlotExecutable(workflow.cp, 'plot_hist',
-                    ifos=trig_file.ifo,
+                    ifos=curr_ifo,
                     out_dir=out_dir,
                     tags=[tag] + tags).create_node()
         if veto_file is not None:
             node.add_opt('--segment-name', veto_name)
             node.add_input_opt('--veto-file', veto_file)
         node.add_input_opt('--trigger-file', trig_file)
+        node.add_opt('--ifo', curr_ifo)
         if bank_file:
             node.add_input_opt('--bank-file', bank_file)
         node.new_output_file_opt(trig_file.segment, '.png', '--output-file')
@@ -503,19 +511,20 @@ def make_single_hist(workflow, trig_file, veto_file, veto_name,
 
 def make_binned_hist(workflow, trig_file, veto_file, veto_name,
                      out_dir, bank_file, exclude=None,
-                     require=None, tags=None):
+                     require=None, tags=None, ifo=None):
     tags = [] if tags is None else tags
     makedir(out_dir)
     secs = requirestr(workflow.cp.get_subsections('plot_binnedhist'), require)
     secs = excludestr(secs, exclude)
     secs = excludestr(secs, workflow.ifo_combinations)
     files = FileList([])
+    curr_ifo = ifo if ifo is not None else (trig_file.ifo if len(trig_file.ifo_list) == 1 else trig_file.ifo_list[0])
     for tag in secs:
         node = PlotExecutable(workflow.cp, 'plot_binnedhist',
-                    ifos=trig_file.ifo,
+                    ifos=curr_ifo,
                     out_dir=out_dir,
                     tags=[tag] + tags).create_node()
-        node.add_opt('--ifo', trig_file.ifo)
+        node.add_opt('--ifo', curr_ifo)
         if veto_file is not None:
             node.add_opt('--veto-segment-name', veto_name)
             node.add_input_opt('--veto-file', veto_file)
@@ -528,7 +537,7 @@ def make_binned_hist(workflow, trig_file, veto_file, veto_name,
 
 
 def make_singles_plot(workflow, trig_files, bank_file, veto_file, veto_name,
-                     out_dir, exclude=None, require=None, tags=None):
+                     out_dir, exclude=None, require=None, tags=None, ifo=None):
     tags = [] if tags is None else tags
     makedir(out_dir)
     secs = requirestr(workflow.cp.get_subsections('plot_singles'), require)
@@ -537,8 +546,9 @@ def make_singles_plot(workflow, trig_files, bank_file, veto_file, veto_name,
     files = FileList([])
     for tag in secs:
         for trig_file in trig_files:
+            curr_ifo = ifo if ifo is not None else (trig_file.ifo if len(trig_file.ifo_list) == 1 else trig_file.ifo_list[0])
             node = PlotExecutable(workflow.cp, 'plot_singles',
-                        ifos=trig_file.ifo,
+                        ifos=curr_ifo,
                         out_dir=out_dir,
                         tags=[tag] + tags).create_node()
 
@@ -547,7 +557,7 @@ def make_singles_plot(workflow, trig_files, bank_file, veto_file, veto_name,
             if veto_file is not None:
                 node.add_input_opt('--veto-file', veto_file)
                 node.add_opt('--segment-name', veto_name)
-            node.add_opt('--detector', trig_file.ifo)
+            node.add_opt('--detector', curr_ifo)
             node.add_input_opt('--single-trig-file', trig_file)
             node.new_output_file_opt(trig_file.segment, '.png', '--output-file')
             workflow += node

@@ -1016,10 +1016,17 @@ class Node(pegasus_workflow.Node):
         self.add_raw_arg(opt)
         self.add_raw_arg(' ')
         for infile in inputs:
-            self.add_raw_arg(infile.ifo)
-            self.add_raw_arg(':')
-            self.add_raw_arg(infile.name)
-            self.add_raw_arg(' ')
+            if hasattr(infile, 'ifo_list') and len(infile.ifo_list) > 1:
+                for ifo in infile.ifo_list:
+                    self.add_raw_arg(ifo)
+                    self.add_raw_arg(':')
+                    self.add_raw_arg(infile.name)
+                    self.add_raw_arg(' ')
+            else:
+                self.add_raw_arg(infile.ifo)
+                self.add_raw_arg(':')
+                self.add_raw_arg(infile.name)
+                self.add_raw_arg(' ')
             self.add_input(infile)
 
     def add_multiifo_output_list_opt(self, opt, outputs):
@@ -1032,10 +1039,17 @@ class Node(pegasus_workflow.Node):
         self.add_raw_arg(opt)
         self.add_raw_arg(' ')
         for outfile in outputs:
-            self.add_raw_arg(outfile.ifo)
-            self.add_raw_arg(':')
-            self.add_raw_arg(outfile.name)
-            self.add_raw_arg(' ')
+            if hasattr(outfile, 'ifo_list') and len(outfile.ifo_list) > 1:
+                for ifo in outfile.ifo_list:
+                    self.add_raw_arg(ifo)
+                    self.add_raw_arg(':')
+                    self.add_raw_arg(outfile.name)
+                    self.add_raw_arg(' ')
+            else:
+                self.add_raw_arg(outfile.ifo)
+                self.add_raw_arg(':')
+                self.add_raw_arg(outfile.name)
+                self.add_raw_arg(' ')
             self.add_output(outfile)
 
     def new_multiifo_output_list_opt(self, opt, ifos, analysis_time, extension,

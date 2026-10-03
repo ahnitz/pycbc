@@ -734,7 +734,13 @@ def make_coinc_info(workflow, singles, bank, coinc_file, out_dir,
     files = FileList([])
     node = PlotExecutable(workflow.cp, name, ifos=workflow.ifos,
                               out_dir=out_dir, tags=tags).create_node()
-    node.add_input_list_opt('--single-trigger-files', singles)
+    unique_singles = []
+    seen = set()
+    for s in singles:
+        if s.name not in seen:
+            seen.add(s.name)
+            unique_singles.append(s)
+    node.add_input_list_opt('--single-trigger-files', unique_singles)
     node.add_input_opt('--statmap-file', coinc_file)
     node.add_input_opt('--bank-file', bank)
     if sort_order:
@@ -901,7 +907,7 @@ def make_qscan_plot(workflow, ifo, trig_time, out_dir, injection_file=None,
 
 def make_singles_timefreq(workflow, single, bank_file, trig_time, out_dir,
                           veto_file=None, time_window=10, data_segments=None,
-                          tags=None):
+                          tags=None, ifo=None):
     """ Generate a singles_timefreq node and add it to workflow.
 
     This function generates a single node of the singles_timefreq executable
@@ -943,7 +949,8 @@ def make_singles_timefreq(workflow, single, bank_file, trig_time, out_dir,
     makedir(out_dir)
     name = 'plot_singles_timefreq'
 
-    curr_exe = SingleTimeFreqExecutable(workflow.cp, name, ifos=[single.ifo],
+    target_ifo = ifo if ifo is not None else (single.ifo if len(getattr(single, 'ifo_list', [])) <= 1 else single.ifo_list[0])
+    curr_exe = SingleTimeFreqExecutable(workflow.cp, name, ifos=[target_ifo],
                           out_dir=out_dir, tags=tags)
 
     # Determine start/end times, using data segments if needed.
@@ -971,7 +978,7 @@ def make_singles_timefreq(workflow, single, bank_file, trig_time, out_dir,
                 if veto_file:
                     node.add_input_opt('--veto-file', veto_file)
 
-                node.add_opt('--detector', single.ifo)
+                node.add_opt('--detector', target_ifo)
                 node.new_output_file_opt(workflow.analysis_time, '.png', '--output-file')
                 workflow += node
                 return node.output_files
@@ -1009,7 +1016,7 @@ def make_singles_timefreq(workflow, single, bank_file, trig_time, out_dir,
     if veto_file:
         node.add_input_opt('--veto-file', veto_file)
 
-    node.add_opt('--detector', single.ifo)
+    node.add_opt('--detector', target_ifo)
     node.new_output_file_opt(workflow.analysis_time, '.png', '--output-file')
     workflow += node
     return node.output_files

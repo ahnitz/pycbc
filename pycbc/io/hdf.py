@@ -1006,9 +1006,16 @@ class ForegroundTriggers(object):
         self.sngl_files = {}
         if sngl_files is not None:
             for sngl_file in sngl_files:
-                curr_dat = FileData(sngl_file)
-                curr_ifo = curr_dat.group_key
-                self.sngl_files[curr_ifo] = curr_dat
+                with HFile(sngl_file, 'r') as hf:
+                    top_keys = list(hf.keys())
+                matching_ifos = [k for k in top_keys if k in self.ifos]
+                if len(matching_ifos) > 1:
+                    for ifo in matching_ifos:
+                        self.sngl_files[ifo] = FileData(sngl_file, group=ifo)
+                else:
+                    curr_dat = FileData(sngl_file)
+                    curr_ifo = curr_dat.group_key
+                    self.sngl_files[curr_ifo] = curr_dat
 
         if not all([ifo in self.sngl_files.keys() for ifo in self.ifos]):
             print("sngl_files: {}".format(sngl_files))

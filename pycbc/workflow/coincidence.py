@@ -370,9 +370,10 @@ def setup_trigger_fitting(workflow, insps, hdfbank, veto_file, veto_name,
     else:
         smoothed_fit_files = FileList()
         for i in workflow.ifos:
-            ifo_insp = [insp for insp in insps if (insp.ifo == i)]
-            assert len(ifo_insp)==1
-            ifo_insp = ifo_insp[0]
+            ifo_insp_list = insps.find_output_with_ifo(i)
+            if not ifo_insp_list:
+                continue
+            ifo_insp = ifo_insp_list[0]
             raw_exe = PyCBCFitByTemplateExecutable(workflow.cp,
                                                    'fit_by_template', ifos=i,
                                                    out_dir=output_dir,
@@ -564,7 +565,7 @@ def setup_interval_coinc(workflow, hdfbank, trig_files, stat_files,
 
     try:
         ifos, _ = trig_files.categorize_by_attr('ifo')
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         ifos = sorted(list({ifo for f in trig_files for ifo in f.ifo_list}))
     findcoinc_exe = PyCBCFindCoincExecutable(workflow.cp, 'coinc',
                                              ifos=ifos,
@@ -603,7 +604,7 @@ def setup_sngls(workflow, hdfbank, trig_files, stat_files,
     """
     try:
         ifos, _ = trig_files.categorize_by_attr('ifo')
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         ifos = sorted(list({ifo for f in trig_files for ifo in f.ifo_list}))
     findsngls_exe = PyCBCFindSnglsExecutable(workflow.cp, 'sngls', ifos=ifos,
                                              tags=tags, out_dir=out_dir)
@@ -640,7 +641,7 @@ def setup_sngls_inj(workflow, hdfbank, inj_trig_files,
     """
     try:
         ifos, _ = inj_trig_files.categorize_by_attr('ifo')
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         ifos = sorted(list({ifo for f in inj_trig_files for ifo in f.ifo_list}))
     findsnglsinj_exe = PyCBCFindSnglsExecutable(workflow.cp, 'sngls', ifos=ifos,
                                                 tags=tags, out_dir=out_dir)

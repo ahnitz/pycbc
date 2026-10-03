@@ -499,8 +499,12 @@ snrchi = wf.make_snrchi_plot(workflow, insps, censored_veto,
 layout.group_layout(rdir['single_triggers'], snrchi)
 
 hist_summ = []
-for insp in full_insps:
-    outdir = rdir['single_triggers/%s_binned_triggers' % insp.ifo]
+for ifo in workflow.ifos:
+    ifo_insps = full_insps.find_output_with_ifo(ifo)
+    if not ifo_insps:
+        continue
+    insp = ifo_insps[0]
+    outdir = rdir['single_triggers/%s_binned_triggers' % ifo]
     singles_plots = wf.make_singles_plot(
         workflow,
         [insp],
@@ -508,29 +512,30 @@ for insp in full_insps:
         censored_veto,
         'closed_box',
         outdir,
-        tags=['full_data']
+        tags=['full_data'],
+        ifo=ifo
     )
     layout.group_layout(outdir, singles_plots)
     # make non-summary hists using the bank file
     # currently, none of these are made
-    outdir = rdir['single_triggers/%s_trigger_histograms' % insp.ifo]
+    outdir = rdir['single_triggers/%s_trigger_histograms' % ifo]
     wf.make_single_hist(workflow, insp, censored_veto, 'closed_box', outdir,
                         bank_file=hdfbank, exclude='summ',
-                        tags=['full_data'])
+                        tags=['full_data'], ifo=ifo)
 
     # make summary hists for all templates together
     # currently, 2 per ifo: snr and newsnr
-    outdir = rdir['single_triggers/%s_trigger_histograms' % insp.ifo]
+    outdir = rdir['single_triggers/%s_trigger_histograms' % ifo]
     allhists = wf.make_single_hist(workflow, insp, censored_veto, 'closed_box',
-                                   outdir, require='summ', tags=['full_data'])
+                                   outdir, require='summ', tags=['full_data'], ifo=ifo)
     layout.group_layout(outdir, allhists)
 
     # make hists of newsnr split up by parameter
     # currently, 1 per ifo split by template duration
-    outdir = rdir['single_triggers/%s_binned_histograms' % insp.ifo]
+    outdir = rdir['single_triggers/%s_binned_histograms' % ifo]
     binhists = wf.make_binned_hist(workflow, insp, censored_veto,
                                    'closed_box', outdir, hdfbank,
-                                   tags=['full_data'])
+                                   tags=['full_data'], ifo=ifo)
     layout.group_layout(outdir, binhists)
     # put raw SNR and binned newsnr hist in summary
     hist_summ += list(layout.grouper([allhists[0], binhists[0]], 2))
@@ -552,8 +557,12 @@ for insp_file in full_insps:
     for tag in insp_file.tags:
         excl_subsecs.add(tag)
 
-for insp_file in full_insps:
-    curr_ifo = insp_file.ifo
+for ifo in workflow.ifos:
+    ifo_insps = full_insps.find_output_with_ifo(ifo)
+    if not ifo_insps:
+        continue
+    insp_file = ifo_insps[0]
+    curr_ifo = ifo
     for subsec in workflow.cp.get_subsections('workflow-sngl_minifollowups'):
         if subsec in excl_subsecs:
             continue

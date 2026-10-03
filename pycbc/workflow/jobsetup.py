@@ -538,7 +538,6 @@ class PyCBCInspiralExecutable(Executable):
         fil.add_metadata('data_seg', data_seg)
         node.add_input_opt('--bank-file', parent)
         if self.ifo_list and len(self.ifo_list) > 1:
-            node.add_opt('--instruments', ' '.join(self.ifo_list))
             if not self.has_opt('channel-name') and '--channel-name' not in node._options:
                 channel_names = []
                 for ifo in self.ifo_list:
