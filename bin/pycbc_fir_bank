@@ -321,7 +321,7 @@ def design_fft_lsqr_filter(target, valid_mask, n_taps, weights, reg_val,
     return taps, n_passes, n_bad
 
 # --- 2. Verification (Double Precision) ---
-def verify_filter_match(taps, h_ref, h_fine, psd, f_low):
+def verify_filter_match(taps, h_ref, h_fine, psd, f_low, sample_rate=None, shift=0):
     """Check how well a designed FIR filter reconstructs the fine template.
 
     Applies `taps` to the coarse reference `h_ref` the way the search engine
@@ -353,6 +353,10 @@ def verify_filter_match(taps, h_ref, h_fine, psd, f_low):
     elif len(H_fir) < len(h_ref): H_fir.resize(len(h_ref))
 
     h_rec = h_ref * H_fir
+    if shift != 0 and sample_rate is not None:
+        freqs = h_rec.sample_frequencies.numpy()
+        phase_corr = np.exp(-1j * 2 * np.pi * freqs * (1.0 / sample_rate) * shift)
+        h_rec = h_rec * phase_corr
 
     s_rec = sigma(h_rec, psd=psd, low_frequency_cutoff=f_low)
     s_ref = sigma(h_ref, psd=psd, low_frequency_cutoff=f_low)
@@ -427,9 +431,23 @@ def process_template(i):
         H_target_raw = ratio * g_args.sample_rate
         band_mask[abs(ratio) > g_args.ratio_cap] = False
         weights_snr /= weights_snr[band_mask].max()
-        return h_ref, H_target_raw, band_mask, weights_snr
 
-    def fit_and_verify(c_idx, h_ref, H_target_raw, band_mask, weights_snr, n_taps, peak_cap_factor):
+        shift = 0
+        if getattr(g_args, 'enable_tap_centering', True):
+            base_b = np.flatnonzero(band_mask)
+            if len(base_b) > 0:
+                phase = np.unwrap(np.angle(ratio[base_b]))
+                gd = -np.gradient(phase, h_ref.delta_f) / (2 * np.pi) * g_args.sample_rate
+                w_b = weights_snr[base_b]
+                sum_w2 = np.sum(w_b**2)
+                shift = int(np.round(np.sum(gd * w_b**2) / sum_w2)) if sum_w2 > 0 else 0
+                freqs = h_ref.sample_frequencies.numpy()
+                phase_shift = np.exp(1j * 2 * np.pi * freqs * (1.0 / g_args.sample_rate) * shift)
+                H_target_raw = H_target_raw * phase_shift
+
+        return h_ref, H_target_raw, band_mask, weights_snr, shift
+
+    def fit_and_verify(c_idx, h_ref, H_target_raw, band_mask, weights_snr, n_taps, peak_cap_factor, shift=0):
         """Design a filter for c_idx at n_taps and check its match.
 
         Returns (qa, taps, sigmas, n_peak_passes, n_bins_capped, max_tap_val).
@@ -479,13 +497,14 @@ def process_template(i):
         if max_tap_val > g_args.max_tap_value:
             logging.warning(f"Template {i} (Ref {c_idx}, {n_taps} taps) rejected: Max tap value {max_tap_val:.2e} exceeded safety threshold.")
             return -1, taps, None, n_peak_passes, n_bins_capped, max_tap_val
-        qa, sigmas = verify_filter_match(taps, h_ref, h_fine, g_psd, g_args.f_low)
+        qa, sigmas = verify_filter_match(taps, h_ref, h_fine, g_psd, g_args.f_low,
+                                         sample_rate=g_args.sample_rate, shift=shift)
         return qa, taps, sigmas, n_peak_passes, n_bins_capped, max_tap_val
 
     current_taps = g_args.n_taps
 
-    best = (i, -1, -1, -1.0, [], [], 0, 0)
-    best_unsuppressed = None  # (qa0, c_idx, best_match, n_taps), cheap to re-derive later
+    best = (i, -1, -1, -1.0, [], [], 0, 0, 0)
+    best_unsuppressed = None  # (qa0, c_idx, best_match, n_taps, shift), cheap to re-derive later
     accepted = False
     n_attempts_total = 0
     n_attempts_suppressed = 0
@@ -494,18 +513,18 @@ def process_template(i):
         round_matches = []
         for c_idx in msearch:
             best_match = matches[c_idx]
-            h_ref, H_target_raw, band_mask, weights_snr = build_problem(c_idx)
+            h_ref, H_target_raw, band_mask, weights_snr, shift = build_problem(c_idx)
 
             try:
                 qa0, taps0, sigmas0, _, _, max_tap0 = fit_and_verify(
-                    c_idx, h_ref, H_target_raw, band_mask, weights_snr, current_taps, peak_cap_factor=0)
+                    c_idx, h_ref, H_target_raw, band_mask, weights_snr, current_taps, peak_cap_factor=0, shift=shift)
             except Exception as e:
                 logging.info(e)
                 continue
             round_matches.append(qa0)
 
             if best_unsuppressed is None or qa0 > best_unsuppressed[0]:
-                best_unsuppressed = (qa0, c_idx, best_match, current_taps)
+                best_unsuppressed = (qa0, c_idx, best_match, current_taps, shift)
 
             logging.debug(f"CoarseTemp:{c_idx} QA-Match(unsuppressed):{qa0} Taps:{current_taps} Max Tap Val: {max_tap0}")
 
@@ -520,7 +539,7 @@ def process_template(i):
             try:
                 qa1, taps1, sigmas1, n_pp1, n_bc1, max_tap1 = fit_and_verify(
                     c_idx, h_ref, H_target_raw, band_mask, weights_snr, current_taps,
-                    peak_cap_factor=g_args.peak_cap_factor)
+                    peak_cap_factor=g_args.peak_cap_factor, shift=shift)
             except Exception as e:
                 logging.info(e)
                 continue
@@ -532,7 +551,7 @@ def process_template(i):
                           f"PeakSuppression: passes={n_pp1} remaining_capped_bins={n_bc1}")
 
             if best[3] < qa1:
-                best = (i, best_match, c_idx, qa1, taps1, sigmas1, n_pp1, n_bc1)
+                best = (i, best_match, c_idx, qa1, taps1, sigmas1, n_pp1, n_bc1, shift)
 
             if qa1 >= g_args.min_match:
                 accepted = True
@@ -552,17 +571,17 @@ def process_template(i):
         # mandatory safety pass once, to the single best (unsuppressed)
         # candidate found across the whole search, so whatever gets delivered
         # as this template's best effort is still numerically safe.
-        qa0, c_idx, best_match, n_taps_at = best_unsuppressed
-        h_ref, H_target_raw, band_mask, weights_snr = build_problem(c_idx)
+        qa0, c_idx, best_match, n_taps_at, shift = best_unsuppressed
+        h_ref, H_target_raw, band_mask, weights_snr, _ = build_problem(c_idx)
         try:
             qa1, taps1, sigmas1, n_pp1, n_bc1, max_tap1 = fit_and_verify(
                 c_idx, h_ref, H_target_raw, band_mask, weights_snr, n_taps_at,
-                peak_cap_factor=g_args.peak_cap_factor)
+                peak_cap_factor=g_args.peak_cap_factor, shift=shift)
             n_attempts_total += 1
             if n_pp1 > 0:
                 n_attempts_suppressed += 1
             if best[3] < qa1:
-                best = (i, best_match, c_idx, qa1, taps1, sigmas1, n_pp1, n_bc1)
+                best = (i, best_match, c_idx, qa1, taps1, sigmas1, n_pp1, n_bc1, shift)
         except Exception as e:
             logging.info(e)
 
@@ -599,13 +618,23 @@ def write_fir_groups(parent_group, all_results, match_dtype='float32'):
         sigmas = group.create_dataset(
             'sigmas', (n_group, 3), dtype='float32',
             chunks=True, compression='gzip', compression_opts=4)
-        for j, (parent_match, _, fit, row_taps, row_sigmas, i) in enumerate(results):
+        shifts = group.create_dataset(
+            'sample_shift', (n_group,), dtype='int32',
+            chunks=True, compression='gzip', compression_opts=4)
+        for j, res_row in enumerate(results):
+            parent_match = res_row[0]
+            fit = res_row[2]
+            row_taps = res_row[3]
+            row_sigmas = res_row[4]
+            shift = res_row[5] if len(res_row) > 6 else 0
+            i = res_row[-1]
             taps[j, :len(row_taps)] = np.asarray(row_taps, dtype=np.float32)
             counts[j] = len(row_taps)
             indices[j] = i
             fits[j] = fit
             parent_matches[j] = parent_match
             sigmas[j] = row_sigmas
+            shifts[j] = shift
         tap_counts.append(counts[:])
     return np.concatenate(tap_counts) if tap_counts else np.array([], dtype=int)
 
@@ -655,10 +684,11 @@ def fit_upper_level(args, middle_bank, psd, flen, output):
         for row in tqdm(pool.imap_unordered(process_template, range(len(results))),
                         total=len(results), desc='Fitting upper level',
                         disable=bool(args.verbose), file=sys.stderr):
-            i, parent_match, parent, fit, taps, sigmas, *_ = row
-            results[i] = (parent_match, parent, fit, taps, sigmas)
-            logging.info('Upper T%d (Top %d): direct=%.6f taps=%d fit=%.9f',
-                         i, parent, parent_match, len(taps), fit)
+            i, parent_match, parent, fit, taps, sigmas, *rest = row
+            shift = rest[2] if len(rest) > 2 else 0
+            results[i] = (parent_match, parent, fit, taps, sigmas, shift)
+            logging.info('Upper T%d (Top %d): direct=%.6f taps=%d fit=%.9f (shift=%d)',
+                         i, parent, parent_match, len(taps), fit, shift)
 
     failed = [i for i, row in enumerate(results)
               if row is None or row[1] < 0 or row[2] < upper.min_match]
@@ -706,6 +736,7 @@ def fit_upper_level(args, middle_bank, psd, flen, output):
     for name, path in (('top', args.top_bank), ('middle', args.coarse_bank),
                        ('fine', args.fine_bank)):
         output['fir_data'].attrs[name + '_bank_sha256'] = file_sha256(path)
+    return results
 
 # --- 4. MAIN PROCESS ---
 def main():
@@ -773,6 +804,11 @@ def main():
     parser.add_argument('--compressed-top-waveforms-interpolation', default='inline_quadratic',
                         choices=('inline_quadratic', 'inline_linear', 'inline_cubic', 'inline_quartic'),
                         help="Interpolation method to use for compressed top waveforms (default: inline_quadratic).")
+    parser.add_argument('--enable-tap-centering', action='store_true', default=True,
+                        help="Enable group-delay phase centering for FIR tap compression (default: True).")
+    parser.add_argument('--disable-tap-centering', action='store_false',
+                        dest='enable_tap_centering',
+                        help="Disable group-delay phase centering.")
     pycbc.psd.insert_psd_option_group(parser)
     args = parser.parse_args()
     if args.top_bank is not None and (args.upper_delta_f is None or
@@ -859,8 +895,8 @@ def main():
 
             for result in results_iter:
                 (i, coarse_match, c_idx, qa_match, final_taps_data, sigmas, n_peak_passes, n_bins_capped,
-                 n_attempts_total, n_attempts_suppressed) = result
-                all_results[i] = (coarse_match, c_idx, qa_match, final_taps_data, sigmas)
+                 shift, n_attempts_total, n_attempts_suppressed) = result
+                all_results[i] = (coarse_match, c_idx, qa_match, final_taps_data, sigmas, shift)
 
                 is_fail = (c_idx == -1) or (qa_match < args.min_match)
                 if is_fail:
@@ -878,7 +914,7 @@ def main():
                 if args.verbose >= 1:
                     mismatch = 1.0 - qa_match
                     logging.info(f"T{i} (Ref {c_idx}): Coarse={coarse_match:.4f}, Taps={len(final_taps_data)}, "
-                                 f"Final={qa_match:.5f}, Mism={mismatch:.5e}, "
+                                 f"Final={qa_match:.5f}, Mism={mismatch:.5e}, Shift={shift}, "
                                  f"PeakSuppression: passes={n_peak_passes} remaining_capped_bins={n_bins_capped}")
                     log.handlers[0].flush() # Flush stdout
 
@@ -891,7 +927,14 @@ def main():
             if failed_count:
                 raise ValueError('%d lower-level FIR fits failed; refusing hierarchy' %
                                  failed_count)
-            fit_upper_level(args, coarse_bank, psd, flen, f_out)
+            upper_results = fit_upper_level(args, coarse_bank, psd, flen, f_out)
+            if upper_results is not None:
+                for c_idx, u_row in enumerate(upper_results):
+                    if u_row is not None and len(u_row) > 5:
+                        shift_u = u_row[5]
+                        c_grp_name = str(c_idx)
+                        if shift_u != 0 and c_grp_name in fir_group and 'sample_shift' in fir_group[c_grp_name]:
+                            fir_group[c_grp_name]['sample_shift'][:] += shift_u
 
         logging.info(f"Done. Saved to {args.output_file}")
 
