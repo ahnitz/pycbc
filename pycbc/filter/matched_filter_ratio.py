@@ -78,6 +78,9 @@ class MatchedFilterRatioControl(object):
         """
         Prepare frequency-domain filters for a batch of taps using TimeDomainFilterBank.
         """
+        fft_lengths = None
+        if os.environ.get('PYCBC_RATIO_FFT_LENGTH'):
+            fft_lengths = [int(x.strip()) for x in os.environ['PYCBC_RATIO_FFT_LENGTH'].split(',') if x.strip()]
         self._td_bank = _mf.TimeDomainFilterBank(
             fir_taps, tap_counts,
             tap_sample_rate=self.tap_sr,
@@ -89,6 +92,7 @@ class MatchedFilterRatioControl(object):
             coarse_band_hz=self._coarse_band_hz,
             device=self._device,
             max_batch_size=self.batch_size,
+            fft_lengths=fft_lengths,
         )
         n_taps_max = int(np.max(tap_counts))
         return self._td_bank.filters_f, n_taps_max

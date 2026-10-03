@@ -830,7 +830,7 @@ def main():
         coarse_tau0_all = None
         inj_chirp_win = 5.0
         if getattr(args, 'filter_inj_only', False) and any(inj_filter_rejector.get(ifo) is not None and getattr(inj_filter_rejector[ifo], 'injection_params', None) is not None for ifo in instruments):
-            ref_ifo = instruments[0]
+            ref_ifo = next(ifo for ifo in instruments if inj_filter_rejector.get(ifo) is not None and getattr(inj_filter_rejector[ifo], 'injection_params', None) is not None)
             ref_rejector = inj_filter_rejector.get(ref_ifo)
             if ref_rejector is not None and getattr(ref_rejector, 'injection_params', None) is not None:
                 inj_tab = ref_rejector.injection_params.table
@@ -1009,8 +1009,9 @@ def main():
                     chunk_scales = all_scales[chunk_slice]
 
                     t_up_prep = time.perf_counter()
+                    any_seg = next(segments[i][0] for i in instruments if len(segments[i]) > 0)
                     upper_chunk = UpperReferenceBatch(
-                        chunk_taps, chunk_counts, chunk_mids, (len(segments[instruments[0]][0]) - 1) * 2)
+                        chunk_taps, chunk_counts, chunk_mids, (len(any_seg) - 1) * 2)
                     TIMERS['upper_prep'] += time.perf_counter() - t_up_prep
 
                     chunk_groups = []
@@ -1048,6 +1049,28 @@ def main():
                         active_ifos = [ifo for ifo in instruments if s_num < len(segments[ifo])]
                         if not active_ifos:
                             continue
+
+                        can_asym_seg = bool(args.asym_windowing and len(active_ifos) > 1)
+                        if can_asym_seg:
+                            seg_gps = {}
+                            for ifo in active_ifos:
+                                st = segments[ifo][s_num]
+                                sr = args.sample_rate[ifo] if isinstance(args.sample_rate, dict) else args.sample_rate
+                                sr = float(sr or getattr(st, 'sample_rate', 2048.0))
+                                t0 = float(gwstrain[ifo].start_time)
+                                s_start = getattr(st, 'seg_slice', slice(0)).start if getattr(st, 'seg_slice', None) is not None else 0
+                                a_start = st.analyze.start if getattr(st, 'analyze', None) is not None else 0
+                                a_stop = st.analyze.stop if getattr(st, 'analyze', None) is not None else len(st)
+                                seg_gps[ifo] = (t0 + (s_start + a_start) / sr, t0 + (s_start + a_stop) / sr)
+
+                            for i_idx in range(len(active_ifos)):
+                                for j_idx in range(i_idx + 1, len(active_ifos)):
+                                    ifo_1, ifo_2 = active_ifos[i_idx], active_ifos[j_idx]
+                                    if max(seg_gps[ifo_1][0], seg_gps[ifo_2][0]) >= min(seg_gps[ifo_1][1], seg_gps[ifo_2][1]):
+                                        can_asym_seg = False
+                                        break
+                                if not can_asym_seg:
+                                    break
 
                         cur_seg_slices = tuple(
                             (ifo,
@@ -1131,7 +1154,7 @@ def main():
                                         snrs = snrs[in_bounds]
                                         tstarts = tstarts[in_bounds]
 
-                                if not (args.asym_windowing and len(active_ifos) > 1):
+                                if not can_asym_seg:
                                     std_trigs[ifo] = process_and_record_triggers(
                                         ids_local, t_idxs, snrs, tstarts,
                                         stilde, h_norm, coarse_idx, fine_indices,
@@ -1143,7 +1166,7 @@ def main():
                                 else:
                                     std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
 
-                            if args.asym_windowing and len(active_ifos) > 1:
+                            if can_asym_seg:
                                 t_asym0 = time.perf_counter()
                                 chi_asym_before = TIMERS['power_chisq']
                                 for ifo_A in active_ifos:
@@ -1179,27 +1202,39 @@ def main():
                                         top_template=top_template, mid_tap_arr=mid_tap_arr,
                                     )
 
+                                    sr_A = args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate
+                                    sr_A = float(sr_A or getattr(stilde_A, 'sample_rate', 2048.0))
+                                    s_start_A = getattr(stilde_A, 'seg_slice', slice(0)).start if getattr(stilde_A, 'seg_slice', None) is not None else 0
+                                    t0_A = float(gwstrain[ifo_A].start_time)
+
                                     for ifo_B in active_ifos:
                                         if ifo_B == ifo_A:
                                             continue
                                         stilde_B = segments[ifo_B][s_num]
                                         h_norm_B = h_norms[ifo_B]
                                         ref_snr_B = middle_series[ifo_B][coarse_idx]
+                                        sr_B = args.sample_rate[ifo_B] if isinstance(args.sample_rate, dict) else args.sample_rate
+                                        sr_B = float(sr_B or getattr(stilde_B, 'sample_rate', 2048.0))
+                                        s_start_B = getattr(stilde_B, 'seg_slice', slice(0)).start if getattr(stilde_B, 'seg_slice', None) is not None else 0
+                                        t0_B = float(gwstrain[ifo_B].start_time)
+
                                         for k in cand_indices:
                                             cand_lid = a_ids[k]
-                                            cand_tcenter = a_tidxs[k]
+                                            a_tcenter = a_tidxs[k]
+                                            gps_trig = t0_A + (s_start_A + a_tcenter) / sr_A
+                                            cand_tcenter = int(round((gps_trig - t0_B) * sr_B)) - s_start_B
 
                                             asym_ids, asym_t_idxs, asym_snrs, asym_tstarts, searched_intervals = sample_asym_bins(
                                                 group_engine=group_engine,
                                                 ref_snr=ref_snr_B,
                                                 local_id=cand_lid,
                                                 t_center=cand_tcenter,
-                                                sample_rate=args.sample_rate[ifo_B] if isinstance(args.sample_rate, dict) else args.sample_rate,
+                                                sample_rate=sr_B,
                                                 bin_width=args.asym_bin_width,
                                                 num_bins=effective_asym_num_bins,
                                                 valid_slice=stilde_B.analyze,
                                                 stilde=stilde_B,
-                                                gps_start_time=args.gps_start_time[ifo_B] if isinstance(args.gps_start_time, dict) else args.gps_start_time,
+                                                gps_start_time=t0_B,
                                             )
 
                                             if searched_intervals:
