@@ -472,12 +472,10 @@ def select_primary_asym_candidates(
 
     Applies:
     1. Primary SNR threshold (rho_A >= asym_snr_threshold, e.g. 6.0).
-    2. Per-template within-window pruning: within each template in the fine group,
-       suppress triggers within half_win_samp of a louder trigger.
-    3. Heuristic 2 (Primary Followup Throttling per Fine Group):
+    2. Primary Followup Throttling per Fine Group (max_primary_per_group_sec):
        Within each 1-second interval and within each fine template group,
-       only allow the loudest Y (max_primary_per_group_sec) primary triggers
-       to instigate secondary followup windowing (set 0 to disable).
+       only allow the loudest Y primary triggers to instigate secondary followup windowing
+       (set 0 to disable).
     """
     if len(a_ids) == 0:
         return np.empty(0, dtype=np.int64)
@@ -493,24 +491,6 @@ def select_primary_asym_candidates(
     if sample_rate is None and stilde is not None:
         sample_rate = getattr(stilde, 'sample_rate', 2048.0)
     sample_rate_val = float(sample_rate or 2048.0)
-
-    # 1. Per-template pruning across the followup half-window
-    half_win_samp = int(round(bin_width * num_bins * 0.5 * sample_rate_val))
-    unique_lids = np.unique(a_ids[cand_indices])
-    pruned = []
-    for uid in unique_lids:
-        u_cands = cand_indices[a_ids[cand_indices] == uid]
-        if len(u_cands) == 1:
-            pruned.append(u_cands[0])
-        else:
-            order = np.argsort(-abs(a_snrs[u_cands]), kind='stable')
-            kept_t = []
-            for ci in u_cands[order]:
-                ct = a_tidxs[ci]
-                if not any(abs(ct - kt) < half_win_samp for kt in kept_t):
-                    kept_t.append(ct)
-                    pruned.append(ci)
-    cand_indices = np.array(pruned, dtype=np.int64)
 
     # 2. Heuristic 2: Primary Followup Throttling per Fine Group per 1-second interval
     if max_primary_per_group_sec is not None and max_primary_per_group_sec > 0 and len(cand_indices) > max_primary_per_group_sec:
