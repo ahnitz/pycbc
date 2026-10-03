@@ -54,30 +54,35 @@ class UpperReferenceBatch:
     def __init__(self, taps, counts, middle_ids, series_length):
         import matchedfilter
 
-        if not hasattr(matchedfilter, 'CorrelationFilter'):
-            raise ImportError('three-level FIR banks require matchedfilter.CorrelationFilter')
         self.middle_ids = np.asarray(middle_ids, dtype=int)
         self.series_length = int(series_length)
-        # At 8001 taps, 32768-point blocks amortize the overlap better than
-        # 16384-point blocks while keeping the output batch manageable.
-        self.n = max(1024, 1 << int(np.ceil(np.log2(4 * int(max(counts))))))
-        self.margin = int(max(counts)) // 2
-        self.step = self.n - 2 * self.margin
-        self.starts = np.arange(0, self.series_length - self.margin,
-                                self.step, dtype=np.uintp)
-        self.plan = matchedfilter.CorrelationFilter(
-            self.n, ndata=1, ntemplates=len(self.middle_ids),
-            device='cpu', valid=(self.margin, self.n - self.margin))
-        # run_series divides its forward FFT by n before its unnormalised
-        # inverse, giving a normalised correlation. The upper FIRs are
-        # centered on their middle sample.
-        spectra = np.empty((len(self.middle_ids), self.n), dtype=np.complex64)
-        for row, count in enumerate(counts):
-            count = int(count)
-            centered = np.zeros(self.n, dtype=np.float32)
-            centered[(np.arange(count) - count // 2) % self.n] = taps[row, :count]
-            spectra[row] = np.fft.fft(centered).astype(np.complex64)
-        self.plan.set_templates(spectra)
+        if hasattr(matchedfilter, 'TimeDomainFilterBank') and hasattr(matchedfilter.TimeDomainFilterBank, 'correlate_series'):
+            # Modern path: dynamic N partitioning, C SIMD ingestion, and fused scaling
+            self.bank = matchedfilter.TimeDomainFilterBank(
+                taps, tap_counts=counts,
+                engine='corr'
+            )
+            self._use_bank = True
+        else:
+            # Fallback path for older matchedfilter versions
+            if not hasattr(matchedfilter, 'CorrelationFilter'):
+                raise ImportError('three-level FIR banks require matchedfilter.CorrelationFilter or TimeDomainFilterBank')
+            self.n = max(1024, 1 << int(np.ceil(np.log2(4 * int(max(counts))))))
+            self.margin = int(max(counts)) // 2
+            self.step = self.n - 2 * self.margin
+            self.starts = np.arange(0, self.series_length - self.margin,
+                                    self.step, dtype=np.uintp)
+            self.plan = matchedfilter.CorrelationFilter(
+                self.n, ndata=1, ntemplates=len(self.middle_ids),
+                device='cpu', valid=(self.margin, self.n - self.margin))
+            spectra = np.empty((len(self.middle_ids), self.n), dtype=np.complex64)
+            for row, count in enumerate(counts):
+                count = int(count)
+                centered = np.zeros(self.n, dtype=np.float32)
+                centered[(np.arange(count) - count // 2) % self.n] = taps[row, :count]
+                spectra[row] = np.fft.fft(centered).astype(np.complex64)
+            self.plan.set_templates(spectra)
+            self._use_bank = False
         self._scales_cache = {}
 
     def get_scales(self, top_norm, middle_templates, psd, tap_sample_rate):
@@ -100,7 +105,6 @@ class UpperReferenceBatch:
         """Return middle-id to SNR series, scaled like direct middle filtering."""
         if len(top_series) != self.series_length:
             raise ValueError('top reference length changed between segments')
-        t0 = time.perf_counter()
         if valid_slice is not None:
             # When an explicit valid_slice is requested (e.g. narrow injection windowing),
             # pad by the maximum lower-stage FIR tap half-width so the lower-stage convolution
@@ -111,8 +115,7 @@ class UpperReferenceBatch:
             ext_slice = slice(v_start, v_stop)
         else:
             ext_slice = None
-        series = self.plan.run_series(top_series, valid_slice=ext_slice)
-        t1 = time.perf_counter()
+
         if (isinstance(middle_norms_or_scales, np.ndarray)
                 and middle_norms_or_scales.ndim == 1
                 and len(middle_norms_or_scales) == len(self.middle_ids)
@@ -122,9 +125,20 @@ class UpperReferenceBatch:
             scales = np.asarray(
                 np.sqrt(top_norm / np.asarray(middle_norms_or_scales)) / tap_sample_rate,
                 dtype=np.float32)
-        scaled_series = series * scales[:, None]
-        self.last_library_seconds = t1 - t0
-        self.last_scale_seconds = time.perf_counter() - t1
+
+        t0 = time.perf_counter()
+        if self._use_bank:
+            scaled_series = self.bank.correlate_series(
+                top_series, valid_slice=ext_slice, scales=scales
+            )
+        else:
+            if hasattr(self.plan, 'run_series') and 'scales' in self.plan.run_series.__code__.co_varnames:
+                scaled_series = self.plan.run_series(top_series, valid_slice=ext_slice, scales=scales)
+            else:
+                series = self.plan.run_series(top_series, valid_slice=ext_slice)
+                scaled_series = series * scales[:, None]
+        self.last_library_seconds = time.perf_counter() - t0
+        self.last_scale_seconds = 0.0
         return dict(zip(self.middle_ids, scaled_series))
 
 
