@@ -152,7 +152,7 @@ if args.distance_type == 'redshift':
 
 if 'snr' in args.distance_type:  # only evaluate SNRs if needed
     opt_snrsq_arr = \
-        [f['injections/optimal_snr_%s' % ifo][:] ** 2. for ifo in ifos]
+        [numpy.nan_to_num(f['injections/optimal_snr_%s' % ifo][:], nan=0.0) ** 2. for ifo in ifos]
     dvals['comb_optimal_snr'] = \
         numpy.array([numpy.sqrt(sum(opt_snrsq))
                      for opt_snrsq in zip(*opt_snrsq_arr)])
