@@ -34,6 +34,7 @@ import pycbc.vetoes
 # --- Imports for Ratio Logic ---
 from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython
 from pycbc.filter.matched_filter_ratio import MatchedFilterRatioControl
+from pycbc.filter import sigmasq
 from pycbc.types import Array, FrequencySeries, complex64, float32, zeros
 from pycbc.vetoes.chisq import (
     power_chisq_at_points_from_precomputed,
@@ -146,9 +147,10 @@ class UpperReferenceBatch:
 def compute_batch_chisq(ids_local, t_idxs, snrs,
                         fine_indices, tstarts, stilde, bank,
                         ref_snr, filters_f, args,
-                        top_template=None, mid_tap_arr=None):
-    """Compute power chisq for triggers using standard power_chisq_bins on the
-    reconstructed decimated waveform, with descending-SNR time clustering."""
+                        top_template=None, mid_tap_arr=None,
+                        h_norm=None):
+    """Compute power chisq for triggers using full-frequency matched filter
+    correlation and same-template descending-SNR time clustering."""
     global_ids = fine_indices[ids_local]
     snr_amp = abs(snrs)
     num_trigs = len(snrs)
@@ -170,41 +172,15 @@ def compute_batch_chisq(ids_local, t_idxs, snrs,
         bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0
     ))
 
-    upper_f_cache = {}
-    def get_upper_f(blen):
-        if blen not in upper_f_cache:
-            if mid_tap_arr is not None and len(mid_tap_arr) > 0:
-                buf_u = np.zeros(blen, dtype=np.float32)
-                cnt_u = len(mid_tap_arr)
-                buf_u[(np.arange(cnt_u) - cnt_u // 2) % blen] = mid_tap_arr
-                upper_f_cache[blen] = np.fft.rfft(buf_u).astype(np.complex64)
-            else:
-                upper_f_cache[blen] = None
-        return upper_f_cache[blen]
+    delta_f = float(stilde.delta_f)
+    N = (len(stilde) - 1) * 2
+    kmin = int(flow / delta_f)
+    kmax = min(int(f_final / delta_f), len(stilde))
 
-    # Reconstruct decimated coarse reference waveform / sqrt(PSD)
-    sample_rate = float(stilde.sample_rate)
-    block_len = len(filters_f[ids_local[0]])
-    df = sample_rate / block_len
-    dec = int(df / stilde.delta_f)
-    n_half = block_len // 2 + 1
+    # stilde is already overwhitened (divided by PSD) in-place at segment setup
+    stilde_slice = stilde[kmin:kmax].numpy()
 
-    psd_dec = stilde.psd[::dec][:n_half]
-    if top_template is not None:
-        top_dec = top_template[::dec][:n_half]
-        uf = get_upper_f(block_len)
-        if uf is not None:
-            coarse_dec = (top_dec * uf) / bank.sample_rate
-        else:
-            coarse_dec = top_dec
-        w = coarse_dec / np.sqrt(psd_dec)
-    else:
-        w = None
-
-    psd2 = FrequencySeries(np.ones(n_half, dtype=np.float32), delta_f=df)
-
-    ref_f_cache = {}
-    bins_cache = {}
+    tmpl_cache = {}
     iterations = 0
 
     for idx in sort_order:
@@ -215,73 +191,47 @@ def compute_batch_chisq(ids_local, t_idxs, snrs,
         if assigned_mask[idx]:
             continue
 
+        target_global_id = int(global_ids[idx])
+        t_idx = int(t_idxs[idx])
         snrv = snrs[idx]
-        t_idx = t_idxs[idx]
-        target_global_id = global_ids[idx]
-        tstart = tstarts[idx]
-        local_id = ids_local[idx]
 
-        rescale = bank.snr_rescale(target_global_id,
-                                   method=args.template_normalization_method)
-        snrvs = np.array([snrv], ndmin=1) / rescale
-        tids2 = np.array([t_idx - tstart], ndmin=1, dtype=np.int32)
+        if target_global_id not in tmpl_cache:
+            tmplt = bank[target_global_id]
 
-        ratio = filters_f[local_id]
-        if len(ratio) != block_len:
-            block_len = len(ratio)
-            df = sample_rate / block_len
-            dec = int(df / stilde.delta_f)
-            n_half = block_len // 2 + 1
-            psd_dec = stilde.psd[::dec][:n_half]
-            if top_template is not None:
-                top_dec = top_template[::dec][:n_half]
-                uf = get_upper_f(block_len)
-                if uf is not None:
-                    coarse_dec = (top_dec * uf) / bank.sample_rate
+            if h_norm is not None:
+                if args.template_normalization_method == 'precalculated_sigma':
+                    if not hasattr(bank, 'sigma_sigma_rescale'):
+                        bank.setup_sigma_norm()
+                    sigmasq_rescale = float(bank.sigma_sigma_rescale[target_global_id] ** 2.0)
                 else:
-                    coarse_dec = top_dec
-                w = coarse_dec / np.sqrt(psd_dec)
-            psd2 = FrequencySeries(np.ones(n_half, dtype=np.float32), delta_f=df)
-
-        if local_id not in bins_cache:
-            if w is not None:
-                fine_dec = abs(w * np.conj(ratio[:n_half])) / bank.sample_rate
-                t2 = FrequencySeries(fine_dec, delta_f=df)
-                bins = power_chisq_bins(t2, int(args.chisq_bins), psd2,
-                                        low_frequency_cutoff=flow,
-                                        high_frequency_cutoff=f_final)
+                    sigmasq_rescale = float(bank.sigma_rescale(target_global_id, method=args.template_normalization_method) ** 2.0)
+                sigmasq_val = float(h_norm * sigmasq_rescale)
             else:
-                kmin = int(flow / df)
-                kmax = min(int(f_final / df), n_half)
-                bins = np.linspace(kmin, kmax, int(args.chisq_bins) + 1).astype(np.int32)
-            bins_cache[local_id] = bins
-        bins = bins_cache[local_id]
-        dof = (len(bins) - 1) * 2 - 2
+                sigmasq_val = float(sigmasq(tmplt, stilde.psd, low_frequency_cutoff=flow, high_frequency_cutoff=f_final))
 
-        cache_key = (tstart, block_len)
-        if cache_key not in ref_f_cache:
-            if isinstance(ref_snr, dict):
-                ref = ref_snr.get(cache_key, ref_snr.get(tstart))
-            elif hasattr(ref_snr, 'ref_snr'):
-                ref = ref_snr.ref_snr[tstart:tstart+block_len]
-            else:
-                ref = ref_snr[tstart:tstart+block_len]
-            if ref is None:
-                continue
-            ref = ref[:block_len]
-            if len(ref) < block_len:
-                ref = np.pad(ref, (0, block_len - len(ref)))
-            ref_f = zeros(len(ref), dtype=complex64)
-            pycbc.fft.FFT(Array(ref, dtype=complex64), ref_f).execute()
-            ref_f_cache[cache_key] = ref_f
-        ref_f = ref_f_cache[cache_key]
+            snr_norm = float((4.0 * delta_f) / np.sqrt(sigmasq_val))
 
-        corr2 = FrequencySeries(ratio * ref_f.numpy(), delta_f=df) / rescale / block_len
-        chi = power_chisq_at_points_from_precomputed(corr2, snrvs, 1.0, bins, tids2)
+            corr_arr = np.zeros(N, dtype=np.complex64)
+            corr_arr[kmin:kmax] = stilde_slice * np.conj(tmplt[kmin:kmax].numpy())
+            corr = FrequencySeries(corr_arr, delta_f=delta_f)
 
-        # Descending SNR assignment across cluster within chisq_window
-        window_mask = (abs(t_idxs - t_idx) <= chisq_window_samp)
-        update_mask = window_mask & (~assigned_mask) & (snr_amp >= cthresh)
+            bins = power_chisq_bins(tmplt, int(args.chisq_bins), stilde.psd,
+                                    low_frequency_cutoff=flow, high_frequency_cutoff=f_final)
+            dof = (len(bins) - 1) * 2 - 2
+            rescale = float(bank.snr_rescale(target_global_id, method=args.template_normalization_method))
+            tmpl_cache[target_global_id] = (corr, snr_norm, rescale, bins, dof)
+
+        corr, snr_norm, rescale, bins, dof = tmpl_cache[target_global_id]
+
+        norm_snr = snrv / rescale
+        unnorm_snrv = np.array([norm_snr / snr_norm], dtype=np.complex64)
+        tids2 = np.array([t_idx], ndmin=1, dtype=np.int32)
+
+        chi = power_chisq_at_points_from_precomputed(corr, unnorm_snrv, snr_norm, bins, tids2)
+
+        # Same-template descending-SNR clustering within chisq_window
+        same_tmpl_window = (global_ids == target_global_id) & (abs(t_idxs - t_idx) <= chisq_window_samp)
+        update_mask = same_tmpl_window & (~assigned_mask) & (snr_amp >= cthresh)
         chisq_vals[update_mask] = float(abs(chi[0]))
         chisq_dof_vals[update_mask] = dof
         assigned_mask[update_mask] = True
@@ -316,7 +266,8 @@ def process_and_record_triggers(
                 ids_local, t_idxs, snrs,
                 fine_indices, tstarts, stilde, bank,
                 ref_snr, filters_f, args,
-                top_template=top_template, mid_tap_arr=mid_tap_arr)
+                top_template=top_template, mid_tap_arr=mid_tap_arr,
+                h_norm=h_norm)
             TIMERS['power_chisq'] += time.perf_counter() - t_chi0
         else:
             chi = np.zeros(len(ids_local), dtype=float32)
