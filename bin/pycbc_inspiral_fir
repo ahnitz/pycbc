@@ -35,7 +35,7 @@ import pycbc.vetoes
 from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython
 from pycbc.filter.matched_filter_ratio import MatchedFilterRatioControl
 from pycbc.filter import sigmasq
-from pycbc.types import Array, FrequencySeries, complex64, float32, zeros
+from pycbc.types import Array, FrequencySeries, TimeSeries, complex64, float32, zeros
 from pycbc.vetoes.chisq import (
     power_chisq_at_points_from_precomputed,
     power_chisq_bins,
@@ -163,6 +163,33 @@ class UpperReferenceBatch:
 
 
 
+_CHISQ_CTX = None
+
+
+def get_chisq_context(sample_rate, n_pad=16384):
+    """Retrieve or allocate reusable FFT plan and workspace buffers for power chisq."""
+    global _CHISQ_CTX
+    if (_CHISQ_CTX is None or
+            _CHISQ_CTX['n_pad'] != n_pad or
+            _CHISQ_CTX['sample_rate'] != sample_rate):
+        invec = TimeSeries(zeros(n_pad, dtype=complex64), delta_t=1.0 / sample_rate)
+        outvec = FrequencySeries(zeros(n_pad, dtype=complex64), delta_f=sample_rate / n_pad)
+        plan = pycbc.fft.FFT(invec, outvec)
+        corr = FrequencySeries(zeros(n_pad, dtype=complex64), delta_f=sample_rate / n_pad)
+        _CHISQ_CTX = {
+            'n_pad': n_pad,
+            'sample_rate': sample_rate,
+            'df_pad': sample_rate / n_pad,
+            'plan': plan,
+            'invec': invec,
+            'outvec': outvec,
+            'corr': corr,
+            'bins_cache': {},
+            'ratio_cache': {},
+        }
+    return _CHISQ_CTX
+
+
 def compute_batch_chisq(ids_local, t_idxs, snrs,
                         fine_indices, tstarts, stilde, bank,
                         ref_snr, filters_f, args,
@@ -193,22 +220,29 @@ def compute_batch_chisq(ids_local, t_idxs, snrs,
 
     sample_rate = float(stilde.sample_rate)
     N_pad = 16384
-    df_pad = sample_rate / N_pad
-    kmin_pad = int(flow / df_pad)
-    kmax_pad = min(int(f_final / df_pad), N_pad // 2)
+    ctx = get_chisq_context(sample_rate, N_pad)
 
-    dec = max(1, int(round(df_pad / stilde.delta_f)))
-    n_half_pad = N_pad // 2 + 1
-    psd_pad = FrequencySeries(stilde.psd[::dec][:n_half_pad], delta_f=df_pad)
-    norm_pad = spa_tmplt_norm(psd_pad, n_half_pad, df_pad, flow)
-    bins = power_chisq_bins_from_sigmasq_series(norm_pad, int(args.chisq_bins), kmin_pad, kmax_pad)
-    dof = (len(bins) - 1) * 2 - 2
+    # Cache bins per (id(psd), flow, f_final, n_bins)
+    bins_key = (id(stilde.psd), flow, f_final, int(args.chisq_bins))
+    if bins_key not in ctx['bins_cache']:
+        df_pad = ctx['df_pad']
+        kmin_pad = int(flow / df_pad)
+        kmax_pad = min(int(f_final / df_pad), N_pad // 2)
+        dec = max(1, int(round(df_pad / stilde.delta_f)))
+        n_half_pad = N_pad // 2 + 1
+        psd_pad = FrequencySeries(stilde.psd[::dec][:n_half_pad], delta_f=df_pad)
+        norm_pad = spa_tmplt_norm(psd_pad, n_half_pad, df_pad, flow)
+        bins = power_chisq_bins_from_sigmasq_series(norm_pad, int(args.chisq_bins), kmin_pad, kmax_pad)
+        dof = (len(bins) - 1) * 2 - 2
+        ctx['bins_cache'][bins_key] = (bins, dof)
+    bins, dof = ctx['bins_cache'][bins_key]
 
     taps_coarse, counts_coarse, _ = bank.get_firs(coarse_idx) if coarse_idx is not None else (None, None, None)
 
     ref_f_cache = {}
-    ratio_cache = {}
     iterations = 0
+    tids2_arr = np.zeros(1, dtype=np.int32)
+    snrvs_arr = np.zeros(1, dtype=complex64)
 
     for idx in sort_order:
         if max_iterations is not None and iterations >= max_iterations:
@@ -225,7 +259,7 @@ def compute_batch_chisq(ids_local, t_idxs, snrs,
         tstart = int(tstarts[idx])
 
         rescale = float(bank.snr_rescale(target_global_id, method=args.template_normalization_method))
-        snrvs = np.array([snrv], ndmin=1) / rescale
+        snrvs_arr[0] = snrv / rescale
 
         block_len = len(filters_f[local_id])
         dt = t_idx - tstart
@@ -240,26 +274,31 @@ def compute_batch_chisq(ids_local, t_idxs, snrs,
                 ref = ref_snr[tstart:tstart+block_len]
             if ref is None:
                 continue
-            ref_padded = np.zeros(N_pad, dtype=np.complex64)
-            ref_padded[:len(ref[:block_len])] = ref[:block_len]
-            ref_f_cache[cache_key] = np.fft.fft(ref_padded)
+            ctx['invec'].clear()
+            ref_slice = ref[:block_len]
+            ctx['invec'].data[:len(ref_slice)] = ref_slice
+            ctx['plan'].execute()
+            ref_f_cache[cache_key] = ctx['outvec'].data.copy()
         ref_f_pad = ref_f_cache[cache_key]
 
-        if local_id not in ratio_cache:
+        ratio_key = (id(bank), coarse_idx, local_id)
+        if ratio_key not in ctx['ratio_cache']:
             if taps_coarse is not None:
                 cnt = int(counts_coarse[local_id])
-                buf = np.zeros(N_pad, dtype=np.float32)
-                buf[:cnt] = taps_coarse[local_id, :cnt]
-                buf = np.roll(buf, -(cnt // 2))
-                ratio_cache[local_id] = np.conj(np.fft.fft(buf).astype(np.complex64))
+                ctx['invec'].clear()
+                ctx['invec'].data[:cnt] = taps_coarse[local_id, :cnt]
+                ctx['invec'].data[:] = np.roll(ctx['invec'].data, -(cnt // 2))
+                ctx['plan'].execute()
+                ctx['ratio_cache'][ratio_key] = np.conj(ctx['outvec'].data).copy()
             else:
-                ratio_cache[local_id] = None
+                ctx['ratio_cache'][ratio_key] = None
 
-        ratio_pad = ratio_cache[local_id]
+        ratio_pad = ctx['ratio_cache'][ratio_key]
         if ratio_pad is not None:
-            corr2 = FrequencySeries(ratio_pad * ref_f_pad, delta_f=df_pad) / rescale / N_pad
-            tids2 = np.array([dt], ndmin=1, dtype=np.int32)
-            chi = power_chisq_at_points_from_precomputed(corr2, snrvs, 1.0, bins, tids2)
+            corr_factor = 1.0 / (rescale * N_pad)
+            ctx['corr'].data[:] = (ratio_pad * ref_f_pad) * corr_factor
+            tids2_arr[0] = dt
+            chi = power_chisq_at_points_from_precomputed(ctx['corr'], snrvs_arr, 1.0, bins, tids2_arr)
         else:
             chi = [0.0]
 
