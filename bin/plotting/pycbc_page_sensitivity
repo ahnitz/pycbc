@@ -246,7 +246,7 @@ for j in range(len(args.bins)-1):
 
     # cycle over inclusive / exclusive significance if available
     for sig_val, do_label, alpha in zip(fvalues, do_labels, alphas):
-        if sig_val[0] is None:
+        if len(sig_val) == 0 or sig_val[0] is None:
             logging.info('Skipping exclusive significance')
             continue
 
