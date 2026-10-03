@@ -133,8 +133,12 @@ class UpperReferenceBatch:
         ser = np.ascontiguousarray(top_series, dtype=np.complex64)
 
         if valid_slice is not None:
-            vs = 0 if valid_slice.start is None else int(valid_slice.start)
-            ve = self.series_length if valid_slice.stop is None else int(valid_slice.stop)
+            if isinstance(valid_slice, (tuple, list)):
+                vs = 0 if valid_slice[0] is None else int(valid_slice[0])
+                ve = self.series_length if valid_slice[1] is None else int(valid_slice[1])
+            else:
+                vs = 0 if valid_slice.start is None else int(valid_slice.start)
+                ve = self.series_length if valid_slice.stop is None else int(valid_slice.stop)
             if vs < 0:
                 vs = max(0, self.series_length + vs)
             if ve < 0:
@@ -150,8 +154,8 @@ class UpperReferenceBatch:
         for p in self._plan:
             cplan = p['cplan']
             st = p['st']
+            lo, hi = p['valid']
             if valid_slice is not None:
-                lo, hi = p['valid']
                 b_start = st + lo
                 b_end = np.minimum(st + hi, self.series_length)
                 keep = (b_start < v_stop) & (b_end > v_start)
@@ -160,11 +164,18 @@ class UpperReferenceBatch:
                 st_run = st
 
             g_dest = out[p['g_slice']]
+            if valid_slice is None and ifo is not None:
+                g_dest[:, :lo] = 0
+                if st_run.size > 0:
+                    last_end = min(self.series_length, st_run[-1] + hi)
+                    if last_end < self.series_length:
+                        g_dest[:, last_end:] = 0
+
             if cplan._gpu is not None:
                 cplan._continuous_gpu(ser, st_run, 0, p['g_cnt'], g_dest)
             else:
                 cplan._execution_plan().correlate_series_continuous(
-                    ser, st_run, p['valid'][0], p['valid'][1], 0, p['g_cnt'], g_dest
+                    ser, st_run, lo, hi, 0, p['g_cnt'], g_dest
                 )
 
         if valid_slice is not None:
@@ -1128,6 +1139,15 @@ def main():
                     if not chunk_groups:
                         continue
 
+                    chunk_pad = max(
+                        [4096] + [
+                            int(g.n)
+                            for g_entry in chunk_groups
+                            if getattr(g_entry[3], '_td_bank', None) is not None
+                            for g in g_entry[3]._td_bank._groups
+                        ]
+                    )
+
                     for s_num in range(num_segs):
                         active_ifos = [ifo for ifo in instruments
                                        if s_num < len(segments[ifo]) and is_valid_segment(segments[ifo][s_num])]
@@ -1154,7 +1174,7 @@ def main():
                             v_slice = getattr(stilde_cur, 'analyze', None) if not os.environ.get('PYCBC_UNCONSTRAINED_UPPER') else None
                             middle_series[ifo] = upper_chunk.run(
                                 series, norm, chunk_scales, bank.sample_rate,
-                                valid_slice=v_slice, ifo=ifo)
+                                valid_slice=v_slice, ifo=ifo, pad=chunk_pad)
                         upper_fir_seconds += time.perf_counter() - t0
                         upper_total_seconds += time.perf_counter() - t_upper_start
                         TIMERS['upper_fir'] += time.perf_counter() - t0
