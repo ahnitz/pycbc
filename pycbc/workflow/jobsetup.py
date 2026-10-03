@@ -562,7 +562,11 @@ class PyCBCInspiralExecutable(Executable):
                     node.add_opt("--frame-files", " ".join(frame_files))
         else:
             if df_parents is not None:
-                node.add_input_list_opt('--frame-files', df_parents)
+                if self.cp.has_option('workflow-matchedfilter', 'matchedfilter-method') and \
+                   self.cp.get('workflow-matchedfilter', 'matchedfilter-method') == 'WORKFLOW_MULTIPLE_IFOS':
+                    node.add_multiifo_input_list_opt('--frame-files', df_parents)
+                else:
+                    node.add_input_list_opt('--frame-files', df_parents)
 
         return node
 
