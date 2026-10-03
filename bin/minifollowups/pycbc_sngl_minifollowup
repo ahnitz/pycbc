@@ -21,6 +21,7 @@ import os
 import argparse
 import logging
 import numpy
+import h5py
 
 from igwn_ligolw import ligolw
 from igwn_ligolw import utils as ligolw_utils
@@ -156,19 +157,23 @@ if args.gating_veto_windows:
         raise ValueError("Gating veto window values must be negative before "
                          "gates and positive after gates.")
     if not (gveto_before == 0 and gveto_after == 0):
-        gate_group = f[args.instrument + '/gating/']
-        autogate_times = numpy.unique(gate_group['auto/time'][:])
-        if 'file' in gate_group:
-            detgate_times = gate_group['file/time'][:]
-        else:
-            detgate_times = []
-        gate_times = numpy.concatenate((autogate_times, detgate_times))
-        gveto_idx = veto.indices_within_times(
-            trigs.end_time,
-            gate_times + gveto_before,
-            gate_times + gveto_after
-        )
-        logging.info('%i triggers in gating vetoes', gveto_idx.size)
+        with h5py.File(args.single_detector_file, 'r') as f_sngl:
+            if args.instrument + '/gating' in f_sngl:
+                gate_group = f_sngl[args.instrument + '/gating/']
+                autogate_times = numpy.unique(gate_group['auto/time'][:])
+                if 'file' in gate_group:
+                    detgate_times = gate_group['file/time'][:]
+                else:
+                    detgate_times = []
+                gate_times = numpy.concatenate((autogate_times, detgate_times))
+                gveto_idx = veto.indices_within_times(
+                    trigs.end_time,
+                    gate_times + gveto_before,
+                    gate_times + gveto_after
+                )
+                logging.info('%i triggers in gating vetoes', gveto_idx.size)
+            else:
+                gveto_idx = numpy.array([], dtype=numpy.uint64)
 else:
     gveto_idx = numpy.array([], dtype=numpy.uint64)
 
@@ -263,10 +268,10 @@ for rank, num_event in enumerate(order):
     tid = trigger_ids[num_event]
     ifo_tid = '%s:%s' %(args.instrument, str(tid))
 
-    layouts += (mini.make_sngl_ifo(workflow, sngl_file, tmpltbank_file,
+    layouts += [(mini.make_sngl_ifo(workflow, sngl_file, tmpltbank_file,
                                    tid, args.output_dir, args.instrument,
                                    statfiles=statfiles,
-                                   tags=args.tags + [str(rank)]),)
+                                   tags=args.tags + [str(rank)])[0],)]
     files += mini.make_trigger_timeseries(workflow, [sngl_file],
                               ifo_time, args.output_dir, special_tids=ifo_tid,
                               tags=args.tags + [str(rank)])
@@ -316,7 +321,8 @@ for rank, num_event in enumerate(order):
     files += mini.make_singles_timefreq(workflow, sngl_file, tmpltbank_file,
                             time, args.output_dir,
                             data_segments=insp_data_seglists,
-                            tags=args.tags + [str(rank)])
+                            tags=args.tags + [str(rank)],
+                            ifo=args.instrument)
 
     files += mini.make_qscan_plot(workflow, args.instrument, time,
                                   args.output_dir,

@@ -574,7 +574,8 @@ for ifo in workflow.ifos:
              data_analysed_name, trig_generated_name, 'daxes', currdir,
              statfiles=wf.FileList(statfiles),
              fg_file=censored_veto, fg_name='closed_box',
-             tags=insp_file.tags + [subsec])
+             tags=insp_file.tags + [subsec],
+             ifo=curr_ifo)
 
 ##################### COINC FULL_DATA plots ###################################
 
@@ -893,17 +894,33 @@ for inj_file, tag in zip(inj_files, inj_tags):
         layout.group_layout(rdir['search_sensitivity/%s' % tag], s)
 
     # Minifollowups
-    curr_dir_nam = 'injections/followup_of_{}'.format(tag)
-    if workflow.cp.has_option_tags('workflow-injection_minifollowups',
-                                   'subsection-suffix', tags=[tag]):
-        suf_str = workflow.cp.get_opt_tags('workflow-injection_minifollowups',
-                                           'subsection-suffix', tags=[tag])
-        curr_dir_nam += '_' + suf_str
-    currdir = rdir[curr_dir_nam]
-    wf.setup_injection_minifollowups(workflow, found_inj, inj_file,
-                                     insps, hdfbank, insp_files_seg_file,
-                                     data_analysed_name, trig_generated_name,
-                                     'daxes', currdir, tags=[tag])
+    inj_subsecs = workflow.cp.get_subsections('workflow-injection_minifollowups')
+    if not inj_subsecs:
+        curr_dir_nam = 'injections/followup_of_{}'.format(tag)
+        if workflow.cp.has_option_tags('workflow-injection_minifollowups',
+                                       'subsection-suffix', tags=[tag]):
+            suf_str = workflow.cp.get_opt_tags('workflow-injection_minifollowups',
+                                               'subsection-suffix', tags=[tag])
+            curr_dir_nam += '_' + suf_str
+        currdir = rdir[curr_dir_nam]
+        wf.setup_injection_minifollowups(workflow, found_inj, inj_file,
+                                         insps, hdfbank, insp_files_seg_file,
+                                         data_analysed_name, trig_generated_name,
+                                         'daxes', currdir, tags=[tag])
+    else:
+        for subsec in inj_subsecs:
+            sec_name = f'workflow-injection_minifollowups-{subsec}'
+            dir_str = subsec
+            if workflow.cp.has_option(sec_name, 'section-header'):
+                dir_str = workflow.cp.get(sec_name, 'section-header')
+            elif workflow.cp.has_option(sec_name, 'subsection-suffix'):
+                dir_str = workflow.cp.get(sec_name, 'subsection-suffix')
+            curr_dir_nam = f'injections/followup_of_{tag}_{dir_str}'
+            currdir = rdir[curr_dir_nam]
+            wf.setup_injection_minifollowups(workflow, found_inj, inj_file,
+                                             insps, hdfbank, insp_files_seg_file,
+                                             data_analysed_name, trig_generated_name,
+                                             'daxes', currdir, tags=[tag, subsec])
 
     # If option given, make throughput plots
     if workflow.cp.has_option_tags('workflow-matchedfilter',

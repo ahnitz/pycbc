@@ -106,7 +106,7 @@ for ifo in args.single_detector_triggers:
     insp_data_seglists[ifo].coalesce()
     insp_analysed_seglists[ifo].coalesce()
 
-num_events = int(workflow.cp.get_opt_tags('workflow-minifollowups', 'num-events', ''))
+num_events = int(workflow.cp.get_opt_tags('workflow-minifollowups', 'num-events', args.tags or []))
 f = HFile(args.statmap_file, 'r')
 file_val = args.analysis_category
 stat = f['{}/stat'.format(file_val)][:]

@@ -139,7 +139,7 @@ def setup_single_det_minifollowups(workflow, single_trig_file, tmpltbank_file,
                                    dax_output, out_dir, veto_file=None,
                                    veto_segment_name=None, fg_file=None,
                                    fg_name=None, statfiles=None,
-                                   tags=None):
+                                   tags=None, ifo=None):
     """ Create plots that followup the Nth loudest clustered single detector
     triggers from a merged single detector trigger HDF file.
 
@@ -164,6 +164,8 @@ def setup_single_det_minifollowups(workflow, single_trig_file, tmpltbank_file,
         statistic.
     tags: {None, optional}
         Tags to add to the minifollowups executables
+    ifo: {None, optional}
+        IFO to follow up when single_trig_file contains multiple detectors.
     Returns
     -------
     layout: list
@@ -183,7 +185,14 @@ def setup_single_det_minifollowups(workflow, single_trig_file, tmpltbank_file,
     makedir(dax_output)
 
     # turn the config file into a File class
-    curr_ifo = single_trig_file.ifo
+    if ifo is not None:
+        curr_ifo = ifo
+    elif hasattr(single_trig_file, 'ifo_list') and len(single_trig_file.ifo_list) == 1:
+        curr_ifo = single_trig_file.ifo_list[0]
+    elif hasattr(single_trig_file, 'ifo'):
+        curr_ifo = single_trig_file.ifo
+    else:
+        curr_ifo = workflow.ifos[0]
     config_path = os.path.abspath(dax_output + '/' + curr_ifo + \
                                    '_'.join(tags) + 'singles_minifollowup.ini')
     workflow.cp.write(open(config_path, 'w'))
@@ -298,7 +307,7 @@ def setup_injection_minifollowups(workflow, injection_file, inj_xml_file,
 
     config_file = resolve_url_to_file(config_path)
 
-    exe = Executable(workflow.cp, 'injection_minifollowup', ifos=workflow.ifos, out_dir=dax_output)
+    exe = Executable(workflow.cp, 'injection_minifollowup', ifos=workflow.ifos, out_dir=dax_output, tags=tags)
 
     node = exe.create_node()
     node.add_input_opt('--config-files', config_file)
