@@ -21,9 +21,14 @@
 #
 # =============================================================================
 #
-import numpy, pycbc.psd
-from pycbc.types import TimeSeries, complex_same_precision_as
+import numpy, pycbc.psd, gc
+from pycbc.types import TimeSeries, FrequencySeries, complex_same_precision_as
 from numpy.random import RandomState
+try:
+    import ctypes
+    _libc = ctypes.CDLL('libc.so.6')
+except Exception:
+    _libc = None
 
 # This constant need to be constant to be able to recover identical results.
 BLOCK_SAMPLES = 1638400
@@ -164,20 +169,41 @@ def colored_noise(psd, start_time, end_time,
 
     kmin = int(low_frequency_cutoff / psd.delta_f)
     psd[:kmin].clear()
-    asd = (psd.squared_norm())**0.25
-    del psd
+    a = psd.data.real**2
+    a += psd.data.imag**2
+    a **= 0.25
+    asd = FrequencySeries(a, delta_f=psd.delta_f)
+    del psd, a
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
 
     white_noise = normal(start_time - filter_duration,
                          end_time + filter_duration,
                          seed=seed,
                          sample_rate=sample_rate)
     white_noise = white_noise.to_frequencyseries()
-    # Here we color. Do not want to duplicate memory here though so use '*='
-    white_noise *= asd*scale
+    if scale != 1.0:
+        asd *= scale
+    white_noise *= asd
     del asd
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
+
     colored = white_noise.to_timeseries(delta_t=1.0/sample_rate)
     del white_noise
-    return colored.time_slice(start_time, end_time)
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
+
+    res = colored.time_slice(start_time, end_time)
+    res = TimeSeries(res.numpy().copy(), delta_t=res.delta_t, epoch=res.start_time)
+    del colored
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
+    return res
 
 def noise_from_string(psd_name, start_time, end_time,
                       seed=0,

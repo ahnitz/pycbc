@@ -858,26 +858,6 @@ def main():
 
         # --- 3. Data Generation ---
         inj_filter_rejector = pycbc.inject.InjFilterRejector.from_cli_multi_ifos(args, instruments)
-        gwstrain = pycbc.strain.from_cli_multi_ifos(args, instruments,
-                                                    inj_filter_rejector_dict=inj_filter_rejector,
-                                                    dyn_range_fac=pycbc.DYN_RANGE_FAC)
-        gc.collect()
-        if libc is not None:
-            libc.malloc_trim(0)
-
-        strain_segments = pycbc.strain.StrainSegments.from_cli_multi_ifos(args, gwstrain, instruments)
-
-        for count, ifo in enumerate(instruments):
-            if count == 0:
-                sample_rate = gwstrain[ifo].sample_rate
-                flen = strain_segments[ifo].freq_len
-                tlen = strain_segments[ifo].time_len
-                delta_f = strain_segments[ifo].delta_f
-            else:
-                assert sample_rate == gwstrain[ifo].sample_rate, f"Sample rate mismatch for {ifo}"
-                assert flen == strain_segments[ifo].freq_len, f"Freq len mismatch for {ifo}"
-                assert tlen == strain_segments[ifo].time_len, f"Time len mismatch for {ifo}"
-                assert delta_f == strain_segments[ifo].delta_f, f"Delta f mismatch for {ifo}"
 
         flow = args.low_frequency_cutoff
         if flow is None:
@@ -885,43 +865,65 @@ def main():
                 if 'f_lower' in f:
                     flow = float(np.min(f['f_lower'][:]))
 
-        gating_info = {ifo: getattr(gwstrain[ifo], 'gating_info', None) for ifo in instruments}
-        gwstrain_start_time = {ifo: float(gwstrain[ifo].start_time) for ifo in instruments}
-
+        gating_info = {}
+        gwstrain_start_time = {}
         psd_var = {}
-        if args.psdvar_segment is not None:
-            logging.info("Calculating PSD variation")
-            for ifo in instruments:
+        segments = {}
+        gwstrain = {}
+
+        for count, ifo in enumerate(instruments):
+            logging.info("Generating and conditioning strain for %s... [RSS=%.1f MB, HWM=%.1f MB]", ifo, *get_mem_mb())
+            ifo_inj_rejector = inj_filter_rejector[ifo] if inj_filter_rejector else None
+            ifo_strain = pycbc.strain.from_cli_single_ifo(
+                args, ifo, inj_filter_rejector=ifo_inj_rejector,
+                dyn_range_fac=pycbc.DYN_RANGE_FAC
+            )
+            gating_info[ifo] = getattr(ifo_strain, 'gating_info', None)
+            gwstrain_start_time[ifo] = float(ifo_strain.start_time)
+
+            logging.info("Making frequency-domain data segments and associating PSDs for %s... [RSS=%.1f MB, HWM=%.1f MB]", ifo, *get_mem_mb())
+            single_det_opt = pycbc.types.optparse.copy_opts_for_single_ifo(args, ifo)
+            ifo_segments = pycbc.strain.StrainSegments.from_cli_single_ifo(args, ifo_strain, ifo)
+
+            if count == 0:
+                sample_rate = ifo_strain.sample_rate
+                flen = ifo_segments.freq_len
+                tlen = ifo_segments.time_len
+                delta_f = ifo_segments.delta_f
+            else:
+                assert sample_rate == ifo_strain.sample_rate, f"Sample rate mismatch for {ifo}"
+                assert flen == ifo_segments.freq_len, f"Freq len mismatch for {ifo}"
+                assert tlen == ifo_segments.time_len, f"Time len mismatch for {ifo}"
+                assert delta_f == ifo_segments.delta_f, f"Delta f mismatch for {ifo}"
+
+            if args.psdvar_segment is not None:
+                logging.info("Calculating PSD variation for %s", ifo)
                 ifo_opts = get_ifo_opts(args, ifo)
                 psd_var[ifo] = pycbc.psd.calc_filt_psd_variation(
-                    gwstrain[ifo], ifo_opts.psdvar_segment,
+                    ifo_strain, ifo_opts.psdvar_segment,
                     ifo_opts.psdvar_short_segment, ifo_opts.psdvar_long_segment,
                     ifo_opts.psdvar_psd_duration, ifo_opts.psdvar_psd_stride,
                     ifo_opts.psd_estimation, ifo_opts.psdvar_low_freq, ifo_opts.psdvar_high_freq
                 )
 
-        logging.info("Making frequency-domain data segments and associating PSDs")
-        segments = {}
-        for ifo in instruments:
-            single_det_opt = pycbc.types.optparse.copy_opts_for_single_ifo(args, ifo)
-            fd_segs = strain_segments[ifo].fourier_segments()
+            fd_segs = ifo_segments.fourier_segments()
             pycbc.psd.associate_psds_to_segments(
-                single_det_opt, fd_segs, gwstrain[ifo], flen, delta_f, flow,
+                single_det_opt, fd_segs, ifo_strain, flen, delta_f, flow,
                 dyn_range_factor=pycbc.DYN_RANGE_FAC, precision='single'
             )
             for seg in fd_segs:
                 if is_valid_segment(seg):
                     seg[:] = seg / seg.psd
             segments[ifo] = fd_segs
-            del strain_segments[ifo]
-            gwstrain[ifo]._data = np.empty(0, dtype=gwstrain[ifo].dtype)
+
+            ifo_strain._data = np.empty(0, dtype=ifo_strain.dtype)
+            gwstrain[ifo] = ifo_strain
+            del ifo_segments
             gc.collect()
             if libc is not None:
                 libc.malloc_trim(0)
-        del strain_segments
-        gc.collect()
-        if libc is not None:
-            libc.malloc_trim(0)
+            logging.info("Finished strain setup for %s: RSS=%.1f MB, HWM=%.1f MB", ifo, *get_mem_mb())
+
         logging.info("After segments creation and strain release: RSS=%.1f MB, HWM=%.1f MB", *get_mem_mb())
 
         # --- 4. Initialize Classes ---
@@ -1346,30 +1348,19 @@ def main():
                         s_fine = TIMERS['fine_fir'] - t_seg_fine_start
                         s_chi = TIMERS['power_chisq'] - t_seg_chi_start
                         s_asym = TIMERS['asym_followup'] - t_seg_asym_start
-                        logging.info(f"Top {top_step+1}/{n_top} (chunk {chunk_start//chunk_size+1}) Seg {s_num+1}/{num_segs}: {len(chunk_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s]")
+                        logging.info(f"Top {top_step+1}/{n_top} (chunk {chunk_start//chunk_size+1}) Seg {s_num+1}/{num_segs}: {len(chunk_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s] [RSS={get_mem_mb()[0]:.1f} MB, HWM={get_mem_mb()[1]:.1f} MB]")
                         del middle_series
                         del norms
                         try:
                             import matchedfilter.time_domain as td_mod
-                            if hasattr(td_mod, '_REF_PROFILE_CACHE'):
-                                td_mod._REF_PROFILE_CACHE.clear()
-                            if hasattr(td_mod, '_REF_BINNED_CACHE'):
-                                td_mod._REF_BINNED_CACHE.clear()
+                            td_mod._REF_PROFILE_CACHE.clear()
+                            td_mod._REF_BINNED_CACHE.clear()
                         except Exception:
                             pass
-
 
                     del chunk_groups
                     del upper_chunk
                     UpperReferenceBatch.clear_buffers()
-                    try:
-                        import matchedfilter.time_domain as td_mod
-                        if hasattr(td_mod, '_REF_PROFILE_CACHE'):
-                            td_mod._REF_PROFILE_CACHE.clear()
-                        if hasattr(td_mod, '_REF_BINNED_CACHE'):
-                            td_mod._REF_BINNED_CACHE.clear()
-                    except Exception:
-                        pass
                     gc.collect()
                     if libc is not None:
                         libc.malloc_trim(0)
