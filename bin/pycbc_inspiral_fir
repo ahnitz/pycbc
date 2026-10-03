@@ -74,6 +74,12 @@ def is_valid_segment(seg):
 class UpperReferenceBatch:
     """Expand one top SNR series into all middle series in one library call."""
 
+    _BUFFERS = {}
+
+    @classmethod
+    def clear_buffers(cls):
+        cls._BUFFERS.clear()
+
     def __init__(self, taps, counts, middle_ids, series_length):
         import matchedfilter
         from matchedfilter import _automatic_series_layout
@@ -87,7 +93,6 @@ class UpperReferenceBatch:
             taps[sort_order], tap_counts=counts_arr[sort_order],
             engine='corr'
         )
-        self._buffers = {}  # lazily allocated per ifo
 
         # Precompute execution plans so run() executes continuous C correlation directly into recycled buffers
         self._plan = []
@@ -120,14 +125,18 @@ class UpperReferenceBatch:
                 dtype=np.float32)
             scales = raw_scales[self.sort_order]
 
+        n_req = len(self.sorted_ids)
         out = None
         if ifo is not None:
-            if ifo not in self._buffers:
-                self._buffers[ifo] = np.zeros((len(self.sorted_ids), self.series_length), dtype=np.complex64)
-            out = self._buffers[ifo]
-
-        if out is None:
-            out = np.zeros((len(self.sorted_ids), self.series_length), dtype=np.complex64)
+            buf_key = (ifo, self.series_length)
+            buf = UpperReferenceBatch._BUFFERS.get(buf_key)
+            if buf is None or buf.shape[0] < n_req:
+                alloc_rows = max(n_req, 16)
+                buf = np.zeros((alloc_rows, self.series_length), dtype=np.complex64)
+                UpperReferenceBatch._BUFFERS[buf_key] = buf
+            out = buf[:n_req]
+        else:
+            out = np.zeros((n_req, self.series_length), dtype=np.complex64)
 
         ser = np.ascontiguousarray(top_series, dtype=np.complex64)
 
@@ -149,26 +158,35 @@ class UpperReferenceBatch:
             v_start = 0
             v_stop = self.series_length
 
-        t0 = time.perf_counter()
         for p in self._plan:
             cplan = p['cplan']
             st = p['st']
             lo, hi = p['valid']
+            g_dest = out[p['g_slice']]
             if valid_slice is not None:
                 b_start = st + lo
                 b_end = np.minimum(st + hi, self.series_length)
                 keep = (b_start < v_stop) & (b_end > v_start)
-                st_run = st[keep] if keep.any() else np.empty(0, dtype=np.uintp)
+                if keep.any():
+                    st_run = st[keep]
+                    k_indices = np.flatnonzero(keep)
+                    cov_start = b_start[k_indices[0]]
+                    cov_end = b_end[k_indices[-1]]
+                    if cov_start > v_start:
+                        g_dest[:, v_start:cov_start] = 0
+                    if cov_end < v_stop:
+                        g_dest[:, cov_end:v_stop] = 0
+                else:
+                    st_run = np.empty(0, dtype=np.uintp)
+                    g_dest[:, v_start:v_stop] = 0
             else:
                 st_run = st
-
-            g_dest = out[p['g_slice']]
-            if valid_slice is None and ifo is not None:
-                g_dest[:, :lo] = 0
-                if st_run.size > 0:
-                    last_end = min(self.series_length, st_run[-1] + hi)
-                    if last_end < self.series_length:
-                        g_dest[:, last_end:] = 0
+                if ifo is not None:
+                    g_dest[:, :lo] = 0
+                    if st_run.size > 0:
+                        last_end = min(self.series_length, st_run[-1] + hi)
+                        if last_end < self.series_length:
+                            g_dest[:, last_end:] = 0
 
             if cplan._gpu is not None:
                 cplan._continuous_gpu(ser, st_run, 0, p['g_cnt'], g_dest)

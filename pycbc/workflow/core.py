@@ -2144,7 +2144,8 @@ def resolve_url_to_file(
     curr_pfn,
     attrs=None,
     hash_max_chunks=10,
-    hash_chunk_size=int(1e6)
+    hash_chunk_size=int(1e6),
+    copy_to_cwd=False,
 ):
     """
     Resolves a PFN into a workflow.File object.
@@ -2194,6 +2195,7 @@ def resolve_url_to_file(
             curr_pfn,
             hash_max_chunks=hash_max_chunks,
             hash_chunk_size=hash_chunk_size,
+            copy_to_cwd=copy_to_cwd,
         )
         # Create File object with default local path
         curr_file = File.from_path(local_file_path, attrs=attrs)
