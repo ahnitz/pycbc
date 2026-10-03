@@ -151,6 +151,7 @@ class MatchedFilterRatioControl(object):
                 raise ValueError('reference series length does not match data segment')
 
         res = self._td_bank.filter_series(self.ref_snr, valid_slice=valid_slice)
+        self.ref_snr = None
         local_idxs = res.template_indices
         t_idxs = res.sample_indices
         snr_vals = res.snr

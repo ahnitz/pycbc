@@ -142,7 +142,7 @@ def add_gate_option_group(parser):
     return gate_group
 
 
-def gate_and_paint(data, lindex, rindex, invpsd, copy=True, method='cholesky',
+def gate_and_paint(data, lindex, rindex, invpsd, copy=True, method='toeplitz',
                    ridge=1e-10):
     """Gates and in-paints data using a hole-filling solver.
 
@@ -159,14 +159,13 @@ def gate_and_paint(data, lindex, rindex, invpsd, copy=True, method='cholesky',
     copy : bool, optional
         Copy the data before applying the gate. Otherwise, the gate will
         be applied in-place. Default is True.
-    method : {'cholesky', 'toeplitz'}, optional
+    method : {'toeplitz', 'cholesky'}, optional
         Algorithm used to solve the linear system for the inpainting projection.
-        'cholesky' (default) uses a regularized Cholesky factorization of the
-        normalized Toeplitz matrix, providing high numerical stability.
-        'toeplitz' uses scipy.linalg.solve_toeplitz (Levinson recursion).
+        'toeplitz' (default) uses regularized scipy.linalg.solve_toeplitz (Levinson recursion, O(K^2)).
+        'cholesky' uses a regularized Cholesky factorization (O(K^3)).
     ridge : float, optional
         Diagonal Tikhonov regularization parameter relative to the diagonal
-        element of the inverse covariance operator. Default is 1e-10.
+        element of the inverse covariance operator. Default is 1e-3.
 
     Returns
     -------
@@ -193,7 +192,10 @@ def gate_and_paint(data, lindex, rindex, invpsd, copy=True, method='cholesky',
         c, lower = linalg.cho_factor(T)
         proj = linalg.cho_solve((c, lower), rhs / diag)
     elif method == 'toeplitz':
-        proj = linalg.solve_toeplitz(tdfilter[:K], owhgated_data[lindex:rindex])
+        col = tdfilter[:K].numpy().copy()
+        if ridge > 0:
+            col[0] += ridge * diag
+        proj = linalg.solve_toeplitz(col, rhs)
     else:
         raise ValueError(f"Unknown inpainting method: {method}")
 

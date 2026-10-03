@@ -885,6 +885,45 @@ def main():
                 if 'f_lower' in f:
                     flow = float(np.min(f['f_lower'][:]))
 
+        gating_info = {ifo: getattr(gwstrain[ifo], 'gating_info', None) for ifo in instruments}
+        gwstrain_start_time = {ifo: float(gwstrain[ifo].start_time) for ifo in instruments}
+
+        psd_var = {}
+        if args.psdvar_segment is not None:
+            logging.info("Calculating PSD variation")
+            for ifo in instruments:
+                ifo_opts = get_ifo_opts(args, ifo)
+                psd_var[ifo] = pycbc.psd.calc_filt_psd_variation(
+                    gwstrain[ifo], ifo_opts.psdvar_segment,
+                    ifo_opts.psdvar_short_segment, ifo_opts.psdvar_long_segment,
+                    ifo_opts.psdvar_psd_duration, ifo_opts.psdvar_psd_stride,
+                    ifo_opts.psd_estimation, ifo_opts.psdvar_low_freq, ifo_opts.psdvar_high_freq
+                )
+
+        logging.info("Making frequency-domain data segments and associating PSDs")
+        segments = {}
+        for ifo in instruments:
+            single_det_opt = pycbc.types.optparse.copy_opts_for_single_ifo(args, ifo)
+            fd_segs = strain_segments[ifo].fourier_segments()
+            pycbc.psd.associate_psds_to_segments(
+                single_det_opt, fd_segs, gwstrain[ifo], flen, delta_f, flow,
+                dyn_range_factor=pycbc.DYN_RANGE_FAC, precision='single'
+            )
+            for seg in fd_segs:
+                if is_valid_segment(seg):
+                    seg[:] = seg / seg.psd
+            segments[ifo] = fd_segs
+            del strain_segments[ifo]
+            gwstrain[ifo]._data = np.empty(0, dtype=gwstrain[ifo].dtype)
+            gc.collect()
+            if libc is not None:
+                libc.malloc_trim(0)
+        del strain_segments
+        gc.collect()
+        if libc is not None:
+            libc.malloc_trim(0)
+        logging.info("After segments creation and strain release: RSS=%.1f MB, HWM=%.1f MB", *get_mem_mb())
+
         # --- 4. Initialize Classes ---
         logging.info("Initializing Ratio Filter Bank...")
         bank = RatioFilterBank(
@@ -898,12 +937,15 @@ def main():
             if inj_filter_rejector.get(ifo) is not None:
                 bank.template_thinning(inj_filter_rejector[ifo])
 
-        preload_thread = None
         if hasattr(bank, 'preload_firs'):
-            import threading
-            preload_thread = threading.Thread(target=bank.preload_firs, daemon=True)
-            preload_thread.start()
-            logging.info("Started background preloading of FIR filter bank...")
+            logging.info("Preloading FIR filter bank...")
+            t_pl0 = time.perf_counter()
+            bank.preload_firs()
+            logging.info("FIR filter bank preloaded in %.2f s [RSS=%.1f MB, HWM=%.1f MB]",
+                         time.perf_counter() - t_pl0, *get_mem_mb())
+            gc.collect()
+            if libc is not None:
+                libc.malloc_trim(0)
 
         if args.asym_windowing:
             primary_snr_threshold = args.asym_snr_threshold if args.asym_snr_threshold is not None else (args.snr_threshold if args.snr_threshold is not None else 6.0)
@@ -944,8 +986,6 @@ def main():
         out_vals_ref = {key: None for key in out_types}
         names = sorted(out_vals_ref.keys())
 
-        gating_info = {ifo: getattr(gwstrain[ifo], 'gating_info', None) for ifo in instruments}
-
         event_mgr = {}
         for ifo in instruments:
             ifo_opts = get_ifo_opts(args, ifo)
@@ -956,57 +996,6 @@ def main():
             event_mgr[ifo].ifo = ifo
 
         cluster_window = int(args.cluster_window * sample_rate) if args.cluster_window else 0
-
-        # --- 6. Analysis Loop ---
-        logging.info("Making frequency-domain data segments")
-        segments = {
-            ifo: strain_segments[ifo].fourier_segments()
-            for ifo in instruments
-        }
-        del strain_segments
-        gc.collect()
-        if libc is not None:
-            libc.malloc_trim(0)
-        logging.info("After segments creation: RSS=%.1f MB, HWM=%.1f MB", *get_mem_mb())
-
-        # Precompute segment-level injection chirp times if filter-inj-only is enabled
-        seg_inj_tau0 = {}
-        coarse_tau0_all = None
-        inj_chirp_win = 5.0
-        if getattr(args, 'filter_inj_only', False) and any(inj_filter_rejector.get(ifo) is not None and getattr(inj_filter_rejector[ifo], 'injection_params', None) is not None for ifo in instruments):
-            ref_ifo = next(ifo for ifo in instruments if inj_filter_rejector.get(ifo) is not None and getattr(inj_filter_rejector[ifo], 'injection_params', None) is not None)
-            ref_rejector = inj_filter_rejector.get(ref_ifo)
-            if ref_rejector is not None and getattr(ref_rejector, 'injection_params', None) is not None:
-                inj_tab = ref_rejector.injection_params.table
-                f_l = ref_rejector.f_lower if ref_rejector.f_lower is not None else flow
-                inj_chirp_win = ref_rejector.chirp_time_window if ref_rejector.chirp_time_window is not None else 5.0
-                all_inj_m1 = inj_tab['mass1']
-                all_inj_m2 = inj_tab['mass2']
-                all_inj_tau0, _ = pycbc.pnutils.mass1_mass2_to_tau0_tau3(all_inj_m1, all_inj_m2, f_l)
-                if hasattr(inj_tab, 'dtype') and inj_tab.dtype.names and 'tc' in inj_tab.dtype.names:
-                    all_inj_tc = inj_tab['tc']
-                else:
-                    all_inj_tc = np.array([float(getattr(x, 'tc', getattr(x, 'geocent_end_time', 0.0))) for x in inj_tab])
-
-                m1_c = bank.coarse_bank.table['mass1']
-                m2_c = bank.coarse_bank.table['mass2']
-                coarse_tau0_all, _ = pycbc.pnutils.mass1_mass2_to_tau0_tau3(m1_c, m2_c, f_l)
-
-                num_segs = max(len(segments[ifo]) for ifo in instruments)
-                for s_num in range(num_segs):
-                    seg_inj_tau0[s_num] = []
-                    for ifo in instruments:
-                        if s_num < len(segments[ifo]):
-                            st = segments[ifo][s_num]
-                            c_idx = getattr(st, 'cumulative_index', 0)
-                            a_sl = getattr(st, 'analyze', None)
-                            if a_sl is not None:
-                                t_start = float(gwstrain[ifo].start_time) + c_idx / sample_rate
-                                t_stop = float(gwstrain[ifo].start_time) + (c_idx + (a_sl.stop - a_sl.start)) / sample_rate
-                                m = (all_inj_tc >= t_start - 5.0) & (all_inj_tc <= t_stop + 5.0)
-                                if np.any(m):
-                                    seg_inj_tau0[s_num].extend(all_inj_tau0[m])
-                    seg_inj_tau0[s_num] = np.array(seg_inj_tau0[s_num])
 
         if all(len(segments[ifo]) == 0 for ifo in instruments):
             logging.info("No segments to analyze. Exiting.")
@@ -1028,28 +1017,6 @@ def main():
             logging.info("Finished.")
             return
 
-        pycbc.psd.associate_psds_to_multi_ifo_segments(
-            args, segments, gwstrain, flen, delta_f, flow, instruments,
-            dyn_range_factor=pycbc.DYN_RANGE_FAC, precision='single'
-        )
-
-        for ifo in instruments:
-            for seg in segments[ifo]:
-                if is_valid_segment(seg):
-                    seg[:] = seg / seg.psd
-
-        psd_var = {}
-        if args.psdvar_segment is not None:
-            logging.info("Calculating PSD variation")
-            for ifo in instruments:
-                ifo_opts = get_ifo_opts(args, ifo)
-                psd_var[ifo] = pycbc.psd.calc_filt_psd_variation(
-                    gwstrain[ifo], ifo_opts.psdvar_segment,
-                    ifo_opts.psdvar_short_segment, ifo_opts.psdvar_long_segment,
-                    ifo_opts.psdvar_psd_duration, ifo_opts.psdvar_psd_stride,
-                    ifo_opts.psd_estimation, ifo_opts.psdvar_low_freq, ifo_opts.psdvar_high_freq
-                )
-
         n_coarse = len(bank.coarse_indices)
         cthresh = args.chisq_snr_threshold
         do_chisq = bool(args.chisq_bins and (cthresh is not None))
@@ -1070,7 +1037,7 @@ def main():
                     st = segments[ifo][s_num]
                     sr = args.sample_rate[ifo] if isinstance(args.sample_rate, dict) else args.sample_rate
                     sr = float(sr or getattr(st, 'sample_rate', 2048.0))
-                    t0 = float(gwstrain[ifo].start_time)
+                    t0 = gwstrain_start_time[ifo]
                     s_start = getattr(st, 'seg_slice', slice(0)).start if getattr(st, 'seg_slice', None) is not None else 0
                     a_start = st.analyze.start if getattr(st, 'analyze', None) is not None else 0
                     a_stop = st.analyze.stop if getattr(st, 'analyze', None) is not None else len(st)
@@ -1125,10 +1092,6 @@ def main():
 
             coarse_keep = set(bank.coarse_indices) if len(bank.coarse_indices) < len(bank.coarse_keys) else None
 
-            if preload_thread is not None:
-                preload_thread.join()
-                logging.info("Background preloading of FIR filter bank complete.")
-
             chunk_size = getattr(args, 'chunk_size', 16) or 16
             total_valid_segs = sum(sum(1 for s in segments[ifo] if is_valid_segment(s)) for ifo in instruments)
             if total_valid_segs == 0:
@@ -1168,10 +1131,14 @@ def main():
                     for row, mid in enumerate(middle_ids)
                 }
 
-                logging.info(f"Top template {top_step+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups (chunked {chunk_size}/chunk) [RSS={get_mem_mb()[0]:.1f} MB, HWM={get_mem_mb()[1]:.1f} MB]")
+                eff_chunk_size = chunk_size
+                if len(middle_ids) <= 20 and chunk_size < len(middle_ids):
+                    eff_chunk_size = len(middle_ids)
 
-                for chunk_start in range(0, len(middle_ids), chunk_size):
-                    chunk_slice = slice(chunk_start, chunk_start + chunk_size)
+                logging.info(f"Top template {top_step+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups (chunked {eff_chunk_size}/chunk) [RSS={get_mem_mb()[0]:.1f} MB, HWM={get_mem_mb()[1]:.1f} MB]")
+
+                for chunk_start in range(0, len(middle_ids), eff_chunk_size):
+                    chunk_slice = slice(chunk_start, chunk_start + eff_chunk_size)
                     chunk_mids = middle_ids[chunk_slice]
                     chunk_counts = counts_u[chunk_slice]
                     chunk_taps = taps_u[chunk_slice]
@@ -1228,12 +1195,6 @@ def main():
 
                         can_asym_seg = can_asym_by_seg.get(s_num, False)
 
-                        if seg_inj_tau0 and s_num in seg_inj_tau0 and coarse_tau0_all is not None:
-                            s_injs = seg_inj_tau0[s_num]
-                            if len(s_injs) > 0:
-                                chunk_c_indices = [g[0] for g in chunk_groups]
-                                if not any(np.any(np.abs(s_injs - coarse_tau0_all[cid]) <= inj_chirp_win) for cid in chunk_c_indices):
-                                    continue
 
                         t_ref0 = time.perf_counter()
                         ref_cur = {}
@@ -1267,12 +1228,6 @@ def main():
                         t_seg_asym_start = TIMERS['asym_followup']
                         for i, g_entry in enumerate(chunk_groups):
                             coarse_idx, counts, fine_indices, group_engine, filters_f, shifts = g_entry
-                            if seg_inj_tau0 and s_num in seg_inj_tau0 and coarse_tau0_all is not None:
-                                s_injs = seg_inj_tau0[s_num]
-                                if len(s_injs) > 0:
-                                    c_t0 = coarse_tau0_all[coarse_idx]
-                                    if not np.any(np.abs(s_injs - c_t0) <= inj_chirp_win):
-                                        continue
                             std_trigs = {}
                             h_norms = {ifo: norms[ifo] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
 
@@ -1285,7 +1240,6 @@ def main():
                                     args, do_chisq, cthresh, is_asym=is_asym,
                                     shifts=shifts,
                                 )
-
                             for ifo in active_ifos:
                                 stilde = segments[ifo][s_num]
                                 h_norm = h_norms[ifo]
@@ -1337,7 +1291,7 @@ def main():
                                     sr_A = args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate
                                     sr_A = float(sr_A or getattr(segments[ifo_A][s_num], 'sample_rate', 2048.0))
                                     s_start_A = getattr(segments[ifo_A][s_num], 'seg_slice', slice(0)).start if getattr(segments[ifo_A][s_num], 'seg_slice', None) is not None else 0
-                                    t0_A = float(gwstrain[ifo_A].start_time)
+                                    t0_A = gwstrain_start_time[ifo_A]
 
                                     for ifo_B in active_ifos:
                                         if ifo_B == ifo_A:
@@ -1347,7 +1301,7 @@ def main():
                                         sr_B = args.sample_rate[ifo_B] if isinstance(args.sample_rate, dict) else args.sample_rate
                                         sr_B = float(sr_B or getattr(stilde_B, 'sample_rate', 2048.0))
                                         s_start_B = getattr(stilde_B, 'seg_slice', slice(0)).start if getattr(stilde_B, 'seg_slice', None) is not None else 0
-                                        t0_B = float(gwstrain[ifo_B].start_time)
+                                        t0_B = gwstrain_start_time[ifo_B]
 
                                         for k in cand_indices:
                                             cand_lid = a_ids[k]
@@ -1395,9 +1349,19 @@ def main():
                         logging.info(f"Top {top_step+1}/{n_top} (chunk {chunk_start//chunk_size+1}) Seg {s_num+1}/{num_segs}: {len(chunk_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s]")
                         del middle_series
                         del norms
+                        try:
+                            import matchedfilter.time_domain as td_mod
+                            if hasattr(td_mod, '_REF_PROFILE_CACHE'):
+                                td_mod._REF_PROFILE_CACHE.clear()
+                            if hasattr(td_mod, '_REF_BINNED_CACHE'):
+                                td_mod._REF_BINNED_CACHE.clear()
+                        except Exception:
+                            pass
+
 
                     del chunk_groups
                     del upper_chunk
+                    UpperReferenceBatch.clear_buffers()
                     try:
                         import matchedfilter.time_domain as td_mod
                         if hasattr(td_mod, '_REF_PROFILE_CACHE'):
@@ -1411,6 +1375,7 @@ def main():
                         libc.malloc_trim(0)
 
                 del top_template
+                UpperReferenceBatch.clear_buffers()
                 global _CHISQ_CTX
                 if _CHISQ_CTX is not None and 'ratio_cache' in _CHISQ_CTX:
                     _CHISQ_CTX['ratio_cache'].clear()

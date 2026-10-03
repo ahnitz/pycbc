@@ -364,18 +364,29 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
     else:
         raise ValueError("Unrecognized precision {}".format(precision))
 
+    invpsd_gating = None
+    def _get_gating_invpsd():
+        nonlocal invpsd_gating
+        if invpsd_gating is None:
+            flow = getattr(opt, 'strain_high_pass', 20.0) or 20.0
+            psd_seg_len = min(16.0, max(2.0, strain.duration / 4.0))
+            invpsd_gating = 1.0 / strain.filter_psd(psd_seg_len, strain.delta_f, flow)
+        return invpsd_gating
+
     if opt.gating_file is not None:
         logger.info("Gating times contained in gating file")
         gate_params = numpy.loadtxt(opt.gating_file)
         if len(gate_params.shape) == 1:
             gate_params = [gate_params]
-        paint_m = getattr(opt, 'paint_method', 'cholesky')
-        paint_r = getattr(opt, 'paint_ridge', 1e-10)
+        paint_m = getattr(opt, 'paint_method', 'toeplitz')
+        paint_r = getattr(opt, 'paint_ridge', 1e-3)
+        invpsd = _get_gating_invpsd() if opt.gating_method == 'paint' else None
         for gate_time, gate_window, gate_taper in gate_params:
             strain = strain.gate(gate_time, window=gate_window,
                                  method=opt.gating_method,
                                  copy=False,
                                  taper_width=gate_taper,
+                                 invpsd=invpsd,
                                  paint_method=paint_m,
                                  paint_ridge=paint_r)
         gating_info['file'] = \
@@ -384,8 +395,8 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
                  and (gp[0] - gp[1] - gp[2] <= strain.end_time)]
 
     if opt.autogating_threshold is not None:
-        paint_m = getattr(opt, 'paint_method', 'cholesky')
-        paint_r = getattr(opt, 'paint_ridge', 1e-10)
+        paint_m = getattr(opt, 'paint_method', 'toeplitz')
+        paint_r = getattr(opt, 'paint_ridge', 1e-3)
         gating_info['auto'] = []
         for _ in range(opt.autogating_max_iterations):
             glitch_times = detect_loud_glitches(
@@ -396,11 +407,16 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
             gate_params = [[gt, opt.autogating_width, opt.autogating_taper]
                            for gt in glitch_times]
             gating_info['auto'] += gate_params
+            if len(gate_params) > 0 and opt.gating_method == 'paint':
+                invpsd = _get_gating_invpsd()
+            else:
+                invpsd = None
             for gate_time, gate_window, gate_taper in gate_params:
                 strain = strain.gate(gate_time, window=gate_window,
                                      method=opt.gating_method,
                                      copy=False,
                                      taper_width=gate_taper,
+                                     invpsd=invpsd,
                                      paint_method=paint_m,
                                      paint_ridge=paint_r)
             if len(glitch_times) > 0:
@@ -478,12 +494,22 @@ def from_cli_multi_ifos(opt, ifos, inj_filter_rejector_dict=None, **kwargs):
     """
     Get the strain for all ifos when using the multi-detector CLI
     """
+    import gc
+    try:
+        import ctypes
+        _libc = ctypes.CDLL('libc.so.6')
+    except Exception:
+        _libc = None
+
     strain = {}
     if inj_filter_rejector_dict is None:
         inj_filter_rejector_dict = {ifo: None for ifo in ifos}
     for ifo in ifos:
         strain[ifo] = from_cli_single_ifo(opt, ifo,
                           inj_filter_rejector_dict[ifo], **kwargs)
+        gc.collect()
+        if _libc is not None:
+            _libc.malloc_trim(0)
     return strain
 
 
@@ -664,13 +690,13 @@ def insert_strain_option_group(parser, gps_times=True):
                                          'Default: `taper`',
                                     choices=['hard', 'taper', 'paint'])
     data_reading_group.add_argument('--paint-method', type=str,
-                                    default='cholesky',
+                                    default='toeplitz',
                                     choices=['cholesky', 'toeplitz', 'matmul'],
-                                    help='Solver method for inpainting. Default: `cholesky`')
+                                    help='Solver method for inpainting. Default: `toeplitz`')
     data_reading_group.add_argument('--paint-ridge', type=float,
-                                    default=1e-10,
+                                    default=1e-3,
                                     help='Diagonal regularization ridge parameter for inpainting. '
-                                         'Default: 1e-10')
+                                         'Default: 1e-3')
     # Optional
     data_reading_group.add_argument("--normalize-strain", type=float,
                     help="(optional) Divide frame data by constant.")
@@ -928,14 +954,14 @@ def insert_strain_option_group_multi_ifo(parser, gps_times=True):
                                     choices=['hard', 'taper', 'paint'])
     data_reading_group_multi.add_argument('--paint-method', type=str,
                                     nargs='+', action=MultiDetOptionAction,
-                                    default='cholesky',
+                                    default='toeplitz',
                                     choices=['cholesky', 'toeplitz', 'matmul'],
-                                    help='Solver method for inpainting. Default: `cholesky`')
+                                    help='Solver method for inpainting. Default: `toeplitz`')
     data_reading_group_multi.add_argument('--paint-ridge', type=float,
                                     nargs='+', action=MultiDetOptionAction,
-                                    default=1e-10,
+                                    default=1e-3,
                                     help='Diagonal regularization ridge parameter for inpainting. '
-                                         'Default: 1e-10')
+                                         'Default: 1e-3')
 
     # Optional
     data_reading_group_multi.add_argument("--normalize-strain", type=float,
@@ -1258,6 +1284,8 @@ class StrainSegments(object):
         if not self._fourier_segments:
             self._fourier_segments = []
             cached_freq_segs = {}
+            from collections import Counter
+            slice_counts = Counter((s.start, s.stop) for s in self.segment_slices)
             for seg_slice, ana in zip(self.segment_slices, self.analyze_slices):
                 key = (seg_slice.start, seg_slice.stop)
                 if key in cached_freq_segs:
@@ -1275,8 +1303,11 @@ class StrainSegments(object):
                         strain_chunk = self.strain[seg_slice.start:]
                         strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
                         base_seg = make_frequency_series(strain_chunk)
-                    cached_freq_segs[key] = base_seg
-                    freq_seg = base_seg.copy()
+                    if slice_counts[key] > 1:
+                        cached_freq_segs[key] = base_seg
+                        freq_seg = base_seg.copy()
+                    else:
+                        freq_seg = base_seg
 
                 freq_seg.analyze = ana
                 freq_seg.cumulative_index = seg_slice.start + ana.start

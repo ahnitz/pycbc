@@ -673,8 +673,8 @@ class TimeSeries(Array):
         return lindex, rindex
 
     def gate(self, time, window=0.25, method='taper', copy=True,
-             taper_width=0.25, invpsd=None, paint_method='cholesky',
-             paint_invmat=None, paint_ridge=1e-10):
+             taper_width=0.25, invpsd=None, paint_method='toeplitz',
+             paint_invmat=None, paint_ridge=1e-3):
         """ Gate out portion of time series
 
         Parameters
@@ -696,16 +696,16 @@ class TimeSeries(Array):
             a PSD is generated using default settings.
         paint_method: str
             Which method to use for inpainting the gated region if
-            method='paint'. If 'cholesky' (default), use regularized Cholesky
-            decomposition. If 'toeplitz', use a Toeplitz solver. If 'matmul',
-            use explicit matrix inversion and multiplication.
+            method='paint'. If 'toeplitz' (default), use regularized Levinson
+            recursion. If 'cholesky', use regularized Cholesky decomposition.
+            If 'matmul', use explicit matrix inversion and multiplication.
         paint_invmat: array
             The uninverted covariance matrix to use to calculate inpainting if
             paint_method='matmul'. If None (default), calculate from given
             invpsd.
         paint_ridge: float, optional
             Diagonal ridge parameter for regularizing covariance inversion.
-            Default is 1e-10.
+            Default is 1e-3.
 
         Returns
         -------
@@ -725,7 +725,8 @@ class TimeSeries(Array):
             if invpsd is None:
                 # These are some bare minimum settings, normally you
                 # should probably provide a psd
-                invpsd = 1. / self.filter_psd(self.duration/32, self.delta_f, 0)
+                seg_dur = min(16.0, max(2.0, self.duration / 4.0))
+                invpsd = 1. / self.filter_psd(seg_dur, self.delta_f, 20.0)
             lindex, rindex = self.get_gate_indices(time, window)
             rindex_time = float(self.start_time + rindex * self.delta_t)
             offset = rindex_time - (time + window)

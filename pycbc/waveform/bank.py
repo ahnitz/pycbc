@@ -1318,7 +1318,7 @@ class RatioFilterBank(FilterBank):
                 cid = self.fine_coarse_map[fid, 0]
                 if cid >= 0:
                     active_coarse.add(cid)
-            self.coarse_indices = np.array(sorted(list(set(self.coarse_indices) & active_coarse)), dtype=int)
+            self.coarse_indices = np.array(sorted(list(active_coarse)), dtype=int)
         elif len(self.fine_keep) == 0:
             self.coarse_indices = np.array([], dtype=int)
 
