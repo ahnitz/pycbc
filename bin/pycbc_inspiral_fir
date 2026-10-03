@@ -39,7 +39,9 @@ from pycbc.types import Array, FrequencySeries, complex64, float32, zeros
 from pycbc.vetoes.chisq import (
     power_chisq_at_points_from_precomputed,
     power_chisq_bins,
+    power_chisq_bins_from_sigmasq_series,
 )
+from pycbc.waveform.spa_tmplt import spa_tmplt_norm
 from pycbc.vetoes.sgchisq import SingleDetSGChisq
 from pycbc.waveform.bank import RatioFilterBank
 from igwn_segments import segment, segmentlist
@@ -148,8 +150,8 @@ def compute_batch_chisq(ids_local, t_idxs, snrs,
                         fine_indices, tstarts, stilde, bank,
                         ref_snr, filters_f, args,
                         top_template=None, mid_tap_arr=None,
-                        h_norm=None):
-    """Compute power chisq for triggers using full-frequency matched filter
+                        h_norm=None, coarse_idx=None):
+    """Compute power chisq for triggers using zero-padded fast frequency-domain
     correlation and same-template descending-SNR time clustering."""
     global_ids = fine_indices[ids_local]
     snr_amp = abs(snrs)
@@ -172,15 +174,23 @@ def compute_batch_chisq(ids_local, t_idxs, snrs,
         bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0
     ))
 
-    delta_f = float(stilde.delta_f)
-    N = (len(stilde) - 1) * 2
-    kmin = int(flow / delta_f)
-    kmax = min(int(f_final / delta_f), len(stilde))
+    sample_rate = float(stilde.sample_rate)
+    N_pad = 16384
+    df_pad = sample_rate / N_pad
+    kmin_pad = int(flow / df_pad)
+    kmax_pad = min(int(f_final / df_pad), N_pad // 2)
 
-    # stilde is already overwhitened (divided by PSD) in-place at segment setup
-    stilde_slice = stilde[kmin:kmax].numpy()
+    dec = max(1, int(round(df_pad / stilde.delta_f)))
+    n_half_pad = N_pad // 2 + 1
+    psd_pad = FrequencySeries(stilde.psd[::dec][:n_half_pad], delta_f=df_pad)
+    norm_pad = spa_tmplt_norm(psd_pad, n_half_pad, df_pad, flow)
+    bins = power_chisq_bins_from_sigmasq_series(norm_pad, int(args.chisq_bins), kmin_pad, kmax_pad)
+    dof = (len(bins) - 1) * 2 - 2
 
-    tmpl_cache = {}
+    taps_coarse, counts_coarse, _ = bank.get_firs(coarse_idx) if coarse_idx is not None else (None, None, None)
+
+    ref_f_cache = {}
+    ratio_cache = {}
     iterations = 0
 
     for idx in sort_order:
@@ -194,40 +204,47 @@ def compute_batch_chisq(ids_local, t_idxs, snrs,
         target_global_id = int(global_ids[idx])
         t_idx = int(t_idxs[idx])
         snrv = snrs[idx]
+        local_id = int(ids_local[idx])
+        tstart = int(tstarts[idx])
 
-        if target_global_id not in tmpl_cache:
-            tmplt = bank[target_global_id]
+        rescale = float(bank.snr_rescale(target_global_id, method=args.template_normalization_method))
+        snrvs = np.array([snrv], ndmin=1) / rescale
 
-            if h_norm is not None:
-                if args.template_normalization_method == 'precalculated_sigma':
-                    if not hasattr(bank, 'sigma_sigma_rescale'):
-                        bank.setup_sigma_norm()
-                    sigmasq_rescale = float(bank.sigma_sigma_rescale[target_global_id] ** 2.0)
-                else:
-                    sigmasq_rescale = float(bank.sigma_rescale(target_global_id, method=args.template_normalization_method) ** 2.0)
-                sigmasq_val = float(h_norm * sigmasq_rescale)
+        block_len = len(filters_f[local_id])
+        dt = t_idx - tstart
+
+        cache_key = (tstart, block_len)
+        if cache_key not in ref_f_cache:
+            if isinstance(ref_snr, dict):
+                ref = ref_snr.get(cache_key, ref_snr.get(tstart))
+            elif hasattr(ref_snr, 'ref_snr'):
+                ref = ref_snr.ref_snr[tstart:tstart+block_len]
             else:
-                sigmasq_val = float(sigmasq(tmplt, stilde.psd, low_frequency_cutoff=flow, high_frequency_cutoff=f_final))
+                ref = ref_snr[tstart:tstart+block_len]
+            if ref is None:
+                continue
+            ref_padded = np.zeros(N_pad, dtype=np.complex64)
+            ref_padded[:len(ref[:block_len])] = ref[:block_len]
+            ref_f_cache[cache_key] = np.fft.fft(ref_padded)
+        ref_f_pad = ref_f_cache[cache_key]
 
-            snr_norm = float((4.0 * delta_f) / np.sqrt(sigmasq_val))
+        if local_id not in ratio_cache:
+            if taps_coarse is not None:
+                cnt = int(counts_coarse[local_id])
+                buf = np.zeros(N_pad, dtype=np.float32)
+                buf[:cnt] = taps_coarse[local_id, :cnt]
+                buf = np.roll(buf, -(cnt // 2))
+                ratio_cache[local_id] = np.conj(np.fft.fft(buf).astype(np.complex64))
+            else:
+                ratio_cache[local_id] = None
 
-            corr_arr = np.zeros(N, dtype=np.complex64)
-            corr_arr[kmin:kmax] = stilde_slice * np.conj(tmplt[kmin:kmax].numpy())
-            corr = FrequencySeries(corr_arr, delta_f=delta_f)
-
-            bins = power_chisq_bins(tmplt, int(args.chisq_bins), stilde.psd,
-                                    low_frequency_cutoff=flow, high_frequency_cutoff=f_final)
-            dof = (len(bins) - 1) * 2 - 2
-            rescale = float(bank.snr_rescale(target_global_id, method=args.template_normalization_method))
-            tmpl_cache[target_global_id] = (corr, snr_norm, rescale, bins, dof)
-
-        corr, snr_norm, rescale, bins, dof = tmpl_cache[target_global_id]
-
-        norm_snr = snrv / rescale
-        unnorm_snrv = np.array([norm_snr / snr_norm], dtype=np.complex64)
-        tids2 = np.array([t_idx], ndmin=1, dtype=np.int32)
-
-        chi = power_chisq_at_points_from_precomputed(corr, unnorm_snrv, snr_norm, bins, tids2)
+        ratio_pad = ratio_cache[local_id]
+        if ratio_pad is not None:
+            corr2 = FrequencySeries(ratio_pad * ref_f_pad, delta_f=df_pad) / rescale / N_pad
+            tids2 = np.array([dt], ndmin=1, dtype=np.int32)
+            chi = power_chisq_at_points_from_precomputed(corr2, snrvs, 1.0, bins, tids2)
+        else:
+            chi = [0.0]
 
         # Same-template descending-SNR clustering within chisq_window
         same_tmpl_window = (global_ids == target_global_id) & (abs(t_idxs - t_idx) <= chisq_window_samp)
@@ -267,7 +284,7 @@ def process_and_record_triggers(
                 fine_indices, tstarts, stilde, bank,
                 ref_snr, filters_f, args,
                 top_template=top_template, mid_tap_arr=mid_tap_arr,
-                h_norm=h_norm)
+                h_norm=h_norm, coarse_idx=coarse_idx)
             TIMERS['power_chisq'] += time.perf_counter() - t_chi0
         else:
             chi = np.zeros(len(ids_local), dtype=float32)
