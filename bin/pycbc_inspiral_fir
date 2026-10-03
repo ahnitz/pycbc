@@ -264,12 +264,15 @@ def process_and_record_triggers(
     s_num, top_idx, ifo, collected_batches,
     args, do_chisq, cthresh, is_asym=False,
     top_template=None, mid_tap_arr=None,
+    shifts=None,
 ):
     """Filter triggers for analysis boundary, evaluate chisq, and append batch record."""
     if len(ids_local) > 0:
         ana = getattr(stilde, 'analyze', None)
         if ana is not None:
-            in_bounds = (t_idxs >= ana.start) & (t_idxs < ana.stop)
+            local_shifts_check = shifts[ids_local] if shifts is not None else 0
+            phys_t = t_idxs - local_shifts_check
+            in_bounds = (phys_t >= ana.start) & (phys_t < ana.stop)
             if not np.all(in_bounds):
                 ids_local = ids_local[in_bounds]
                 t_idxs = t_idxs[in_bounds]
@@ -290,6 +293,7 @@ def process_and_record_triggers(
             chi = np.zeros(len(ids_local), dtype=float32)
             chi_dof = np.zeros(len(ids_local), dtype=np.int32) - 100
 
+        local_shifts = shifts[ids_local] if shifts is not None else 0
         time_offset = (-stilde.analyze.start + stilde.cumulative_index) if getattr(stilde, 'analyze', None) is not None else 0
         collected_batches[ifo].append({
             's_num': s_num,
@@ -297,8 +301,8 @@ def process_and_record_triggers(
             'coarse_idx': coarse_idx,
             'gids': fine_indices[ids_local],
             'ids_local': ids_local,
-            't_idxs': t_idxs,
-            'time_index': t_idxs + time_offset,
+            't_idxs': t_idxs - local_shifts,
+            'time_index': t_idxs + time_offset - local_shifts,
             'snrs': snrs,
             'tstarts': tstarts,
             'h_norm': h_norm,
@@ -1023,7 +1027,7 @@ def main():
                     chunk_groups = []
                     for row_c, mid in enumerate(chunk_mids):
                         coarse_idx = int(mid)
-                        taps, counts, fine_indices = bank.get_firs(coarse_idx)
+                        taps, counts, fine_indices, shifts = bank.get_firs(coarse_idx, return_shifts=True)
                         if len(fine_indices) == 0:
                             continue
                         group_engine = MatchedFilterRatioControl(
@@ -1043,7 +1047,7 @@ def main():
                         mid_tap_arr = chunk_taps[row_c, :chunk_counts[row_c]]
                         chunk_groups.append([coarse_idx, counts, fine_indices,
                                              group_engine, filters_f,
-                                             mid_tap_arr])
+                                             mid_tap_arr, shifts])
 
                     if not chunk_groups:
                         continue
@@ -1128,7 +1132,7 @@ def main():
                         t_seg_chi_start = TIMERS['power_chisq']
                         t_seg_asym_start = TIMERS['asym_followup']
                         for i, g_entry in enumerate(chunk_groups):
-                            coarse_idx, counts, fine_indices, group_engine, filters_f, mid_tap_arr = g_entry
+                            coarse_idx, counts, fine_indices, group_engine, filters_f, mid_tap_arr, shifts = g_entry
                             if seg_inj_tau0 and s_num in seg_inj_tau0 and coarse_tau0_all is not None:
                                 s_injs = seg_inj_tau0[s_num]
                                 if len(s_injs) > 0:
@@ -1168,6 +1172,7 @@ def main():
                                         s_num, top_idx, ifo, collected_batches,
                                         args, do_chisq, cthresh, is_asym=False,
                                         top_template=top_template, mid_tap_arr=mid_tap_arr,
+                                        shifts=shifts,
                                     )
                                 else:
                                     std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
@@ -1206,6 +1211,7 @@ def main():
                                         s_num, top_idx, ifo_A, collected_batches,
                                         args, do_chisq, cthresh, is_asym=False,
                                         top_template=top_template, mid_tap_arr=mid_tap_arr,
+                                        shifts=shifts,
                                     )
 
                                     sr_A = args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate
@@ -1261,6 +1267,7 @@ def main():
                                                 s_num, top_idx, ifo_B, collected_batches,
                                                 args, do_chisq, cthresh, is_asym=True,
                                                 top_template=top_template, mid_tap_arr=mid_tap_arr,
+                                                shifts=shifts,
                                             )
                                 TIMERS['asym_followup'] += (time.perf_counter() - t_asym0) - (TIMERS['power_chisq'] - chi_asym_before)
 

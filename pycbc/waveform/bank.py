@@ -1471,6 +1471,12 @@ class RatioFilterBank(FilterBank):
         ts[-start:] = taps[:start]
         ts = TimeSeries(ts, delta_t=1.0/self.sample_rate)
         fs = ts.to_frequencyseries().astype(self.dtype)
+        if 'sample_shift' in grp:
+            shift = int(grp['sample_shift'][local])
+            if shift != 0:
+                freqs = fs.sample_frequencies.numpy()
+                phase_corr = np.exp(-1j * 2 * np.pi * freqs * (1.0 / self.sample_rate) * shift)
+                fs = fs * phase_corr
         fs.params = self.table[fine_index]
         return fs
 
@@ -1506,7 +1512,7 @@ class RatioFilterBank(FilterBank):
         sigmas_sorted = sigmas[sort_idx] if sigmas is not None else None
         return taps[sort_idx], counts[sort_idx], child_indices[sort_idx], sigmas_sorted
 
-    def get_firs(self, coarse_index):
+    def get_firs(self, coarse_index, return_shifts=False):
         """Retrieve the FIR tap information for the batch of fine templates
         associated with a specific coarse reference.
         """
@@ -1515,7 +1521,7 @@ class RatioFilterBank(FilterBank):
             self._firs_cache = {}
         cached = self._firs_cache.get(coarse_key)
         if cached is not None:
-            return cached
+            return cached if return_shifts else cached[:3]
 
         group_key = str(coarse_index)
         grp = self.level1_group
@@ -1527,20 +1533,29 @@ class RatioFilterBank(FilterBank):
         taps = c_group['taps'][:]
         actual_tap_counts = c_group['actual_tap_count'][:]
         fine_indices = c_group['fine_bank_index'][:]
+        if 'sample_shift' in c_group:
+            sample_shifts = c_group['sample_shift'][:]
+        else:
+            sample_shifts = np.zeros(len(fine_indices), dtype=np.int32)
 
         if getattr(self, 'fine_keep', None) is not None:
             fine_mask = np.isin(fine_indices, list(self.fine_keep))
             taps = taps[fine_mask]
             actual_tap_counts = actual_tap_counts[fine_mask]
             fine_indices = fine_indices[fine_mask]
+            sample_shifts = sample_shifts[fine_mask]
 
         if len(fine_indices) > 0:
             sort_idx = np.argsort(actual_tap_counts)
-            res = (taps[sort_idx], actual_tap_counts[sort_idx], fine_indices[sort_idx])
+            res = (taps[sort_idx], actual_tap_counts[sort_idx], fine_indices[sort_idx], sample_shifts[sort_idx])
         else:
-            res = (taps[:0], actual_tap_counts[:0], fine_indices[:0])
+            res = (taps[:0], actual_tap_counts[:0], fine_indices[:0], sample_shifts[:0])
         self._firs_cache[coarse_key] = res
-        return res
+        return res if return_shifts else res[:3]
+
+    def get_shifts(self, coarse_index):
+        """Retrieve the sample shifts for fine templates associated with coarse reference."""
+        return self.get_firs(coarse_index, return_shifts=True)[3]
 
     def preload_firs(self, indices=None):
         """Pre-populate the FIR cache for given or all coarse indices."""
