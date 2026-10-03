@@ -321,6 +321,14 @@ def setup_matchedfltr_dax_generated_multi(workflow, science_segs, datafind_outs,
         if cp.has_option('inspiral', 'pad-data'):
             pad_data = int(cp.get('inspiral', 'pad-data'))
 
+        start_pad = 0
+        if cp.has_option('inspiral', 'segment-start-pad'):
+            start_pad = int(cp.get('inspiral', 'segment-start-pad'))
+
+        end_pad = 0
+        if cp.has_option('inspiral', 'segment-end-pad'):
+            end_pad = int(cp.get('inspiral', 'segment-end-pad'))
+
         from igwn_segments import segment
 
         job_instances = {}
@@ -351,7 +359,10 @@ def setup_matchedfltr_dax_generated_multi(workflow, science_segs, datafind_outs,
                     v_end = int(curr_seg[1])
 
                 valid_seg = segment([v_start, v_end])
-                data_seg = segment([v_start - pad_data, v_end + pad_data])
+                # Ensure each job reads sufficient data padding (start_pad and end_pad)
+                # before and after its valid trigger window to prevent zero-padding
+                # corruption of incoming waveforms at inter-job boundaries.
+                data_seg = segment([v_start - start_pad - pad_data, v_end + end_pad + pad_data])
 
                 if coincident_only:
                     job_ifos = list(ifos)
