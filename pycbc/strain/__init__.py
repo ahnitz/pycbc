@@ -37,3 +37,32 @@ def read_model_from_config(cp, ifo, section="calibration"):
     recalibrator = models[model].from_config(cp, ifo.lower(), section)
 
     return recalibrator
+
+
+def from_overwhitened_file(filename, start_time=None, end_time=None, which="dow"):
+    """Load overwhitened or whitened strain TimeSeries from an overwhitened HDF5
+    file or directory of files.
+
+    Parameters
+    ----------
+    filename : str or list of str
+        Path to overwhitened HDF5 file or directory.
+    start_time : float, optional
+        GPS start time of the slice.
+    end_time : float, optional
+        GPS end time of the slice.
+    which : {'dow', 'dw'}, default 'dow'
+        Whether to return the overwhitened strain ('dow') or the companion
+        intermediate whitened strain ('dw').
+
+    Returns
+    -------
+    ts : TimeSeries
+        PyCBC TimeSeries with .gating_info, .valid_segments, and .boundary_pad attached.
+    """
+    from pycbc.filter.overwhiten import OverwhitenedData
+    data = OverwhitenedData(filename)
+    if start_time is not None or end_time is not None:
+        return data.time_slice(start_time, end_time, which=which)
+    return data.get_series(which=which)
+

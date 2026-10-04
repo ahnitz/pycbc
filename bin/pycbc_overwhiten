@@ -1,0 +1,362 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2026 PyCBC Team
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+"""Produce regularized continuous overwhitened strain data d_ow(t),
+companion certified whitened stream d_w(t), and compact instantaneous PSD product.
+"""
+
+import os
+import sys
+import logging
+import argparse
+import json
+import time
+import numpy as np
+import scipy.signal as sig
+import scipy.stats as stats
+import h5py
+
+import pycbc
+import pycbc.strain
+import pycbc.psd
+import pycbc.filter
+from pycbc.types import TimeSeries, FrequencySeries
+
+
+def load_input_strain(args):
+    """Load strain from input file or PyCBC strain CLI options."""
+    if hasattr(args, "input_strain_file") and args.input_strain_file:
+        fn = args.input_strain_file
+        logging.info("Reading input strain from file: %s", fn)
+        if fn.endswith((".hdf", ".hdf5", ".h5")):
+            with h5py.File(fn, "r") as f:
+                if "strain" in f and "Strain" in f["strain"]:
+                    dset = f["strain/Strain"]
+                    arr = dset[:].astype(np.float64)
+                    dt = float(dset.attrs.get("Xspacing", 1.0 / 4096.0))
+                    t0 = float(dset.attrs.get("Xstart", 0.0))
+                    ts = TimeSeries(arr, delta_t=dt, epoch=t0)
+                elif "strain" in f and isinstance(f["strain"], h5py.Dataset):
+                    dset = f["strain"]
+                    arr = dset[:].astype(np.float64)
+                    dt = float(dset.attrs.get("delta_t", 1.0 / 4096.0))
+                    t0 = float(dset.attrs.get("start_time", 0.0))
+                    ts = TimeSeries(arr, delta_t=dt, epoch=t0)
+                else:
+                    # Generic PyCBC TimeSeries format
+                    ts = TimeSeries.read(fn, group=args.channel_name if args.channel_name else None)
+        else:
+            ts = TimeSeries.read(fn, group=args.channel_name if args.channel_name else None)
+
+        if args.sample_rate and float(ts.sample_rate) != float(args.sample_rate):
+            logging.info("Resampling strain from %s Hz to %s Hz", ts.sample_rate, args.sample_rate)
+            ts = pycbc.filter.resample_to_delta_t(ts, 1.0 / float(args.sample_rate))
+
+        if args.gps_start_time is not None or args.gps_end_time is not None:
+            t_start = float(args.gps_start_time) if args.gps_start_time is not None else float(ts.start_time)
+            t_end = float(args.gps_end_time) if args.gps_end_time is not None else float(ts.end_time)
+            ts = ts.time_slice(t_start, t_end)
+
+        return ts
+    else:
+        # Standard PyCBC strain from CLI
+        ts = pycbc.strain.from_cli(args, dyn_range_fac=1.0, precision='double')
+        return ts
+
+
+def run_statistical_validation(ts_dw, f_low=18.0, fs=2048.0):
+    """Run full statistical whiteness and Gaussianity validation battery on d_w(t)."""
+    x = ts_dw.numpy()
+    N = len(x)
+    # Exclude filter transient edge regions (6 s on each side)
+    edge_skip = int(round(6.0 * fs))
+    if 2 * edge_skip < N:
+        valid_x = x[edge_skip : N - edge_skip]
+    else:
+        valid_x = x
+
+    mean_dw = float(np.mean(valid_x))
+    std_dw = float(np.std(valid_x))
+    skew_dw = float(stats.skew(valid_x))
+    kurt_dw = float(stats.kurtosis(valid_x))
+
+    # Autocorrelation function up to lag 100
+    n_acf = min(len(valid_x), int(10000 * fs))
+    sub_x = valid_x[:n_acf] - np.mean(valid_x[:n_acf])
+    acf = sig.correlate(sub_x, sub_x, mode="full")
+    mid = len(sub_x) - 1
+    acf_norm = acf[mid : mid + 101] / max(acf[mid], 1e-30)
+    max_offzero_acf = float(np.max(np.abs(acf_norm[1:])))
+
+    # Spectral Flatness Measure (SFM / Wiener Entropy) in [f_low + 5, nyquist - 50]
+    nperseg = int(round(4.0 * fs))
+    f_spec, P_dw = sig.welch(valid_x, fs=fs, nperseg=nperseg)
+    f_max_sfm = min(float(fs / 2.0 - 50.0), 900.0)
+    band_eval = (f_spec >= f_low + 5.0) & (f_spec <= f_max_sfm)
+    P_band = P_dw[band_eval]
+    if len(P_band) > 0 and np.all(P_band > 0):
+        sfm = float(np.exp(np.mean(np.log(P_band))) / np.mean(P_band))
+    else:
+        sfm = 0.0
+
+    # KS normality test
+    z_dw = (valid_x - mean_dw) / max(std_dw, 1e-30)
+    ks_sub = z_dw[:min(len(z_dw), 50000)]
+    ks_stat, ks_pval = stats.kstest(ks_sub, "norm")
+
+    # Tail Exceedances vs Standard Gaussian Q(x)
+    p3_obs = float(np.mean(np.abs(z_dw) > 3.0))
+    p4_obs = float(np.mean(np.abs(z_dw) > 4.0))
+    p5_obs = float(np.mean(np.abs(z_dw) > 5.0))
+    p3_th = float(2.0 * (1.0 - stats.norm.cdf(3.0)))
+    p4_th = float(2.0 * (1.0 - stats.norm.cdf(4.0)))
+    p5_th = float(2.0 * (1.0 - stats.norm.cdf(5.0)))
+
+    results = {
+        "duration_evaluated_s": len(valid_x) / fs,
+        "sample_rate_hz": fs,
+        "mean": mean_dw,
+        "std": std_dw,
+        "skewness": skew_dw,
+        "excess_kurtosis": kurt_dw,
+        "max_offzero_acf": max_offzero_acf,
+        "spectral_flatness_wiener": sfm,
+        "ks_stat": float(ks_stat),
+        "ks_pval": float(ks_pval),
+        "tail_3sigma_obs": p3_obs,
+        "tail_3sigma_th": p3_th,
+        "tail_3sigma_ratio": float(p3_obs / max(p3_th, 1e-30)),
+        "tail_4sigma_obs": p4_obs,
+        "tail_4sigma_th": p4_th,
+        "tail_4sigma_ratio": float(p4_obs / max(p4_th, 1e-30)),
+        "tail_5sigma_obs": p5_obs,
+        "tail_5sigma_th": p5_th,
+    }
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    pycbc.add_common_pycbc_options(parser)
+    pycbc.strain.insert_strain_option_group(parser)
+
+    # Input override
+    parser.add_argument("--input-strain-file", type=str, default=None,
+                        help="Direct path to input strain file (HDF5 or frame), bypassing frame-files/frame-cache.")
+
+    # Highpass option
+    parser.add_argument("--highpass-frequency", type=float, default=15.0,
+                        help="Highpass frequency in Hz applied to strain before overwhitening (default: 15.0; 0 to disable).")
+
+    # Overwhitening & PSD parameters
+    parser.add_argument("--f-low", type=float, default=18.0,
+                        help="Low frequency cutoff in Hz (default: 18.0).")
+    parser.add_argument("--f-taper", type=float, default=4.0,
+                        help="Highpass taper width below f_low in Hz (default: 4.0).")
+    parser.add_argument("--max-filter-duration", type=float, default=4.0,
+                        help="Max time-domain filter length in seconds for IST (default: 4.0).")
+    parser.add_argument("--chunk-duration", type=float, default=16.0,
+                        help="Overlap-save chunk duration in seconds (default: 16.0).")
+    parser.add_argument("--psd-method", type=str, default="welch-median",
+                        choices=["welch-median", "welch-mean", "welch-trimmed", "multitaper", "als-spline", "als-spline-continuum"],
+                        help="Base PSD estimation method: empirical Welch/multitaper or smooth analytical ALS spline (default: welch-median).")
+    parser.add_argument("--psd-seg-len", type=float, default=4.0,
+                        help="PSD segment length in seconds (default: 4.0).")
+    parser.add_argument("--psd-seg-stride", type=float, default=2.0,
+                        help="PSD segment stride in seconds (default: 2.0).")
+    parser.add_argument("--track-nonstationarity", action="store_true", default=False,
+                        help="Fit compact instantaneous PSD and track 1 Hz multi-band scale factors.")
+
+    # Glitch gating & inpainting
+    parser.add_argument("--gate-glitches", action="store_true", default=False,
+                        help="Detect loud transients and inpaint gaps using regularized Cholesky.")
+    parser.add_argument("--glitch-threshold", type=float, default=15.0,
+                        help="SNR threshold for glitch detection (default: 15.0).")
+    parser.add_argument("--gate-width", type=float, default=0.2,
+                        help="Gate interval width in seconds around each glitch (default: 0.2).")
+
+    parser.add_argument("--inpaint-edges", action="store_true", default=False,
+                        help="Inpaint outer edges using regularized hole-filling to eliminate boundary step transients.")
+    parser.add_argument("--edge-pad-duration", type=float, default=2.0,
+                        help="Duration of edge inpainting padding in seconds (default: 2.0).")
+
+    # Outputs
+    parser.add_argument("--output-file", type=str, required=True,
+                        help="Output packaged HDF5 file containing d_ow, d_w, and PSD models.")
+    parser.add_argument("--output-dow-file", type=str, default=None,
+                        help="Optional separate file for overwhitened strain d_ow(t).")
+    parser.add_argument("--output-dw-file", type=str, default=None,
+                        help="Optional separate file for whitened strain d_w(t).")
+    parser.add_argument("--output-stats-json", type=str, default=None,
+                        help="Save statistical validation metrics to JSON.")
+    parser.add_argument("--validate", action="store_true", default=False,
+                        help="Execute statistical whiteness/normality battery and print report.")
+
+    args = parser.parse_args()
+    pycbc.init_logging(args.verbose, default_level=1)
+
+    logging.info("Starting PyCBC Overwhitening Conditioner")
+    t0_all = time.time()
+
+    # 1. Load strain
+    ts = load_input_strain(args)
+    fs = float(ts.sample_rate)
+    duration = float(ts.duration)
+    logging.info("Loaded strain: %d samples (%.2f s at %.1f Hz, GPS [%.2f, %.2f])",
+                 len(ts), duration, fs, float(ts.start_time), float(ts.end_time))
+
+    # Pre-condition: Highpass below seismic cutoff if needed
+    if getattr(args, "highpass_frequency", 0.0) > 0:
+        if not getattr(args, "strain_high_pass", None):
+            logging.info("Applying %.1f Hz highpass filter to suppress low-frequency seismic wall", args.highpass_frequency)
+            ts = pycbc.filter.highpass(ts, frequency=args.highpass_frequency)
+
+    # 2. Estimate base PSD
+    logging.info("Estimating base PSD using method: %s", args.psd_method)
+    seg_len_samples = int(round(args.psd_seg_len * fs))
+    seg_stride_samples = int(round(args.psd_seg_stride * fs))
+
+    if args.psd_method == "welch-median":
+        psd_base = pycbc.psd.welch(ts, seg_len=seg_len_samples, seg_stride=seg_stride_samples, avg_method="median")
+    elif args.psd_method == "welch-mean":
+        psd_base = pycbc.psd.welch(ts, seg_len=seg_len_samples, seg_stride=seg_stride_samples, avg_method="mean")
+    elif args.psd_method == "welch-trimmed":
+        psd_base = pycbc.psd.estimate_psd_trimmed_welch(ts, seg_len=seg_len_samples, seg_stride=seg_stride_samples, alpha=0.20)
+    elif args.psd_method == "multitaper":
+        psd_base = pycbc.psd.estimate_psd_multitaper(ts, seg_len=seg_len_samples, seg_stride=seg_stride_samples, NW=3.0, avg_method="median")
+    elif args.psd_method in ("als-spline", "als-spline-continuum"):
+        logging.info("Computing pilot spectrum and fitting smooth ALS spline model...")
+        pilot = pycbc.psd.welch(ts, seg_len=seg_len_samples, seg_stride=seg_stride_samples, avg_method="median")
+        model = pycbc.psd.CompactInstantaneousPSD(f_min=args.f_low, f_max=min(1024.0, fs / 2.0), n_knots=48)
+        model.fit_static_from_psd(pilot)
+        freqs_full = pilot.sample_frequencies.numpy()
+        include_lines = (args.psd_method == "als-spline")
+        psd_vals = model.eval_psd(freqs_full, include_lines=include_lines)
+        psd_base = FrequencySeries(psd_vals, delta_f=pilot.delta_f)
+    else:
+        raise ValueError(f"Unknown psd-method: {args.psd_method}")
+
+    gated_segments = []
+    # 3. Optional: Gating and Cholesky Inpainting
+    if args.gate_glitches:
+        logging.info("Scanning for loud transients above threshold %.1f", args.glitch_threshold)
+        glitch_times = pycbc.strain.strain.detect_loud_glitches(
+            ts, psd_duration=args.psd_seg_len, psd_stride=args.psd_seg_stride,
+            low_freq_cutoff=args.f_low, threshold=args.glitch_threshold
+        )
+        if glitch_times:
+            logging.info("Found %d glitches to inpaint: %s", len(glitch_times), glitch_times)
+            from pycbc.strain.gate import gate_and_paint
+            # Build inverse spectrum for inpainting
+            psd_ist = pycbc.psd.inverse_spectrum_truncation(
+                pycbc.psd.interpolate(psd_base, ts.delta_f),
+                max_filter_len=int(round(args.max_filter_duration * fs)),
+                which_spectrum="invpsd", low_frequency_cutoff=args.f_low, trunc_method="hann"
+            )
+            invpsd = 1.0 / psd_ist
+            half_w = args.gate_width / 2.0
+            for gt in glitch_times:
+                gated_segments.append((float(gt - half_w), float(gt + half_w)))
+                l_idx = max(0, int(round((gt - float(ts.start_time) - half_w) * fs)))
+                r_idx = min(len(ts), int(round((gt - float(ts.start_time) + half_w) * fs)))
+                ts = gate_and_paint(ts, l_idx, r_idx, invpsd, copy=True, method="cholesky", ridge=1e-10)
+        else:
+            logging.info("No glitches exceeded threshold %.1f", args.glitch_threshold)
+
+    # 4. Optional: Compact Instantaneous PSD modeling
+    model_compact = None
+    if args.track_nonstationarity:
+        logging.info("Fitting compact factorized continuum + line model and tracking non-stationarity")
+        model_compact = pycbc.psd.CompactInstantaneousPSD(f_min=15.0, f_max=min(1024.0, fs / 2.0), n_knots=48)
+        model_compact.fit_static_from_psd(psd_base)
+        model_compact.track_nonstationarity(ts, t_step=1.0, t_window=4.0)
+        logging.info("Instantaneous PSD tracked over %d timesteps (Memory: %d bytes)",
+                     len(model_compact.scale_times) if model_compact.scale_times is not None else 0,
+                     model_compact.get_memory_footprint()["total_bytes"])
+
+    # 5. Overwhitening & Whitening Filtering
+    logging.info("Constructing regularized kernels and streaming overlap-save filter")
+    ts_dow, ts_dw, kernels_dict = pycbc.filter.overwhiten_strain(
+        ts, psd=psd_base, f_low=args.f_low, f_taper=args.f_taper,
+        max_filter_duration=args.max_filter_duration,
+        use_overlap_save=True, chunk_len_s=args.chunk_duration,
+        model_compact=model_compact,
+        inpaint_edges=args.inpaint_edges,
+        edge_pad_duration=args.edge_pad_duration
+    )
+    logging.info("Filtering complete: d_ow(t) and d_w(t) successfully produced")
+
+    # 6. Statistical Validation
+    val_stats = {}
+    if args.validate or args.output_stats_json:
+        logging.info("Executing statistical validation battery on whitened stream d_w(t)")
+        val_stats = run_statistical_validation(ts_dw, f_low=args.f_low, fs=fs)
+        logging.info("Validation Results:")
+        logging.info("  Mean:                %.6f (Target: 0.0)", val_stats["mean"])
+        logging.info("  Standard Deviation:  %.4f (Target: 1.00)", val_stats["std"])
+        logging.info("  Skewness:            %.4f (Target: 0.0)", val_stats["skewness"])
+        logging.info("  Excess Kurtosis:     %.4f (Target: 0.0)", val_stats["excess_kurtosis"])
+        logging.info("  Max Off-Zero ACF:    %.4f (Target: <0.02)", val_stats["max_offzero_acf"])
+        logging.info("  Spectral Flatness:   %.4f (Target: 1.00)", val_stats["spectral_flatness_wiener"])
+        logging.info("  3-Sigma Exceedance:  Obs=%.5f vs Th=%.5f (Ratio=%.2fx)",
+                     val_stats["tail_3sigma_obs"], val_stats["tail_3sigma_th"], val_stats["tail_3sigma_ratio"])
+
+        if args.output_stats_json:
+            with open(args.output_stats_json, "w") as jf:
+                json.dump(val_stats, jf, indent=2)
+            logging.info("Saved validation statistics to: %s", args.output_stats_json)
+
+    # 7. Package Outputs
+    out_dir = os.path.dirname(os.path.abspath(args.output_file))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    metadata = {
+        "f_low": args.f_low,
+        "f_taper": args.f_taper,
+        "max_filter_duration": args.max_filter_duration,
+        "chunk_duration": args.chunk_duration,
+        "psd_method": args.psd_method,
+        "channel_name": args.channel_name or "STRAIN",
+        "sample_rate": fs,
+        "start_time": float(ts.start_time),
+        "duration": duration,
+        "wall_time_s": time.time() - t0_all,
+    }
+
+    logging.info("Packaging overwhitened product to: %s", args.output_file)
+    pycbc.psd.package_overwhitened_product(
+        args.output_file, ts_dow, ts_dw, model_compact=model_compact,
+        psd_base=psd_base, metadata=metadata,
+        gated_segments=gated_segments,
+        boundary_pad=float(args.max_filter_duration) / 2.0
+    )
+
+    if args.output_dow_file:
+        logging.info("Writing d_ow to separate file: %s", args.output_dow_file)
+        ts_dow.save(args.output_dow_file, group="dow")
+
+    if args.output_dw_file:
+        logging.info("Writing d_w to separate file: %s", args.output_dw_file)
+        ts_dw.save(args.output_dw_file, group="dw")
+
+    logging.info("Processing successfully completed in %.2f seconds.", time.time() - t0_all)
+
+
+if __name__ == "__main__":
+    main()

@@ -20,6 +20,7 @@ from pycbc.psd.analytical import *
 from pycbc.psd.analytical_space import *
 from pycbc.psd.estimate import *
 from pycbc.psd.variation import *
+from pycbc.psd.model import *
 from pycbc.types import float32,float64
 from pycbc.types import MultiDetOptionAppendAction, MultiDetOptionAction
 from pycbc.types import DictOptionAction, MultiDetDictOptionAction

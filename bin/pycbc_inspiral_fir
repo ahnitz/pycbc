@@ -26,7 +26,7 @@ import pycbc.scheme
 import pycbc.strain
 import pycbc.types.optparse
 import pycbc.vetoes
-from pycbc.filter.matched_filter_ratio import MatchedFilterRatioControl
+from pycbc.filter.matched_filter_ratio import MatchedFilterRatioControl, dynamic_snr_renormalize, get_dynamic_snr_renorm_factor
 from pycbc.types import FrequencySeries, TimeSeries, complex64, float32, zeros
 from pycbc.vetoes.chisq import (
     SingleDetPowerChisq,
@@ -192,9 +192,10 @@ class RatioPowerChisq(SingleDetPowerChisq):
         self.bins_cache = {}
         self.ratio_cache = {}
 
-    def compute(self, ids_local, t_idxs, snrs, fine_indices, tstarts, stilde, bank, ref_snr, filters_f, coarse_idx, args):
+    def compute(self, ids_local, t_idxs, snrs, fine_indices, tstarts, stilde, bank, ref_snr, filters_f, coarse_idx, args, snr_amp=None):
         global_ids = fine_indices[ids_local]
-        snr_amp = abs(snrs)
+        if snr_amp is None:
+            snr_amp = abs(snrs)
         num_trigs = len(snrs)
         chisq_vals = np.zeros(num_trigs, dtype=float32)
         chisq_dof_vals = np.zeros(num_trigs, dtype=np.int32) - 100
@@ -303,6 +304,8 @@ def process_and_record_triggers(
     args, power_chisq, is_asym=False,
     shifts=None,
     timers=None,
+    renorm_factor=None,
+    primary_snr_threshold=6.0,
 ):
     """Filter triggers for analysis boundary, evaluate chisq, and append batch record."""
     if len(ids_local) > 0 and getattr(stilde, 'analyze', None) is not None:
@@ -315,14 +318,32 @@ def process_and_record_triggers(
             snrs = snrs[in_bounds]
             tstarts = tstarts[in_bounds]
 
+    if len(ids_local) > 0 and renorm_factor is not None:
+        local_shifts = shifts[ids_local] if shifts is not None else 0
+        phys_t = np.clip(t_idxs - local_shifts, 0, len(renorm_factor) - 1)
+        r = renorm_factor[phys_t]
+        snrs_renorm = snrs * r
+        thresh = getattr(args, 'asym_secondary_snr_threshold', 4.0) if is_asym else primary_snr_threshold
+        if thresh is not None and thresh > 0:
+            keep = np.abs(snrs_renorm) >= thresh
+            if not np.all(keep):
+                ids_local = ids_local[keep]
+                t_idxs = t_idxs[keep]
+                snrs = snrs[keep]
+                snrs_renorm = snrs_renorm[keep]
+                tstarts = tstarts[keep]
+    else:
+        snrs_renorm = snrs
+
     n_trig = len(ids_local)
     if n_trig > 0:
-        if power_chisq.do and np.any(abs(snrs) >= power_chisq.snr_threshold):
+        if power_chisq.do and np.any(abs(snrs_renorm) >= power_chisq.snr_threshold):
             t_chi0 = time.perf_counter()
             chi, chi_dof = power_chisq.compute(
                 ids_local, t_idxs, snrs,
                 fine_indices, tstarts, stilde, bank,
-                ref_snr, filters_f, coarse_idx, args)
+                ref_snr, filters_f, coarse_idx, args,
+                snr_amp=abs(snrs_renorm))
             chi_dur = time.perf_counter() - t_chi0
             t_clock = timers if timers is not None else TIMERS
             t_clock['power_chisq'] += chi_dur
@@ -336,7 +357,7 @@ def process_and_record_triggers(
             'template_id': fine_indices[ids_local],
             'time_index': (t_idxs + time_offset - local_shifts).astype(np.int64),
             't_idx': (t_idxs - local_shifts).astype(np.int64),
-            'snr': snrs.astype(complex64),
+            'snr': snrs_renorm.astype(complex64),
             'sigmasq': np.full(n_trig, h_norm, dtype=np.float32),
             'chisq': chi.astype(float32),
             'chisq_dof': chi_dof.astype(np.int32),
@@ -346,6 +367,7 @@ def process_and_record_triggers(
         ifo_trigs = triggers[ifo]
         for col, arr in batch.items():
             ifo_trigs[col].append(arr)
+
 
 
 def sample_asym_bins(group_engine, ref_snr, local_id, t_center,
@@ -425,9 +447,12 @@ def select_primary_asym_candidates(
 def filter_secondary_asym_triggers(
     asym_ids, asym_t_idxs, asym_snrs, asym_tstarts, primary_snr,
     secondary_snr_threshold=None, network_snr_threshold=None, max_followup_bins=0,
+    return_indices=False,
 ):
     """Filter secondary triggers based on secondary SNR, network SNR, and loudest bins."""
     if len(asym_ids) == 0:
+        if return_indices:
+            return asym_ids, asym_t_idxs, asym_snrs, asym_tstarts, np.empty(0, dtype=np.int64)
         return asym_ids, asym_t_idxs, asym_snrs, asym_tstarts
 
     rho_sec = np.abs(asym_snrs)
@@ -445,18 +470,25 @@ def filter_secondary_asym_triggers(
         passing_indices = np.arange(len(asym_ids))
 
     if len(passing_indices) == 0:
-        return asym_ids[:0], asym_t_idxs[:0], asym_snrs[:0], asym_tstarts[:0]
+        empty_res = (asym_ids[:0], asym_t_idxs[:0], asym_snrs[:0], asym_tstarts[:0])
+        if return_indices:
+            return (*empty_res, np.empty(0, dtype=np.int64))
+        return empty_res
 
     if max_followup_bins is not None and max_followup_bins > 0 and len(passing_indices) > max_followup_bins:
         order = np.argsort(-rho_sec[passing_indices], kind='stable')
         passing_indices = np.sort(passing_indices[order[:max_followup_bins]])
 
-    return (
+    res = (
         asym_ids[passing_indices],
         asym_t_idxs[passing_indices],
         asym_snrs[passing_indices],
         asym_tstarts[passing_indices],
     )
+    if return_indices:
+        return (*res, passing_indices)
+    return res
+
 
 
 def followup_asym_candidates(
@@ -466,6 +498,7 @@ def followup_asym_candidates(
     args, primary_snr_threshold, effective_asym_num_bins,
     ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
     timers=None,
+    renorm_factors=None,
 ):
     """Follow up primary candidate triggers in secondary detectors within asymmetric windows."""
     t_asym0 = time.perf_counter()
@@ -476,10 +509,18 @@ def followup_asym_candidates(
         a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
         if len(a_ids) == 0:
             continue
+        rf_A = renorm_factors.get(ifo_A) if renorm_factors else None
+        if rf_A is not None:
+            shifts_A = shifts[a_ids] if shifts is not None else 0
+            phys_t_A = np.clip(a_tidxs - shifts_A, 0, len(rf_A) - 1)
+            a_snrs_eval = a_snrs * rf_A[phys_t_A]
+        else:
+            a_snrs_eval = a_snrs
+
         cand_indices = select_primary_asym_candidates(
             a_ids=a_ids,
             a_tidxs=a_tidxs,
-            a_snrs=a_snrs,
+            a_snrs=a_snrs_eval,
             sample_rate=ifo_sample_rates[ifo_A],
             asym_snr_threshold=primary_snr_threshold,
             max_primary_per_group_sec=args.asym_max_primary_per_group_sec,
@@ -499,6 +540,8 @@ def followup_asym_candidates(
             args, power_chisq, is_asym=False,
             shifts=shifts,
             timers=timers,
+            renorm_factor=rf_A,
+            primary_snr_threshold=primary_snr_threshold,
         )
 
         sr_A = ifo_sample_rates[ifo_A]
@@ -513,6 +556,7 @@ def followup_asym_candidates(
             sr_B = ifo_sample_rates[ifo_B]
             s_start_B = seg_starts[(ifo_B, s_num)]
             t0_B = ifo_gps_starts[ifo_B]
+            rf_B = renorm_factors.get(ifo_B) if renorm_factors else None
 
             for k in cand_indices:
                 cand_lid = a_ids[k]
@@ -533,23 +577,35 @@ def followup_asym_candidates(
 
                 has_asym_followup[ifo_B] += 1
 
-                asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = filter_secondary_asym_triggers(
-                    asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
-                    primary_snr=a_snrs[k],
+                if rf_B is not None and len(asym_ids) > 0:
+                    shifts_B = shifts[asym_ids] if shifts is not None else 0
+                    phys_t_B = np.clip(asym_t_idxs - shifts_B, 0, len(rf_B) - 1)
+                    asym_snrs_eval = asym_snrs * rf_B[phys_t_B]
+                else:
+                    asym_snrs_eval = asym_snrs
+
+                prim_snr_eval = a_snrs_eval[k]
+                asym_ids, asym_t_idxs, _, asym_tstarts, passing_idx = filter_secondary_asym_triggers(
+                    asym_ids, asym_t_idxs, asym_snrs_eval, asym_tstarts,
+                    primary_snr=prim_snr_eval,
                     secondary_snr_threshold=args.asym_secondary_snr_threshold,
                     network_snr_threshold=args.asym_network_snr_threshold,
                     max_followup_bins=args.asym_max_followup_bins,
+                    return_indices=True,
                 )
 
                 process_and_record_triggers(
-                    asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
+                    asym_ids, asym_t_idxs, asym_snrs[passing_idx], asym_tstarts,
                     stilde_B, h_norms[ifo_B], coarse_idx, fine_indices,
                     filters_f, ref_snr_B, bank,
                     s_num, ifo_B, triggers,
                     args, power_chisq, is_asym=True,
                     shifts=shifts,
                     timers=timers,
+                    renorm_factor=rf_B,
+                    primary_snr_threshold=args.asym_secondary_snr_threshold,
                 )
+
 
     chi_asym_now = t_clock['power_chisq']
     asym_dur = (time.perf_counter() - t_asym0) - (chi_asym_now - chi_asym_before)
@@ -697,10 +753,22 @@ def process_top_template_task(task_args):
 
         middle_series = {}
         norms = {}
+        renorm_factors = {}
         for ifo in active_ifos:
             st = segments[ifo][s_num]
             t_ref0 = time.perf_counter()
             series, norm = engine.make_reference_series(st, st.psd, top_template)
+            dt_sample = float(st.delta_t)
+            amp_scale = float(st.delta_t / engine.decimation_factor)
+            if not getattr(args, 'disable_dynamic_snr_renorm', False):
+                renorm_factors[ifo] = get_dynamic_snr_renorm_factor(
+                    series, dt=dt_sample, scale=amp_scale,
+                    window_duration=getattr(args, 'dynamic_snr_window', 8.0),
+                    hollow_duration=getattr(args, 'dynamic_snr_hollow', 0.5),
+                    variance_floor=getattr(args, 'dynamic_snr_variance_floor', 1.0),
+                )
+            else:
+                renorm_factors[ifo] = None
             local_timers['upper_ref'] += time.perf_counter() - t_ref0
             norms[ifo] = norm
 
@@ -744,6 +812,8 @@ def process_top_template_task(task_args):
                         args, power_chisq, is_asym=False,
                         shifts=shifts,
                         timers=local_timers,
+                        renorm_factor=renorm_factors.get(ifo),
+                        primary_snr_threshold=primary_snr_threshold,
                     )
                 else:
                     std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
@@ -756,6 +826,7 @@ def process_top_template_task(task_args):
                     args, primary_snr_threshold, effective_asym_num_bins,
                     ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
                     timers=local_timers,
+                    renorm_factors=renorm_factors,
                 )
 
         t_seg_dur = max(time.time() - t_seg_start, 1e-6)
@@ -769,6 +840,8 @@ def process_top_template_task(task_args):
         logging.info(f"[Top {top_idx}] Seg {s_num+1}/{num_segs}: {len(top_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s]")
         del middle_series
         del norms
+        del renorm_factors
+
 
     del top_groups
     del upper_batch
@@ -1238,6 +1311,15 @@ def get_args():
                        help="Width of the band the first stage filters, in Hz. 0 uses the design table's choice.")
     group.add_argument('--ratio-filter-first-stage-snr', type=float, default=0, metavar='SNR',
                        help="SNR the first stage is calibrated against. 0 uses the design table.")
+    group.add_argument('--dynamic-snr-window', type=float, default=8.0,
+                       help="Rolling window duration in seconds for dynamic SNR renormalization (default: 8.0).")
+    group.add_argument('--dynamic-snr-hollow', type=float, default=0.5,
+                       help="Hollow exclusion half-width in seconds for dynamic SNR renormalization (default: 0.5).")
+    group.add_argument('--dynamic-snr-variance-floor', type=float, default=1.0,
+                       help="Variance floor for dynamic SNR renormalization (default: 1.0).")
+    group.add_argument('--disable-dynamic-snr-renorm', action='store_true',
+                       help="Disable dynamic SNR renormalization.")
+
 
     # Power Chisq Options
     parser.add_argument("--chisq-snr-threshold", type=float,

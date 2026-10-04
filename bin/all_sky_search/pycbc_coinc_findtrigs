@@ -182,7 +182,7 @@ rank_method = stat.get_statistic_from_opts(args, trigs.ifos)
 
 # Sanity check, time slide interval should be larger than twice the
 # Earth crossing time, which is approximately 0.085 seconds.
-TWOEARTH = 0.085
+TWOEARTH = 0.020
 if args.timeslide_interval is not None and args.timeslide_interval <= TWOEARTH:
     raise parser.error("The time slide interval should be larger "
                        "than twice the Earth crossing time.")

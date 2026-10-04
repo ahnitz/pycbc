@@ -190,3 +190,35 @@ def from_xml(filename, length, delta_f, low_freq_cutoff, ifo_string=None,
 
     return from_numpy_arrays(freq_data, noise_data, length, delta_f,
                              low_freq_cutoff)
+
+
+def from_overwhitened_file(filename, gps_time, length=None, delta_f=None,
+                           low_frequency_cutoff=None, f_high=None):
+    """Retrieve an instantaneous PSD FrequencySeries from an overwhitened HDF5 file
+    or directory containing overwhitened files at a specified GPS time.
+
+    Parameters
+    ----------
+    filename : str or list of str
+        Path to an overwhitened HDF5 file or directory containing files.
+    gps_time : float
+        GPS time at which to evaluate the instantaneous PSD.
+    length : int, optional
+        Desired length of output FrequencySeries.
+    delta_f : float, optional
+        Desired frequency resolution in Hz.
+    low_frequency_cutoff : float, optional
+        Low frequency cutoff in Hz (frequencies below set to zero/inf as standard).
+    f_high : float, optional
+        High frequency cutoff in Hz.
+
+    Returns
+    -------
+    psd : FrequencySeries
+        Instantaneous PSD at gps_time.
+    """
+    from pycbc.filter.overwhiten import OverwhitenedData
+    data = OverwhitenedData(filename)
+    return data.get_psd(gps_time, length=length, delta_f=delta_f,
+                        low_frequency_cutoff=low_frequency_cutoff, f_high=f_high)
+

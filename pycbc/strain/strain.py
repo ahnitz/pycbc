@@ -1111,6 +1111,7 @@ class StrainSegments(object):
             for analysis.
         """
         self._fourier_segments = None
+        self._inpaint_invpsd = None
         self.strain = strain
 
         self.delta_t = strain.delta_t
@@ -1302,10 +1303,27 @@ class StrainSegments(object):
                     elif seg_slice.start < 0:
                         strain_chunk = self.strain[:seg_slice.stop]
                         strain_chunk.prepend_zeros(-seg_slice.start)
+                        from pycbc.strain.gate import gate_and_paint
+                        if self._inpaint_invpsd is None:
+                            psd_seg_len = min(16.0, max(2.0, self.strain.duration / 4.0))
+                            self._inpaint_invpsd = 1.0 / self.strain.filter_psd(
+                                psd_seg_len, self.delta_f, 20.0)
+                        gate_and_paint(strain_chunk, 0, -seg_slice.start,
+                                       self._inpaint_invpsd, copy=False,
+                                       method='toeplitz', ridge=1e-3)
                         base_seg = make_frequency_series(strain_chunk)
                     elif seg_slice.stop > len(self.strain):
+                        orig_len = len(self.strain) - seg_slice.start
                         strain_chunk = self.strain[seg_slice.start:]
                         strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
+                        from pycbc.strain.gate import gate_and_paint
+                        if self._inpaint_invpsd is None:
+                            psd_seg_len = min(16.0, max(2.0, self.strain.duration / 4.0))
+                            self._inpaint_invpsd = 1.0 / self.strain.filter_psd(
+                                psd_seg_len, self.delta_f, 20.0)
+                        gate_and_paint(strain_chunk, orig_len, len(strain_chunk),
+                                       self._inpaint_invpsd, copy=False,
+                                       method='toeplitz', ridge=1e-3)
                         base_seg = make_frequency_series(strain_chunk)
                     if slice_counts[key] > 1:
                         cached_freq_segs[key] = base_seg

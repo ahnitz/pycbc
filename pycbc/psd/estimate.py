@@ -381,3 +381,118 @@ def bandlimited_interpolate(series, delta_f):
 
     return interpolated_series
 
+
+def estimate_psd_trimmed_welch(timeseries, seg_len=4096, seg_stride=2048, alpha=0.20):
+    """Robust Trimmed-Mean Welch PSD estimator.
+    Discards the lowest alpha and highest alpha fraction of periodograms at each bin,
+    mitigating both transient loud glitches/signals and deep nulls.
+    Corrects for the finite-sample trimmed mean bias on Chi-squared (2 DOF) noise.
+
+    Parameters
+    ----------
+    timeseries : TimeSeries
+        Input PyCBC TimeSeries.
+    seg_len : int, optional
+        Segment length in samples (default: 4096).
+    seg_stride : int, optional
+        Segment stride in samples (default: 2048).
+    alpha : float, optional
+        Fraction to trim from each end (default: 0.20).
+
+    Returns
+    -------
+    psd : FrequencySeries
+        Bias-corrected estimated PSD.
+    """
+    fs = float(timeseries.sample_rate)
+    delta_f = 1.0 / (seg_len / fs)
+    num_segs = (len(timeseries) - seg_len) // seg_stride + 1
+    if num_segs < 1:
+        raise ValueError("timeseries too short for seg_len")
+    w = numpy.hanning(seg_len)
+    w_sum_sq = numpy.sum(w**2)
+
+    seg_specs = []
+    for i in range(num_segs):
+        seg = timeseries[i * seg_stride : i * seg_stride + seg_len].numpy()
+        seg_spec = numpy.abs(numpy.fft.rfft(w * seg))**2 * (2.0 / (fs * w_sum_sq))
+        # Halve DC and Nyquist components to be consistent with T010095 & PyCBC convention
+        seg_spec[0] /= 2.0
+        seg_spec[-1] /= 2.0
+        seg_specs.append(seg_spec)
+    seg_specs = numpy.array(seg_specs)
+
+    k_trim = int(num_segs * alpha)
+    sorted_specs = numpy.sort(seg_specs, axis=0)
+    if k_trim > 0 and 2 * k_trim < num_segs:
+        trimmed = sorted_specs[k_trim : num_segs - k_trim, :]
+        raw_psd = numpy.mean(trimmed, axis=0)
+        # Analytical expectation of trimmed standard exponential distribution:
+        bias_factor = float(1.0 + (alpha * numpy.log(alpha) - (1.0 - alpha) * numpy.log(1.0 - alpha)) / (1.0 - 2.0 * alpha))
+    else:
+        raw_psd = numpy.median(sorted_specs, axis=0)
+        bias_factor = median_bias(num_segs)
+
+    corrected_psd = raw_psd / bias_factor
+    return FrequencySeries(corrected_psd, delta_f=delta_f, epoch=timeseries.start_time)
+
+
+def estimate_psd_multitaper(timeseries, seg_len=4096, seg_stride=2048, NW=3.0, avg_method='median'):
+    """Multitaper Spectral Estimator using Discrete Prolate Spheroidal Sequences (DPSS).
+    Applies K = 2*NW - 1 orthonormal Slepian tapers per segment to minimize spectral
+    leakage across steep dynamic range gradients (e.g. seismic wall at 15-20 Hz).
+    Combines segments via median or mean for non-Gaussian glitch robustness.
+
+    Parameters
+    ----------
+    timeseries : TimeSeries
+        Input PyCBC TimeSeries.
+    seg_len : int, optional
+        Segment length in samples (default: 4096).
+    seg_stride : int, optional
+        Segment stride in samples (default: 2048).
+    NW : float, optional
+        Time-halfbandwidth product (default: 3.0).
+    avg_method : {'median', 'mean'}, optional
+        Segment averaging method (default: 'median').
+
+    Returns
+    -------
+    psd : FrequencySeries
+        Bias-corrected estimated PSD.
+    """
+    from scipy.signal.windows import dpss
+    import scipy.stats as stats
+
+    fs = float(timeseries.sample_rate)
+    delta_f = 1.0 / (seg_len / fs)
+    K = int(2 * NW - 1)
+    tapers, _ = dpss(seg_len, NW=NW, Kmax=K, return_ratios=True)
+
+    num_segs = (len(timeseries) - seg_len) // seg_stride + 1
+    if num_segs < 1:
+        raise ValueError("timeseries too short for seg_len")
+    seg_psds = []
+    for i in range(num_segs):
+        seg = timeseries[i * seg_stride : i * seg_stride + seg_len].numpy()
+        tapered = tapers * seg[None, :]
+        spec = numpy.abs(numpy.fft.rfft(tapered, axis=1))**2 * (2.0 / fs)
+        # Halve DC and Nyquist components to be consistent with T010095 & PyCBC convention
+        spec[:, 0] /= 2.0
+        spec[:, -1] /= 2.0
+        seg_psd = numpy.mean(spec, axis=0)
+        seg_psds.append(seg_psd)
+    seg_psds = numpy.array(seg_psds)
+
+    if avg_method == 'median':
+        psd_raw = numpy.median(seg_psds, axis=0)
+        bias = float(stats.gamma.ppf(0.5, a=K) / K)
+        psd_est = psd_raw / bias
+    elif avg_method == 'mean':
+        psd_est = numpy.mean(seg_psds, axis=0)
+    else:
+        raise ValueError(f"Unknown avg_method: {avg_method}")
+
+    return FrequencySeries(psd_est, delta_f=delta_f, epoch=timeseries.start_time)
+
+
