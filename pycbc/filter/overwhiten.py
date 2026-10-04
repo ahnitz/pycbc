@@ -570,6 +570,8 @@ def overwhiten_strain(timeseries, psd=None, f_low=18.0, f_taper=4.0, max_filter_
                 psd_ext, fs, dur_ext, f_low=f_low, f_taper=f_taper, max_filter_duration=max_filter_duration
             )
             invpsd_fs = FrequencySeries(invpsd_ext, delta_f=ts_ext.delta_f)
+            if hasattr(ts_ext, 'precision') and ts_ext.precision == 'single':
+                invpsd_fs = invpsd_fs.astype(np.float32)
 
             painted = gate_and_paint(ts_ext, 0, pad_n, invpsd_fs, method='toeplitz')
             painted = gate_and_paint(painted, pad_n + N_orig, N_tot, invpsd_fs, method='toeplitz')

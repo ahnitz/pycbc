@@ -178,6 +178,8 @@ def gate_and_paint(data, lindex, rindex, invpsd, copy=True, method='toeplitz',
         data = data.copy()
     data[lindex:rindex] = 0.0
     K = rindex - lindex
+    if hasattr(invpsd, 'precision') and hasattr(data, 'precision') and invpsd.precision != data.precision:
+        invpsd = invpsd.astype(np.float32 if data.precision == 'single' else np.float64)
     # get the over-whitened gated data
     tdfilter = invpsd.astype('complex').to_timeseries() * invpsd.delta_t
     owhgated_data = (data.to_frequencyseries() * invpsd).to_timeseries()

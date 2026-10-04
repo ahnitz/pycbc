@@ -938,6 +938,41 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
         gating_info[ifo] = getattr(ifo_strain, 'gating_info', None)
         gwstrain_start_time[ifo] = float(ifo_strain.start_time)
 
+        raw_strain_for_psd = ifo_strain.copy() if getattr(args, 'overwhiten_strain', False) else ifo_strain
+
+        if getattr(args, 'subtract_lines', False):
+            logging.info("Applying coherent line subtraction for %s...", ifo)
+            from pycbc.filter.overwhiten import subtract_coherent_lines
+            orig_injs = getattr(ifo_strain, 'injections', None)
+            orig_gating = getattr(ifo_strain, 'gating_info', None)
+            f_low_sub = getattr(args, 'overwhiten_f_low', 18.0)
+            ifo_strain, sub_lines = subtract_coherent_lines(ifo_strain, f_low=f_low_sub)
+            ifo_strain = ifo_strain.astype(np.float32)
+            if orig_injs is not None:
+                ifo_strain.injections = orig_injs
+            if orig_gating is not None:
+                ifo_strain.gating_info = orig_gating
+            logging.info("Subtracted %d coherent lines in %s", len(sub_lines), ifo)
+
+        if getattr(args, 'overwhiten_strain', False):
+            logging.info("Applying continuous overwhitening for %s...", ifo)
+            from pycbc.filter.overwhiten import overwhiten_strain
+            orig_injs = getattr(ifo_strain, 'injections', None)
+            orig_gating = getattr(ifo_strain, 'gating_info', None)
+            f_low_ow = getattr(args, 'overwhiten_f_low', 18.0)
+            max_dur_ow = getattr(args, 'overwhiten_max_filter_duration', 4.0)
+            inpaint_ow = getattr(args, 'inpaint_edges', False)
+            ifo_strain, _, _ = overwhiten_strain(
+                ifo_strain, f_low=f_low_ow, max_filter_duration=max_dur_ow,
+                inpaint_edges=inpaint_ow
+            )
+            ifo_strain = ifo_strain.astype(np.float32)
+            if orig_injs is not None:
+                ifo_strain.injections = orig_injs
+            if orig_gating is not None:
+                ifo_strain.gating_info = orig_gating
+            logging.info("Overwhitening completed for %s", ifo)
+
         logging.info("Making frequency-domain data segments and associating PSDs for %s...", ifo)
         single_det_opt = pycbc.types.optparse.copy_opts_for_single_ifo(args, ifo)
         ifo_segments = pycbc.strain.StrainSegments.from_cli_single_ifo(args, ifo_strain, ifo)
@@ -955,7 +990,7 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
             logging.info("Calculating PSD variation for %s", ifo)
             ifo_opts = get_ifo_opts(args, ifo)
             psd_var[ifo] = pycbc.psd.calc_filt_psd_variation(
-                ifo_strain, ifo_opts.psdvar_segment,
+                raw_strain_for_psd, ifo_opts.psdvar_segment,
                 ifo_opts.psdvar_short_segment, ifo_opts.psdvar_long_segment,
                 ifo_opts.psdvar_psd_duration, ifo_opts.psdvar_psd_stride,
                 ifo_opts.psd_estimation, ifo_opts.psdvar_low_freq, ifo_opts.psdvar_high_freq
@@ -963,14 +998,22 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
 
         fd_segs = ifo_segments.fourier_segments()
         pycbc.psd.associate_psds_to_segments(
-            single_det_opt, fd_segs, ifo_strain, flen, delta_f, flow,
+            single_det_opt, fd_segs, raw_strain_for_psd, flen, delta_f, flow,
             dyn_range_factor=pycbc.DYN_RANGE_FAC, precision='single'
         )
-        for seg in fd_segs:
-            seg[:] = seg / seg.psd
+        if not getattr(args, 'overwhiten_strain', False):
+            for seg in fd_segs:
+                seg[:] = seg / seg.psd
+        else:
+            for seg in fd_segs:
+                if seg.dtype != np.complex64:
+                    seg._data = seg._data.astype(np.complex64)
         segments[ifo] = fd_segs
 
         ifo_strain._data = np.empty(0, dtype=ifo_strain.dtype)
+        if raw_strain_for_psd is not ifo_strain:
+            raw_strain_for_psd._data = np.empty(0, dtype=raw_strain_for_psd.dtype)
+            del raw_strain_for_psd
         gwstrain[ifo] = ifo_strain
         del ifo_segments
         logging.info("Finished strain setup for %s", ifo)
@@ -1319,6 +1362,17 @@ def get_args():
                        help="Variance floor for dynamic SNR renormalization (default: 1.0).")
     group.add_argument('--disable-dynamic-snr-renorm', action='store_true',
                        help="Disable dynamic SNR renormalization.")
+
+    # Overwhitening & Line Subtraction Options
+    ow_group = parser.add_argument_group("Overwhitening & Line Subtraction Options")
+    ow_group.add_argument("--overwhiten-strain", action="store_true", default=False,
+                          help="Enable continuous time-domain overwhitening of strain data.")
+    ow_group.add_argument("--overwhiten-f-low", type=float, default=18.0,
+                          help="Low-frequency cutoff in Hz for continuous overwhitening filter (default: 18.0).")
+    ow_group.add_argument("--overwhiten-max-filter-duration", type=float, default=4.0,
+                          help="Maximum filter duration in seconds for overwhitening filter (default: 4.0).")
+    ow_group.add_argument("--subtract-lines", action="store_true", default=False,
+                          help="Enable coherent line subtraction before filtering.")
 
 
     # Power Chisq Options
