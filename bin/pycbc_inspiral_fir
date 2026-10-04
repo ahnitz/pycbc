@@ -380,6 +380,21 @@ def compute_batch_chisq(*pos_args, **kwargs):
     return chisq_vals, chisq_dof_vals
 
 
+class TriggerBatchCollector(object):
+    """Container for accumulating detected trigger batches per detector."""
+    def __init__(self):
+        self.gids = []
+        self.times = []
+        self.tidxs = []
+        self.snums = []
+        self.snrs = []
+        self.chisq = []
+        self.chisq_dof = []
+        self.norms = []
+        self.is_asym = []
+        self.total_triggers = 0
+
+
 def process_and_record_triggers(
     ids_local, t_idxs, snrs, tstarts,
     stilde, h_norm, coarse_idx, fine_indices,
@@ -402,7 +417,8 @@ def process_and_record_triggers(
                 snrs = snrs[in_bounds]
                 tstarts = tstarts[in_bounds]
 
-    if len(ids_local) > 0:
+    n_trig = len(ids_local)
+    if n_trig > 0:
         if do_chisq and np.any(abs(snrs) >= cthresh):
             t_chi0 = time.perf_counter()
             chi, chi_dof = compute_batch_chisq(
@@ -412,26 +428,22 @@ def process_and_record_triggers(
                 coarse_idx=coarse_idx)
             TIMERS['power_chisq'] += time.perf_counter() - t_chi0
         else:
-            chi = np.zeros(len(ids_local), dtype=float32)
-            chi_dof = np.zeros(len(ids_local), dtype=np.int32) - 100
+            chi = np.zeros(n_trig, dtype=float32)
+            chi_dof = np.zeros(n_trig, dtype=np.int32) - 100
 
         local_shifts = shifts[ids_local] if shifts is not None else 0
         time_offset = (-stilde.analyze.start + stilde.cumulative_index) if getattr(stilde, 'analyze', None) is not None else 0
-        collected_batches[ifo].append({
-            's_num': s_num,
-            'top_idx': top_idx,
-            'coarse_idx': coarse_idx,
-            'gids': fine_indices[ids_local],
-            'ids_local': ids_local,
-            't_idxs': t_idxs - local_shifts,
-            'time_index': t_idxs + time_offset - local_shifts,
-            'snrs': snrs,
-            'tstarts': tstarts,
-            'h_norm': h_norm,
-            'chisq': chi,
-            'chisq_dof': chi_dof,
-            'is_asym': is_asym,
-        })
+        collector = collected_batches[ifo]
+        collector.gids.append(fine_indices[ids_local])
+        collector.times.append((t_idxs + time_offset - local_shifts).astype(np.int64))
+        collector.tidxs.append((t_idxs - local_shifts).astype(np.int64))
+        collector.snums.append(np.full(n_trig, s_num, dtype=np.int32))
+        collector.snrs.append(snrs.astype(complex64))
+        collector.chisq.append(chi.astype(float32))
+        collector.chisq_dof.append(chi_dof.astype(np.int32))
+        collector.norms.append(np.full(n_trig, h_norm, dtype=np.float32))
+        collector.is_asym.append(np.full(n_trig, is_asym, dtype=bool))
+        collector.total_triggers += n_trig
 
     return ids_local, t_idxs, snrs, tstarts
 
@@ -1018,7 +1030,7 @@ def main():
         n_coarse = len(bank.coarse_indices)
         cthresh = args.chisq_snr_threshold
         do_chisq = bool(args.chisq_bins and (cthresh is not None))
-        collected_batches = {ifo: [] for ifo in instruments}
+        collected_batches = {ifo: TriggerBatchCollector() for ifo in instruments}
         has_asym_followup = {ifo: 0 for ifo in instruments}
         num_segs = max(len(segments[ifo]) for ifo in instruments)
 
@@ -1229,15 +1241,6 @@ def main():
                             std_trigs = {}
                             h_norms = {ifo: norms[ifo] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
 
-                            def record_triggers(ifo_key, ids, tidxs, s_vals, starts, is_asym=False):
-                                return process_and_record_triggers(
-                                    ids, tidxs, s_vals, starts,
-                                    segments[ifo_key][s_num], h_norms[ifo_key], coarse_idx, fine_indices,
-                                    filters_f, middle_series[ifo_key][coarse_idx], bank,
-                                    s_num, top_idx, ifo_key, collected_batches,
-                                    args, do_chisq, cthresh, is_asym=is_asym,
-                                    shifts=shifts,
-                                )
                             for ifo in active_ifos:
                                 stilde = segments[ifo][s_num]
                                 h_norm = h_norms[ifo]
@@ -1253,8 +1256,13 @@ def main():
                                 TIMERS['fine_fir'] += time.perf_counter() - t_fine0
 
                                 if not can_asym_seg:
-                                    std_trigs[ifo] = record_triggers(
-                                        ifo, ids_local, t_idxs, snrs, tstarts, is_asym=False
+                                    process_and_record_triggers(
+                                        ids_local, t_idxs, snrs, tstarts,
+                                        stilde, h_norm, coarse_idx, fine_indices,
+                                        filters_f, ref_snr, bank,
+                                        s_num, top_idx, ifo, collected_batches,
+                                        args, do_chisq, cthresh, is_asym=False,
+                                        shifts=shifts,
                                     )
                                 else:
                                     std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
@@ -1281,9 +1289,14 @@ def main():
                                     if len(cand_indices) == 0:
                                         continue
 
-                                    record_triggers(
-                                        ifo_A, a_ids[cand_indices], a_tidxs[cand_indices],
-                                        a_snrs[cand_indices], a_tstarts[cand_indices], is_asym=False
+                                    process_and_record_triggers(
+                                        a_ids[cand_indices], a_tidxs[cand_indices],
+                                        a_snrs[cand_indices], a_tstarts[cand_indices],
+                                        segments[ifo_A][s_num], h_norms[ifo_A], coarse_idx, fine_indices,
+                                        filters_f, middle_series[ifo_A][coarse_idx], bank,
+                                        s_num, top_idx, ifo_A, collected_batches,
+                                        args, do_chisq, cthresh, is_asym=False,
+                                        shifts=shifts,
                                     )
 
                                     sr_A = args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate
@@ -1331,8 +1344,13 @@ def main():
                                                 bin_width_samp=int(round(args.asym_bin_width * sr_B)),
                                             )
 
-                                            record_triggers(
-                                                ifo_B, asym_ids, asym_t_idxs, asym_snrs, asym_tstarts, is_asym=True
+                                            process_and_record_triggers(
+                                                asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
+                                                stilde_B, h_norms[ifo_B], coarse_idx, fine_indices,
+                                                filters_f, ref_snr_B, bank,
+                                                s_num, top_idx, ifo_B, collected_batches,
+                                                args, do_chisq, cthresh, is_asym=True,
+                                                shifts=shifts,
                                             )
                                     TIMERS['asym_followup'] += (time.perf_counter() - t_asym0) - (TIMERS['power_chisq'] - chi_asym_before)
 
@@ -1347,28 +1365,16 @@ def main():
                         logging.info(f"Top {top_step+1}/{n_top} (chunk {chunk_start//chunk_size+1}) Seg {s_num+1}/{num_segs}: {len(chunk_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s] [RSS={get_mem_mb()[0]:.1f} MB, HWM={get_mem_mb()[1]:.1f} MB]")
                         del middle_series
                         del norms
-                        try:
-                            import matchedfilter.time_domain as td_mod
-                            td_mod._REF_PROFILE_CACHE.clear()
-                            td_mod._REF_BINNED_CACHE.clear()
-                        except Exception:
-                            pass
 
                     del chunk_groups
                     del upper_chunk
                     UpperReferenceBatch.clear_buffers()
-                    gc.collect()
-                    if libc is not None:
-                        libc.malloc_trim(0)
 
                 del top_template
                 UpperReferenceBatch.clear_buffers()
                 global _CHISQ_CTX
                 if _CHISQ_CTX is not None and 'ratio_cache' in _CHISQ_CTX:
                     _CHISQ_CTX['ratio_cache'].clear()
-                gc.collect()
-                if libc is not None:
-                    libc.malloc_trim(0)
 
         if bank.top_bank is not None:
             logging.info('Upper synthesis time: direct-reference %.3f s, FIR %.3f s, total %.3f s',
@@ -1378,7 +1384,7 @@ def main():
         # --- Veto Processing Complete & Trigger Ingestion ---
         for ifo in instruments:
             logging.info("[%s] Trigger ingestion start: RSS=%.1f MB, HWM=%.1f MB", ifo, *get_mem_mb())
-            ifo_batches = collected_batches[ifo]
+            collector = collected_batches[ifo]
             ifo_mgr = event_mgr[ifo]
             ifo_strain = gwstrain[ifo]
             ifo_segments = segments[ifo]
@@ -1391,53 +1397,24 @@ def main():
             else:
                 ifo_mgr.non_threshold_time = 0.0
 
-            n_candidates = sum(len(b['ids_local']) for b in ifo_batches)
+            n_candidates = collector.total_triggers
             logging.info("[%s] Trigger identification complete: %d total triggers in %d batches",
-                         ifo, n_candidates, len(ifo_batches))
-            gc.collect()
-            if libc is not None:
-                libc.malloc_trim(0)
+                         ifo, n_candidates, len(collector.gids))
 
             t_ingest_start = time.time()
             sg_dur = 0.0
             logging.info("[%s] Grouping triggers by template...", ifo)
             if n_candidates > 0:
-                all_gids = []
-                all_times = []
-                all_tidxs = []
-                all_snums = []
-                all_snrs = []
-                all_chisq = []
-                all_chisq_dof = []
-                all_norms = []
-                all_is_asym = []
-                for b in ifo_batches:
-                    n_b = len(b['ids_local'])
-                    if n_b == 0:
-                        continue
-                    all_gids.append(b['gids'])
-                    all_times.append(b['time_index'])
-                    all_tidxs.append(b['t_idxs'])
-                    all_snums.append(np.full(n_b, b['s_num'], dtype=np.int32))
-                    all_snrs.append(b['snrs'])
-                    all_chisq.append(b['chisq'])
-                    all_chisq_dof.append(b['chisq_dof'])
-                    all_norms.append(np.full(n_b, b['h_norm'], dtype=np.float32))
-                    all_is_asym.append(np.full(n_b, b.get('is_asym', False), dtype=bool))
-
+                all_gids = np.concatenate(collector.gids)
+                all_times = np.concatenate(collector.times)
+                all_tidxs = np.concatenate(collector.tidxs)
+                all_snums = np.concatenate(collector.snums)
+                all_snrs = np.concatenate(collector.snrs)
+                all_chisq = np.concatenate(collector.chisq)
+                all_chisq_dof = np.concatenate(collector.chisq_dof)
+                all_norms = np.concatenate(collector.norms)
+                all_is_asym = np.concatenate(collector.is_asym)
                 collected_batches[ifo] = None
-                del ifo_batches
-                gc.collect()
-
-                all_gids = np.concatenate(all_gids)
-                all_times = np.concatenate(all_times).astype(np.int64)
-                all_tidxs = np.concatenate(all_tidxs).astype(np.int64)
-                all_snums = np.concatenate(all_snums).astype(np.int32)
-                all_snrs = np.concatenate(all_snrs).astype(complex64)
-                all_chisq = np.concatenate(all_chisq).astype(float32)
-                all_chisq_dof = np.concatenate(all_chisq_dof).astype(np.int32)
-                all_norms = np.concatenate(all_norms).astype(float32)
-                all_is_asym = np.concatenate(all_is_asym).astype(bool)
 
                 sort_idx = np.argsort(all_gids, kind='stable')
                 all_gids = all_gids[sort_idx]
@@ -1540,11 +1517,7 @@ def main():
                     if args.finalize_events_template_rate is not None and (t_idx + 1) % args.finalize_events_template_rate == 0:
                         ifo_mgr.consolidate_events(ifo_opts, gwstrain=ifo_strain)
 
-                del all_gids, all_times, all_tidxs, all_snums, all_snrs, all_chisq, all_chisq_dof, all_norms, all_sg_chisq, all_is_asym
-                del unique_gids, start_indices, end_indices
-                gc.collect()
-                if libc is not None:
-                    libc.malloc_trim(0)
+
 
             ingest_total = time.time() - t_ingest_start
             TIMERS['event_ingest'] += max(0.0, ingest_total - sg_dur)
