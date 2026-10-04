@@ -49,7 +49,7 @@ class UpperReferenceBatch:
     def clear_buffers(cls):
         cls._BUFFERS.clear()
 
-    def __init__(self, taps, counts, middle_ids, series_length):
+    def __init__(self, taps, counts, middle_ids, series_length, scales=None):
         import matchedfilter
         from matchedfilter import _automatic_series_layout
 
@@ -58,6 +58,7 @@ class UpperReferenceBatch:
         self.sort_order = sort_order
         self.sorted_ids = np.asarray(middle_ids, dtype=int)[sort_order]
         self.series_length = int(series_length)
+        self.scales = np.asarray(scales, dtype=np.float32)[sort_order] if scales is not None else None
         self.bank = matchedfilter.TimeDomainFilterBank(
             taps[sort_order], tap_counts=counts_arr[sort_order],
             engine='corr'
@@ -78,21 +79,15 @@ class UpperReferenceBatch:
                 'valid': cplan.valid,
             })
 
-    def run(self, top_series, top_norm, middle_norms_or_scales, tap_sample_rate, valid_slice=None, ifo=None, pad=4096):
+    def run(self, top_series, valid_slice=None, ifo=None, pad=4096, scales=None):
         """Return middle-id to SNR series, scaled like direct middle filtering."""
         if len(top_series) != self.series_length:
             raise ValueError('top reference length changed between segments')
 
-        if (isinstance(middle_norms_or_scales, np.ndarray)
-                and middle_norms_or_scales.ndim == 1
-                and len(middle_norms_or_scales) == len(self.sorted_ids)
-                and middle_norms_or_scales.dtype == np.float32):
-            scales = middle_norms_or_scales[self.sort_order]
-        else:
-            raw_scales = np.asarray(
-                np.sqrt(top_norm / np.asarray(middle_norms_or_scales)) / tap_sample_rate,
-                dtype=np.float32)
-            scales = raw_scales[self.sort_order]
+        if scales is None:
+            scales = self.scales
+        elif len(scales) == len(self.sorted_ids):
+            scales = scales[self.sort_order]
 
         n_req = len(self.sorted_ids)
         out = None
@@ -100,7 +95,7 @@ class UpperReferenceBatch:
             buf_key = (ifo, self.series_length)
             buf = UpperReferenceBatch._BUFFERS.get(buf_key)
             if buf is None or buf.shape[0] < n_req:
-                alloc_rows = max(n_req, 16)
+                alloc_rows = max(n_req, 32)
                 buf = np.zeros((alloc_rows, self.series_length), dtype=np.complex64)
                 UpperReferenceBatch._BUFFERS[buf_key] = buf
             out = buf[:n_req]
@@ -177,13 +172,18 @@ class UpperReferenceBatch:
 
 class RatioPowerChisq(SingleDetPowerChisq):
     """Calculates power chisq for ratio/FIR filtering using precomputed FFT workspaces."""
-    def __init__(self, num_bins, snr_threshold, sample_rate, n_pad=16384):
+    def __init__(self, num_bins, snr_threshold, sample_rate, flow=20.0, f_final=800.0,
+                 chisq_window=1.0, chisq_iterations=None, n_pad=16384):
         super(RatioPowerChisq, self).__init__(num_bins=num_bins, snr_threshold=snr_threshold)
         if self.do and self.num_bins is not None:
             self.num_bins = int(self.num_bins)
         if self.snr_threshold is not None:
             self.snr_threshold = float(self.snr_threshold)
         self.sample_rate = float(sample_rate)
+        self.flow = float(flow)
+        self.f_final = float(f_final)
+        self.chisq_window_samp = int(chisq_window * self.sample_rate)
+        self.max_iterations = chisq_iterations
         self.n_pad = int(n_pad)
         self.df_pad = self.sample_rate / self.n_pad
         self.invec = TimeSeries(zeros(self.n_pad, dtype=complex64), delta_t=1.0 / self.sample_rate)
@@ -206,24 +206,17 @@ class RatioPowerChisq(SingleDetPowerChisq):
         if len(above_thresh) == 0:
             return chisq_vals, chisq_dof_vals
 
-        chisq_window_samp = int(getattr(args, 'chisq_window', 1.0) * stilde.sample_rate)
-        max_iterations = getattr(args, 'chisq_iterations', None)
         sort_order = np.argsort(snr_amp)[::-1]
 
-        flow = float(getattr(args, 'low_frequency_cutoff', 20.0))
-        f_final = float(getattr(args, 'high_frequency_cutoff', None) or (
-            bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0
-        ))
-
-        bins_key = (id(stilde.psd), flow, f_final, self.num_bins)
+        bins_key = id(stilde.psd)
         if bins_key not in self.bins_cache:
             df_pad = self.df_pad
-            kmin_pad = int(flow / df_pad)
-            kmax_pad = min(int(f_final / df_pad), self.n_pad // 2)
+            kmin_pad = int(self.flow / df_pad)
+            kmax_pad = min(int(self.f_final / df_pad), self.n_pad // 2)
             dec = max(1, int(round(df_pad / stilde.delta_f)))
             n_half_pad = self.n_pad // 2 + 1
             psd_pad = FrequencySeries(stilde.psd[::dec][:n_half_pad], delta_f=df_pad)
-            norm_pad = spa_tmplt_norm(psd_pad, n_half_pad, df_pad, flow)
+            norm_pad = spa_tmplt_norm(psd_pad, n_half_pad, df_pad, self.flow)
             bins = power_chisq_bins_from_sigmasq_series(norm_pad, self.num_bins, kmin_pad, kmax_pad)
             dof = (len(bins) - 1) * 2 - 2
             self.bins_cache[bins_key] = (bins, dof)
@@ -237,7 +230,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
         snrvs_arr = np.zeros(1, dtype=complex64)
 
         for idx in sort_order:
-            if max_iterations is not None and iterations >= max_iterations:
+            if self.max_iterations is not None and iterations >= self.max_iterations:
                 break
             if snr_amp[idx] < cthresh:
                 break
@@ -258,28 +251,23 @@ class RatioPowerChisq(SingleDetPowerChisq):
 
             cache_key = (tstart, block_len)
             if cache_key not in ref_f_cache:
-                if isinstance(ref_snr, dict):
-                    ref = ref_snr.get(cache_key, ref_snr.get(tstart))
-                elif hasattr(ref_snr, 'ref_snr'):
-                    ref = ref_snr.ref_snr[tstart:tstart+block_len]
-                else:
-                    ref = ref_snr[tstart:tstart+block_len]
-                if ref is None:
+                ref = ref_snr[tstart:tstart+block_len]
+                if ref is None or len(ref) == 0:
                     continue
                 self.invec.clear()
-                ref_slice = ref[:block_len]
-                self.invec.data[:len(ref_slice)] = ref_slice
+                self.invec.data[:len(ref)] = ref
                 self.plan.execute()
                 ref_f_cache[cache_key] = self.outvec.data.copy()
             ref_f_pad = ref_f_cache[cache_key]
 
-            ratio_key = (id(bank), coarse_idx, local_id)
+            ratio_key = (coarse_idx, local_id)
             if ratio_key not in self.ratio_cache:
                 if taps_coarse is not None:
                     cnt = int(counts_coarse[local_id])
+                    half = cnt // 2
                     self.invec.clear()
-                    self.invec.data[:cnt] = taps_coarse[local_id, :cnt]
-                    self.invec.data[:] = np.roll(self.invec.data, -(cnt // 2))
+                    self.invec.data[:cnt - half] = taps_coarse[local_id, half:cnt]
+                    self.invec.data[self.n_pad - half:] = taps_coarse[local_id, :half]
                     self.plan.execute()
                     self.ratio_cache[ratio_key] = np.conj(self.outvec.data).copy()
                 else:
@@ -294,7 +282,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
             else:
                 chi = [0.0]
 
-            same_tmpl_window = (global_ids == target_global_id) & (abs(t_idxs - t_idx) <= chisq_window_samp)
+            same_tmpl_window = (global_ids == target_global_id) & (abs(t_idxs - t_idx) <= self.chisq_window_samp)
             update_mask = same_tmpl_window & (~assigned_mask) & (snr_amp >= cthresh)
             chisq_vals[update_mask] = float(abs(chi[0]))
             chisq_dof_vals[update_mask] = dof
@@ -311,7 +299,6 @@ def process_and_record_triggers(
     s_num, ifo, triggers,
     args, power_chisq, is_asym=False,
     shifts=None,
-    **kwargs,
 ):
     """Filter triggers for analysis boundary, evaluate chisq, and append batch record."""
     if len(ids_local) > 0 and getattr(stilde, 'analyze', None) is not None:
@@ -354,8 +341,6 @@ def process_and_record_triggers(
         for col, arr in batch.items():
             ifo_trigs[col].append(arr)
 
-    return ids_local, t_idxs, snrs, tstarts
-
 
 def get_ifo_opts(opt, ifo):
     """Return a single-ifo namespace with all multi-det options resolved for ifo."""
@@ -375,21 +360,16 @@ def sample_asym_bins(
     ref_snr,
     local_id,
     t_center,
-    sample_rate,
+    sample_rate=2048.0,
     bin_width=0.1,
     num_bins=100,
     valid_slice=None,
-    stilde=None,
-    **kwargs,
 ):
     """Sample peak SNR in each bin across an asymmetric window around t_center.
 
     Uses matchedfilter library natively with zero external FFT calls.
     """
-    if sample_rate is None and stilde is not None:
-        sample_rate = getattr(stilde, 'sample_rate', 2048.0)
     sample_rate_val = float(sample_rate or 2048.0)
-
     bs = int(round(bin_width * sample_rate_val))
 
     if num_bins <= 1:
@@ -422,10 +402,10 @@ def sample_asym_bins(
         template_index=local_id
     )
     return (
-        res.template_indices.astype(np.int32),
-        res.sample_indices.astype(np.int64),
-        res.snr.astype(np.complex64),
-        res.block_starts.astype(np.int32),
+        res.template_indices.astype(np.int32, copy=False),
+        res.sample_indices.astype(np.int64, copy=False),
+        res.snr.astype(np.complex64, copy=False),
+        res.block_starts.astype(np.int32, copy=False),
     )
 
 
@@ -435,21 +415,11 @@ def select_primary_asym_candidates(
     a_snrs,
     sample_rate,
     asym_snr_threshold,
-    bin_width,
-    num_bins,
     max_primary_per_group_sec=1,
     stilde=None,
     gps_start_time=None,
 ):
-    """Select candidate primary triggers to instigate secondary followup windowing.
-
-    Applies:
-    1. Primary SNR threshold (rho_A >= asym_snr_threshold, e.g. 6.0).
-    2. Primary Followup Throttling per Fine Group (max_primary_per_group_sec):
-       Within each 1-second interval and within each fine template group,
-       only allow the loudest Y primary triggers to instigate secondary followup windowing
-       (set 0 to disable).
-    """
+    """Select candidate primary triggers to instigate secondary followup windowing."""
     if len(a_ids) == 0:
         return np.empty(0, dtype=np.int64)
 
@@ -461,18 +431,12 @@ def select_primary_asym_candidates(
     if len(cand_indices) <= 1:
         return cand_indices
 
-    if sample_rate is None and stilde is not None:
-        sample_rate = getattr(stilde, 'sample_rate', 2048.0)
     sample_rate_val = float(sample_rate or 2048.0)
 
-    # 2. Heuristic 2: Primary Followup Throttling per Fine Group per 1-second interval
     if max_primary_per_group_sec is not None and max_primary_per_group_sec > 0 and len(cand_indices) > max_primary_per_group_sec:
         cum_idx = getattr(stilde, 'cumulative_index', 0) if stilde is not None else 0
         an_start = stilde.analyze.start if (stilde is not None and hasattr(stilde, 'analyze') and stilde.analyze is not None) else 0
-        if gps_start_time is None:
-            gps_start_val = float(getattr(stilde, 'start_time', getattr(stilde, 'epoch', 0.0)))
-        else:
-            gps_start_val = float(gps_start_time)
+        gps_start_val = float(gps_start_time) if gps_start_time is not None else float(getattr(stilde, 'start_time', 0.0))
         gps_times = gps_start_val + (a_tidxs[cand_indices] - an_start + cum_idx) / sample_rate_val
         sec_bins = np.floor(gps_times).astype(np.int64)
 
@@ -500,19 +464,8 @@ def filter_secondary_asym_triggers(
     secondary_snr_threshold=None,
     network_snr_threshold=None,
     max_followup_bins=0,
-    **kwargs,
 ):
-    """Filter secondary triggers based on secondary SNR, network SNR, and loudest bins.
-
-    A secondary trigger is kept if EITHER:
-    (1) |rho_secondary| >= secondary_snr_threshold, OR
-    (2) rho_net = sqrt(|rho_primary|^2 + |rho_secondary|^2) >= network_snr_threshold.
-
-    Heuristic 1: If max_followup_bins > 0 and more than max_followup_bins bins pass
-    the thresholds, only the top max_followup_bins loudest bins (ranked by secondary SNR)
-    are kept. Set max_followup_bins=0 to keep all passing bins. All bins are treated
-    identically to preserve completely unbiased background estimation.
-    """
+    """Filter secondary triggers based on secondary SNR, network SNR, and loudest bins."""
     if len(asym_ids) == 0:
         return asym_ids, asym_t_idxs, asym_snrs, asym_tstarts
 
@@ -888,8 +841,7 @@ def main():
             'psd_var_val': float32,
         }
 
-        out_vals_ref = {key: None for key in out_types}
-        names = sorted(out_vals_ref.keys())
+        names = sorted(out_types.keys())
 
         event_mgr = {}
         for ifo in instruments:
@@ -922,8 +874,15 @@ def main():
             logging.info("Finished.")
             return
 
-        n_coarse = len(bank.coarse_indices)
-        power_chisq = RatioPowerChisq(args.chisq_bins, args.chisq_snr_threshold, sample_rate)
+        power_chisq = RatioPowerChisq(
+            args.chisq_bins,
+            args.chisq_snr_threshold,
+            sample_rate,
+            flow=flow,
+            f_final=bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0,
+            chisq_window=getattr(args, 'chisq_window', 1.0),
+            chisq_iterations=getattr(args, 'chisq_iterations', None),
+        )
         triggers = {ifo: collections.defaultdict(list) for ifo in instruments}
         has_asym_followup = {ifo: 0 for ifo in instruments}
         num_segs = max(len(segments[ifo]) for ifo in instruments)
@@ -967,9 +926,6 @@ def main():
         tsetup = time.time() - tstart
         TIMERS['data_setup'] = tsetup
 
-        upper_ref_seconds = 0.0
-        upper_fir_seconds = 0.0
-        upper_total_seconds = 0.0
 
         if bank.top_bank is None:
             raise ValueError("pycbc_inspiral_fir requires a hierarchical bank with top_bank.")
@@ -1033,241 +989,221 @@ def main():
                     for row, mid in enumerate(middle_ids)
                 }
 
-                eff_chunk_size = chunk_size
-                if len(middle_ids) <= 20 and chunk_size < len(middle_ids):
-                    eff_chunk_size = len(middle_ids)
+                logging.info(f"Top template {top_step+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups")
 
-                logging.info(f"Top template {top_step+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups (chunked {eff_chunk_size}/chunk)")
+                t_up_prep = time.perf_counter()
+                any_seg = next(segments[i][0] for i in instruments if len(segments[i]) > 0)
+                upper_batch = UpperReferenceBatch(
+                    taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2, scales=all_scales
+                )
+                TIMERS['upper_prep'] += time.perf_counter() - t_up_prep
 
-                for chunk_start in range(0, len(middle_ids), eff_chunk_size):
-                    chunk_slice = slice(chunk_start, chunk_start + eff_chunk_size)
-                    chunk_mids = middle_ids[chunk_slice]
-                    chunk_counts = counts_u[chunk_slice]
-                    chunk_taps = taps_u[chunk_slice]
-                    chunk_scales = all_scales[chunk_slice]
+                top_groups = []
+                for mid in middle_ids:
+                    coarse_idx = int(mid)
+                    taps, counts, fine_indices, shifts = bank.get_firs(coarse_idx, return_shifts=True)
+                    if len(fine_indices) == 0:
+                        continue
+                    group_engine = MatchedFilterRatioControl(
+                        snr_threshold=primary_snr_threshold,
+                        delta_f=delta_f,
+                        high_frequency_cutoff=args.high_frequency_cutoff,
+                        batch_size=args.batch_size,
+                        tap_sample_rate=bank.sample_rate,
+                        engine_sample_rate=sample_rate,
+                        engine=args.ratio_filter_engine,
+                        false_dismissal=args.ratio_filter_false_dismissal,
+                        coarse_band_hz=args.ratio_filter_band,
+                        first_stage_snr=args.ratio_filter_first_stage_snr,
+                    )
+                    t_fp0 = time.perf_counter()
+                    filters_f, _ = group_engine.prepare_filters(taps, counts)
+                    TIMERS['filter_prep'] += time.perf_counter() - t_fp0
+                    top_groups.append((coarse_idx, counts, fine_indices,
+                                       group_engine, filters_f, shifts,
+                                       np.arange(len(fine_indices))))
 
-                    t_up_prep = time.perf_counter()
-                    any_seg = next(segments[i][0] for i in instruments if len(segments[i]) > 0)
-                    upper_chunk = UpperReferenceBatch(
-                        chunk_taps, chunk_counts, chunk_mids, (len(any_seg) - 1) * 2)
-                    TIMERS['upper_prep'] += time.perf_counter() - t_up_prep
+                if not top_groups:
+                    del upper_batch
+                    continue
 
-                    chunk_groups = []
-                    for row_c, mid in enumerate(chunk_mids):
-                        coarse_idx = int(mid)
-                        taps, counts, fine_indices, shifts = bank.get_firs(coarse_idx, return_shifts=True)
-                        if len(fine_indices) == 0:
-                            continue
-                        group_engine = MatchedFilterRatioControl(
-                            snr_threshold=primary_snr_threshold,
-                            delta_f=delta_f,
-                            high_frequency_cutoff=args.high_frequency_cutoff,
-                            batch_size=args.batch_size,
-                            tap_sample_rate=bank.sample_rate,
-                            engine_sample_rate=sample_rate,
-                            engine=args.ratio_filter_engine,
-                            false_dismissal=args.ratio_filter_false_dismissal,
-                            coarse_band_hz=args.ratio_filter_band,
-                            first_stage_snr=args.ratio_filter_first_stage_snr)
-                        t_fp0 = time.perf_counter()
-                        filters_f, _ = group_engine.prepare_filters(taps, counts)
-                        TIMERS['filter_prep'] += time.perf_counter() - t_fp0
-                        chunk_groups.append([coarse_idx, counts, fine_indices,
-                                             group_engine, filters_f, shifts])
+                top_pad = max(
+                    [4096] + [
+                        int(g.n)
+                        for g_entry in top_groups
+                        if getattr(g_entry[3], '_td_bank', None) is not None
+                        for g in g_entry[3]._td_bank._groups
+                    ]
+                )
 
-                    if not chunk_groups:
-                        del upper_chunk
+                for s_num in range(num_segs):
+                    active_ifos = [ifo for ifo in instruments
+                                   if s_num < len(segments[ifo])]
+                    if not active_ifos:
                         continue
 
-                    chunk_pad = max(
-                        [4096] + [
-                            int(g.n)
-                            for g_entry in chunk_groups
-                            if getattr(g_entry[3], '_td_bank', None) is not None
-                            for g in g_entry[3]._td_bank._groups
-                        ]
-                    )
+                    can_asym_seg = can_asym_by_seg.get(s_num, False)
 
-                    for s_num in range(num_segs):
-                        active_ifos = [ifo for ifo in instruments
-                                       if s_num < len(segments[ifo])]
-                        if not active_ifos:
-                            continue
+                    t_ref0 = time.perf_counter()
+                    ref_cur = {}
+                    for ifo in active_ifos:
+                        st = segments[ifo][s_num]
+                        ref_cur[ifo] = engine.make_reference_series(st, st.psd, top_template)
+                    t_ref_dur = time.perf_counter() - t_ref0
+                    TIMERS['upper_ref'] += t_ref_dur
 
-                        can_asym_seg = can_asym_by_seg.get(s_num, False)
+                    middle_series = {}
+                    norms = {}
+                    t0 = time.perf_counter()
+                    for ifo in active_ifos:
+                        series, norm = ref_cur[ifo]
+                        norms[ifo] = norm
+                        stilde_cur = segments[ifo][s_num]
+                        v_slice = getattr(stilde_cur, 'analyze', None) if not os.environ.get('PYCBC_UNCONSTRAINED_UPPER') else None
+                        middle_series[ifo] = upper_batch.run(
+                            series, valid_slice=v_slice, ifo=ifo, pad=top_pad
+                        )
+                    del ref_cur
+                    TIMERS['upper_fir'] += time.perf_counter() - t0
 
+                    t_seg_start = time.time()
+                    t_seg_fine_start = TIMERS['fine_fir']
+                    t_seg_chi_start = TIMERS['power_chisq']
+                    t_seg_asym_start = TIMERS['asym_followup']
+                    for g_entry in top_groups:
+                        coarse_idx, counts, fine_indices, group_engine, filters_f, shifts, local_arange = g_entry
+                        std_trigs = {}
+                        h_norms = {ifo: norms[ifo] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
 
-                        t_ref0 = time.perf_counter()
-                        ref_cur = {}
                         for ifo in active_ifos:
-                            st = segments[ifo][s_num]
-                            ref_cur[ifo] = engine.make_reference_series(st, st.psd, top_template)
-                        t_ref_dur = time.perf_counter() - t_ref0
-                        upper_ref_seconds += t_ref_dur
-                        TIMERS['upper_ref'] += t_ref_dur
+                            stilde = segments[ifo][s_num]
+                            h_norm = h_norms[ifo]
+                            ref_snr = middle_series[ifo][coarse_idx]
+                            t_fine0 = time.perf_counter()
+                            ids_local, t_idxs, snrs, tstarts, _ = group_engine.process_segment(
+                                stilde, stilde.psd, h_norm, filters_f, counts,
+                                local_arange,
+                                valid_slice=stilde.analyze,
+                                reference_series=ref_snr,
+                                profile_template=top_template,
+                            )
+                            TIMERS['fine_fir'] += time.perf_counter() - t_fine0
 
-                        middle_series = {}
-                        norms = {}
-                        t_upper_start = time.perf_counter()
-                        t0 = time.perf_counter()
-                        for ifo in active_ifos:
-                            series, norm = ref_cur[ifo]
-                            norms[ifo] = norm
-                            stilde_cur = segments[ifo][s_num]
-                            v_slice = getattr(stilde_cur, 'analyze', None) if not os.environ.get('PYCBC_UNCONSTRAINED_UPPER') else None
-                            middle_series[ifo] = upper_chunk.run(
-                                series, norm, chunk_scales, bank.sample_rate,
-                                valid_slice=v_slice, ifo=ifo, pad=chunk_pad)
-                        del ref_cur
-                        upper_fir_seconds += time.perf_counter() - t0
-                        upper_total_seconds += time.perf_counter() - t_upper_start
-                        TIMERS['upper_fir'] += time.perf_counter() - t0
-
-                        t_seg_start = time.time()
-                        t_seg_fine_start = TIMERS['fine_fir']
-                        t_seg_chi_start = TIMERS['power_chisq']
-                        t_seg_asym_start = TIMERS['asym_followup']
-                        for i, g_entry in enumerate(chunk_groups):
-                            coarse_idx, counts, fine_indices, group_engine, filters_f, shifts = g_entry
-                            std_trigs = {}
-                            h_norms = {ifo: norms[ifo] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
-
-                            for ifo in active_ifos:
-                                stilde = segments[ifo][s_num]
-                                h_norm = h_norms[ifo]
-                                ref_snr = middle_series[ifo][coarse_idx]
-                                t_fine0 = time.perf_counter()
-                                ids_local, t_idxs, snrs, tstarts, _ = group_engine.process_segment(
-                                    stilde, stilde.psd, h_norm, filters_f, counts,
-                                    np.arange(len(fine_indices)),
-                                    valid_slice=stilde.analyze,
-                                    reference_series=ref_snr,
-                                    profile_template=top_template,
+                            if not can_asym_seg:
+                                process_and_record_triggers(
+                                    ids_local, t_idxs, snrs, tstarts,
+                                    stilde, h_norm, coarse_idx, fine_indices,
+                                    filters_f, ref_snr, bank,
+                                    s_num, ifo, triggers,
+                                    args, power_chisq, is_asym=False,
+                                    shifts=shifts,
                                 )
-                                TIMERS['fine_fir'] += time.perf_counter() - t_fine0
+                            else:
+                                std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
 
-                                if not can_asym_seg:
-                                    process_and_record_triggers(
-                                        ids_local, t_idxs, snrs, tstarts,
-                                        stilde, h_norm, coarse_idx, fine_indices,
-                                        filters_f, ref_snr, bank,
-                                        s_num, ifo, triggers,
-                                        args, power_chisq, is_asym=False,
-                                        shifts=shifts,
-                                    )
-                                else:
-                                    std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
+                        if can_asym_seg:
+                            t_asym0 = time.perf_counter()
+                            chi_asym_before = TIMERS['power_chisq']
+                            for ifo_A in active_ifos:
+                                a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
+                                if len(a_ids) == 0:
+                                    continue
+                                cand_indices = select_primary_asym_candidates(
+                                    a_ids=a_ids,
+                                    a_tidxs=a_tidxs,
+                                    a_snrs=a_snrs,
+                                    sample_rate=args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate,
+                                    asym_snr_threshold=primary_snr_threshold,
+                                    max_primary_per_group_sec=args.asym_max_primary_per_group_sec,
+                                    stilde=segments[ifo_A][s_num],
+                                    gps_start_time=args.gps_start_time[ifo_A] if isinstance(args.gps_start_time, dict) else args.gps_start_time,
+                                )
+                                if len(cand_indices) == 0:
+                                    continue
 
-                            if can_asym_seg:
-                                t_asym0 = time.perf_counter()
-                                chi_asym_before = TIMERS['power_chisq']
-                                for ifo_A in active_ifos:
-                                    a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
-                                    if len(a_ids) == 0:
-                                        continue
-                                    cand_indices = select_primary_asym_candidates(
-                                        a_ids=a_ids,
-                                        a_tidxs=a_tidxs,
-                                        a_snrs=a_snrs,
-                                        sample_rate=args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate,
-                                        asym_snr_threshold=primary_snr_threshold,
-                                        bin_width=args.asym_bin_width,
-                                        num_bins=effective_asym_num_bins,
-                                        max_primary_per_group_sec=args.asym_max_primary_per_group_sec,
-                                        stilde=segments[ifo_A][s_num],
-                                        gps_start_time=args.gps_start_time[ifo_A] if isinstance(args.gps_start_time, dict) else args.gps_start_time,
-                                    )
-                                    if len(cand_indices) == 0:
-                                        continue
+                                process_and_record_triggers(
+                                    a_ids[cand_indices], a_tidxs[cand_indices],
+                                    a_snrs[cand_indices], a_tstarts[cand_indices],
+                                    segments[ifo_A][s_num], h_norms[ifo_A], coarse_idx, fine_indices,
+                                    filters_f, middle_series[ifo_A][coarse_idx], bank,
+                                    s_num, ifo_A, triggers,
+                                    args, power_chisq, is_asym=False,
+                                    shifts=shifts,
+                                )
 
-                                    process_and_record_triggers(
-                                        a_ids[cand_indices], a_tidxs[cand_indices],
-                                        a_snrs[cand_indices], a_tstarts[cand_indices],
-                                        segments[ifo_A][s_num], h_norms[ifo_A], coarse_idx, fine_indices,
-                                        filters_f, middle_series[ifo_A][coarse_idx], bank,
-                                        s_num, ifo_A, triggers,
-                                        args, power_chisq, is_asym=False,
-                                        shifts=shifts,
-                                    )
+                                sr_A = args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate
+                                sr_A = float(sr_A or getattr(segments[ifo_A][s_num], 'sample_rate', 2048.0))
+                                s_start_A = getattr(segments[ifo_A][s_num], 'seg_slice', slice(0)).start if getattr(segments[ifo_A][s_num], 'seg_slice', None) is not None else 0
+                                t0_A = gwstrain_start_time[ifo_A]
 
-                                    sr_A = args.sample_rate[ifo_A] if isinstance(args.sample_rate, dict) else args.sample_rate
-                                    sr_A = float(sr_A or getattr(segments[ifo_A][s_num], 'sample_rate', 2048.0))
-                                    s_start_A = getattr(segments[ifo_A][s_num], 'seg_slice', slice(0)).start if getattr(segments[ifo_A][s_num], 'seg_slice', None) is not None else 0
-                                    t0_A = gwstrain_start_time[ifo_A]
+                                for ifo_B in active_ifos:
+                                    if ifo_B == ifo_A:
+                                         continue
+                                    stilde_B = segments[ifo_B][s_num]
+                                    ref_snr_B = middle_series[ifo_B][coarse_idx]
+                                    sr_B = args.sample_rate[ifo_B] if isinstance(args.sample_rate, dict) else args.sample_rate
+                                    sr_B = float(sr_B or getattr(stilde_B, 'sample_rate', 2048.0))
+                                    s_start_B = getattr(stilde_B, 'seg_slice', slice(0)).start if getattr(stilde_B, 'seg_slice', None) is not None else 0
+                                    t0_B = gwstrain_start_time[ifo_B]
 
-                                    for ifo_B in active_ifos:
-                                        if ifo_B == ifo_A:
-                                             continue
-                                        stilde_B = segments[ifo_B][s_num]
-                                        ref_snr_B = middle_series[ifo_B][coarse_idx]
-                                        sr_B = args.sample_rate[ifo_B] if isinstance(args.sample_rate, dict) else args.sample_rate
-                                        sr_B = float(sr_B or getattr(stilde_B, 'sample_rate', 2048.0))
-                                        s_start_B = getattr(stilde_B, 'seg_slice', slice(0)).start if getattr(stilde_B, 'seg_slice', None) is not None else 0
-                                        t0_B = gwstrain_start_time[ifo_B]
+                                    for k in cand_indices:
+                                        cand_lid = a_ids[k]
+                                        a_tcenter = a_tidxs[k]
+                                        gps_trig = t0_A + (s_start_A + a_tcenter) / sr_A
+                                        cand_tcenter = int(round((gps_trig - t0_B) * sr_B)) - s_start_B
 
-                                        for k in cand_indices:
-                                            cand_lid = a_ids[k]
-                                            a_tcenter = a_tidxs[k]
-                                            gps_trig = t0_A + (s_start_A + a_tcenter) / sr_A
-                                            cand_tcenter = int(round((gps_trig - t0_B) * sr_B)) - s_start_B
+                                        asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = sample_asym_bins(
+                                            group_engine=group_engine,
+                                            ref_snr=ref_snr_B,
+                                            local_id=cand_lid,
+                                            t_center=cand_tcenter,
+                                            sample_rate=sr_B,
+                                            bin_width=args.asym_bin_width,
+                                            num_bins=effective_asym_num_bins,
+                                            valid_slice=stilde_B.analyze,
+                                        )
 
-                                            asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = sample_asym_bins(
-                                                group_engine=group_engine,
-                                                ref_snr=ref_snr_B,
-                                                local_id=cand_lid,
-                                                t_center=cand_tcenter,
-                                                sample_rate=sr_B,
-                                                bin_width=args.asym_bin_width,
-                                                num_bins=effective_asym_num_bins,
-                                                valid_slice=stilde_B.analyze,
-                                                stilde=stilde_B,
-                                            )
+                                        has_asym_followup[ifo_B] += 1
 
-                                            has_asym_followup[ifo_B] += 1
+                                        asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = filter_secondary_asym_triggers(
+                                            asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
+                                            primary_snr=a_snrs[k],
+                                            secondary_snr_threshold=args.asym_secondary_snr_threshold,
+                                            network_snr_threshold=args.asym_network_snr_threshold,
+                                            max_followup_bins=args.asym_max_followup_bins,
+                                        )
 
-                                            asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = filter_secondary_asym_triggers(
-                                                asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
-                                                primary_snr=a_snrs[k],
-                                                secondary_snr_threshold=args.asym_secondary_snr_threshold,
-                                                network_snr_threshold=args.asym_network_snr_threshold,
-                                                max_followup_bins=args.asym_max_followup_bins,
-                                                t_center=cand_tcenter,
-                                                bin_width_samp=int(round(args.asym_bin_width * sr_B)),
-                                            )
+                                        process_and_record_triggers(
+                                            asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
+                                            stilde_B, h_norms[ifo_B], coarse_idx, fine_indices,
+                                            filters_f, ref_snr_B, bank,
+                                            s_num, ifo_B, triggers,
+                                            args, power_chisq, is_asym=True,
+                                            shifts=shifts,
+                                        )
+                            TIMERS['asym_followup'] += (time.perf_counter() - t_asym0) - (TIMERS['power_chisq'] - chi_asym_before)
 
-                                            process_and_record_triggers(
-                                                asym_ids, asym_t_idxs, asym_snrs, asym_tstarts,
-                                                stilde_B, h_norms[ifo_B], coarse_idx, fine_indices,
-                                                filters_f, ref_snr_B, bank,
-                                                s_num, ifo_B, triggers,
-                                                args, power_chisq, is_asym=True,
-                                                shifts=shifts,
-                                            )
-                                    TIMERS['asym_followup'] += (time.perf_counter() - t_asym0) - (TIMERS['power_chisq'] - chi_asym_before)
+                    t_seg_dur = max(time.time() - t_seg_start, 1e-6)
+                    n_tmpl_seg = sum(len(g[2]) for g in top_groups)
+                    stilde_ref = segments[active_ifos[0]][s_num]
+                    total_analyzed_dur = len(active_ifos) * (stilde_ref.analyze.stop - stilde_ref.analyze.start) * stilde_ref.delta_t
+                    tperf_seg = total_analyzed_dur / t_seg_dur * n_tmpl_seg
+                    s_fine = TIMERS['fine_fir'] - t_seg_fine_start
+                    s_chi = TIMERS['power_chisq'] - t_seg_chi_start
+                    s_asym = TIMERS['asym_followup'] - t_seg_asym_start
+                    logging.info(f"Top {top_step+1}/{n_top} Seg {s_num+1}/{num_segs}: {len(top_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s]")
+                    del middle_series
+                    del norms
 
-                        t_seg_dur = max(time.time() - t_seg_start, 1e-6)
-                        n_tmpl_seg = sum(len(g[2]) for g in chunk_groups)
-                        stilde_ref = segments[active_ifos[0]][s_num]
-                        total_analyzed_dur = len(active_ifos) * (stilde_ref.analyze.stop - stilde_ref.analyze.start) * stilde_ref.delta_t
-                        tperf_seg = total_analyzed_dur / t_seg_dur * n_tmpl_seg
-                        s_fine = TIMERS['fine_fir'] - t_seg_fine_start
-                        s_chi = TIMERS['power_chisq'] - t_seg_chi_start
-                        s_asym = TIMERS['asym_followup'] - t_seg_asym_start
-                        logging.info(f"Top {top_step+1}/{n_top} (chunk {chunk_start//chunk_size+1}) Seg {s_num+1}/{num_segs}: {len(chunk_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s]")
-                        del middle_series
-                        del norms
-
-                    del chunk_groups
-                    del upper_chunk
-                    UpperReferenceBatch.clear_buffers()
-
+                del top_groups
+                del upper_batch
                 del top_template
                 UpperReferenceBatch.clear_buffers()
                 power_chisq.ratio_cache.clear()
 
         if bank.top_bank is not None:
-            logging.info('Upper synthesis time: direct-reference %.3f s, FIR %.3f s, total %.3f s',
-                         upper_ref_seconds, upper_fir_seconds, upper_total_seconds)
+            logging.info('Upper synthesis time: direct-reference %.3f s, FIR %.3f s',
+                         TIMERS['upper_ref'], TIMERS['upper_fir'])
         logging.info("After all top templates")
 
         # --- Veto Processing Complete & Trigger Ingestion ---
@@ -1372,12 +1308,17 @@ def main():
             for t_idx, (gid, s_idx, e_idx) in enumerate(zip(unique_gids, start_indices, end_indices)):
                 ifo_mgr.new_template(tmplt=bank.table[int(gid)])
                 tmpl_is_asym = data['is_asym'][s_idx:e_idx]
-                for mask, do_cluster in ((~tmpl_is_asym, cluster_window > 0), (tmpl_is_asym, False)):
-                    if np.any(mask):
-                        sub = s_idx + np.flatnonzero(mask)
-                        ifo_mgr.add_template_events(ingest_cols, [data[col][sub] for col in ingest_cols])
-                        if do_cluster:
-                            ifo_mgr.cluster_template_events("time_index", "snr", cluster_window)
+                if not np.any(tmpl_is_asym):
+                    ifo_mgr.add_template_events(ingest_cols, [data[col][s_idx:e_idx] for col in ingest_cols])
+                    if cluster_window > 0:
+                        ifo_mgr.cluster_template_events("time_index", "snr", cluster_window)
+                else:
+                    for mask, do_cluster in ((~tmpl_is_asym, cluster_window > 0), (tmpl_is_asym, False)):
+                        if np.any(mask):
+                            sub = s_idx + np.flatnonzero(mask)
+                            ifo_mgr.add_template_events(ingest_cols, [data[col][sub] for col in ingest_cols])
+                            if do_cluster:
+                                ifo_mgr.cluster_template_events("time_index", "snr", cluster_window)
 
                 ifo_mgr.finalize_template_events()
                 if args.finalize_events_template_rate is not None and (t_idx + 1) % args.finalize_events_template_rate == 0:
