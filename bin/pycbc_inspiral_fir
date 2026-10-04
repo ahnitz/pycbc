@@ -352,7 +352,7 @@ def process_and_record_triggers(
         else:
             num_b = int(getattr(power_chisq, 'num_bins', 64) or 64) if power_chisq is not None else 64
             chi = np.full(n_trig, 2 * num_b - 2, dtype=float32)
-            chi_dof = np.full(n_trig, num_b, dtype=np.int32)
+            chi_dof = np.full(n_trig, 2 * num_b - 2, dtype=np.int32)
 
         local_shifts = shifts[ids_local] if shifts is not None else 0
         time_offset = (-stilde.analyze.start + stilde.cumulative_index) if getattr(stilde, 'analyze', None) is not None else 0
