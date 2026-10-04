@@ -7,6 +7,7 @@ using the Ratio Matched Filter method.
 import argparse
 import collections
 import logging
+import multiprocessing as mp
 import os
 import re
 import sys
@@ -301,6 +302,7 @@ def process_and_record_triggers(
     s_num, ifo, triggers,
     args, power_chisq, is_asym=False,
     shifts=None,
+    timers=None,
 ):
     """Filter triggers for analysis boundary, evaluate chisq, and append batch record."""
     if len(ids_local) > 0 and getattr(stilde, 'analyze', None) is not None:
@@ -321,7 +323,9 @@ def process_and_record_triggers(
                 ids_local, t_idxs, snrs,
                 fine_indices, tstarts, stilde, bank,
                 ref_snr, filters_f, coarse_idx, args)
-            TIMERS['power_chisq'] += time.perf_counter() - t_chi0
+            chi_dur = time.perf_counter() - t_chi0
+            t_clock = timers if timers is not None else TIMERS
+            t_clock['power_chisq'] += chi_dur
         else:
             chi = np.zeros(n_trig, dtype=float32)
             chi_dof = np.zeros(n_trig, dtype=np.int32) - 100
@@ -461,10 +465,12 @@ def followup_asym_candidates(
     segments, bank, triggers, has_asym_followup, power_chisq,
     args, primary_snr_threshold, effective_asym_num_bins,
     ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
+    timers=None,
 ):
     """Follow up primary candidate triggers in secondary detectors within asymmetric windows."""
     t_asym0 = time.perf_counter()
-    chi_asym_before = TIMERS['power_chisq']
+    t_clock = timers if timers is not None else TIMERS
+    chi_asym_before = t_clock['power_chisq']
 
     for ifo_A in active_ifos:
         a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
@@ -492,6 +498,7 @@ def followup_asym_candidates(
             s_num, ifo_A, triggers,
             args, power_chisq, is_asym=False,
             shifts=shifts,
+            timers=timers,
         )
 
         sr_A = ifo_sample_rates[ifo_A]
@@ -541,9 +548,244 @@ def followup_asym_candidates(
                     s_num, ifo_B, triggers,
                     args, power_chisq, is_asym=True,
                     shifts=shifts,
+                    timers=timers,
                 )
 
-    TIMERS['asym_followup'] += (time.perf_counter() - t_asym0) - (TIMERS['power_chisq'] - chi_asym_before)
+    chi_asym_now = t_clock['power_chisq']
+    asym_dur = (time.perf_counter() - t_asym0) - (chi_asym_now - chi_asym_before)
+    t_clock['asym_followup'] += asym_dur
+
+
+_SHARED_WORKER_CONTEXT = {}
+
+
+def process_top_template_task(task_args):
+    """Filter a single top template across all data segments and detectors."""
+    top_idx, rank, n_top, fine_cnt = task_args
+    ctx = _SHARED_WORKER_CONTEXT
+
+    bank = ctx['bank']
+    top_templates = ctx['top_templates']
+    upper_group_data = ctx['upper_group_data']
+    instruments = ctx['instruments']
+    segments = ctx['segments']
+    num_segs = ctx['num_segs']
+    can_asym_by_seg = ctx['can_asym_by_seg']
+    ifo_sample_rates = ctx['ifo_sample_rates']
+    ifo_gps_starts = ctx['ifo_gps_starts']
+    ifo_gps_cli_starts = ctx['ifo_gps_cli_starts']
+    seg_starts = ctx['seg_starts']
+    args = ctx['args']
+    primary_snr_threshold = ctx['primary_snr_threshold']
+    delta_f = ctx['delta_f']
+    sample_rate = ctx['sample_rate']
+    flow = ctx['flow']
+    effective_asym_num_bins = ctx['effective_asym_num_bins']
+    coarse_keep = ctx['coarse_keep']
+
+    # Independent engine per worker task ensuring isolated FFT buffers
+    engine = MatchedFilterRatioControl(
+        snr_threshold=primary_snr_threshold,
+        delta_f=delta_f,
+        high_frequency_cutoff=args.high_frequency_cutoff,
+        batch_size=args.batch_size,
+        tap_sample_rate=bank.sample_rate,
+        engine_sample_rate=sample_rate,
+        engine=args.ratio_filter_engine,
+        false_dismissal=args.ratio_filter_false_dismissal,
+        coarse_band_hz=args.ratio_filter_band,
+        first_stage_snr=args.ratio_filter_first_stage_snr,
+    )
+
+    local_timers = collections.defaultdict(float)
+    worker_triggers = {ifo: collections.defaultdict(list) for ifo in instruments}
+    worker_asym = {ifo: 0 for ifo in instruments}
+
+    top_idx = int(top_idx)
+    u_data = upper_group_data[top_idx]
+    counts_raw = u_data['counts']
+    order_raw = np.argsort(counts_raw)
+    m_all = u_data['m_all'][order_raw]
+
+    if coarse_keep is not None:
+        row_mask = np.isin(m_all, list(coarse_keep))
+        if not row_mask.any():
+            return top_idx, {ifo: {} for ifo in instruments}, worker_asym, dict(local_timers)
+        keep_idx = np.flatnonzero(row_mask)
+    else:
+        keep_idx = slice(None)
+
+    middle_ids = m_all[keep_idx]
+    counts_u = counts_raw[order_raw][keep_idx]
+    taps_u = u_data['taps'][order_raw][keep_idx]
+    sigmas_u = u_data['sigmas'][order_raw][keep_idx]
+
+    t_dec0 = time.perf_counter()
+    top_template = top_templates[top_idx]
+    local_timers['top_decomp'] += time.perf_counter() - t_dec0
+    ref_s = sigmas_u[:, 0]
+    target_s = sigmas_u[:, 2]
+    all_scales = np.asarray((ref_s / target_s) / bank.sample_rate, dtype=np.float32)
+    sigmasq_ratio_by_middle = {
+        int(mid): float((target_s[row] / ref_s[row]) ** 2)
+        for row, mid in enumerate(middle_ids)
+    }
+
+    logging.info(f"Top template {rank+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups ({fine_cnt} fine templates)")
+
+    t_up_prep = time.perf_counter()
+    any_seg = next(segments[i][0] for i in instruments if len(segments[i]) > 0)
+    upper_batch = UpperReferenceBatch(
+        taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2, scales=all_scales
+    )
+    local_timers['upper_prep'] += time.perf_counter() - t_up_prep
+
+    top_groups = []
+    for mid in middle_ids:
+        coarse_idx = int(mid)
+        taps, counts, fine_indices, shifts = bank.get_firs(coarse_idx, return_shifts=True)
+        if len(fine_indices) == 0:
+            continue
+        group_engine = MatchedFilterRatioControl(
+            snr_threshold=primary_snr_threshold,
+            delta_f=delta_f,
+            high_frequency_cutoff=args.high_frequency_cutoff,
+            batch_size=args.batch_size,
+            tap_sample_rate=bank.sample_rate,
+            engine_sample_rate=sample_rate,
+            engine=args.ratio_filter_engine,
+            false_dismissal=args.ratio_filter_false_dismissal,
+            coarse_band_hz=args.ratio_filter_band,
+            first_stage_snr=args.ratio_filter_first_stage_snr,
+        )
+        t_fp0 = time.perf_counter()
+        filters_f, _ = group_engine.prepare_filters(taps, counts)
+        local_timers['filter_prep'] += time.perf_counter() - t_fp0
+        top_groups.append((coarse_idx, counts, fine_indices,
+                           group_engine, filters_f, shifts,
+                           np.arange(len(fine_indices))))
+
+    if not top_groups:
+        del upper_batch
+        return top_idx, {ifo: {} for ifo in instruments}, worker_asym, dict(local_timers)
+
+    top_pad = max(
+        [4096] + [
+            int(g.n)
+            for g_entry in top_groups
+            if getattr(g_entry[3], '_td_bank', None) is not None
+            for g in g_entry[3]._td_bank._groups
+        ]
+    )
+
+    power_chisq = RatioPowerChisq(
+        args.chisq_bins,
+        args.chisq_snr_threshold,
+        sample_rate,
+        flow=flow,
+        f_final=bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0,
+        chisq_window=getattr(args, 'chisq_window', 1.0),
+        chisq_iterations=getattr(args, 'chisq_iterations', None),
+    )
+
+    for s_num in range(num_segs):
+        active_ifos = [ifo for ifo in instruments if s_num < len(segments[ifo])]
+        if not active_ifos:
+            continue
+
+        can_asym_seg = can_asym_by_seg.get(s_num, False)
+
+        middle_series = {}
+        norms = {}
+        for ifo in active_ifos:
+            st = segments[ifo][s_num]
+            t_ref0 = time.perf_counter()
+            series, norm = engine.make_reference_series(st, st.psd, top_template)
+            local_timers['upper_ref'] += time.perf_counter() - t_ref0
+            norms[ifo] = norm
+
+            t0 = time.perf_counter()
+            v_slice = getattr(st, 'analyze', None) if not os.environ.get('PYCBC_UNCONSTRAINED_UPPER') else None
+            middle_series[ifo] = upper_batch.run(
+                series, valid_slice=v_slice, ifo=ifo, pad=top_pad
+            )
+            local_timers['upper_fir'] += time.perf_counter() - t0
+
+        t_seg_start = time.time()
+        t_seg_fine_start = local_timers['fine_fir']
+        t_seg_chi_start = local_timers['power_chisq']
+        t_seg_asym_start = local_timers['asym_followup']
+
+        for g_entry in top_groups:
+            coarse_idx, counts, fine_indices, group_engine, filters_f, shifts, local_arange = g_entry
+            std_trigs = {}
+            h_norms = {ifo: norms[ifo] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
+
+            for ifo in active_ifos:
+                stilde = segments[ifo][s_num]
+                h_norm = h_norms[ifo]
+                ref_snr = middle_series[ifo][coarse_idx]
+                t_fine0 = time.perf_counter()
+                ids_local, t_idxs, snrs, tstarts, _ = group_engine.process_segment(
+                    stilde, stilde.psd, h_norm, filters_f, counts,
+                    local_arange,
+                    valid_slice=stilde.analyze,
+                    reference_series=ref_snr,
+                    profile_template=top_template,
+                )
+                local_timers['fine_fir'] += time.perf_counter() - t_fine0
+
+                if not can_asym_seg:
+                    process_and_record_triggers(
+                        ids_local, t_idxs, snrs, tstarts,
+                        stilde, h_norm, coarse_idx, fine_indices,
+                        filters_f, ref_snr, bank,
+                        s_num, ifo, worker_triggers,
+                        args, power_chisq, is_asym=False,
+                        shifts=shifts,
+                        timers=local_timers,
+                    )
+                else:
+                    std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
+
+            if can_asym_seg:
+                followup_asym_candidates(
+                    std_trigs, active_ifos, s_num, coarse_idx, fine_indices,
+                    group_engine, filters_f, shifts, h_norms, middle_series,
+                    segments, bank, worker_triggers, worker_asym, power_chisq,
+                    args, primary_snr_threshold, effective_asym_num_bins,
+                    ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
+                    timers=local_timers,
+                )
+
+        t_seg_dur = max(time.time() - t_seg_start, 1e-6)
+        n_tmpl_seg = sum(len(g[2]) for g in top_groups)
+        stilde_ref = segments[active_ifos[0]][s_num]
+        total_analyzed_dur = len(active_ifos) * (stilde_ref.analyze.stop - stilde_ref.analyze.start) * stilde_ref.delta_t
+        tperf_seg = total_analyzed_dur / t_seg_dur * n_tmpl_seg
+        s_fine = local_timers['fine_fir'] - t_seg_fine_start
+        s_chi = local_timers['power_chisq'] - t_seg_chi_start
+        s_asym = local_timers['asym_followup'] - t_seg_asym_start
+        logging.info(f"[Top {top_idx}] Seg {s_num+1}/{num_segs}: {len(top_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s]")
+        del middle_series
+        del norms
+
+    del top_groups
+    del upper_batch
+    del top_template
+    UpperReferenceBatch.clear_buffers()
+    power_chisq.ratio_cache.clear()
+
+    collapsed_trigs = {}
+    for ifo in instruments:
+        collapsed_trigs[ifo] = {}
+        for col, arrs in worker_triggers[ifo].items():
+            if arrs:
+                collapsed_trigs[ifo][col] = np.concatenate(arrs)
+            else:
+                collapsed_trigs[ifo][col] = np.empty(0)
+
+    return top_idx, collapsed_trigs, worker_asym, dict(local_timers)
 
 
 # -----------------------------------------------------------------------------
@@ -862,7 +1104,7 @@ def ingest_ifo_triggers(
     logging.info("[%s] Ingestion completed in %.2f s", ifo, ingest_total)
 
 
-def log_performance_summary(run_time, tsetup, instruments, segments, bank, output_path):
+def log_performance_summary(run_time, tsetup, instruments, segments, bank, output_path, cores=1):
     """Log formatted timing breakdown and write timing JSON output."""
     total_analyzed_det_sec = sum(
         sum((segments[ifo][s].analyze.stop - segments[ifo][s].analyze.start) * segments[ifo][s].delta_t
@@ -871,8 +1113,12 @@ def log_performance_summary(run_time, tsetup, instruments, segments, bank, outpu
     )
     total_tmpl_sec = total_analyzed_det_sec * len(bank.table)
     overall_throughput = total_tmpl_sec / max(run_time, 1e-6)
-    logging.info("Overall search throughput: %.0f template-s/core-s (%.2f M templates/core-s) over %.2f s run time",
-                 overall_throughput, overall_throughput / 1e6, run_time)
+    cores = max(1, int(cores))
+    core_throughput = overall_throughput / cores
+    logging.info(
+        "Overall search throughput: %.0f template-s/s (%.2f M templates/s, %.2f M template-s/core-s on %d cores) over %.2f s run time",
+        overall_throughput, overall_throughput / 1e6, core_throughput / 1e6, cores, run_time,
+    )
 
     other_time = max(0.0, run_time - sum(TIMERS.values()))
     categories = [
@@ -907,6 +1153,8 @@ def log_performance_summary(run_time, tsetup, instruments, segments, bank, outpu
         timing_dict = {cat_name: cat_time for cat_name, cat_time in categories}
         timing_dict["Total Run Time"] = run_time
         timing_dict["Overall Throughput"] = overall_throughput
+        timing_dict["Core Throughput"] = core_throughput
+        timing_dict["Cores"] = cores
         timing_path = output_path + ".timing.json"
         with open(timing_path, "w") as tf:
             json.dump(timing_dict, tf, indent=2)
@@ -958,6 +1206,8 @@ def get_args():
     # Analysis Options
     parser.add_argument('--output', required=True,
                         help="Path to output HDF5 file.")
+    parser.add_argument('--cores', type=int, default=1,
+                        help="Number of CPU cores to use for multiprocessing over top templates (default: 1).")
     parser.add_argument("--bank-file", type=str, required=True,
                         help="Path to the HDF5 Ratio Bank file.")
     parser.add_argument('--snr-threshold', type=float, default=None,
@@ -1085,18 +1335,6 @@ def main():
             primary_snr_threshold = args.snr_threshold if args.snr_threshold is not None else 5.5
         logging.info("Primary SNR threshold: %.2f (asym_windowing=%s)", primary_snr_threshold, args.asym_windowing)
 
-        engine = MatchedFilterRatioControl(
-            snr_threshold=primary_snr_threshold,
-            delta_f=delta_f,
-            high_frequency_cutoff=args.high_frequency_cutoff,
-            batch_size=args.batch_size,
-            tap_sample_rate=bank.sample_rate,
-            engine_sample_rate=sample_rate,
-            engine=args.ratio_filter_engine,
-            false_dismissal=args.ratio_filter_false_dismissal,
-            coarse_band_hz=args.ratio_filter_band,
-            first_stage_snr=args.ratio_filter_first_stage_snr,
-        )
 
         sg_chisq = SingleDetSGChisq.from_cli(args, bank, str(args.chisq_bins))
         event_mgr = init_event_managers(args, instruments, gating_info)
@@ -1122,15 +1360,6 @@ def main():
             logging.info("Finished.")
             return
 
-        power_chisq = RatioPowerChisq(
-            args.chisq_bins,
-            args.chisq_snr_threshold,
-            sample_rate,
-            flow=flow,
-            f_final=bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0,
-            chisq_window=getattr(args, 'chisq_window', 1.0),
-            chisq_iterations=getattr(args, 'chisq_iterations', None),
-        )
         triggers = {ifo: collections.defaultdict(list) for ifo in instruments}
         has_asym_followup = {ifo: 0 for ifo in instruments}
         num_segs = max(len(segments[ifo]) for ifo in instruments)
@@ -1141,6 +1370,14 @@ def main():
 
         is_injection_run = bool(getattr(args, 'injection_file', None))
         effective_asym_num_bins = 1 if is_injection_run else args.asym_num_bins
+
+        # Pre-compute normalization tables so child processes inherit them via COW
+        if args.template_normalization_method == 'precalculated_sigma':
+            if not hasattr(bank, 'sigma_snr_rescale'):
+                bank.setup_sigma_norm()
+        elif args.template_normalization_method == 'mchirp':
+            if not hasattr(bank, 'mchirp_norm_rescale'):
+                bank.setup_mchirp_norm()
 
         tsetup = time.time() - tstart
         TIMERS['data_setup'] = tsetup
@@ -1172,171 +1409,93 @@ def main():
             bank_top_indices = []
         else:
             bank_top_indices = bank.top_indices
-        n_top = len(bank_top_indices)
 
-        for top_step, top_idx in enumerate(bank_top_indices):
-            top_idx = int(top_idx)
-            group_u = bank.upper_group[str(top_idx)]
-            counts_raw = group_u['actual_tap_count'][:]
-            order_raw = np.argsort(counts_raw)
-            m_all = group_u['fine_bank_index'][:][order_raw]
+        # Pre-warm bank data structures in the parent process so they are cleanly shared via Linux COW
+        if args.template_normalization_method == 'precalculated_sigma':
+            bank.setup_sigma_norm()
+        elif args.template_normalization_method == 'mchirp':
+            bank.setup_mchirp_norm()
 
-            if coarse_keep is not None:
-                row_mask = np.isin(m_all, list(coarse_keep))
-                if not row_mask.any():
-                    continue
-                keep_idx = np.flatnonzero(row_mask)
-            else:
-                keep_idx = slice(None)
-
-            middle_ids = m_all[keep_idx]
-            counts_u = counts_raw[order_raw][keep_idx]
-            taps_u = group_u['taps'][:][order_raw][keep_idx]
-            sigmas_u = group_u['sigmas'][:][order_raw][keep_idx]
-
-            t_dec0 = time.perf_counter()
-            top_template = bank.get_top_template(top_idx)
-            TIMERS['top_decomp'] += time.perf_counter() - t_dec0
-            ref_s = sigmas_u[:, 0]
-            target_s = sigmas_u[:, 2]
-            all_scales = np.asarray((ref_s / target_s) / bank.sample_rate, dtype=np.float32)
-            sigmasq_ratio_by_middle = {
-                int(mid): float((target_s[row] / ref_s[row]) ** 2)
-                for row, mid in enumerate(middle_ids)
+        top_templates = {int(i): bank.get_top_template(int(i)) for i in bank_top_indices}
+        upper_group_data = {}
+        for i in bank_top_indices:
+            i_int = int(i)
+            grp = bank.upper_group[str(i_int)]
+            upper_group_data[i_int] = {
+                'counts': grp['actual_tap_count'][:],
+                'm_all': grp['fine_bank_index'][:],
+                'taps': grp['taps'][:],
+                'sigmas': grp['sigmas'][:],
             }
+        for c in bank.coarse_indices:
+            bank.get_firs(c, return_shifts=True)
 
-            logging.info(f"Top template {top_step+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups")
-
-            t_up_prep = time.perf_counter()
-            any_seg = next(segments[i][0] for i in instruments if len(segments[i]) > 0)
-            upper_batch = UpperReferenceBatch(
-                taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2, scales=all_scales
-            )
-            TIMERS['upper_prep'] += time.perf_counter() - t_up_prep
-
-            top_groups = []
-            for mid in middle_ids:
-                coarse_idx = int(mid)
-                taps, counts, fine_indices, shifts = bank.get_firs(coarse_idx, return_shifts=True)
-                if len(fine_indices) == 0:
-                    continue
-                group_engine = MatchedFilterRatioControl(
-                    snr_threshold=primary_snr_threshold,
-                    delta_f=delta_f,
-                    high_frequency_cutoff=args.high_frequency_cutoff,
-                    batch_size=args.batch_size,
-                    tap_sample_rate=bank.sample_rate,
-                    engine_sample_rate=sample_rate,
-                    engine=args.ratio_filter_engine,
-                    false_dismissal=args.ratio_filter_false_dismissal,
-                    coarse_band_hz=args.ratio_filter_band,
-                    first_stage_snr=args.ratio_filter_first_stage_snr,
-                )
-                t_fp0 = time.perf_counter()
-                filters_f, _ = group_engine.prepare_filters(taps, counts)
-                TIMERS['filter_prep'] += time.perf_counter() - t_fp0
-                top_groups.append((coarse_idx, counts, fine_indices,
-                                   group_engine, filters_f, shifts,
-                                   np.arange(len(fine_indices))))
-
-            if not top_groups:
-                del upper_batch
+        # Prepare top template tasks sorted by descending fine template count (LPT scheduling)
+        top_tasks = []
+        for top_idx in bank_top_indices:
+            top_idx = int(top_idx)
+            m_all = upper_group_data[top_idx]['m_all']
+            if coarse_keep is not None:
+                m_all = [m for m in m_all if m in coarse_keep]
+            if len(m_all) == 0:
                 continue
+            fine_count = sum(len(bank.get_firs(int(m))[2]) for m in m_all)
+            top_tasks.append((top_idx, fine_count))
 
-            top_pad = max(
-                [4096] + [
-                    int(g.n)
-                    for g_entry in top_groups
-                    if getattr(g_entry[3], '_td_bank', None) is not None
-                    for g in g_entry[3]._td_bank._groups
-                ]
-            )
+        top_tasks.sort(key=lambda x: x[1], reverse=True)
+        n_top = len(top_tasks)
+        sorted_top_tasks = [(item[0], rank, n_top, item[1]) for rank, item in enumerate(top_tasks)]
 
-            for s_num in range(num_segs):
-                active_ifos = [ifo for ifo in instruments if s_num < len(segments[ifo])]
-                if not active_ifos:
-                    continue
+        global _SHARED_WORKER_CONTEXT
+        _SHARED_WORKER_CONTEXT = {
+            'bank': bank,
+            'top_templates': top_templates,
+            'upper_group_data': upper_group_data,
+            'instruments': instruments,
+            'segments': segments,
+            'num_segs': num_segs,
+            'can_asym_by_seg': can_asym_by_seg,
+            'ifo_sample_rates': ifo_sample_rates,
+            'ifo_gps_starts': ifo_gps_starts,
+            'ifo_gps_cli_starts': ifo_gps_cli_starts,
+            'seg_starts': seg_starts,
+            'args': args,
+            'primary_snr_threshold': primary_snr_threshold,
+            'delta_f': delta_f,
+            'sample_rate': sample_rate,
+            'flow': flow,
+            'effective_asym_num_bins': effective_asym_num_bins,
+            'coarse_keep': coarse_keep,
+        }
 
-                can_asym_seg = can_asym_by_seg.get(s_num, False)
+        total_cores = max(1, int(getattr(args, 'cores', 1) or 1))
+        n_workers = min(total_cores, n_top) if n_top > 0 else 1
 
-                middle_series = {}
-                norms = {}
-                for ifo in active_ifos:
-                    st = segments[ifo][s_num]
-                    t_ref0 = time.perf_counter()
-                    series, norm = engine.make_reference_series(st, st.psd, top_template)
-                    TIMERS['upper_ref'] += time.perf_counter() - t_ref0
-                    norms[ifo] = norm
+        if n_workers > 1:
+            logging.info("Parallelizing %d top templates across %d cores using fork multiprocessing...", n_top, n_workers)
+            ctx = mp.get_context('fork')
+            with ctx.Pool(processes=n_workers) as pool:
+                for top_idx, worker_trigs, worker_asym, worker_timers in pool.imap_unordered(process_top_template_task, sorted_top_tasks):
+                    for ifo in instruments:
+                        for col, arr in worker_trigs[ifo].items():
+                            if len(arr) > 0:
+                                triggers[ifo][col].append(arr)
+                        has_asym_followup[ifo] += worker_asym[ifo]
+                    for k, v in worker_timers.items():
+                        TIMERS[k] += v
+        else:
+            logging.info("Filtering %d top templates serially (1 core)...", n_top)
+            for task_args in sorted_top_tasks:
+                top_idx, worker_trigs, worker_asym, worker_timers = process_top_template_task(task_args)
+                for ifo in instruments:
+                    for col, arr in worker_trigs[ifo].items():
+                        if len(arr) > 0:
+                            triggers[ifo][col].append(arr)
+                    has_asym_followup[ifo] += worker_asym[ifo]
+                for k, v in worker_timers.items():
+                    TIMERS[k] += v
 
-                    t0 = time.perf_counter()
-                    v_slice = getattr(st, 'analyze', None) if not os.environ.get('PYCBC_UNCONSTRAINED_UPPER') else None
-                    middle_series[ifo] = upper_batch.run(
-                        series, valid_slice=v_slice, ifo=ifo, pad=top_pad
-                    )
-                    TIMERS['upper_fir'] += time.perf_counter() - t0
-
-                t_seg_start = time.time()
-                t_seg_fine_start = TIMERS['fine_fir']
-                t_seg_chi_start = TIMERS['power_chisq']
-                t_seg_asym_start = TIMERS['asym_followup']
-
-                for g_entry in top_groups:
-                    coarse_idx, counts, fine_indices, group_engine, filters_f, shifts, local_arange = g_entry
-                    std_trigs = {}
-                    h_norms = {ifo: norms[ifo] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
-
-                    for ifo in active_ifos:
-                        stilde = segments[ifo][s_num]
-                        h_norm = h_norms[ifo]
-                        ref_snr = middle_series[ifo][coarse_idx]
-                        t_fine0 = time.perf_counter()
-                        ids_local, t_idxs, snrs, tstarts, _ = group_engine.process_segment(
-                            stilde, stilde.psd, h_norm, filters_f, counts,
-                            local_arange,
-                            valid_slice=stilde.analyze,
-                            reference_series=ref_snr,
-                            profile_template=top_template,
-                        )
-                        TIMERS['fine_fir'] += time.perf_counter() - t_fine0
-
-                        if not can_asym_seg:
-                            process_and_record_triggers(
-                                ids_local, t_idxs, snrs, tstarts,
-                                stilde, h_norm, coarse_idx, fine_indices,
-                                filters_f, ref_snr, bank,
-                                s_num, ifo, triggers,
-                                args, power_chisq, is_asym=False,
-                                shifts=shifts,
-                            )
-                        else:
-                            std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
-
-                    if can_asym_seg:
-                        followup_asym_candidates(
-                            std_trigs, active_ifos, s_num, coarse_idx, fine_indices,
-                            group_engine, filters_f, shifts, h_norms, middle_series,
-                            segments, bank, triggers, has_asym_followup, power_chisq,
-                            args, primary_snr_threshold, effective_asym_num_bins,
-                            ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
-                        )
-
-                t_seg_dur = max(time.time() - t_seg_start, 1e-6)
-                n_tmpl_seg = sum(len(g[2]) for g in top_groups)
-                stilde_ref = segments[active_ifos[0]][s_num]
-                total_analyzed_dur = len(active_ifos) * (stilde_ref.analyze.stop - stilde_ref.analyze.start) * stilde_ref.delta_t
-                tperf_seg = total_analyzed_dur / t_seg_dur * n_tmpl_seg
-                s_fine = TIMERS['fine_fir'] - t_seg_fine_start
-                s_chi = TIMERS['power_chisq'] - t_seg_chi_start
-                s_asym = TIMERS['asym_followup'] - t_seg_asym_start
-                logging.info(f"Top {top_step+1}/{n_top} Seg {s_num+1}/{num_segs}: {len(top_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s]")
-                del middle_series
-                del norms
-
-            del top_groups
-            del upper_batch
-            del top_template
-            UpperReferenceBatch.clear_buffers()
-            power_chisq.ratio_cache.clear()
+        _SHARED_WORKER_CONTEXT.clear()
 
         if bank.top_bank is not None:
             logging.info('Upper synthesis time: direct-reference %.3f s, FIR %.3f s',
@@ -1372,7 +1531,7 @@ def main():
         ifo_mgr.write_events(args.output)
     TIMERS['event_finalize'] += time.time() - t_fin
 
-    log_performance_summary(run_time, tsetup, instruments, segments, bank, args.output)
+    log_performance_summary(run_time, tsetup, instruments, segments, bank, args.output, cores=total_cores)
     logging.info("Finished.")
 
 
