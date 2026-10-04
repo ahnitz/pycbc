@@ -291,7 +291,7 @@ if len(cidx_multi) > 0 and len(cidx_singles) > 0:
         near = False
         if pos < len(sorted_multi_times) and abs(sorted_multi_times[pos] - s_t) < args.cluster_window:
             near = True
-        elif pos > 0 and abs(sorted_multi_times[pos - 1] - s_t) < args.cluster_window:
+        if pos > 0 and abs(sorted_multi_times[pos - 1] - s_t) < args.cluster_window:
             near = True
         if not near:
             surv_singles.append(s_idx)
