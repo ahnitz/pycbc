@@ -450,16 +450,9 @@ def select_primary_asym_candidates(
 def filter_secondary_asym_triggers(
     asym_ids, asym_t_idxs, asym_snrs, asym_tstarts, primary_snr,
     secondary_snr_threshold=None, network_snr_threshold=None, max_followup_bins=0,
-    return_indices=False, t_center=None, sample_rate=2048.0, light_travel_slack=0.015,
+    return_indices=False,
 ):
-    """Filter secondary triggers based on secondary SNR, network SNR, and loudest bins.
-
-    Guarantees that on-source secondary triggers within the physical light-travel window
-    (plus timing slack, e.g. |t - t_center| <= 15 ms) are evaluated against secondary OR network
-    thresholds and retained without being crowded out or displaced by off-source noise peaks.
-    Off-source bins (for timeslide background livetime) are filtered at secondary_snr_threshold
-    and capped at max_followup_bins.
-    """
+    """Filter secondary triggers based on secondary SNR, network SNR, and loudest bins."""
     if len(asym_ids) == 0:
         if return_indices:
             return asym_ids, asym_t_idxs, asym_snrs, asym_tstarts, np.empty(0, dtype=np.int64)
@@ -469,53 +462,25 @@ def filter_secondary_asym_triggers(
     has_sec = (secondary_snr_threshold is not None) and (secondary_snr_threshold > 0.0)
     has_net = (network_snr_threshold is not None) and (network_snr_threshold > 0.0)
 
-    # Classify on-source (physical light-travel window) vs off-source (timeslide bins)
-    if t_center is not None:
-        max_dt_samp = int(round(light_travel_slack * float(sample_rate or 2048.0)))
-        on_source_mask = np.abs(asym_t_idxs - t_center) <= max_dt_samp
-    else:
-        # Fallback if t_center not provided: central bin is treated as on-source
-        on_source_mask = np.zeros(len(asym_ids), dtype=bool)
-        if len(asym_ids) > 0:
-            on_source_mask[len(asym_ids) // 2] = True
-
-    # 1. On-source evaluation: passes if secondary >= threshold OR network >= network_threshold
-    on_source_keep = np.zeros(len(asym_ids), dtype=bool)
-    if np.any(on_source_mask):
-        on_pass = np.zeros(np.sum(on_source_mask), dtype=bool)
-        rho_on = rho_sec[on_source_mask]
+    if has_sec or has_net:
+        keep_mask = np.zeros(len(asym_ids), dtype=bool)
         if has_sec:
-            on_pass |= (rho_on >= secondary_snr_threshold)
+            keep_mask |= (rho_sec >= secondary_snr_threshold)
         if has_net:
-            on_pass |= (np.sqrt(abs(primary_snr) ** 2 + rho_on ** 2) >= network_snr_threshold)
-        if not (has_sec or has_net):
-            on_pass[:] = True
-        on_source_keep[on_source_mask] = on_pass
-
-    # 2. Off-source evaluation: strictly requires secondary >= secondary_snr_threshold
-    off_source_mask = ~on_source_mask
-    off_source_keep = np.zeros(len(asym_ids), dtype=bool)
-    if np.any(off_source_mask):
-        if has_sec:
-            off_source_keep[off_source_mask] = (rho_sec[off_source_mask] >= secondary_snr_threshold)
-        elif not has_net:
-            off_source_keep[off_source_mask] = True
-
-    on_indices = np.flatnonzero(on_source_keep)
-    off_indices = np.flatnonzero(off_source_keep)
-
-    # Off-source bins are throttled to max_followup_bins to prevent timeslide bloat
-    if max_followup_bins is not None and max_followup_bins > 0 and len(off_indices) > max_followup_bins:
-        order = np.argsort(-rho_sec[off_indices], kind='stable')
-        off_indices = np.sort(off_indices[order[:max_followup_bins]])
-
-    passing_indices = np.sort(np.concatenate([on_indices, off_indices]))
+            keep_mask |= (np.sqrt(abs(primary_snr) ** 2 + rho_sec ** 2) >= network_snr_threshold)
+        passing_indices = np.flatnonzero(keep_mask)
+    else:
+        passing_indices = np.arange(len(asym_ids))
 
     if len(passing_indices) == 0:
         empty_res = (asym_ids[:0], asym_t_idxs[:0], asym_snrs[:0], asym_tstarts[:0])
         if return_indices:
             return (*empty_res, np.empty(0, dtype=np.int64))
         return empty_res
+
+    if max_followup_bins is not None and max_followup_bins > 0 and len(passing_indices) > max_followup_bins:
+        order = np.argsort(-rho_sec[passing_indices], kind='stable')
+        passing_indices = np.sort(passing_indices[order[:max_followup_bins]])
 
     res = (
         asym_ids[passing_indices],
@@ -630,8 +595,6 @@ def followup_asym_candidates(
                     network_snr_threshold=args.asym_network_snr_threshold,
                     max_followup_bins=args.asym_max_followup_bins,
                     return_indices=True,
-                    t_center=cand_tcenter,
-                    sample_rate=sr_B,
                 )
 
                 process_and_record_triggers(
