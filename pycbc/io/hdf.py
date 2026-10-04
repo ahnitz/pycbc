@@ -1009,7 +1009,7 @@ class ForegroundTriggers(object):
                 with HFile(sngl_file, 'r') as hf:
                     top_keys = list(hf.keys())
                 matching_ifos = [k for k in top_keys if k in self.ifos]
-                if len(matching_ifos) > 1:
+                if matching_ifos:
                     for ifo in matching_ifos:
                         self.sngl_files[ifo] = FileData(sngl_file, group=ifo)
                 else:

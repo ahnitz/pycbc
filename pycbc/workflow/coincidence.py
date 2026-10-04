@@ -598,14 +598,17 @@ def setup_interval_coinc(workflow, hdfbank, trig_files, stat_files,
 
 
 def setup_sngls(workflow, hdfbank, trig_files, stat_files,
-                veto_file, veto_name, out_dir, tags=None):
+                veto_file, veto_name, out_dir, tags=None, ifo=None):
     """
     This function sets up getting statistic values for single-detector triggers
     """
-    try:
-        ifos, _ = trig_files.categorize_by_attr('ifo')
-    except (ValueError, AttributeError, TypeError):
-        ifos = sorted(list({ifo for f in trig_files for ifo in f.ifo_list}))
+    if ifo is not None:
+        ifos = [ifo]
+    else:
+        try:
+            ifos, _ = trig_files.categorize_by_attr('ifo')
+        except (ValueError, AttributeError, TypeError):
+            ifos = sorted(list({ifo for f in trig_files for ifo in f.ifo_list}))
     findsngls_exe = PyCBCFindSnglsExecutable(workflow.cp, 'sngls', ifos=ifos,
                                              tags=tags, out_dir=out_dir)
     # Wall time knob and memory knob
@@ -634,15 +637,18 @@ def setup_sngls(workflow, hdfbank, trig_files, stat_files,
 
 def setup_sngls_inj(workflow, hdfbank, inj_trig_files,
                     stat_files, background_file, veto_file, veto_name,
-                    out_dir, tags=None):
+                    out_dir, tags=None, ifo=None):
     """
     This function sets up getting statistic values for single-detector triggers
     from injections
     """
-    try:
-        ifos, _ = inj_trig_files.categorize_by_attr('ifo')
-    except (ValueError, AttributeError, TypeError):
-        ifos = sorted(list({ifo for f in inj_trig_files for ifo in f.ifo_list}))
+    if ifo is not None:
+        ifos = [ifo]
+    else:
+        try:
+            ifos, _ = inj_trig_files.categorize_by_attr('ifo')
+        except (ValueError, AttributeError, TypeError):
+            ifos = sorted(list({ifo for f in inj_trig_files for ifo in f.ifo_list}))
     findsnglsinj_exe = PyCBCFindSnglsExecutable(workflow.cp, 'sngls', ifos=ifos,
                                                 tags=tags, out_dir=out_dir)
     # Wall time knob and memory knob

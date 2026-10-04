@@ -105,7 +105,8 @@ trigs = ReadByTemplate(trigger_file,
                        args.template_bank,
                        args.segment_name,
                        args.veto_files,
-                       args.gating_veto_windows)
+                       args.gating_veto_windows,
+                       ifo=ifo)
 logging.info("%d triggers in file", trigf[ifo + '/snr'].size)
 
 stat_all = []

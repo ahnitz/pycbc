@@ -340,7 +340,7 @@ for ifo in ifo_ids.keys():
     ctagsngl = ['full_data', '1det']
     no_fg_exc_files[ifo] = wf.setup_sngls(
         workflow, hdfbank, inspcomb, statfiles, final_veto_file,
-        final_veto_name, output_dir, tags=ctagsngl)
+        final_veto_name, output_dir, tags=ctagsngl, ifo=ifo)
 
 #check to see if workflow should stop at statmap jobs.
 check_stop('statmap', container, workflow, finalize_workflow)
@@ -812,7 +812,8 @@ for inj_file, tag in zip(inj_files, inj_tags):
             final_veto_file,
             final_veto_name,
             output_dir,
-            tags=ctagsngl
+            tags=ctagsngl,
+            ifo=ifo
         )
 
     combctags = [tag, 'injections']
