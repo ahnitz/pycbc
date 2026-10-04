@@ -196,9 +196,9 @@ class RatioPowerChisq(SingleDetPowerChisq):
         global_ids = fine_indices[ids_local]
         if snr_amp is None:
             snr_amp = abs(snrs)
-        num_trigs = len(snrs)
-        chisq_vals = np.zeros(num_trigs, dtype=float32)
-        chisq_dof_vals = np.zeros(num_trigs, dtype=np.int32) - 100
+        num_b = int(self.num_bins) if self.num_bins is not None else 64
+        chisq_vals = np.full(num_trigs, 2 * num_b - 2, dtype=float32)
+        chisq_dof_vals = np.full(num_trigs, num_b, dtype=np.int32)
         assigned_mask = np.zeros(num_trigs, dtype=bool)
 
         cthresh = self.snr_threshold
@@ -323,15 +323,16 @@ def process_and_record_triggers(
         phys_t = np.clip(t_idxs - local_shifts, 0, len(renorm_factor) - 1)
         r = renorm_factor[phys_t]
         snrs_renorm = snrs * r
-        thresh = getattr(args, 'asym_secondary_snr_threshold', 4.0) if is_asym else primary_snr_threshold
-        if thresh is not None and thresh > 0:
-            keep = np.abs(snrs_renorm) >= thresh
-            if not np.all(keep):
-                ids_local = ids_local[keep]
-                t_idxs = t_idxs[keep]
-                snrs = snrs[keep]
-                snrs_renorm = snrs_renorm[keep]
-                tstarts = tstarts[keep]
+        if not is_asym:
+            thresh = primary_snr_threshold
+            if thresh is not None and thresh > 0:
+                keep = np.abs(snrs_renorm) >= thresh
+                if not np.all(keep):
+                    ids_local = ids_local[keep]
+                    t_idxs = t_idxs[keep]
+                    snrs = snrs[keep]
+                    snrs_renorm = snrs_renorm[keep]
+                    tstarts = tstarts[keep]
     else:
         snrs_renorm = snrs
 
@@ -348,8 +349,9 @@ def process_and_record_triggers(
             t_clock = timers if timers is not None else TIMERS
             t_clock['power_chisq'] += chi_dur
         else:
-            chi = np.zeros(n_trig, dtype=float32)
-            chi_dof = np.zeros(n_trig, dtype=np.int32) - 100
+            num_b = int(getattr(power_chisq, 'num_bins', 64) or 64) if power_chisq is not None else 64
+            chi = np.full(n_trig, 2 * num_b - 2, dtype=float32)
+            chi_dof = np.full(n_trig, num_b, dtype=np.int32)
 
         local_shifts = shifts[ids_local] if shifts is not None else 0
         time_offset = (-stilde.analyze.start + stilde.cumulative_index) if getattr(stilde, 'analyze', None) is not None else 0
@@ -945,7 +947,7 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
             from pycbc.filter.overwhiten import subtract_coherent_lines
             orig_injs = getattr(ifo_strain, 'injections', None)
             orig_gating = getattr(ifo_strain, 'gating_info', None)
-            f_low_sub = getattr(args, 'overwhiten_f_low', 18.0)
+            f_low_sub = max(25.0, getattr(args, 'overwhiten_f_low', 25.0))
             ifo_strain, sub_lines = subtract_coherent_lines(ifo_strain, f_low=f_low_sub)
             ifo_strain = ifo_strain.astype(np.float32)
             if orig_injs is not None:
@@ -967,6 +969,7 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
                 inpaint_edges=inpaint_ow
             )
             ifo_strain = ifo_strain.astype(np.float32)
+            ifo_strain._is_overwhitened = True
             if orig_injs is not None:
                 ifo_strain.injections = orig_injs
             if orig_gating is not None:
@@ -1461,9 +1464,29 @@ def main():
             dtype=np.complex64,
             enable_compressed_waveforms=args.enable_compressed_waveforms,
         )
-        for ifo in instruments:
-            if inj_filter_rejector.get(ifo) is not None:
-                bank.template_thinning(inj_filter_rejector[ifo])
+        active_rejectors = [inj_filter_rejector[ifo] for ifo in instruments
+                            if inj_filter_rejector.get(ifo) is not None
+                            and getattr(inj_filter_rejector[ifo], 'enabled', False)]
+        if active_rejectors:
+            if len(active_rejectors) == 1:
+                bank.template_thinning(active_rejectors[0])
+            else:
+                tables = []
+                for rej in active_rejectors:
+                    if hasattr(rej, 'injection_params') and rej.injection_params is not None:
+                        if hasattr(rej.injection_params, 'table') and rej.injection_params.table is not None and len(rej.injection_params.table) > 0:
+                            tables.append(rej.injection_params.table)
+                if tables:
+                    import types
+                    combined_table = np.concatenate(tables).view(type(tables[0])) if len(tables) > 1 else tables[0]
+                    combined_inj_params = types.SimpleNamespace(table=combined_table)
+                    combined_rej = types.SimpleNamespace(
+                        enabled=True,
+                        chirp_time_window=max(getattr(r, 'chirp_time_window', 1.0) for r in active_rejectors),
+                        f_lower=min(getattr(r, 'f_lower', flow) for r in active_rejectors),
+                        injection_params=combined_inj_params,
+                    )
+                    bank.template_thinning(combined_rej)
 
         if args.asym_windowing:
             primary_snr_threshold = args.asym_snr_threshold if args.asym_snr_threshold is not None else (args.snr_threshold if args.snr_threshold is not None else 6.0)
@@ -1504,8 +1527,9 @@ def main():
             args, instruments, segments, gwstrain_start_time, num_segs, sample_rate
         )
 
-        is_injection_run = bool(getattr(args, 'injection_file', None))
-        effective_asym_num_bins = 1 if is_injection_run else args.asym_num_bins
+        # Ensure asym_num_bins is identical between full search and injection jobs
+        # to eliminate trials-factor and recovery bias
+        effective_asym_num_bins = args.asym_num_bins
 
         # Pre-compute normalization tables so child processes inherit them via COW
         if args.template_normalization_method == 'precalculated_sigma':

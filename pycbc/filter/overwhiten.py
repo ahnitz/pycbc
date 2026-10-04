@@ -336,15 +336,20 @@ def subtract_coherent_lines(timeseries, lines=None, psd=None, f_low=18.0,
         p_med = median_filter(p_vals, size=k_med)
         ratio = p_vals / np.maximum(p_med, 1e-60)
 
-        in_range = np.where((f_pilot >= f_low) & (f_pilot <= (fs / 2.0) - 5.0) & (ratio >= line_threshold))[0]
+        f_search_low = max(25.0, f_low)
+        in_range = np.where((f_pilot >= f_search_low) & (f_pilot <= (fs / 2.0) - 5.0) & (ratio >= line_threshold))[0]
         detected = []
         if len(in_range) > 0:
             clusters = np.split(in_range, np.where(np.diff(in_range) > 1)[0] + 1)
             for c in clusters:
+                cluster_width = float(len(c) * df_pilot)
+                # True instrumental lines are narrow. Broad features are slopes/glitches.
+                if cluster_width > 2.0:
+                    continue
                 peak_idx = c[np.argmax(ratio[c])]
                 f0 = float(f_pilot[peak_idx])
                 excess = float(ratio[peak_idx])
-                fwhm = max(0.05, float(len(c) * df_pilot))
+                fwhm = max(0.05, min(1.0, cluster_width))
                 detected.append((f0, excess, fwhm))
         detected.sort(key=lambda item: item[1], reverse=True)
         lines = detected[:max_lines]
@@ -361,8 +366,9 @@ def subtract_coherent_lines(timeseries, lines=None, psd=None, f_low=18.0,
     X = np.fft.rfft(timeseries.numpy())
     T = np.ones(len(freqs), dtype=np.float64)
 
+    min_sub_f = max(25.0, f_low)
     for f0, excess, fwhm in line_list:
-        if f0 < f_low or f0 >= fs / 2.0:
+        if f0 < min_sub_f or f0 >= fs / 2.0:
             continue
         sigma_f = max(0.01, min(0.20, fwhm / 2.355 if fwhm > 0 else bandwidth / 2.355))
         atten = 1.0 - 1.0 / np.sqrt(max(1.01, excess))
@@ -614,6 +620,7 @@ def overwhiten_strain(timeseries, psd=None, f_low=18.0, f_taper=4.0, max_filter_
         "inpainted_edges": inpaint_edges,
         "edge_pad_duration": pad_dur if inpaint_edges else 0.0,
     }
+    ts_dow._is_overwhitened = True
     return ts_dow, ts_dw, metadata
 
 

@@ -1279,6 +1279,26 @@ class StrainSegments(object):
         self.segment_slices = segment_slices_red
         self.analyze_slices = analyze_slices_red
 
+    def _get_inpaint_invpsd(self):
+        if self._inpaint_invpsd is None:
+            psd_seg_len = min(16.0, max(2.0, self.strain.duration / 4.0))
+            psd_raw = self.strain.filter_psd(psd_seg_len, self.delta_f, 20.0)
+            freqs = psd_raw.sample_frequencies.numpy()
+            f_low = 20.0
+            f_taper = 4.0
+            f_start = max(0.0, f_low - f_taper)
+            taper = numpy.ones(len(freqs), dtype=numpy.float64)
+            taper[freqs < f_start] = 0.0
+            mid = (freqs >= f_start) & (freqs < f_low)
+            if numpy.any(mid):
+                taper[mid] = 0.5 * (1.0 - numpy.cos(numpy.pi * (freqs[mid] - f_start) / f_taper))
+            psd_vals = numpy.maximum(psd_raw.numpy(), 1e-60)
+            inv_vals = numpy.where(taper > 0, taper / psd_vals, 0.0)
+            self._inpaint_invpsd = FrequencySeries(inv_vals, delta_f=self.delta_f)
+            if hasattr(self.strain, 'precision') and self.strain.precision == 'single':
+                self._inpaint_invpsd = self._inpaint_invpsd.astype(numpy.float32)
+        return self._inpaint_invpsd
+
     def fourier_segments(self):
         """ Return a list of the FFT'd segments.
         Return the list of FrequencySeries. Additional properties are
@@ -1304,28 +1324,22 @@ class StrainSegments(object):
                     elif seg_slice.start < 0:
                         strain_chunk = self.strain[:seg_slice.stop]
                         strain_chunk.prepend_zeros(-seg_slice.start)
-                        if self.inpaint_edges:
+                        if self.inpaint_edges and not getattr(self.strain, '_is_overwhitened', False):
                             from pycbc.strain.gate import gate_and_paint
-                            if self._inpaint_invpsd is None:
-                                psd_seg_len = min(16.0, max(2.0, self.strain.duration / 4.0))
-                                self._inpaint_invpsd = 1.0 / self.strain.filter_psd(
-                                    psd_seg_len, self.delta_f, 20.0)
+                            invpsd = self._get_inpaint_invpsd()
                             gate_and_paint(strain_chunk, 0, -seg_slice.start,
-                                           self._inpaint_invpsd, copy=False,
+                                           invpsd, copy=False,
                                            method='toeplitz', ridge=1e-3)
                         base_seg = make_frequency_series(strain_chunk)
                     elif seg_slice.stop > len(self.strain):
                         orig_len = len(self.strain) - seg_slice.start
                         strain_chunk = self.strain[seg_slice.start:]
                         strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
-                        if self.inpaint_edges:
+                        if self.inpaint_edges and not getattr(self.strain, '_is_overwhitened', False):
                             from pycbc.strain.gate import gate_and_paint
-                            if self._inpaint_invpsd is None:
-                                psd_seg_len = min(16.0, max(2.0, self.strain.duration / 4.0))
-                                self._inpaint_invpsd = 1.0 / self.strain.filter_psd(
-                                    psd_seg_len, self.delta_f, 20.0)
+                            invpsd = self._get_inpaint_invpsd()
                             gate_and_paint(strain_chunk, orig_len, len(strain_chunk),
-                                           self._inpaint_invpsd, copy=False,
+                                           invpsd, copy=False,
                                            method='toeplitz', ridge=1e-3)
                         base_seg = make_frequency_series(strain_chunk)
                     if slice_counts[key] > 1:

@@ -244,18 +244,69 @@ for ifo in all_ifos:
         f.create_dataset('background_exc/{}/trigger_id'.format(ifo),
                          data=bg_exc_trig_ids[ifo])
 
-# fg_times is a tuple of trigger time arrays
-fg_times = (f['foreground/%s/time' % ifo][:] for ifo in all_ifos)
+# Determine active participating ifos and coinc mean times
+fg_times_list = [f['foreground/%s/time' % ifo][:] for ifo in all_ifos]
+active_ifos_count = np.zeros(n_triggers, dtype=int)
+coinc_mean_times = np.zeros(n_triggers, dtype=float)
+for arr in fg_times_list:
+    valid = (arr > 0)
+    active_ifos_count += valid.astype(int)
+    coinc_mean_times += np.where(valid, arr, 0.0)
+coinc_mean_times = np.where(active_ifos_count > 0, coinc_mean_times / np.maximum(1, active_ifos_count), 0.0)
 
-# Cluster using the chosen method. Currently only clustering zerolag,
-# i.e. foreground, so set all timeslide_ids to zero
-cidx = pycbc.events.cluster_coincs_multiifo(f[f'foreground/{args.cluster_stat}'][:],
-                                            fg_times,
-                                            np.zeros(n_triggers), 0,
-                                            args.cluster_window)
-cidx = np.asarray(cidx, dtype=int)
+# Two-stage prioritized clustering:
+# 1. Multi-detector coincidences (>= 2 ifos) are clustered over args.cluster_window
+# 2. Single-detector candidates (== 1 ifo) are clustered over args.cluster_window
+# 3. Singles occurring within args.cluster_window of a surviving multi-detector coincidence are suppressed
+multi_mask = (active_ifos_count >= 2)
+singles_mask = (active_ifos_count == 1)
 
-del fg_times
+cidx_multi = np.empty(0, dtype=int)
+if np.any(multi_mask):
+    multi_indices = np.where(multi_mask)[0]
+    cidx_multi_local = pycbc.events.cluster_over_time(
+        f[f'foreground/{args.cluster_stat}'][:][multi_indices],
+        coinc_mean_times[multi_indices],
+        args.cluster_window
+    )
+    cidx_multi = multi_indices[cidx_multi_local]
+
+cidx_singles = np.empty(0, dtype=int)
+if np.any(singles_mask):
+    singles_indices = np.where(singles_mask)[0]
+    cidx_singles_local = pycbc.events.cluster_over_time(
+        f[f'foreground/{args.cluster_stat}'][:][singles_indices],
+        coinc_mean_times[singles_indices],
+        args.cluster_window
+    )
+    cidx_singles = singles_indices[cidx_singles_local]
+
+if len(cidx_multi) > 0 and len(cidx_singles) > 0:
+    multi_times = coinc_mean_times[cidx_multi]
+    single_times = coinc_mean_times[cidx_singles]
+    sorted_multi_times = np.sort(multi_times)
+    surv_singles = []
+    for s_idx, s_t in zip(cidx_singles, single_times):
+        pos = np.searchsorted(sorted_multi_times, s_t)
+        near = False
+        if pos < len(sorted_multi_times) and abs(sorted_multi_times[pos] - s_t) < args.cluster_window:
+            near = True
+        elif pos > 0 and abs(sorted_multi_times[pos - 1] - s_t) < args.cluster_window:
+            near = True
+        if not near:
+            surv_singles.append(s_idx)
+    surv_singles = np.array(surv_singles, dtype=int)
+    cidx = np.sort(np.concatenate([cidx_multi, surv_singles]))
+elif len(cidx_multi) > 0:
+    cidx = np.sort(cidx_multi)
+elif len(cidx_singles) > 0:
+    cidx = np.sort(cidx_singles)
+else:
+    cidx = np.empty(0, dtype=int)
+
+logging.info('Clustered events: %d multi-detector coincidences, %d singles preserved (%d total)',
+             len(cidx_multi), len(cidx) - len(cidx_multi), len(cidx))
+del fg_times_list
 
 def filter_dataset(h5file, name, idx):
     # Dataset needs to be deleted and remade as it is a different size
