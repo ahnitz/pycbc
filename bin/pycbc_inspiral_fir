@@ -199,7 +199,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
         num_trigs = len(snrs)
         num_b = int(self.num_bins) if self.num_bins is not None else 64
         chisq_vals = np.full(num_trigs, 2 * num_b - 2, dtype=float32)
-        chisq_dof_vals = np.full(num_trigs, num_b, dtype=np.int32)
+        chisq_dof_vals = np.full(num_trigs, 2 * num_b - 2, dtype=np.int32)
         assigned_mask = np.zeros(num_trigs, dtype=bool)
 
         cthresh = self.snr_threshold
