@@ -17,7 +17,6 @@ from collections import defaultdict
 import numpy as np
 import scipy.linalg
 from scipy.linalg import solve_toeplitz
-from scipy.sparse.linalg import LinearOperator, lsqr
 from tqdm import tqdm
 
 import pycbc
@@ -89,124 +88,7 @@ def init_worker(coarse_waveforms, fine_bank, psd, args_namespace):
     # Silence worker logging
     logging.getLogger('pycbc').setLevel(logging.CRITICAL + 1)
 
-# --- 1. Filter Designer (Double Precision) ---
-def design_optimal_real_filter(H_target_pos, valid_mask_pos, K_taps, weights_pos=None, reg_type='ridge', reg_val=1e-4,
-                                peak_cap_factor=10.0, peak_bad_weight_fraction=1.0, peak_max_passes=3):
-    """
-    Designs a filter using regularized least squares.
-    reg_type='ridge'      -> Minimizes energy (Standard)
-    reg_type='derivative' -> Minimizes roughness (Smooth coefficients)
-
-    Peak suppression (peak_cap_factor > 0): the fit above is only
-    constrained inside valid_mask_pos (the analysis passband). Outside it,
-    for templates poorly matched to their coarse reference, the achieved
-    frequency response can develop an enormous, essentially unconstrained
-    gain at a handful of bins -- harmless in exact arithmetic (that region
-    gets multiplied by ~zero data content), but applying such a filter in
-    single precision causes floating-point cancellation error large enough
-    to produce wildly incorrect reconstructed SNR values. After the initial
-    fit, any bin (evaluated across the FULL band, not just valid_mask_pos)
-    whose magnitude exceeds peak_cap_factor times the filter's own median
-    magnitude is nudged toward zero by adding extra rows to the same
-    least-squares system -- weighted like a typical in-band fit row, not
-    the (much larger) bin value itself, since matching that scale bleeds
-    energy back into the passband -- and refitting, up to peak_max_passes
-    times. Set peak_cap_factor to 0 or None to disable.
-    """
-    # 1. Setup Grid
-    N_nyquist = len(H_target_pos)
-    N_full = 2 * (N_nyquist - 1)
-    f_grid_pos = np.arange(N_nyquist) / N_full
-
-    # 2. Select Valid
-    valid_indices = np.where(valid_mask_pos)[0]
-    f_valid = f_grid_pos[valid_indices]
-    b_complex = H_target_pos[valid_indices]
-
-    # 3. Design Matrix A
-    if K_taps % 2 == 1:
-        k_idx = np.arange(-(K_taps-1)//2, (K_taps-1)//2 + 1)
-    else:
-        k_idx = np.arange(-K_taps//2 + 1, K_taps//2 + 1)
-
-    A_complex = np.exp(-1j * 2 * np.pi * np.outer(f_valid, k_idx))
-
-    # Weights
-    if weights_pos is not None:
-        w_valid = weights_pos[valid_indices]
-        A_complex *= w_valid[:, None]
-        b_complex *= w_valid
-    else:
-        w_valid = np.ones(len(valid_indices))
-
-    # Real Stack
-    A_real = np.vstack([A_complex.real, A_complex.imag])
-    b_real = np.concatenate([b_complex.real, b_complex.imag])
-
-    if reg_type == 'derivative':
-        reg_matrix = np.zeros((K_taps - 1, K_taps))
-        for i in range(K_taps - 1):
-            reg_matrix[i, i] = 1
-            reg_matrix[i, i+1] = -1
-        reg_matrix *= np.sqrt(reg_val)
-        target_reg = np.zeros(K_taps - 1)
-
-    elif reg_type == 'composite':
-        # 1. Ridge component (Size control)
-        reg_ridge = np.eye(K_taps) * np.sqrt(reg_val * 0.5)
-
-        # 2. Derivative component (Smoothness control)
-        reg_deriv = np.zeros((K_taps - 1, K_taps))
-        for i in range(K_taps - 1):
-            reg_deriv[i, i] = 1
-            reg_deriv[i, i+1] = -1
-        reg_deriv *= np.sqrt(reg_val * 0.5)
-
-        # Stack both penalties together
-        reg_matrix = np.vstack([reg_ridge, reg_deriv])
-        target_reg = np.zeros(K_taps + K_taps - 1)
-
-    else: # Default 'ridge'
-        reg_matrix = np.eye(K_taps) * np.sqrt(reg_val)
-        target_reg = np.zeros(K_taps)
-
-    A_final = np.vstack([A_real, reg_matrix])
-    b_final = np.concatenate([b_real, target_reg])
-
-    h_optimal, _, _, _ = scipy.linalg.lstsq(A_final, b_final, lapack_driver='gelss')
-
-    n_peak_passes = 0
-    n_bins_capped = 0
-    if peak_cap_factor:
-        A_full = np.exp(-1j * 2 * np.pi * np.outer(f_grid_pos, k_idx))
-        positive_w = w_valid[w_valid > 0]
-        typical_w = np.median(positive_w) if len(positive_w) else 1.0
-        constrained_bins = set()
-        cap = None
-        for _pass in range(peak_max_passes):
-            achieved = A_full @ h_optimal
-            mag = np.abs(achieved)
-            if cap is None:
-                cap = peak_cap_factor * np.median(mag)
-            bad = np.where(mag > cap)[0]
-            n_bins_capped = len(bad)
-            if n_bins_capped == 0:
-                break
-            n_peak_passes += 1
-            constrained_bins.update(bad.tolist())
-
-            idxs = np.array(sorted(constrained_bins))
-            f_bad = f_grid_pos[idxs]
-            w_bad = peak_bad_weight_fraction * typical_w
-            row = np.exp(-1j * 2 * np.pi * np.outer(f_bad, k_idx)) * w_bad
-            extra_A = np.vstack([row.real, row.imag])
-            extra_b = np.zeros(2 * len(idxs))
-
-            A_aug = np.vstack([A_real, reg_matrix, extra_A])
-            b_aug = np.concatenate([b_real, target_reg, extra_b])
-            h_optimal, _, _, _ = scipy.linalg.lstsq(A_aug, b_aug, lapack_driver='gelss')
-
-    return h_optimal, n_peak_passes, n_bins_capped
+# --- 1. Filter Designer (Toeplitz) ---
 
 
 def _hermitian_corr(bins, values, nfft):
@@ -290,79 +172,6 @@ def design_fft_toeplitz_filter(target, valid_mask, n_taps, weights, reg_val,
                                  np.sum(base_weights**2))
                 cap = peak_cap_factor * inband
             bad = np.flatnonzero((magnitudes > cap) & ~fitted)
-        n_bad = len(bad)
-        if not n_bad or attempt == peak_max_passes:
-            break
-        extra_bins = np.union1d(extra_bins, bad)
-        n_passes += 1
-    return taps, n_passes, n_bad
-
-
-def design_fft_lsqr_filter(target, valid_mask, n_taps, weights, reg_val,
-                           peak_cap_factor=10.0, peak_bad_weight_fraction=1.0,
-                           peak_max_passes=3, atol=1e-11, btol=1e-11, iter_lim=None):
-    """Fit a long real FIR on a fine grid without a dense Vandermonde matrix.
-
-    FFT and inverse FFT implement the design matrix and its exact real-valued
-    adjoint. This permits an upper fit with thousands of taps and a grid
-    finer than the lower bank's, without cubic-time dense SVDs.
-    """
-    nfft = 2 * (len(target) - 1)
-    if n_taps >= nfft:
-        raise ValueError('FIR tap count must be below fit-grid FFT length')
-    if reg_val < 0:
-        raise ValueError('regularization must be nonnegative')
-    center = n_taps // 2
-    positions = (np.arange(n_taps) - center) % nfft
-    base_bins = np.flatnonzero(valid_mask)
-    base_weights = np.asarray(weights[base_bins], dtype=np.float64)
-    base_target = np.asarray(target[base_bins], dtype=np.complex128)
-    if len(base_bins) == 0 or not np.any(base_weights > 0):
-        raise ValueError('upper FIR has no weighted fit bins')
-    extra_bins = np.array([], dtype=int)
-    typical = np.median(base_weights[base_weights > 0])
-    cap = None
-    n_passes = 0
-    n_bad = 0
-    for attempt in range(peak_max_passes + 1):
-        bins = np.concatenate((base_bins, extra_bins))
-        w = np.concatenate((base_weights,
-                            np.full(len(extra_bins),
-                                    peak_bad_weight_fraction * typical)))
-        desired = np.concatenate((base_target,
-                                  np.zeros(len(extra_bins), dtype=np.complex128)))
-        ridge = np.sqrt(reg_val)
-
-        def matvec(x):
-            waveform = np.zeros(nfft, dtype=np.float64)
-            waveform[positions] = x
-            z = np.fft.fft(waveform)[bins] * w
-            return np.concatenate((z.real, z.imag, ridge * x))
-
-        def rmatvec(y):
-            m = len(bins)
-            freq = np.zeros(nfft, dtype=np.complex128)
-            np.add.at(freq, bins, (y[:m] + 1j * y[m:2*m]) * w)
-            return (np.fft.ifft(freq).real[positions] * nfft +
-                    ridge * y[2*m:])
-
-        operator = LinearOperator((2 * len(bins) + n_taps, n_taps),
-                                  matvec=matvec, rmatvec=rmatvec,
-                                  dtype=np.float64)
-        rhs = np.concatenate(((desired * w).real, (desired * w).imag,
-                              np.zeros(n_taps)))
-        actual_iter_lim = iter_lim if iter_lim is not None else min(3000, 2 * n_taps)
-        taps = lsqr(operator, rhs, atol=atol, btol=btol,
-                    iter_lim=actual_iter_lim)[0]
-        waveform = np.zeros(nfft, dtype=np.float64)
-        waveform[positions] = taps
-        response = np.fft.rfft(waveform)
-        if not peak_cap_factor:
-            break
-        magnitudes = np.abs(response)
-        if cap is None:
-            cap = peak_cap_factor * np.median(magnitudes)
-        bad = np.flatnonzero(magnitudes > cap)
         n_bad = len(bad)
         if not n_bad or attempt == peak_max_passes:
             break
@@ -494,22 +303,10 @@ def _design(prob, n_taps, peak_cap_factor):
     common = dict(peak_cap_factor=peak_cap_factor,
                   peak_bad_weight_fraction=g_args.peak_bad_weight_fraction,
                   peak_max_passes=g_args.peak_max_passes)
-    solver = g_args.fit_solver
-    if solver == 'toeplitz':
-        return design_fft_toeplitz_filter(
-            prob['target'][::d], prob['band'][::d], n_taps, prob['w_fit'][::d],
-            g_args.regularization_magnitude, cap_mode=g_args.peak_cap_mode,
-            toeplitz_solve=_toeplitz_solve_cached if prob.get('shared') else None, **common)
-    if solver == 'fft-lsqr':
-        return design_fft_lsqr_filter(
-            prob['target'][::d], prob['band'][::d], n_taps, prob['w_fit'][::d],
-            g_args.regularization_magnitude,
-            atol=g_args.lsqr_atol, btol=g_args.lsqr_atol,
-            iter_lim=g_args.lsqr_iter_lim, **common)
-    return design_optimal_real_filter(
-        prob['target'][::d], prob['band'][::d], n_taps,
-        weights_pos=prob['w_fit'][::d], reg_type=g_args.regularization_type,
-        reg_val=g_args.regularization_magnitude, **common)
+    return design_fft_toeplitz_filter(
+        prob['target'][::d], prob['band'][::d], n_taps, prob['w_fit'][::d],
+        g_args.regularization_magnitude, cap_mode=g_args.peak_cap_mode,
+        toeplitz_solve=_toeplitz_solve_cached if prob.get('shared') else None, **common)
 
 
 def _response(taps):
@@ -1112,6 +909,8 @@ def merge_groups(pool, results, feats, args, label='middle',
     parent field is a child-bank index; updated in place. Returns #merges."""
     n_neighbours = getattr(args, 'merge_neighbours', 3)
     n_candidates = getattr(args, 'merge_candidates', 16)
+    max_merge_group_size = getattr(args, 'merge_max_group_size', 140)
+    min_pass_frac = getattr(args, 'merge_gn_min_pass_frac', 0.5)
     groups = defaultdict(set)
     for i, row in enumerate(results):
         if row is not None and row[1] >= 0:
@@ -1125,6 +924,9 @@ def merge_groups(pool, results, feats, args, label='middle',
         for p in sorted(groups, key=lambda q: (len(groups[q]), q)):
             if p not in groups:
                 continue
+            if max_merge_group_size is not None and len(groups[p]) > max_merge_group_size:
+                # Groups are sorted by size; all remaining groups are even larger
+                break
             others = np.array([q for q in groups if q != p], dtype=int)
             if not len(others):
                 break
@@ -1158,21 +960,25 @@ def merge_groups(pool, results, feats, args, label='middle',
                     # the check used the undeformed template, so refit with that
                     chosen_z = np.zeros(20)
                 elif gn_on:
-                    if screen and screen > 0:
-                        reach = [(w, cand_radius[int(c)], int(c)) for c, _, w in check_results
-                                 if np.isfinite(w)]
-                        best_cand = min(reach)[2] if reach else None
-                    else:
-                        cand_counts = {int(c): int(n) for c, n, _ in check_results}
-                        best_cand = int(max(cands, key=lambda c: (cand_counts.get(int(c), 0),
-                                                                  -cand_radius[int(c)])))
-                    if best_cand is not None:
-                        # start from the undeformed template the screen measured
-                        opt_z, n_fail = _optimize_parent_group(pool, union, best_cand, args,
-                                                               order=order_of[best_cand])
-                        if n_fail == 0:
-                            chosen = best_cand
-                            chosen_z = opt_z
+                    cand_counts = {int(c): int(n) for c, n, _ in check_results}
+                    max_pass = max(cand_counts.values()) if cand_counts else 0
+                    min_needed = max(1, int(min_pass_frac * len(union)))
+                    best_cand = None
+                    if max_pass >= min_needed:
+                        if screen and screen > 0:
+                            reach = [(w, cand_radius[int(c)], int(c)) for c, _, w in check_results
+                                     if np.isfinite(w) and cand_counts.get(int(c), 0) >= min_needed]
+                            best_cand = min(reach)[2] if reach else None
+                        else:
+                            best_cand = int(max(cands, key=lambda c: (cand_counts.get(int(c), 0),
+                                                                      -cand_radius[int(c)])))
+                        if best_cand is not None:
+                            # start from the undeformed template the screen measured
+                            opt_z, n_fail = _optimize_parent_group(pool, union, best_cand, args,
+                                                                   order=order_of[best_cand])
+                            if n_fail == 0:
+                                chosen = best_cand
+                                chosen_z = opt_z
                 if chosen is None:
                     continue
                 rows = dict(pool.imap_unordered(_fit_forced, [(int(i), chosen, chosen_z) for i in union],
@@ -1629,6 +1435,12 @@ def main():
     parser.add_argument('--merge-candidates', type=int, default=16,
                         help='Group merging: candidate parents tried per merge (templates of the '
                              'union nearest its centre in normalised tau0, tau3, chi_eff)')
+    parser.add_argument('--merge-max-group-size', type=int, default=140,
+                        help='Group merging: maximum group size to consider as a merge source (default: 140). '
+                             'Groups larger than this are skipped, accelerating merge passes.')
+    parser.add_argument('--merge-gn-min-pass-frac', type=float, default=0.5,
+                        help='Group merging: minimum fraction of children that must pass undeformed before '
+                             'attempting Gauss-Newton deformation (default: 0.5).')
     parser.add_argument('--seed-chunks', type=int,
                         help='Bottom-up seeding: number of tau0-contiguous chunks clustered '
                              'independently (default: --n-processes)')
