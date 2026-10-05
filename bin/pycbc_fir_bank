@@ -1615,6 +1615,8 @@ def main():
                              'within --max-taps')
     parser.add_argument('--no-optimize-middle', action='store_false', dest='optimize_middle',
                         help='Skip continuous Gauss-Newton middle waveform optimization during group merging')
+    parser.add_argument('--optimize-middle', action='store_true', dest='optimize_middle', default=True,
+                        help='Enable continuous Gauss-Newton middle waveform optimization during group merging (default: enabled)')
     parser.add_argument('--no-optimize-top', action='store_false', dest='optimize_top',
                         help='Skip continuous Gauss-Newton top waveform optimization during group merging')
     parser.add_argument('--optimize-top', action='store_true', dest='optimize_top', default=True,

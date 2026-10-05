@@ -421,12 +421,17 @@ def compute_combined_fars(combos, ifos, in_combo_time, in_fars, fg_data, isolate
 
     stat_arr = fg_data['stat'][:] if hasattr(fg_data['stat'], '__getitem__') else fg_data['stat']
     n_trigs = len(stat_arr)
+
+    def _get_time(key):
+        if f'{key}/time' in fg_data:
+            return fg_data[f'{key}/time'][:]
+        if f'foreground/{key}/time' in fg_data:
+            return fg_data[f'foreground/{key}/time'][:]
+        return np.zeros(n_trigs)
+
     n_active = np.zeros(n_trigs, dtype=int)
     for ifo in ifos:
-        if f'{ifo}/time' in fg_data:
-            n_active += (fg_data[f'{ifo}/time'][:] > 0).astype(int)
-        elif f'foreground/{ifo}/time' in fg_data:
-            n_active += (fg_data[f'foreground/{ifo}/time'][:] > 0).astype(int)
+        n_active += (_get_time(ifo) > 0).astype(int)
 
     compat_mask = np.zeros((len(combos), n_trigs), dtype=bool)
     for ct_idx, ct in enumerate(combos):
@@ -434,7 +439,7 @@ def compute_combined_fars(combos, ifos, in_combo_time, in_fars, fg_data, isolate
         if ct_n_ifos >= 2:
             compat_mask[ct_idx] = (n_active >= 2)
         elif ct_n_ifos == 1:
-            t_ifo = fg_data[f'{ct}/time'][:] if f'{ct}/time' in fg_data else fg_data[f'foreground/{ct}/time'][:]
+            t_ifo = _get_time(ct)
             compat_mask[ct_idx] = (n_active == 1) & (t_ifo > 0)
         else:
             compat_mask[ct_idx] = True

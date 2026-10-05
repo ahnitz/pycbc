@@ -1738,13 +1738,13 @@ class ExpFitStatistic(PhaseTDStatistic):
         if self.single_coinc_downweight > 0:
             if "in_coinc_time" in sngls.dtype.names:
                 in_coinc = sngls["in_coinc_time"].astype(bool)
-                if isinstance(loglr, numpy.ndarray):
-                    loglr[in_coinc] -= self.single_coinc_downweight
-                elif in_coinc:
-                    loglr -= self.single_coinc_downweight
             elif "end_time" in sngls.dtype.names:
                 in_coinc = self.check_in_coinc_time(None, sngls["end_time"])
-                if isinstance(loglr, numpy.ndarray):
+            else:
+                in_coinc = None
+
+            if in_coinc is not None:
+                if isinstance(loglr, numpy.ndarray) and loglr.ndim > 0:
                     loglr[in_coinc] -= self.single_coinc_downweight
                 elif in_coinc:
                     loglr -= self.single_coinc_downweight
