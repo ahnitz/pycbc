@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+# Default to single-threaded numerical libraries (one process per core), but
+# respect anything the user has already exported.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+             "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 import argparse
 import hashlib
@@ -36,6 +36,16 @@ g_fine_bank = None
 g_fine_tau0 = None
 g_psd = None
 g_args = None
+# numpy views used by the fast zero-lag verification / fit-problem code
+g_coarse_np = None
+g_coarse_ss = None
+g_psd_np = None
+g_inv_psd = None
+g_kslice = None
+g_nfft = None
+g_freqs = None
+g_delta_f = None
+g_band_mask = None
 
 def init_worker(coarse_waveforms, fine_bank, psd, args_namespace):
     """
@@ -43,12 +53,14 @@ def init_worker(coarse_waveforms, fine_bank, psd, args_namespace):
     Sets read-only global variables.
     """
     global g_coarse_waveforms, g_coarse_sigmasq, g_coarse_tau0, g_fine_bank, g_fine_tau0, g_psd, g_args
+    global g_coarse_np, g_coarse_ss, g_psd_np, g_inv_psd, g_kslice, g_nfft, g_freqs, g_delta_f, g_band_mask
     try:
         import pycbc.filter.matchedfilter as mf
         import pycbc.filter.matchedfilter_cpu as mc
         mf.correlate = mc.correlate_numpy
     except Exception:
         pass
+    from pycbc.filter.matchedfilter import get_cutoff_indices
     g_coarse_waveforms = coarse_waveforms
     g_fine_bank = fine_bank
     g_psd = psd
@@ -56,6 +68,19 @@ def init_worker(coarse_waveforms, fine_bank, psd, args_namespace):
     g_coarse_tau0 = getattr(args_namespace, '_coarse_tau0', None)
     g_fine_tau0 = getattr(args_namespace, '_fine_tau0', None)
     g_coarse_sigmasq = [pycbc.filter.sigmasq(h, psd=g_psd, low_frequency_cutoff=g_args.f_low) for h in coarse_waveforms]
+
+    g_delta_f = float(psd.delta_f)
+    g_psd_np = psd.numpy().astype(np.float64)
+    g_nfft = 2 * (len(g_psd_np) - 1)
+    g_freqs = np.arange(len(g_psd_np)) * g_delta_f
+    g_inv_psd = np.zeros_like(g_psd_np)
+    np.divide(1.0, g_psd_np, out=g_inv_psd, where=g_psd_np > 0)
+    kmin, kmax = get_cutoff_indices(g_args.f_low, None, g_delta_f, g_nfft)
+    g_kslice = slice(kmin, kmax)
+    g_band_mask = (g_freqs >= g_args.f_low) & (g_freqs < g_args.sample_rate / 2.0) & (g_psd_np > 0)
+    g_coarse_np = [h.numpy().astype(np.complex128) for h in coarse_waveforms]
+    g_coarse_ss = [float(np.sum(np.abs(h[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
+                   for h in g_coarse_np]
     # Silence worker logging
     logging.getLogger('pycbc').setLevel(logging.CRITICAL + 1)
 
@@ -143,13 +168,7 @@ def design_optimal_real_filter(H_target_pos, valid_mask_pos, K_taps, weights_pos
     A_final = np.vstack([A_real, reg_matrix])
     b_final = np.concatenate([b_real, target_reg])
 
-    try:
-        h_optimal, _, _, _ = scipy.linalg.lstsq(A_final, b_final, lapack_driver='gelss')
-        #h_optimal, _, _, _ = np.linalg.lstsq(A_final, b_final, rcond=None)
-    except:
-        logging.info('Exception with numpy least squares, moving to scipy')
-        h_optimal, _, _, _ = scipy.linalg.lstsq(A_final, b_final, lapack_driver='gelss')
-        logging.info('Scipy suceeded')
+    h_optimal, _, _, _ = scipy.linalg.lstsq(A_final, b_final, lapack_driver='gelss')
 
     n_peak_passes = 0
     n_bins_capped = 0
@@ -187,12 +206,22 @@ def design_optimal_real_filter(H_target_pos, valid_mask_pos, K_taps, weights_pos
 
 def design_fft_toeplitz_filter(target, valid_mask, n_taps, weights, reg_val,
                                 peak_cap_factor=10.0, peak_bad_weight_fraction=1.0,
-                                peak_max_passes=3):
+                                peak_max_passes=3, cap_mode='inband'):
     """Fit a real FIR on a fine grid using direct Levinson-Durbin Toeplitz inversion.
 
     The normal equations (A^T W^2 A + lambda I) h = A^T W^2 d form an exact
     symmetric Toeplitz system, solvable in O(n_taps^2) via Levinson-Durbin
     without dense matrix storage or iterative LSQR passes.
+
+    Peak suppression (peak_cap_factor > 0) adds zero-target rows for bins
+    whose achieved gain exceeds the cap, and refits.
+
+    cap_mode='inband' (default): only bins *outside* the fitted band are
+        constrained, and the cap is peak_cap_factor times the filter's
+        weighted RMS gain over the fitted band. Inside the band the target
+        itself decides the gain, so constraining it would only fight the fit.
+    cap_mode='median' (legacy): any bin may be constrained, cap relative to
+        the median gain over the full band.
     """
     nfft = 2 * (len(target) - 1)
     if n_taps >= nfft:
@@ -205,7 +234,9 @@ def design_fft_toeplitz_filter(target, valid_mask, n_taps, weights, reg_val,
     base_weights = np.asarray(weights[base_bins], dtype=np.float64)
     base_target = np.asarray(target[base_bins], dtype=np.complex128)
     if len(base_bins) == 0 or not np.any(base_weights > 0):
-        raise ValueError('upper FIR has no weighted fit bins')
+        raise ValueError('FIR fit has no weighted fit bins')
+    fitted = np.zeros(len(target), dtype=bool)
+    fitted[base_bins] = True
     extra_bins = np.array([], dtype=int)
     typical = np.median(base_weights[base_weights > 0])
     cap = None
@@ -231,15 +262,21 @@ def design_fft_toeplitz_filter(target, valid_mask, n_taps, weights, reg_val,
         b = (0.5 * np.fft.ifft(freq_d).real * nfft)[positions]
 
         taps = solve_toeplitz(r, b)
-        waveform = np.zeros(nfft, dtype=np.float64)
-        waveform[positions] = taps
-        response = np.fft.rfft(waveform)
         if not peak_cap_factor:
             break
-        magnitudes = np.abs(response)
-        if cap is None:
-            cap = peak_cap_factor * np.median(magnitudes)
-        bad = np.flatnonzero(magnitudes > cap)
+        waveform = np.zeros(nfft, dtype=np.float64)
+        waveform[positions] = taps
+        magnitudes = np.abs(np.fft.rfft(waveform))
+        if cap_mode == 'median':
+            if cap is None:
+                cap = peak_cap_factor * np.median(magnitudes)
+            bad = np.flatnonzero(magnitudes > cap)
+        else:
+            if cap is None:
+                inband = np.sqrt(np.sum(base_weights**2 * magnitudes[base_bins]**2) /
+                                 np.sum(base_weights**2))
+                cap = peak_cap_factor * inband
+            bad = np.flatnonzero((magnitudes > cap) & ~fitted)
         n_bad = len(bad)
         if not n_bad or attempt == peak_max_passes:
             break
@@ -365,227 +402,283 @@ def verify_filter_match(taps, h_ref, h_fine, psd, f_low, sample_rate=None, shift
     return m, (s_ref, s_rec, s_fine)
 
 # --- 3. WORKER FUNCTION (Executes in parallel) ---
-def process_template(i):
-    """
-    Worker function that runs the full design loop for a single template index 'i'.
+#
+# Acceptance has two parts, and every tap count tried must pass both:
+#
+#   (i)  reconstruction accuracy: zero-lag, phase-maximised overlap between
+#        the target template and (reference x FIR) >= --min-match, computed
+#        with the float32 taps exactly as they will be stored;
+#   (ii) downstream numerical niceness: the filter is applied in single
+#        precision to a reference SNR series whose rounding noise covers the
+#        whole band, so it must not have huge coefficients (--max-tap-value),
+#        large gain outside the fitted band (--peak-cap-factor, relative to its
+#        match-weighted in-band RMS gain) or, optionally, a large white-noise
+#        gain (--max-noise-gain).
+#
+# The tap search returns the fewest taps that pass both.
 
-    Peak suppression (see design_optimal_real_filter) can only ever hold a
-    fit's achieved match the same or make it worse -- it adds constraints to
-    the same least-squares system, never relaxes any. So checking it on a
-    (coarse reference, tap count) attempt that hasn't reached --min-match
-    without suppression is wasted work: that attempt is going to escalate to
-    more taps regardless of what suppression does to it. Suppression is
-    therefore only evaluated at the two points where its result actually
-    changes what gets accepted: (1) a candidate that clears --min-match
-    *before* suppression, to confirm it still clears it after (if not, this
-    isn't actually good enough yet -- keep escalating instead of accepting
-    it); (2) the single best (by unsuppressed match) candidate seen across
-    the whole search, as the final safety pass on whatever gets delivered if
-    nothing ever cleared --min-match at all.
+def _positions(n_taps, nfft):
+    return (np.arange(n_taps) - n_taps // 2) % nfft
+
+
+def _snap(k, up=True):
+    """Snap a tap count onto the odd grid min_taps + j * tap_granularity."""
+    gran = g_args.tap_granularity
+    j = (k - g_args.min_taps) / float(gran)
+    j = int(np.ceil(j - 1e-9)) if up else int(np.floor(j + 1e-9))
+    return g_args.min_taps + max(j, 0) * gran
+
+
+def _build_problem(c_idx, h_fine_np):
+    """Fit target, masks and weights for parent c_idx (cached by caller)."""
+    h_ref = g_coarse_np[c_idx]
+    band = g_band_mask.copy()
+    ratio = np.zeros(len(h_ref), dtype=np.complex128)
+    np.divide(h_fine_np, h_ref, out=ratio, where=np.abs(h_ref) > 0)
+    ratio = np.nan_to_num(ratio, copy=False)
+    w_match = np.zeros(len(h_ref), dtype=np.float64)
+    np.divide(np.abs(h_ref) ** 2, g_psd_np, out=w_match, where=band)
+    w_match = np.nan_to_num(w_match, copy=False)
+    band[np.abs(ratio) > g_args.ratio_cap] = False
+    if not band.any() or w_match[band].max() <= 0:
+        return None
+    # w_match = |h_ref|^2 / S is the weight the match error actually carries on
+    # |H - D|^2. The least-squares row weight is w_match ** p, so the fitted
+    # error weight is w_match ** (2p): p = 0.5 is match-consistent.
+    w_match /= w_match[band].max()
+    w_fit = w_match ** g_args.fit_weight_power
+
+    shift = 0
+    if g_args.enable_tap_centering:
+        b = np.flatnonzero(band)
+        phase = np.unwrap(np.angle(ratio[b]))
+        gd = -np.gradient(phase, g_delta_f) / (2 * np.pi) * g_args.sample_rate
+        wc = w_fit[b] ** 2
+        if wc.sum() > 0:
+            shift = int(np.round(np.sum(gd * wc) / np.sum(wc)))
+    target = ratio * g_args.sample_rate
+    if shift:
+        target = target * np.exp(1j * 2 * np.pi * g_freqs * shift / g_args.sample_rate)
+    return dict(c_idx=int(c_idx), h_ref=h_ref, target=target, band=band,
+                w_fit=w_fit, w_match=w_match, shift=shift)
+
+
+def _design(prob, n_taps, peak_cap_factor):
+    d = g_args.dec_factor
+    common = dict(peak_cap_factor=peak_cap_factor,
+                  peak_bad_weight_fraction=g_args.peak_bad_weight_fraction,
+                  peak_max_passes=g_args.peak_max_passes)
+    solver = g_args.fit_solver
+    if solver == 'toeplitz':
+        return design_fft_toeplitz_filter(
+            prob['target'][::d], prob['band'][::d], n_taps, prob['w_fit'][::d],
+            g_args.regularization_magnitude, cap_mode=g_args.peak_cap_mode, **common)
+    if solver == 'fft-lsqr':
+        return design_fft_lsqr_filter(
+            prob['target'][::d], prob['band'][::d], n_taps, prob['w_fit'][::d],
+            g_args.regularization_magnitude,
+            atol=g_args.lsqr_atol, btol=g_args.lsqr_atol,
+            iter_lim=g_args.lsqr_iter_lim, **common)
+    return design_optimal_real_filter(
+        prob['target'][::d], prob['band'][::d], n_taps,
+        weights_pos=prob['w_fit'][::d], reg_type=g_args.regularization_type,
+        reg_val=g_args.regularization_magnitude, **common)
+
+
+def _response(taps):
+    wave = np.zeros(g_nfft, dtype=np.float64)
+    wave[_positions(len(taps), g_nfft)] = taps
+    return np.fft.rfft(wave)
+
+
+def _filter_metrics(H, taps, prob):
+    """(max |tap|, out-of-band peak gain, white-noise gain).
+
+    Gains are relative to the filter's match-weighted RMS gain over the fitted
+    band, so they measure how much the filter amplifies content (rounding
+    noise) that carries no signal, compared with how it treats the signal.
+    """
+    mag = np.abs(H)
+    fb = prob['band']
+    wm = prob['w_match'][fb]
+    inband = np.sqrt(np.sum(wm * mag[fb] ** 2) / np.sum(wm))
+    if inband <= 0:
+        return float(np.max(np.abs(taps))), np.inf, np.inf
+    oob = mag[~fb].max() / inband if (~fb).any() else 0.0
+    noise_gain = np.sqrt(np.mean(mag ** 2)) / inband
+    return float(np.max(np.abs(taps))), float(oob), float(noise_gain)
+
+
+def _verify(H, prob, h_fine_np, fine_ss):
+    """Zero-lag, phase-maximised overlap and (sigma_ref, sigma_rec, sigma_fine)."""
+    # taps are fit to ratio * sample_rate; the engine response is rfft / SR
+    H = H / g_args.sample_rate
+    if prob['shift']:
+        H = H * np.exp(-1j * 2 * np.pi * g_freqs * prob['shift'] / g_args.sample_rate)
+    sl = g_kslice
+    rec = prob['h_ref'][sl] * H[sl]
+    ip = np.sum(np.conj(h_fine_np[sl]) * rec * g_inv_psd[sl])
+    rec_ss = np.sum((rec.real ** 2 + rec.imag ** 2) * g_inv_psd[sl])
+    m = abs(ip) / np.sqrt(rec_ss * fine_ss) if rec_ss > 0 else 0.0
+    scale = 4.0 * g_delta_f
+    ref_ss = g_coarse_ss[prob['c_idx']]
+    return float(m), (np.sqrt(scale * ref_ss), np.sqrt(scale * rec_ss),
+                      np.sqrt(scale * fine_ss))
+
+
+def _evaluate(prob, n_taps, h_fine, h_fine_np, fine_ss, stats, suppress=True):
+    """Design at n_taps and run the full (accuracy + niceness) acceptance test."""
+    taps, n_pp, n_bc = _design(prob, n_taps,
+                               g_args.peak_cap_factor if suppress else 0)
+    taps32 = np.asarray(taps, dtype=np.float32)
+    H = _response(taps32.astype(np.float64))
+    if suppress:
+        stats['attempts'] += 1
+        if n_pp:
+            stats['suppressed'] += 1
+    metrics = _filter_metrics(H, taps32, prob)
+    if g_args.verify_mode == 'match':
+        qa, sigmas = verify_filter_match(
+            taps32.astype(np.float64), g_coarse_waveforms[prob['c_idx']], h_fine,
+            g_psd, g_args.f_low, sample_rate=g_args.sample_rate, shift=prob['shift'])
+    else:
+        qa, sigmas = _verify(H, prob, h_fine_np, fine_ss)
+    max_tap, oob, noise_gain = metrics
+    ok = (qa >= g_args.min_match and np.isfinite(max_tap)
+          and max_tap <= g_args.max_tap_value)
+    if ok and g_args.peak_cap_factor and g_args.peak_cap_mode == 'inband':
+        ok = oob <= g_args.peak_cap_factor * (1 + 1e-6)
+    if ok and g_args.max_noise_gain is not None:
+        ok = noise_gain <= g_args.max_noise_gain
+    return ok, dict(c_idx=prob['c_idx'], n_taps=int(n_taps), qa=qa, taps=taps32,
+                    sigmas=sigmas, n_pp=n_pp, n_bc=n_bc, shift=prob['shift'],
+                    metrics=metrics)
+
+
+def _min_taps(prob, k_cap, h_fine, h_fine_np, fine_ss, stats):
+    """Fewest taps <= k_cap passing the acceptance test for one parent.
+
+    Steps up a coarse ladder (--n-taps, + --tap-step) until a count passes,
+    then (--tap-search bisect) bisects down to --tap-granularity between the
+    last failing and first passing count. Returns (accepted_record or None,
+    best_failed_record or None).
+    """
+    best_fail = None
+    if k_cap < g_args.min_taps:
+        return None, None
+    ladder = []
+    k = _snap(g_args.n_taps)
+    while k <= k_cap:
+        ladder.append(k)
+        k = _snap(k + g_args.tap_step)
+    top = _snap(k_cap, up=False)
+    if not ladder or ladder[-1] < top:
+        ladder.append(top)
+    lo, hi, hi_rec = None, None, None
+    for k in ladder:
+        ok, rec = _evaluate(prob, k, h_fine, h_fine_np, fine_ss, stats)
+        if ok:
+            hi, hi_rec = k, rec
+            break
+        if best_fail is None or rec['qa'] > best_fail['qa']:
+            best_fail = rec
+        lo = k
+    if hi_rec is None:
+        return None, best_fail
+    if g_args.tap_search == 'bisect':
+        gran = g_args.tap_granularity
+        lo = lo if lo is not None else g_args.min_taps - gran
+        while hi - lo > gran:
+            mid = _snap((lo + hi) // 2, up=False)
+            if mid <= lo:
+                mid = lo + gran
+            if mid >= hi:
+                break
+            ok, rec = _evaluate(prob, mid, h_fine, h_fine_np, fine_ss, stats)
+            if ok:
+                hi, hi_rec = mid, rec
+            else:
+                lo = mid
+    return hi_rec, best_fail
+
+
+def process_template(i):
+    """Find the parent and FIR with the fewest taps that pass acceptance.
+
+    Candidate parents are the --search-depth nearest in tau0. They are ranked
+    either by how well a quick --n-taps fit reconstructs the template
+    (--parent-selection min-taps) or by direct template match (direct-match).
+    The top --parent-refine candidates each get the full minimum-tap search,
+    capped below the best count found so far; the fewest taps wins. If none
+    of them pass, the remaining candidates are tried in rank order.
     """
     h_fine = g_fine_bank[i].copy()
-    fine_sigmasq = pycbc.filter.sigmasq(h_fine, psd=g_psd, low_frequency_cutoff=g_args.f_low)
+    h_fine_np = h_fine.numpy().astype(np.complex128)
+    sl = g_kslice
+    fine_ss = float(np.sum(np.abs(h_fine_np[sl]) ** 2 * g_inv_psd[sl]))
+    stats = {'attempts': 0, 'suppressed': 0}
 
+    n_cand = min(len(g_coarse_waveforms), g_args.search_depth)
     if g_coarse_tau0 is not None and g_fine_tau0 is not None:
-        fine_tau0 = g_fine_tau0[i]
-        dt = np.abs(g_coarse_tau0 - fine_tau0)
-        n_cand = min(len(g_coarse_waveforms), max(25, g_args.search_depth))
-        candidate_indices = np.argsort(dt)[:n_cand]
+        candidates = np.argsort(np.abs(g_coarse_tau0 - g_fine_tau0[i]))[:n_cand]
     else:
-        candidate_indices = np.arange(len(g_coarse_waveforms))
+        candidates = np.arange(len(g_coarse_waveforms))
 
-    matches = {}
-    for c_idx in candidate_indices:
-        h_ref = g_coarse_waveforms[c_idx]
-        c_norm = g_coarse_sigmasq[c_idx] if g_coarse_sigmasq is not None else None
-        m, _ = match(h_fine, h_ref, psd=g_psd, low_frequency_cutoff=g_args.f_low,
-                     v1_norm=fine_sigmasq, v2_norm=c_norm)
-        matches[c_idx] = m
+    problems = {}
 
-    cand_sorted = sorted(candidate_indices, key=lambda c: matches[c], reverse=True)
-    msearch = np.array(cand_sorted[:g_args.search_depth])
+    def problem(c):
+        if c not in problems:
+            problems[c] = _build_problem(c, h_fine_np)
+        return problems[c]
 
-    def build_problem(c_idx):
-        """Build the least-squares fit target for coarse template c_idx.
+    def direct_match(c):
+        m, _ = match(h_fine, g_coarse_waveforms[c], psd=g_psd,
+                     low_frequency_cutoff=g_args.f_low,
+                     v1_norm=fine_ss * 4.0 * g_delta_f, v2_norm=g_coarse_sigmasq[c])
+        return float(m)
 
-        Returns h_ref, the target frequency-domain ratio (H_target_raw),
-        the in-band mask, and the PSD-based fit weights -- the inputs
-        design_optimal_real_filter needs.
-        """
-        h_ref = g_coarse_waveforms[c_idx]
-        freqs = h_fine.sample_frequencies.numpy()
-        band_mask = (freqs >= g_args.f_low) & (freqs < g_args.sample_rate / 2.0)
-        ratio = np.zeros(len(h_ref), dtype=np.complex128)
-        np.divide(h_fine.numpy(), h_ref.numpy(), out=ratio,
-                  where=np.abs(h_ref.numpy()) > 0)
-
-        # PSD based weights
-        psd_np = g_psd.numpy()
-        weights_snr = np.zeros_like(psd_np, dtype=np.float64)
-        ref_mag = np.abs(h_ref.numpy())
-        np.divide(ref_mag**2, psd_np, out=weights_snr, where=band_mask)
-
-        # Clean up potential divide errors and normalize
-        ratio = np.nan_to_num(ratio, copy=False)
-        weights_snr = np.nan_to_num(weights_snr, copy=False)
-        H_target_raw = ratio * g_args.sample_rate
-        band_mask[abs(ratio) > g_args.ratio_cap] = False
-        weights_snr /= weights_snr[band_mask].max()
-
-        shift = 0
-        if getattr(g_args, 'enable_tap_centering', True):
-            base_b = np.flatnonzero(band_mask)
-            if len(base_b) > 0:
-                phase = np.unwrap(np.angle(ratio[base_b]))
-                gd = -np.gradient(phase, h_ref.delta_f) / (2 * np.pi) * g_args.sample_rate
-                w_b = weights_snr[base_b]
-                sum_w2 = np.sum(w_b**2)
-                shift = int(np.round(np.sum(gd * w_b**2) / sum_w2)) if sum_w2 > 0 else 0
-                freqs = h_ref.sample_frequencies.numpy()
-                phase_shift = np.exp(1j * 2 * np.pi * freqs * (1.0 / g_args.sample_rate) * shift)
-                H_target_raw = H_target_raw * phase_shift
-
-        return h_ref, H_target_raw, band_mask, weights_snr, shift
-
-    def fit_and_verify(c_idx, h_ref, H_target_raw, band_mask, weights_snr, n_taps, peak_cap_factor, shift=0):
-        """Design a filter for c_idx at n_taps and check its match.
-
-        Returns (qa, taps, sigmas, n_peak_passes, n_bins_capped, max_tap_val).
-        qa is -1 (and sigmas None) if the fit is rejected outright for
-        having an unsafely large tap value, without ever computing match.
-        """
-        solver = getattr(g_args, 'fit_solver', 'dense')
-        if solver == 'toeplitz':
-            if g_args.regularization_type != 'ridge':
-                raise ValueError('toeplitz currently requires ridge regularization')
-            taps, n_peak_passes, n_bins_capped = design_fft_toeplitz_filter(
-                H_target_raw[::g_args.dec_factor],
-                band_mask[::g_args.dec_factor], n_taps,
-                weights_snr[::g_args.dec_factor],
-                g_args.regularization_magnitude,
-                peak_cap_factor=peak_cap_factor,
-                peak_bad_weight_fraction=g_args.peak_bad_weight_fraction,
-                peak_max_passes=g_args.peak_max_passes)
-        elif solver == 'fft-lsqr':
-            if g_args.regularization_type != 'ridge':
-                raise ValueError('fft-lsqr currently requires ridge regularization')
-            taps, n_peak_passes, n_bins_capped = design_fft_lsqr_filter(
-                H_target_raw[::g_args.dec_factor],
-                band_mask[::g_args.dec_factor], n_taps,
-                weights_snr[::g_args.dec_factor],
-                g_args.regularization_magnitude,
-                peak_cap_factor=peak_cap_factor,
-                peak_bad_weight_fraction=g_args.peak_bad_weight_fraction,
-                peak_max_passes=g_args.peak_max_passes,
-                atol=getattr(g_args, 'lsqr_atol', 1e-11),
-                btol=getattr(g_args, 'lsqr_atol', 1e-11),
-                iter_lim=getattr(g_args, 'lsqr_iter_lim', min(3000, 2 * n_taps)))
+    scores = {}
+    for c in candidates:
+        c = int(c)
+        if problem(c) is None:
+            continue
+        if g_args.parent_selection == 'direct-match':
+            scores[c] = direct_match(c)
         else:
-            taps, n_peak_passes, n_bins_capped = design_optimal_real_filter(
-                H_target_raw[::g_args.dec_factor],
-                band_mask[::g_args.dec_factor],
-                n_taps, weights_pos=weights_snr[::g_args.dec_factor],
-                reg_type=g_args.regularization_type,
-                reg_val=g_args.regularization_magnitude,
-                peak_cap_factor=peak_cap_factor,
-                peak_bad_weight_fraction=g_args.peak_bad_weight_fraction,
-                peak_max_passes=g_args.peak_max_passes)
-
-        # Check if the taps are sane or if they contains a crazy number of
-        # extreme / large values
-        max_tap_val = np.max(np.abs(taps))
-        if max_tap_val > g_args.max_tap_value:
-            logging.warning(f"Template {i} (Ref {c_idx}, {n_taps} taps) rejected: Max tap value {max_tap_val:.2e} exceeded safety threshold.")
-            return -1, taps, None, n_peak_passes, n_bins_capped, max_tap_val
-        qa, sigmas = verify_filter_match(taps, h_ref, h_fine, g_psd, g_args.f_low,
-                                         sample_rate=g_args.sample_rate, shift=shift)
-        return qa, taps, sigmas, n_peak_passes, n_bins_capped, max_tap_val
-
-    current_taps = g_args.n_taps
-
-    best = (i, -1, -1, -1.0, [], [], 0, 0, 0)
-    best_unsuppressed = None  # (qa0, c_idx, best_match, n_taps, shift), cheap to re-derive later
-    accepted = False
-    n_attempts_total = 0
-    n_attempts_suppressed = 0
-
-    while current_taps <= g_args.max_taps and not accepted:
-        round_matches = []
-        for c_idx in msearch:
-            best_match = matches[c_idx]
-            h_ref, H_target_raw, band_mask, weights_snr, shift = build_problem(c_idx)
-
             try:
-                qa0, taps0, sigmas0, _, _, max_tap0 = fit_and_verify(
-                    c_idx, h_ref, H_target_raw, band_mask, weights_snr, current_taps, peak_cap_factor=0, shift=shift)
+                taps, _, _ = _design(problem(c), _snap(g_args.n_taps), 0)
+                H = _response(np.asarray(taps, dtype=np.float32).astype(np.float64))
+                scores[c] = _verify(H, problem(c), h_fine_np, fine_ss)[0]
             except Exception as e:
-                logging.info(e)
-                continue
-            round_matches.append(qa0)
+                logging.info('T%d parent %d probe failed: %s', i, c, e)
+    ranked = sorted(scores, key=lambda c: scores[c], reverse=True)
 
-            if best_unsuppressed is None or qa0 > best_unsuppressed[0]:
-                best_unsuppressed = (qa0, c_idx, best_match, current_taps, shift)
-
-            logging.debug(f"CoarseTemp:{c_idx} QA-Match(unsuppressed):{qa0} Taps:{current_taps} Max Tap Val: {max_tap0}")
-
-            if qa0 < g_args.min_match:
-                # This attempt is escalating regardless of what suppression would
-                # do to it (suppression can only hold or lower the match) -- skip
-                # the extra fit passes.
-                continue
-
-            # A candidate for acceptance: confirm it still clears --min-match
-            # once made numerically safe before actually committing to it.
-            try:
-                qa1, taps1, sigmas1, n_pp1, n_bc1, max_tap1 = fit_and_verify(
-                    c_idx, h_ref, H_target_raw, band_mask, weights_snr, current_taps,
-                    peak_cap_factor=g_args.peak_cap_factor, shift=shift)
-            except Exception as e:
-                logging.info(e)
-                continue
-            n_attempts_total += 1
-            if n_pp1 > 0:
-                n_attempts_suppressed += 1
-
-            logging.debug(f"CoarseTemp:{c_idx} QA-Match(suppressed):{qa1} Taps:{current_taps} Max Tap Val: {max_tap1} "
-                          f"PeakSuppression: passes={n_pp1} remaining_capped_bins={n_bc1}")
-
-            if best[3] < qa1:
-                best = (i, best_match, c_idx, qa1, taps1, sigmas1, n_pp1, n_bc1, shift)
-
-            if qa1 >= g_args.min_match:
-                accepted = True
-                break
-
-        if accepted:
+    step = g_args.tap_granularity if g_args.tap_search == 'bisect' else g_args.tap_step
+    best, best_fail = None, None
+    for rank, c in enumerate(ranked):
+        if best is not None and rank >= g_args.parent_refine:
             break
-
-        round_matches = np.array(round_matches)
-        top = round_matches.argsort()[::-1]
-        tnum = int(max(1, len(round_matches) * 0.8))
-        msearch = msearch[top[:tnum]]
-        current_taps += g_args.tap_step
-
-    if not accepted and best_unsuppressed is not None:
-        # Nothing ever cleared --min-match even before suppression. Apply the
-        # mandatory safety pass once, to the single best (unsuppressed)
-        # candidate found across the whole search, so whatever gets delivered
-        # as this template's best effort is still numerically safe.
-        qa0, c_idx, best_match, n_taps_at, shift = best_unsuppressed
-        h_ref, H_target_raw, band_mask, weights_snr, _ = build_problem(c_idx)
+        cap = g_args.max_taps if best is None else best['n_taps'] - step
         try:
-            qa1, taps1, sigmas1, n_pp1, n_bc1, max_tap1 = fit_and_verify(
-                c_idx, h_ref, H_target_raw, band_mask, weights_snr, n_taps_at,
-                peak_cap_factor=g_args.peak_cap_factor, shift=shift)
-            n_attempts_total += 1
-            if n_pp1 > 0:
-                n_attempts_suppressed += 1
-            if best[3] < qa1:
-                best = (i, best_match, c_idx, qa1, taps1, sigmas1, n_pp1, n_bc1, shift)
+            rec, fail = _min_taps(problem(c), cap, h_fine, h_fine_np, fine_ss, stats)
         except Exception as e:
-            logging.info(e)
+            logging.info('T%d parent %d failed: %s', i, c, e)
+            continue
+        if rec is not None and (best is None or rec['n_taps'] < best['n_taps']):
+            best = rec
+        if fail is not None and (best_fail is None or fail['qa'] > best_fail['qa']):
+            best_fail = fail
 
-    return best + (n_attempts_total, n_attempts_suppressed)
+    accepted = best is not None
+    chosen = best if accepted else best_fail
+    if chosen is None:
+        return (i, -1.0, -1, -1.0, [], [], 0, 0, 0, stats['attempts'],
+                stats['suppressed'], (np.nan, np.nan, np.nan), False)
+    c = chosen['c_idx']
+    coarse_match = scores[c] if g_args.parent_selection == 'direct-match' else direct_match(c)
+    return (i, coarse_match, c, chosen['qa'], chosen['taps'], chosen['sigmas'],
+            chosen['n_pp'], chosen['n_bc'], chosen['shift'], stats['attempts'],
+            stats['suppressed'], chosen['metrics'], accepted)
 
 
 def write_fir_groups(parent_group, all_results, match_dtype='float32'):
@@ -595,47 +688,34 @@ def write_fir_groups(parent_group, all_results, match_dtype='float32'):
         if result is not None and result[1] >= 0:
             results_by_parent[result[1]].append(result + (i,))
 
+    comp = dict(shuffle=True, compression='gzip', compression_opts=9)
     tap_counts = []
     for parent_index, results in results_by_parent.items():
         group = parent_group.create_group(str(parent_index))
         n_group = len(results)
-        max_taps = max(len(row[3]) for row in results)
-        taps = group.create_dataset(
-            'taps', (n_group, max_taps), dtype='float32',
-            chunks=(n_group, max_taps), shuffle=True, compression='gzip', compression_opts=9)
-        counts = group.create_dataset(
-            'actual_tap_count', (n_group,), dtype='int32',
-            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
-        indices = group.create_dataset(
-            'fine_bank_index', (n_group,), dtype='int32',
-            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
-        fits = group.create_dataset(
-            'filter_match', (n_group,), dtype=match_dtype,
-            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
-        parent_matches = group.create_dataset(
-            'coarse_match', (n_group,), dtype='float32',
-            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
-        sigmas = group.create_dataset(
-            'sigmas', (n_group, 3), dtype='float32',
-            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
-        shifts = group.create_dataset(
-            'sample_shift', (n_group,), dtype='int32',
-            chunks=True, shuffle=True, compression='gzip', compression_opts=9)
-        for j, res_row in enumerate(results):
-            parent_match = res_row[0]
-            fit = res_row[2]
-            row_taps = res_row[3]
-            row_sigmas = res_row[4]
-            shift = res_row[5] if len(res_row) > 6 else 0
-            i = res_row[-1]
-            taps[j, :len(row_taps)] = np.asarray(row_taps, dtype=np.float32)
-            counts[j] = len(row_taps)
-            indices[j] = i
-            fits[j] = fit
-            parent_matches[j] = parent_match
-            sigmas[j] = row_sigmas
-            shifts[j] = shift
-        tap_counts.append(counts[:])
+        counts = np.array([len(row[3]) for row in results], dtype=np.int32)
+        max_taps = int(counts.max())
+        taps = np.zeros((n_group, max_taps), dtype=np.float32)
+        for j, row in enumerate(results):
+            taps[j, :counts[j]] = np.asarray(row[3], dtype=np.float32)
+        group.create_dataset('taps', data=taps, chunks=(n_group, max_taps), **comp)
+        columns = (
+            ('actual_tap_count', counts, 'int32'),
+            ('fine_bank_index', [row[-1] for row in results], 'int32'),
+            ('filter_match', [row[2] for row in results], match_dtype),
+            ('coarse_match', [row[0] for row in results], 'float32'),
+            ('sigmas', [row[4] for row in results], 'float32'),
+            ('sample_shift', [row[5] if len(row) > 6 else 0 for row in results], 'int32'),
+        )
+        if all(len(row) > 7 and row[6] is not None for row in results):
+            metrics = np.array([row[6] for row in results], dtype=np.float32)
+            columns += (('max_tap', metrics[:, 0], 'float32'),
+                        ('oob_gain', metrics[:, 1], 'float32'),
+                        ('noise_gain', metrics[:, 2], 'float32'))
+        for name, values, dtype in columns:
+            group.create_dataset(name, data=np.asarray(values, dtype=dtype),
+                                 chunks=True, **comp)
+        tap_counts.append(counts)
     return np.concatenate(tap_counts) if tap_counts else np.array([], dtype=int)
 
 
@@ -647,8 +727,35 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def fit_upper_level(args, middle_bank, psd, flen, output):
-    """Fit top->middle in the same output file as middle->fine."""
+def upper_namespace(args):
+    """Copy of args with the --upper-* overrides applied (top->middle fit)."""
+    upper = argparse.Namespace(**vars(args))
+    upper.delta_f = args.upper_delta_f or args.delta_f
+    upper.fit_solver = args.upper_fit_solver
+    for name in ('n_taps', 'max_taps', 'tap_step', 'min_match', 'search_depth',
+                 'regularization_magnitude', 'lsqr_atol', 'lsqr_iter_lim',
+                 'parent_refine', 'tap_granularity', 'min_taps', 'fit_weight_power'):
+        value = getattr(args, 'upper_' + name, None)
+        if value is not None:
+            setattr(upper, name, value)
+    return upper
+
+
+def upper_psd_from_cli(args):
+    upper_df = args.upper_delta_f or args.delta_f
+    upper_flen = int((args.sample_rate / 2.0) / upper_df) + 1
+    if abs((upper_flen - 1) * upper_df - args.sample_rate / 2.0) > 1e-8:
+        raise ValueError('upper delta_f must divide the Nyquist frequency')
+    return upper_df, upper_flen, pycbc.psd.from_cli(args, length=upper_flen, delta_f=upper_df,
+                                                    low_frequency_cutoff=args.f_low)
+
+
+def fit_upper_level(args, middle_bank, psd, flen, output, used_middles=None):
+    """Fit top->middle in the same output file as middle->fine.
+
+    Only middle templates listed in used_middles (those with fine children)
+    are fitted; others get no upper group.
+    """
     if args.top_bank is None:
         return
     upper_df = args.upper_delta_f or args.delta_f
@@ -668,33 +775,42 @@ def fit_upper_level(args, middle_bank, psd, flen, output):
     if not top_waveforms:
         raise ValueError('top bank is empty')
 
-    upper = argparse.Namespace(**vars(args))
-    upper.delta_f = upper_df
-    upper.fit_solver = args.upper_fit_solver
-    for name in ('n_taps', 'max_taps', 'tap_step', 'min_match', 'search_depth',
-                 'regularization_magnitude', 'lsqr_atol', 'lsqr_iter_lim'):
-        value = getattr(args, 'upper_' + name, None)
-        if value is not None:
-            setattr(upper, name, value)
+    upper = upper_namespace(args)
     upper.search_depth = min(upper.search_depth, len(top_bank))
+    # Candidate parents for the upper fit are top templates, children are
+    # middle templates: do not inherit the middle/fine tau0 arrays.
+    def _tau0(bank):
+        if hasattr(bank, 'table') and 'tau0' in bank.table.dtype.names:
+            return np.array(bank.table['tau0'], dtype=np.float64)
+        return None
+    upper._coarse_tau0 = _tau0(top_bank)
+    upper._fine_tau0 = _tau0(upper_middle)
 
+    if used_middles is None:
+        used_middles = range(len(upper_middle))
+    used_middles = sorted(int(c) for c in used_middles)
     results = [None] * len(upper_middle)
+    rejected = []
     with mp.Pool(processes=args.n_processes, initializer=init_worker,
                  initargs=(top_waveforms, upper_middle, upper_psd, upper)) as pool:
-        for row in tqdm(pool.imap_unordered(process_template, range(len(results))),
-                        total=len(results), desc='Fitting upper level',
+        for row in tqdm(pool.imap_unordered(process_template, used_middles),
+                        total=len(used_middles), desc='Fitting upper level',
                         disable=bool(args.verbose), file=sys.stderr):
-            i, parent_match, parent, fit, taps, sigmas, *rest = row
-            shift = rest[2] if len(rest) > 2 else 0
-            results[i] = (parent_match, parent, fit, taps, sigmas, shift)
-            logging.info('Upper T%d (Top %d): direct=%.6f taps=%d fit=%.9f (shift=%d)',
-                         i, parent, parent_match, len(taps), fit, shift)
+            i, parent_match, parent, fit, taps, sigmas = row[:6]
+            shift, metrics, accepted = row[8], row[11], row[12]
+            results[i] = (parent_match, parent, fit, taps, sigmas, shift, metrics)
+            logging.info('Upper T%d (Top %d): direct=%.6f taps=%d fit=%.9f (shift=%d) '
+                         'max_tap=%.3g oob=%.3g noise=%.3g accepted=%s',
+                         i, parent, parent_match, len(taps), fit, shift,
+                         metrics[0], metrics[1], metrics[2], accepted)
+            if not accepted:
+                rejected.append(i)
 
-    failed = [i for i, row in enumerate(results)
-              if row is None or row[1] < 0 or row[2] < upper.min_match]
+    failed = sorted(set(rejected) | {i for i in used_middles
+                                     if results[i] is None or results[i][1] < 0})
     if failed:
-        raise ValueError('upper FIR fits below %.9f for middle indices %s' %
-                         (upper.min_match, failed))
+        raise ValueError('upper FIR fits failed acceptance (min match %.9f) for middle '
+                         'indices %s' % (upper.min_match, failed))
 
     top_bank.ensure_hash()
     top_bank.write_to_hdf(args.output_file, file_handler=output,
@@ -729,8 +845,11 @@ def fit_upper_level(args, middle_bank, psd, flen, output):
     group = output.require_group('fir_data/upper')
     for name in ('sample_rate', 'delta_f', 'n_taps', 'max_taps', 'tap_step',
                  'min_match', 'search_depth', 'regularization_magnitude',
-                 'fit_solver'):
+                 'fit_solver', 'fit_weight_power', 'tap_search', 'tap_granularity',
+                 'min_taps', 'parent_selection', 'parent_refine', 'verify_mode',
+                 'peak_cap_mode', 'peak_cap_factor', 'max_tap_value'):
         group.attrs[name] = getattr(upper, name)
+    group.attrs['sample_shift_folded_into_lower'] = 1
     write_fir_groups(group, results, match_dtype='float64')
     output['fir_data'].attrs['hierarchy_version'] = 2
     for name, path in (('top', args.top_bank), ('middle', args.coarse_bank),
@@ -738,13 +857,204 @@ def fit_upper_level(args, middle_bank, psd, flen, output):
         output['fir_data'].attrs[name + '_bank_sha256'] = file_sha256(path)
     return results
 
+# --- 3b. BOTTOM-UP SEED SELECTION (used when no coarse / top bank is given) ---
+#
+# Seeds (parents) are chosen from the child bank itself by greedy clustering in
+# tau0: the densest unassigned template becomes a seed, and every unassigned
+# template within --seed-dtau-max whose FIR from that seed passes the full
+# acceptance test at --seed-target-taps joins its cluster. Clusters are then
+# re-centred on their tau0 medoid when that covers at least as many templates,
+# and clusters smaller than --min-group-size are dropped when all their members
+# can instead be fit (within --max-taps) from a seed of a large cluster.
+# Membership only decides *which* seeds exist; the regular per-template pass
+# then picks each child's fewest-tap parent among all seeds.
+
+g_seed_source = None   # (FilterBank, psd, namespace, settings) for forked seed workers
+
+
+def _seed_cluster(sel):
+    """Greedy clustering over the worker's g_coarse_* templates; returns local seed indices."""
+    tau0 = g_coarse_tau0
+    n = len(g_coarse_np)
+    rng = np.random.default_rng(sel['rng_seed'])
+    k_target = _snap(sel['target_taps'], up=False)
+    k_absorb = _snap(sel['absorb_taps'], up=False)
+    stats = {'attempts': 0, 'suppressed': 0}
+
+    def fits(seed, cand, k):
+        h_np = g_coarse_np[cand]
+        prob = _build_problem(seed, h_np)
+        if prob is None:
+            return False
+        ok, _ = _evaluate(prob, k, g_coarse_waveforms[cand], h_np, g_coarse_ss[cand], stats)
+        return ok
+
+    def direct(seed, cand):
+        m, _ = match(g_coarse_waveforms[cand], g_coarse_waveforms[seed], psd=g_psd,
+                     low_frequency_cutoff=g_args.f_low,
+                     v1_norm=g_coarse_sigmasq[cand], v2_norm=g_coarse_sigmasq[seed])
+        return float(m)
+
+    def grow(seed, pool):
+        members = [seed]
+        for c in pool:
+            c = int(c)
+            if c == seed or abs(tau0[c] - tau0[seed]) > sel['dtau_max']:
+                continue
+            if sel['direct_min'] > 0 and direct(seed, c) < sel['direct_min']:
+                continue
+            if fits(seed, c, k_target):
+                members.append(c)
+        return members
+
+    unassigned = set(range(n))
+    clusters = []
+    while unassigned:
+        ul = np.fromiter(unassigned, dtype=int, count=len(unassigned))
+        t = tau0[ul]
+        if len(ul) > 200:
+            sample = rng.choice(len(ul), size=100, replace=False)
+        else:
+            sample = np.arange(len(ul))
+        dens = [np.sum(np.abs(t - t[j]) < sel['density_window']) for j in sample]
+        seed = int(ul[sample[int(np.argmax(dens))]])
+        members = grow(seed, ul)
+        if sel['medoid'] and len(members) > 2:
+            mt = tau0[members]
+            medoid = int(members[int(np.argmin(np.abs(mt[:, None] - mt[None, :]).sum(axis=1)))])
+            if medoid != seed:
+                alt = grow(medoid, ul)
+                if len(alt) >= len(members):
+                    seed, members = medoid, alt
+        unassigned.difference_update(members)
+        clusters.append((seed, members))
+
+    if sel['min_group_size'] > 1:
+        large = [c for c in clusters if len(c[1]) >= sel['min_group_size']]
+        large_seeds = np.array([c[0] for c in large], dtype=int)
+        kept = list(large)
+        for seed, members in clusters:
+            if len(members) >= sel['min_group_size']:
+                continue
+            absorbed = len(large_seeds) > 0
+            for m in members:
+                if not absorbed:
+                    break
+                near = large_seeds[np.argsort(np.abs(tau0[large_seeds] - tau0[m]))]
+                near = near[:sel['absorb_depth']]
+                absorbed = any(fits(int(s2), m, k_absorb) for s2 in near
+                               if abs(tau0[s2] - tau0[m]) <= 1.5 * sel['dtau_max'])
+            if not absorbed:
+                kept.append((seed, members))
+        clusters = kept
+    return sorted(c[0] for c in clusters), stats['attempts']
+
+
+def _seed_chunk(task):
+    """Pool task: cluster one tau0-contiguous chunk of the source bank."""
+    chunk_id, indices, tau0 = task
+    bank, psd, ns, sel = g_seed_source
+    waves = [bank[int(i)].copy() for i in indices]
+    ns = argparse.Namespace(**vars(ns))
+    ns._coarse_tau0 = np.asarray(tau0, dtype=np.float64)
+    ns._fine_tau0 = None
+    init_worker(waves, None, psd, ns)
+    sel = dict(sel, rng_seed=sel['rng_seed'] + chunk_id)
+    seeds, attempts = _seed_cluster(sel)
+    return chunk_id, [int(indices[s]) for s in seeds], attempts
+
+
+def select_seeds(bank, psd, ns, sel, candidates, n_chunks, n_processes, desc):
+    """Choose seed templates among bank[candidates]; returns sorted bank indices."""
+    global g_seed_source
+    candidates = np.asarray(candidates, dtype=int)
+    tau0_all = np.array(bank.table['tau0'], dtype=np.float64)
+    order = candidates[np.argsort(tau0_all[candidates], kind='stable')]
+    chunks = [c for c in np.array_split(order, max(1, n_chunks)) if len(c)]
+    tasks = [(cid, c, tau0_all[c]) for cid, c in enumerate(chunks)]
+    g_seed_source = (bank, psd, ns, sel)   # inherited by the forked workers
+    seeds, attempts = [], 0
+    with mp.Pool(processes=max(1, min(n_processes, len(tasks)))) as pool:
+        for cid, s, a in tqdm(pool.imap_unordered(_seed_chunk, tasks), total=len(tasks),
+                              desc=desc, disable=bool(ns.verbose), file=sys.stderr):
+            seeds.extend(s)
+            attempts += a
+            logging.info('%s: chunk %d -> %d seeds (%d designs)', desc, cid, len(s), a)
+    g_seed_source = None
+    return np.array(sorted(seeds), dtype=int)
+
+
+def write_seed_bank(src_path, indices, dst_path, force=False):
+    """Write rows `indices` of template bank `src_path` to a new bank file."""
+    import h5py
+    if os.path.exists(dst_path) and not force:
+        raise ValueError('%s exists; refusing to overwrite (use --force)' % dst_path)
+    with h5py.File(src_path, 'r') as src, h5py.File(dst_path, 'w') as dst:
+        n = len(src['tau0'])
+        for key in src:
+            obj = src[key]
+            if (isinstance(obj, h5py.Dataset) and key not in ('template_hash', 'seed_source_index')
+                    and obj.shape and obj.shape[0] == n):
+                dst.create_dataset(key, data=obj[:][indices])
+        for key, value in src.attrs.items():
+            dst.attrs[key] = value
+        dst.attrs['seed_source_bank'] = os.path.abspath(src_path)
+        dst.attrs['seed_source_sha256'] = file_sha256(src_path)
+        dst.create_dataset('seed_source_index', data=np.asarray(indices, dtype=np.int64))
+    logging.info('Wrote %d seeds to %s', len(indices), dst_path)
+
+
+def _seed_settings(args, level_ns, upper=False):
+    p = 'upper_' if upper else ''
+    target = getattr(args, p + 'seed_target_taps') or level_ns.n_taps
+    return dict(target_taps=target, dtau_max=getattr(args, p + 'seed_dtau_max'),
+                direct_min=getattr(args, p + 'seed_direct_match_min'),
+                density_window=getattr(args, p + 'seed_density_window'),
+                min_group_size=getattr(args, p + 'min_group_size'),
+                absorb_taps=level_ns.max_taps, absorb_depth=5,
+                medoid=not args.no_seed_medoid, rng_seed=12345)
+
+
 # --- 4. MAIN PROCESS ---
 def main():
     parser = argparse.ArgumentParser(description="Generate Optimized FIR Filter Bank (MP)")
     pycbc.add_common_pycbc_options(parser)
-    parser.add_argument('--coarse-bank', required=True)
+    parser.add_argument('--coarse-bank',
+                        help='Middle (reference) bank. If omitted (recommended), the middle and '
+                             'top levels are built bottom-up from --fine-bank alone.')
+    parser.add_argument('--coarse-bank-output',
+                        help='Optionally keep the bottom-up middle seeds as a bank file here '
+                             '(they are always stored inside --output-file)')
     parser.add_argument('--fine-bank', required=True)
+    parser.add_argument('--two-level', action='store_true',
+                        help='With bottom-up seeding, stop after the middle level (default '
+                             'builds middle and top levels from the fine bank alone)')
     parser.add_argument('--top-bank', help='Optional third, sparsest template bank')
+    parser.add_argument('--top-bank-output',
+                        help='Optionally keep the bottom-up top seeds as a bank file here')
+    parser.add_argument('--seed-target-taps', type=int, default=501,
+                        help='Bottom-up seeding: a template joins a seed cluster if its FIR from '
+                             'the seed passes acceptance at this many taps')
+    parser.add_argument('--seed-dtau-max', type=float, default=3.5,
+                        help='Bottom-up seeding: max tau0 distance (s) from seed to member')
+    parser.add_argument('--seed-direct-match-min', type=float, default=0.28,
+                        help='Bottom-up seeding: direct-match prefilter before trying a fit (0 disables)')
+    parser.add_argument('--seed-density-window', type=float, default=1.0,
+                        help='Bottom-up seeding: tau0 window (s) for the density used to pick seeds')
+    parser.add_argument('--min-group-size', type=int, default=24,
+                        help='Bottom-up seeding: drop clusters smaller than this if all members can be '
+                             'fit (within --max-taps) from a seed of a larger cluster')
+    parser.add_argument('--no-seed-medoid', action='store_true',
+                        help='Bottom-up seeding: skip medoid re-centring of clusters')
+    parser.add_argument('--seed-chunks', type=int,
+                        help='Bottom-up seeding: number of tau0-contiguous chunks clustered '
+                             'independently (default: --n-processes)')
+    parser.add_argument('--upper-seed-target-taps', type=int,
+                        help='Top seeding analogue of --seed-target-taps (default: --upper-n-taps)')
+    parser.add_argument('--upper-seed-dtau-max', type=float, default=15.0)
+    parser.add_argument('--upper-seed-direct-match-min', type=float, default=0.10)
+    parser.add_argument('--upper-seed-density-window', type=float, default=3.0)
+    parser.add_argument('--upper-min-group-size', type=int, default=1)
     parser.add_argument('--output-file', required=True)
     parser.add_argument('--f-low', type=float, default=20.0)
     parser.add_argument('--sample-rate', type=float, default=2048.0)
@@ -766,7 +1076,9 @@ def main():
     parser.add_argument('--upper-regularization-magnitude', type=float)
     parser.add_argument('--n-processes', '-n', type=int, default=1)
     parser.add_argument('--regularization-type', default='ridge', type=str)
-    parser.add_argument('--regularization-magnitude', default=1e-1, type=float)
+    parser.add_argument('--regularization-magnitude', default=1e-2, type=float,
+                        help='Ridge regularisation of the tap fit. 1e-2 keeps taps small and the '
+                             'out-of-band gain low at little tap-count cost.')
     parser.add_argument('--fit-solver', choices=('dense', 'fft-lsqr', 'toeplitz'), default='toeplitz')
     parser.add_argument('--lsqr-atol', type=float, default=1e-11,
                         help="LSQR atol/btol tolerance.")
@@ -777,13 +1089,13 @@ def main():
     parser.add_argument('--upper-lsqr-iter-lim', type=int, default=2000,
                         help="Upper LSQR max iterations per solve.")
     parser.add_argument('--decimation-factor', default=1, type=int, dest='dec_factor')
-    parser.add_argument('--search-depth', default=3, type=int,
-                        help="Number of coarse templates to check for a good FIR representation")
+    parser.add_argument('--search-depth', default=25, type=int,
+                        help="Number of tau0-nearest coarse templates considered as parents")
     parser.add_argument('--ratio-cap', default=1000, type=int,
                         help="Don't fit ratio values above this number to avoid numerical instability of the fitting procedure")
     parser.add_argument('--max-tap-value', default=1e5, type=float,
                         help="If the calculated taps are larger in magnitude than this value, consider the constructionf failed")
-    parser.add_argument('--peak-cap-factor', default=10.0, type=float,
+    parser.add_argument('--peak-cap-factor', default=0.0, type=float,
                         help="After fitting, any frequency bin (checked across the full band, not just the "
                              "fitted region) whose achieved magnitude exceeds this many times the filter's own "
                              "median magnitude is nudged toward zero and the filter is refit. Guards against "
@@ -794,6 +1106,39 @@ def main():
                              "relative to a typical in-band fit row.")
     parser.add_argument('--peak-max-passes', default=3, type=int,
                         help="Maximum number of fit/detect/constrain refinement passes for peak suppression.")
+    parser.add_argument('--peak-cap-mode', choices=('inband', 'median'), default='inband',
+                        help="inband (default): only bins outside the fitted band are capped, at "
+                             "--peak-cap-factor times the filter's weighted RMS in-band gain, and an "
+                             "accepted filter must satisfy that cap. median: legacy full-band cap "
+                             "relative to the median gain (not part of acceptance).")
+    parser.add_argument('--max-noise-gain', type=float, default=None,
+                        help="Optional acceptance limit on the white-noise (full-band RMS) gain "
+                             "relative to the match-weighted in-band RMS gain.")
+    parser.add_argument('--fit-weight-power', type=float, default=0.5,
+                        help="Least-squares row weight is (|h_ref|^2/S)**p. p=0.5 (default) makes "
+                             "the fitted error weight equal the match weight; 1.0 is legacy.")
+    parser.add_argument('--tap-search', choices=('bisect', 'ladder'), default='bisect',
+                        help="bisect (default): after the --tap-step ladder finds a passing count, "
+                             "bisect down to --tap-granularity. ladder: legacy, stop at first pass.")
+    parser.add_argument('--tap-granularity', type=int, default=8,
+                        help="Tap-count resolution (even, so counts stay odd).")
+    parser.add_argument('--min-taps', type=int, default=15,
+                        help="Smallest tap count considered (forced odd).")
+    parser.add_argument('--parent-selection', choices=('min-taps', 'direct-match'),
+                        default='min-taps',
+                        help="Rank candidate parents by a probe fit at --n-taps (default) or by "
+                             "direct template match (legacy).")
+    parser.add_argument('--parent-refine', type=int, default=3,
+                        help="Number of top-ranked parents that get the full minimum-tap search.")
+    parser.add_argument('--verify-mode', choices=('zero-lag', 'match'), default='zero-lag',
+                        help="zero-lag (default): phase-maximised overlap at zero lag, the quantity "
+                             "the search uses. match: legacy time-maximised pycbc match.")
+    parser.add_argument('--upper-parent-refine', type=int)
+    parser.add_argument('--upper-tap-granularity', type=int)
+    parser.add_argument('--upper-min-taps', type=int)
+    parser.add_argument('--upper-fit-weight-power', type=float)
+    parser.add_argument('--force', action='store_true',
+                        help="Overwrite --output-file if it exists.")
     parser.add_argument('--store-compressed-top-waveforms', action='store_true', default=True,
                         help="Store compressed top waveforms in the bank to eliminate runtime waveform generation (default: True).")
     parser.add_argument('--no-compressed-top-waveforms', action='store_false',
@@ -811,9 +1156,46 @@ def main():
                         help="Disable group-delay phase centering.")
     pycbc.psd.insert_psd_option_group(parser)
     args = parser.parse_args()
-    if args.top_bank is not None and (args.upper_delta_f is None or
-                                      args.upper_max_taps is None):
-        parser.error('--top-bank requires --upper-delta-f and --upper-max-taps')
+    if args.coarse_bank is not None and args.coarse_bank_output is not None:
+        parser.error('give only one of --coarse-bank / --coarse-bank-output')
+    if args.top_bank is not None and args.top_bank_output is not None:
+        parser.error('give only one of --top-bank / --top-bank-output')
+    if args.coarse_bank is not None and args.top_bank is None and args.top_bank_output is None:
+        build_top = False            # explicit two-level run on a given middle bank
+    else:
+        build_top = args.top_bank is None and not args.two_level
+    three_level = args.top_bank is not None or build_top
+    args._temp_files = []
+    if args.coarse_bank is None and args.coarse_bank_output is None:
+        args.coarse_bank_output = args.output_file + '.middle_seeds.tmp.hdf'
+        args._temp_files.append(args.coarse_bank_output)
+    if build_top and args.top_bank_output is None:
+        args.top_bank_output = args.output_file + '.top_seeds.tmp.hdf'
+        args._temp_files.append(args.top_bank_output)
+    for path in (args.coarse_bank_output, args.top_bank_output):
+        if path is not None and os.path.exists(path) and not args.force:
+            parser.error('%s exists; refusing to overwrite (use --force)' % path)
+    if three_level:
+        # Defaults for the top->middle fit: finer grid for the long top
+        # templates and a 10x tighter match so the two levels compound to
+        # roughly --min-match.
+        defaults = dict(upper_delta_f=args.delta_f / 16.0, upper_n_taps=3001,
+                        upper_max_taps=6001, upper_tap_step=1000, upper_tap_granularity=16,
+                        upper_min_match=1.0 - (1.0 - args.min_match) / 10.0,
+                        upper_regularization_magnitude=1e-6)
+        for name, value in defaults.items():
+            if getattr(args, name) is None:
+                setattr(args, name, value)
+    for prefix in ('', 'upper_'):
+        gran = getattr(args, prefix + 'tap_granularity')
+        if gran is not None and (gran < 2 or gran % 2):
+            parser.error('--%stap-granularity must be a positive even number' %
+                         prefix.replace('_', '-'))
+        mt = getattr(args, prefix + 'min_taps')
+        if mt is not None:
+            setattr(args, prefix + 'min_taps', max(1, mt | 1))
+    if os.path.exists(args.output_file) and not args.force:
+        parser.error('%s exists; refusing to overwrite (use --force)' % args.output_file)
 
     pycbc.init_logging(args.verbose)
 
@@ -829,6 +1211,17 @@ def main():
 
     psd = pycbc.psd.from_cli(args, length=flen, delta_f=args.delta_f,
                              low_frequency_cutoff=args.f_low)
+
+    if args.coarse_bank is None:
+        logging.info("Bottom-up seeding: choosing middle templates from the fine bank...")
+        seed_src = FilterBank(args.fine_bank, flen, args.delta_f, dtype=np.complex128,
+                              enable_compressed_waveforms=False)
+        seeds = select_seeds(seed_src, psd, args, _seed_settings(args, args),
+                             np.arange(len(seed_src)), args.seed_chunks or args.n_processes,
+                             args.n_processes, 'Seeding middle level')
+        write_seed_bank(args.fine_bank, seeds, args.coarse_bank_output, force=args.force)
+        args.coarse_bank = args.coarse_bank_output
+        del seed_src
 
     logging.info("Loading coarse bank references...")
     coarse_bank = FilterBank(args.coarse_bank, flen, args.delta_f,
@@ -883,24 +1276,27 @@ def main():
     total_attempts_suppressed = 0
     job_list = range(n_fine)
     all_results = [None] * n_fine
+    all_metrics = [None] * n_fine
+    failed_idx = []
 
     try:
         with mp.Pool(processes=args.n_processes, initializer=init_worker,
                      initargs=(coarse_waveforms, fine_bank, psd, args)) as pool:
 
-            results_iter = pool.imap_unordered(process_template, job_list)
+            results_iter = pool.imap_unordered(process_template, job_list, chunksize=8)
             if not args.verbose:
                  results_iter = tqdm(results_iter, total=n_fine, desc="Designing Filters",
                                      postfix={"failed": 0}, file=sys.stderr)
 
             for result in results_iter:
                 (i, coarse_match, c_idx, qa_match, final_taps_data, sigmas, n_peak_passes, n_bins_capped,
-                 shift, n_attempts_total, n_attempts_suppressed) = result
-                all_results[i] = (coarse_match, c_idx, qa_match, final_taps_data, sigmas, shift)
+                 shift, n_attempts_total, n_attempts_suppressed, metrics, accepted) = result
+                all_results[i] = (coarse_match, c_idx, qa_match, final_taps_data, sigmas, shift, metrics)
+                all_metrics[i] = metrics
 
-                is_fail = (c_idx == -1) or (qa_match < args.min_match)
-                if is_fail:
+                if not accepted:
                     failed_count += 1
+                    failed_idx.append(i)
                 if n_peak_passes > 0:
                     peak_suppressed_count += 1
                 if n_bins_capped > 0:
@@ -914,8 +1310,9 @@ def main():
                 if args.verbose >= 1:
                     mismatch = 1.0 - qa_match
                     logging.info(f"T{i} (Ref {c_idx}): Coarse={coarse_match:.4f}, Taps={len(final_taps_data)}, "
-                                 f"Final={qa_match:.5f}, Mism={mismatch:.5e}, Shift={shift}, "
-                                 f"PeakSuppression: passes={n_peak_passes} remaining_capped_bins={n_bins_capped}")
+                                 f"Final={qa_match:.7f}, Mism={mismatch:.3e}, Shift={shift}, "
+                                 f"max_tap={metrics[0]:.3g} oob={metrics[1]:.3g} noise={metrics[2]:.3g} "
+                                 f"accepted={accepted} attempts={n_attempts_total}")
                     log.handlers[0].flush() # Flush stdout
 
         # --- PHASE 3: Write Results ---
@@ -923,11 +1320,27 @@ def main():
 
         tap_counts = write_fir_groups(fir_group, all_results)
 
-        if args.top_bank is not None:
+        if three_level:
             if failed_count:
                 raise ValueError('%d lower-level FIR fits failed; refusing hierarchy' %
                                  failed_count)
-            upper_results = fit_upper_level(args, coarse_bank, psd, flen, f_out)
+            used_middles = sorted({row[1] for row in all_results if row is not None and row[1] >= 0})
+            if args.top_bank is None:
+                logging.info("Bottom-up seeding: choosing top templates from %d used middles...",
+                             len(used_middles))
+                upper_ns = upper_namespace(args)
+                _, upper_flen, upper_psd = upper_psd_from_cli(args)
+                mid_src = FilterBank(args.coarse_bank, upper_flen, upper_ns.delta_f,
+                                     dtype=np.complex128, enable_compressed_waveforms=False)
+                top_seeds = select_seeds(mid_src, upper_psd, upper_ns,
+                                         _seed_settings(args, upper_ns, upper=True),
+                                         used_middles, 1, 1, 'Seeding top level')
+                write_seed_bank(args.coarse_bank, top_seeds, args.top_bank_output,
+                                force=args.force)
+                args.top_bank = args.top_bank_output
+                del mid_src
+            upper_results = fit_upper_level(args, coarse_bank, psd, flen, f_out,
+                                            used_middles=used_middles)
             if upper_results is not None:
                 for c_idx, u_row in enumerate(upper_results):
                     if u_row is not None and len(u_row) > 5:
@@ -940,22 +1353,39 @@ def main():
 
     finally:
         f_out.close()
+        for path in args._temp_files:
+            if os.path.exists(path):
+                os.remove(path)
 
-    tap_ave = np.mean(tap_counts) if len(tap_counts) else float('nan')
-    summary_msg = f"Summary: {failed_count}/{n_fine} templates failed QA (<{args.min_match}).\n"
-    summary_msg += f"Average taps: {tap_ave}\n"
-    summary_msg += (f"Peak suppression triggered for the FINAL accepted filter of {peak_suppressed_count}/{n_fine} "
-                     f"templates (achieved out-of-band gain exceeded {args.peak_cap_factor}x the filter's own "
-                     f"median); {peak_still_capped_count}/{n_fine} still had bins above that cap after "
-                     f"{args.peak_max_passes} refinement passes.\n")
-    if total_attempts > 0:
-        summary_msg += (f"Across the {total_attempts} attempts where peak suppression was actually evaluated (a "
-                         f"candidate accepted before suppression, or the final best-effort fallback -- cheap "
-                         f"escalation steps that were going to be superseded regardless skip the check), it "
-                         f"triggered on {total_attempts_suppressed} "
-                         f"({100.0 * total_attempts_suppressed / total_attempts:.1f}%).\n")
+    def _pct(x):
+        x = np.asarray(x, dtype=np.float64)
+        x = x[np.isfinite(x)]
+        if not len(x):
+            return 'n/a'
+        p = np.percentile(x, [50, 90, 99, 100])
+        return 'p50=%.3g p90=%.3g p99=%.3g max=%.3g' % tuple(p)
 
-    if failed_count > 0 or peak_still_capped_count > 0: logging.warning(summary_msg)
+    summary_msg = (f"Summary: {failed_count}/{n_fine} templates failed acceptance "
+                   f"(match >= {args.min_match}, max|tap| <= {args.max_tap_value}"
+                   + (f", out-of-band gain <= {args.peak_cap_factor}" if
+                      args.peak_cap_factor and args.peak_cap_mode == 'inband' else '')
+                   + (f", noise gain <= {args.max_noise_gain}" if args.max_noise_gain else '')
+                   + ").\n")
+    if failed_idx:
+        summary_msg += f"Failed indices (first 20): {sorted(failed_idx)[:20]}\n"
+    if len(tap_counts):
+        summary_msg += (f"Taps: mean={np.mean(tap_counts):.1f} median={np.median(tap_counts):.0f} "
+                        f"min={np.min(tap_counts)} max={np.max(tap_counts)}\n")
+    m = np.array([x for x in all_metrics if x is not None], dtype=np.float64).reshape(-1, 3)
+    summary_msg += f"max|tap|:    {_pct(m[:, 0])}\n"
+    summary_msg += f"oob gain:    {_pct(m[:, 1])}\n"
+    summary_msg += f"noise gain:  {_pct(m[:, 2])}\n"
+    summary_msg += (f"Peak suppression active in the final filter of {peak_suppressed_count}/{n_fine} "
+                    f"templates; {peak_still_capped_count}/{n_fine} still had bins above the cap after "
+                    f"{args.peak_max_passes} passes. Designs evaluated: {total_attempts} "
+                    f"(suppression triggered on {total_attempts_suppressed}).\n")
+
+    if failed_count > 0: logging.warning(summary_msg)
     else: logging.info(summary_msg)
 
 if __name__ == '__main__':
