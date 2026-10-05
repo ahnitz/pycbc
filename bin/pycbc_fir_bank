@@ -209,9 +209,24 @@ def design_optimal_real_filter(H_target_pos, valid_mask_pos, K_taps, weights_pos
     return h_optimal, n_peak_passes, n_bins_capped
 
 
+def _hermitian_corr(bins, values, nfft):
+    """0.5 * nfft * ifft(F).real for the Hermitian F with F[b] = v, F[-b] = conj(v).
+
+    Same as filling the full spectrum with np.add.at (DC / Nyquist counted
+    twice) and inverse transforming, but via a single irfft of the half
+    spectrum. `values` may be 1-D (len(bins)) or 2-D (n, len(bins)).
+    """
+    values = np.asarray(values)
+    half = np.zeros(values.shape[:-1] + (nfft // 2 + 1,), dtype=np.complex128)
+    half[..., bins] = values
+    half[..., 0] *= 2.0
+    half[..., -1] *= 2.0
+    return (0.5 * nfft) * np.fft.irfft(half, n=nfft, axis=-1)
+
+
 def design_fft_toeplitz_filter(target, valid_mask, n_taps, weights, reg_val,
                                 peak_cap_factor=10.0, peak_bad_weight_fraction=1.0,
-                                peak_max_passes=3, cap_mode='inband'):
+                                peak_max_passes=3, cap_mode='inband', toeplitz_solve=None):
     """Fit a real FIR on a fine grid using direct Levinson-Durbin Toeplitz inversion.
 
     The normal equations (A^T W^2 A + lambda I) h = A^T W^2 d form an exact
@@ -255,18 +270,11 @@ def design_fft_toeplitz_filter(target, valid_mask, n_taps, weights, reg_val,
         desired = np.concatenate((base_target,
                                   np.zeros(len(extra_bins), dtype=np.complex128)))
 
-        freq_weights = np.zeros(nfft, dtype=np.float64)
-        np.add.at(freq_weights, bins, w**2)
-        np.add.at(freq_weights, (nfft - bins) % nfft, w**2)
-        r = (0.5 * np.fft.ifft(freq_weights).real * nfft)[:n_taps].copy()
+        r = _hermitian_corr(bins, w**2, nfft)[:n_taps].copy()
         r[0] += reg_val
+        b = _hermitian_corr(bins, desired * (w**2), nfft)[positions]
 
-        freq_d = np.zeros(nfft, dtype=np.complex128)
-        np.add.at(freq_d, bins, desired * (w**2))
-        np.add.at(freq_d, (nfft - bins) % nfft, np.conj(desired) * (w**2))
-        b = (0.5 * np.fft.ifft(freq_d).real * nfft)[positions]
-
-        taps = solve_toeplitz(r, b)
+        taps = (toeplitz_solve or solve_toeplitz)(r, b)
         if not peak_cap_factor:
             break
         waveform = np.zeros(nfft, dtype=np.float64)
@@ -442,8 +450,13 @@ def _build_problem(c_idx, h_fine_np):
                               g_coarse_waveforms[c_idx], c_idx, h_fine_np)
 
 
-def _build_problem_ref(h_ref, ref_ss, ref_fs, c_idx, h_fine_np):
-    """As _build_problem for an explicit parent (numpy array, |h|^2/S sum, series)."""
+def _build_problem_ref(h_ref, ref_ss, ref_fs, c_idx, h_fine_np, shared=False):
+    """As _build_problem for an explicit parent (numpy array, |h|^2/S sum, series).
+
+    shared=True marks a parent reused for many children: the normal-equation
+    matrix then depends only on the parent (unless --ratio-cap masks differ),
+    so _design reuses a cached factorisation for it.
+    """
     band = g_band_mask.copy()
     ratio = np.zeros(len(h_ref), dtype=np.complex128)
     np.divide(h_fine_np, h_ref, out=ratio, where=np.abs(h_ref) > 0)
@@ -472,7 +485,8 @@ def _build_problem_ref(h_ref, ref_ss, ref_fs, c_idx, h_fine_np):
     if shift:
         target = target * np.exp(1j * 2 * np.pi * g_freqs * shift / g_args.sample_rate)
     return dict(c_idx=int(c_idx), h_ref=h_ref, target=target, band=band,
-                w_fit=w_fit, w_match=w_match, shift=shift, ref_ss=ref_ss, ref_fs=ref_fs)
+                w_fit=w_fit, w_match=w_match, shift=shift, ref_ss=ref_ss, ref_fs=ref_fs,
+                shared=shared)
 
 
 def _design(prob, n_taps, peak_cap_factor):
@@ -484,7 +498,8 @@ def _design(prob, n_taps, peak_cap_factor):
     if solver == 'toeplitz':
         return design_fft_toeplitz_filter(
             prob['target'][::d], prob['band'][::d], n_taps, prob['w_fit'][::d],
-            g_args.regularization_magnitude, cap_mode=g_args.peak_cap_mode, **common)
+            g_args.regularization_magnitude, cap_mode=g_args.peak_cap_mode,
+            toeplitz_solve=_toeplitz_solve_cached if prob.get('shared') else None, **common)
     if solver == 'fft-lsqr':
         return design_fft_lsqr_filter(
             prob['target'][::d], prob['band'][::d], n_taps, prob['w_fit'][::d],
@@ -819,24 +834,42 @@ def _child_wave(j):
     return hit
 
 
+_g_factor_cache = {}
+
+
+def _toeplitz_solve_cached(r, b):
+    """solve_toeplitz(r, b) through a per-worker cache of Cholesky factors.
+
+    Children of one parent share the same normal-equation matrix, so the
+    O(k^3/3) factorisation is paid once per (parent, tap count) and each
+    further solve (any number of right-hand sides) costs O(k^2).
+    """
+    key = r.tobytes()
+    fac = _g_factor_cache.get(key)
+    if fac is None:
+        if len(_g_factor_cache) >= 64:
+            _g_factor_cache.clear()
+        fac = _g_factor_cache[key] = scipy.linalg.cho_factor(
+            scipy.linalg.toeplitz(r), lower=True, check_finite=False)
+    return scipy.linalg.cho_solve(fac, b, check_finite=False)
+
+
 def _toeplitz_fit_batch(prob, k, targets, reg_val, nfft):
+    """Least-squares FIR fits of several targets on prob's band / weights.
+
+    Returns (responses (n, nfft//2+1), taps (k, n)). Same normal equations as
+    design_fft_toeplitz_filter (without peak suppression).
+    """
     bins = np.flatnonzero(prob['band'])
     w2 = prob['w_fit'][bins] ** 2
-    fw = np.zeros(nfft)
-    np.add.at(fw, bins, w2)
-    np.add.at(fw, (nfft - bins) % nfft, w2)
-    r = (0.5 * np.fft.ifft(fw).real * nfft)[:k].copy()
+    r = _hermitian_corr(bins, w2, nfft)[:k].copy()
     r[0] += reg_val
     pos = (np.arange(k) - k // 2) % nfft
-    fd = np.zeros((len(targets), nfft), dtype=np.complex128)
-    for j, t in enumerate(targets):
-        np.add.at(fd[j], bins, t[bins] * w2)
-        np.add.at(fd[j], (nfft - bins) % nfft, np.conj(t[bins]) * w2)
-    b = (0.5 * np.fft.ifft(fd, axis=1).real * nfft)[:, pos]
-    taps = solve_toeplitz(r, b.T)
-    wave = np.zeros((nfft, len(targets)))
+    b = _hermitian_corr(bins, targets[:, bins] * w2[None, :], nfft)[:, pos]
+    taps = _toeplitz_solve_cached(r, b.T)
+    wave = np.zeros((nfft, taps.shape[1]))
     wave[pos] = taps
-    return np.fft.rfft(wave, axis=0).T
+    return np.fft.rfft(wave, axis=0).T, taps
 
 
 def _gn_apply_correction(h0, z):
@@ -847,25 +880,42 @@ def _gn_apply_correction(h0, z):
     return h_m
 
 
-def _gn_eval_lin(task):
-    base_idx, z, child_indices, k = task
-    h0_c, h0_np, _ = _child_wave(base_idx)
+def _gn_parent(base_idx, z):
+    """(numpy waveform, |h|^2/S sum, FrequencySeries) of the deformed parent."""
+    h0_c, h0_np, h0_ss = _child_wave(base_idx)
+    if z is None or not np.any(z):
+        return h0_np, h0_ss, h0_c
     h_m = _gn_apply_correction(h0_np, z)
     mss = float(np.sum(np.abs(h_m[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
-    st = {'attempts': 0, 'suppressed': 0}
+    from pycbc.types import FrequencySeries
+    return h_m, mss, FrequencySeries(h_m, delta_f=g_delta_f, epoch=h0_c.epoch)
+
+
+def _gn_eval_lin(task):
+    """Per child: (index, mismatch at k, residual R, J^T J, J^T rho) for the GN step."""
+    base_idx, z, child_indices, k = task
+    h_m, mss, h_fs = _gn_parent(base_idx, z)
     nz = len(g_correction_basis)
+    st = {'attempts': 0, 'suppressed': 0}
+    exact_qa = not (g_args.peak_cap_factor or g_args.verify_mode != 'zero-lag')
     out = []
     for i in child_indices:
         h_ch, ch_np, ch_ss = _child_wave(i)
-        prob = _build_problem_ref(h_m, mss, None, base_idx, ch_np)
+        prob = _build_problem_ref(h_m, mss, h_fs, base_idx, ch_np, shared=True)
         if prob is None:
             out.append((i, 1.0, 1e-10, np.zeros((nz, nz)), np.zeros(nz)))
             continue
-        ok, rec = _evaluate(prob, k, h_ch, ch_np, ch_ss, st)
-        mis = 1.0 - rec['qa']
         T0 = prob['target']
-        targets = [T0] + [T0 * c for c in g_correction_basis]
-        resp = _toeplitz_fit_batch(prob, k, targets, g_args.regularization_magnitude, g_nfft)
+        targets = np.vstack([T0[None, :], T0[None, :] * g_correction_basis])
+        resp, taps = _toeplitz_fit_batch(prob, k, targets, g_args.regularization_magnitude,
+                                         g_nfft)
+        if exact_qa:
+            # column 0 is exactly the k-tap design _evaluate would make; score
+            # it the same way (float32 taps, zero-lag match)
+            H = _response(taps[:, 0].astype(np.float32).astype(np.float64))
+            mis = 1.0 - _verify(H, prob, ch_np, ch_ss)[0]
+        else:
+            mis = 1.0 - _evaluate(prob, k, h_ch, ch_np, ch_ss, st)[1]['qa']
         bins = np.flatnonzero(prob['band'])
         w = prob['w_fit'][bins]
         rho = (resp[0] - T0)[bins] * w
@@ -877,76 +927,72 @@ def _gn_eval_lin(task):
     return out
 
 
-def _gn_eval_mism(task):
-    base_idx, z, child_indices, k = task
-    h0_c, h0_np, _ = _child_wave(base_idx)
-    h_m = _gn_apply_correction(h0_np, z)
-    mss = float(np.sum(np.abs(h_m[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
+def _gn_eval_check(task):
+    """Per child: (index, mismatch, accepted) of the k-tap design from the deformed parent.
+
+    If abort_above is given the chunk stops at the first child whose mismatch
+    exceeds it (the rest are reported as (i, inf, False)): used by the GN line
+    search, where one such child already rejects the step.
+    """
+    base_idx, z, child_indices, k, abort_above = task
+    h_m, mss, h_fs = _gn_parent(base_idx, z)
     st = {'attempts': 0, 'suppressed': 0}
     out = []
-    for i in child_indices:
+    for n, i in enumerate(child_indices):
         h_ch, ch_np, ch_ss = _child_wave(i)
-        prob = _build_problem_ref(h_m, mss, None, base_idx, ch_np)
+        prob = _build_problem_ref(h_m, mss, h_fs, base_idx, ch_np, shared=True)
         if prob is None:
-            out.append(1.0)
-            continue
-        rec = _evaluate(prob, k, h_ch, ch_np, ch_ss, st)[1]
-        out.append(1.0 - rec['qa'])
+            mis, ok = 1.0, False
+        else:
+            ok, rec = _evaluate(prob, k, h_ch, ch_np, ch_ss, st)
+            mis = 1.0 - rec['qa']
+        out.append((i, mis, ok))
+        if abort_above is not None and mis >= abort_above:
+            out.extend((j, np.inf, False) for j in child_indices[n + 1:])
+            break
     return out
 
 
-def _gn_eval_taps(task):
-    base_idx, z, child_indices, max_taps = task
-    h0_c, h0_np, _ = _child_wave(base_idx)
-    h_m = _gn_apply_correction(h0_np, z)
-    mss = float(np.sum(np.abs(h_m[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
-    st = {'attempts': 0, 'suppressed': 0}
-    out = []
-    for i in child_indices:
-        h_ch, ch_np, ch_ss = _child_wave(i)
-        prob = _build_problem_ref(h_m, mss, None, base_idx, ch_np)
-        rec = _min_taps(prob, max_taps, h_ch, ch_np, ch_ss, st)[0] if prob is not None else None
-        out.append(rec['n_taps'] if rec is not None else 99999)
-    return out
+def _optimize_middle_group(pool, union, base_cand, args, initial_z=None, order=None):
+    """Deform parent `base_cand` (20 smooth log-amplitude / phase terms) so that
+    every child of `union` passes at --max-taps.
 
-
-def _optimize_middle_group(pool, union, base_cand, args, initial_z=None):
+    Minimises a soft-max of the children's least-squares residuals at 85% of
+    the cap (margin) with damped Gauss-Newton; after each round the actual
+    acceptance at the cap is checked. `order` (children hardest first) is used
+    to spread hard children over the work chunks so line-search rejections
+    abort early. Returns (z, number of children failing at the cap).
+    """
     max_taps = args.max_taps
+    k_cap = max_taps if max_taps % 2 else max_taps - 1
     min_match = getattr(args, 'min_match', 0.9999)
     nz = 20
     z = np.zeros(nz, dtype=np.float64) if initial_z is None else np.array(initial_z, dtype=np.float64).copy()
     n_proc = getattr(args, 'n_processes', 8)
-    chunks = [list(c) for c in np.array_split(union, min(len(union), 4 * n_proc))]
+    n_chunks = max(1, min(len(union), 4 * n_proc))
+    ordered = [int(x) for x in (order if order is not None else union)]
+    chunks = [ordered[j::n_chunks] for j in range(n_chunks)]
+    chunks = [c for c in chunks if c]
 
-    def _eval_all_lin(cur_z, k):
-        tasks = [(base_cand, cur_z, c, k) for c in chunks]
-        res = pool.imap_unordered(_gn_eval_lin, tasks)
+    def _run(fn, cur_z, extra):
+        res = pool.imap_unordered(fn, [(base_cand, cur_z, c) + extra for c in chunks])
         return [item for sub in res for item in sub]
 
-    def _eval_all_mism(cur_z, k):
-        tasks = [(base_cand, cur_z, c, k) for c in chunks]
-        res = pool.imap_unordered(_gn_eval_mism, tasks)
-        return [item for sub in res for item in sub]
+    def _lin(cur_z, k):
+        return _run(_gn_eval_lin, cur_z, (k,))
 
-    def _eval_all_taps(cur_z):
-        tasks = [(base_cand, cur_z, c, max_taps) for c in chunks]
-        res = pool.imap_unordered(_gn_eval_taps, tasks)
-        return np.array([item for sub in res for item in sub])
+    def _check(cur_z, k, abort_above=None):
+        return _run(_gn_eval_check, cur_z, (k, abort_above))
 
-    t_init = _eval_all_taps(z)
-    if t_init.max() <= max_taps:
-        return z, t_init
-
-    k = _snap(int(0.85 * min(int(t_init.max()), max_taps)), args=args)
-    best_z = z.copy()
-    best_taps = t_init
+    k = _snap(int(0.85 * max_taps), args=args)
+    best_z, best_fail, best_worst = z.copy(), None, np.inf
 
     for rnd in range(3):
         mu = 1e-2
         p = 8.0
         zreg = 1e-3
         for it in range(8):
-            lin = _eval_all_lin(z, k)
+            lin = _lin(z, k)
             mis = np.array([x[1] for x in lin])
             worst = mis.max()
             if worst <= (1.0 - min_match):
@@ -964,7 +1010,7 @@ def _optimize_middle_group(pool, union, base_cand, args, initial_z=None):
             accepted = False
             for _ in range(6):
                 dz = -np.linalg.solve(A + (mu + zreg) * scale * np.eye(nz), g + zreg * scale * z)
-                new_mis = np.array(_eval_all_mism(z + dz, k))
+                new_mis = np.array([x[1] for x in _check(z + dz, k, abort_above=worst)])
                 if new_mis.max() < worst:
                     z = z + dz
                     mu = max(mu / 3, 1e-6)
@@ -974,40 +1020,51 @@ def _optimize_middle_group(pool, union, base_cand, args, initial_z=None):
             if not accepted:
                 break
 
-        t_cur = _eval_all_taps(z)
-        if (t_cur > max_taps).sum() < (best_taps > max_taps).sum() or (
-            (t_cur > max_taps).sum() == (best_taps > max_taps).sum() and t_cur.max() < best_taps.max()
-        ):
-            best_z = z.copy()
-            best_taps = t_cur
-        if best_taps.max() <= max_taps:
+        cap = _check(z, k_cap)
+        n_fail = sum(1 for _, _, ok in cap if not ok)
+        worst_cap = max(m for _, m, _ in cap)
+        if best_fail is None or (n_fail, worst_cap) < (best_fail, best_worst):
+            best_z, best_fail, best_worst = z.copy(), n_fail, worst_cap
+        if best_fail == 0:
             break
-        k = _snap(int(0.85 * min(int(t_cur.max()), max_taps)), args=args)
-
-    return best_z, best_taps
+    return best_z, best_fail
 
 
 def _merge_check(task):
     """Can child-bank template `cand` parent every one of `children` at the cap?
 
-    Children are tried in the given order (hardest first) and the check stops at
-    the first failure. Returns (cand, number of children that passed).
+    Children are tried in the given order (hardest first). Returns
+    (cand, number of children passed before the first failure, worst
+    mismatch). Without screening (screen <= 0) the check stops at the first
+    failure. With screening it keeps going so the worst mismatch over all
+    children is known (the GN deformation start point), but stops as soon as
+    a child's mismatch exceeds screen * (1 - min_match): such a merge is
+    treated as out of reach for the parent deformation.
     """
-    cand, children = task
+    cand, children, screen = task
     h_c, c_np, c_ss = _child_wave(cand)
     k = g_args.max_taps if g_args.max_taps % 2 else g_args.max_taps - 1
+    limit = screen * (1.0 - g_args.min_match) if screen and screen > 0 else None
     stats = {'attempts': 0, 'suppressed': 0}
+    n_pass, worst = None, 0.0
     for n, i in enumerate(children):
         if i == cand:
             continue
         h, h_np, ss = _child_wave(i)
-        prob = _build_problem_ref(c_np, c_ss, h_c, cand, h_np)
+        prob = _build_problem_ref(c_np, c_ss, h_c, cand, h_np, shared=True)
         if prob is None:
-            return cand, n
-        ok, _ = _evaluate(prob, k, h, h_np, ss, stats)
-        if not ok:
-            return cand, n
-    return cand, len(children)
+            ok, mis = False, 1.0
+        else:
+            ok, rec = _evaluate(prob, k, h, h_np, ss, stats)
+            mis = 1.0 - rec['qa']
+        worst = max(worst, mis)
+        if not ok and n_pass is None:
+            n_pass = n
+            if limit is None:
+                return cand, n, np.inf
+        if limit is not None and mis > limit:
+            return cand, n_pass, np.inf
+    return cand, len(children) if n_pass is None else n_pass, worst
 
 
 def _fit_forced(task):
@@ -1017,15 +1074,10 @@ def _fit_forced(task):
     else:
         i, cand = task
         z = None
-    h_c, c_np, c_ss = _child_wave(cand)
-    if z is not None and np.any(z):
-        c_np = _gn_apply_correction(c_np, z)
-        c_ss = float(np.sum(np.abs(c_np[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
-        from pycbc.types import FrequencySeries
-        h_c = FrequencySeries(c_np, delta_f=g_delta_f, epoch=h_c.epoch)
+    c_np, c_ss, h_c = _gn_parent(cand, z)
     h, h_np, ss = _child_wave(i)
     stats = {'attempts': 0, 'suppressed': 0}
-    prob = _build_problem_ref(c_np, c_ss, h_c, cand, h_np)
+    prob = _build_problem_ref(c_np, c_ss, h_c, cand, h_np, shared=True)
     rec = _min_taps(prob, g_args.max_taps, h, h_np, ss, stats)[0] if prob is not None else None
     if rec is None:
         return i, None
@@ -1088,24 +1140,35 @@ def merge_groups(pool, results, feats, args, label='middle',
                 cand_radius = {int(c): float(d[idx].max()) for idx, c in enumerate(pool_c)}
                 cands = pool_c[np.argsort(d.max(axis=1))][:n_candidates]
                 tasks = []
+                gn_on = optimize_middle and label == 'middle'
+                screen = getattr(args, 'merge_gn_screen', 0.0) if gn_on else 0.0
                 for c in cands:
                     dc = np.sqrt((((f_u - feats[c]) / span) ** 2).sum(-1))
-                    tasks.append((int(c), [int(x) for x in union[np.argsort(-dc)]]))
+                    tasks.append((int(c), [int(x) for x in union[np.argsort(-dc)]], screen))
+                order_of = {t[0]: t[1] for t in tasks}
                 check_results = list(pool.imap_unordered(_merge_check, tasks))
-                passed = {c for c, n in check_results if n == len(union)}
+                passed = {c for c, n, _ in check_results if n == len(union)}
                 chosen = next((int(c) for c in cands if int(c) in passed), None)
                 chosen_z = None
                 if chosen is not None:
-                    chosen_z = parent_corrections.get(chosen, np.zeros(20)) if parent_corrections is not None else np.zeros(20)
-                elif optimize_middle and label == 'middle':
-                    cand_counts = {int(c): int(n) for c, n in check_results}
-                    best_cand = max(cands, key=lambda c: (cand_counts.get(int(c), 0), -cand_radius[int(c)]))
-                    best_cand = int(best_cand)
-                    init_z = parent_corrections.get(best_cand, None) if parent_corrections is not None else None
-                    opt_z, opt_taps = _optimize_middle_group(pool, union, best_cand, args, initial_z=init_z)
-                    if opt_taps.max() <= args.max_taps:
-                        chosen = best_cand
-                        chosen_z = opt_z
+                    # the check used the undeformed template, so refit with that
+                    chosen_z = np.zeros(20)
+                elif gn_on:
+                    if screen and screen > 0:
+                        reach = [(w, cand_radius[int(c)], int(c)) for c, _, w in check_results
+                                 if np.isfinite(w)]
+                        best_cand = min(reach)[2] if reach else None
+                    else:
+                        cand_counts = {int(c): int(n) for c, n, _ in check_results}
+                        best_cand = int(max(cands, key=lambda c: (cand_counts.get(int(c), 0),
+                                                                  -cand_radius[int(c)])))
+                    if best_cand is not None:
+                        # start from the undeformed template the screen measured
+                        opt_z, n_fail = _optimize_middle_group(pool, union, best_cand, args,
+                                                               order=order_of[best_cand])
+                        if n_fail == 0:
+                            chosen = best_cand
+                            chosen_z = opt_z
                 if chosen is None:
                     continue
                 rows = dict(pool.imap_unordered(_fit_forced, [(int(i), chosen, chosen_z) for i in union],
@@ -1530,6 +1593,11 @@ def main():
                              'within --max-taps')
     parser.add_argument('--no-optimize-middle', action='store_false', dest='optimize_middle',
                         help='Skip continuous Gauss-Newton middle waveform optimization during group merging')
+    parser.add_argument('--merge-gn-screen', type=float, default=30.0,
+                        help='Only attempt the Gauss-Newton parent deformation for a merge if some '
+                             'undeformed candidate parent keeps every child within this multiple of '
+                             'the allowed mismatch (1 - --min-match) at --max-taps; the best such '
+                             'candidate is the GN start. 0 disables the screen (always try GN).')
     parser.add_argument('--merge-neighbours', type=int, default=3,
                         help='Group merging: number of tau0-nearest groups tried per group')
     parser.add_argument('--merge-candidates', type=int, default=16,
