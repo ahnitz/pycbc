@@ -1,0 +1,324 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2026 Alex Nitz, Antigravity AI
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+
+"""
+Compute optimal and optimal matched-filter (MF) SNRs for every injection
+in an input HDF file and store the results in HDF file datasets:
+- optimal_snr_<ifo>: deterministic signal strength sqrt(<h|h>)
+- optimal_mf_snr_<ifo>: realized matched-filter SNR max|<s+h|h>|/sigma in detector noise
+"""
+
+import os
+import sys
+import glob
+import logging
+import argparse
+import multiprocessing
+import numpy as np
+
+import pycbc
+import pycbc.inject
+import pycbc.psd
+import pycbc.pnutils
+from pycbc.filter import sigma, matched_filter, make_frequency_series, resample_to_delta_t, highpass
+from pycbc.types import TimeSeries, FrequencySeries, zeros, float32, MultiDetOptionAction, load_frequencyseries
+from pycbc.io.hdf import HFile
+from pycbc.frame import read_frame
+
+
+class TimeVaryingPSD(object):
+    def __init__(self, file_name, length=None, delta_f=None, f_low=None):
+        with HFile(file_name, 'r') as f:
+            self.file_name = file_name
+            detector = tuple(f.keys())[0]
+            self.start_times = f[detector + '/start_time'][:]
+            self.end_times = f[detector + '/end_time'][:]
+            self.file_f_low = f.attrs['low_frequency_cutoff']
+        self._curr_psd = {}
+        self._curr_psd_index = {}
+        self.detector = detector
+        self.length = length
+        self.delta_f = delta_f
+        self.f_low = f_low
+
+    def __call__(self, time=None):
+        mask = np.logical_and(self.start_times <= time, self.end_times > time)
+        if not mask.any():
+            return None
+        center_times = (self.start_times[mask] + self.end_times[mask]) / 2.0
+        closest_idx = np.argmin(abs(center_times - time))
+        return self.get_psd(np.flatnonzero(mask)[closest_idx])
+
+    def get_psd(self, index):
+        curr_pid = multiprocessing.current_process().pid
+        if curr_pid not in self._curr_psd_index:
+            self._curr_psd_index[curr_pid] = -1
+        if not index == self._curr_psd_index[curr_pid]:
+            group = self.detector + '/psds/' + str(index)
+            psd = load_frequencyseries(self.file_name, group=group)
+            if self.delta_f is not None and psd.delta_f != self.delta_f:
+                psd = pycbc.psd.interpolate(psd, self.delta_f)
+            if self.length is not None and self.length != len(psd):
+                psd2 = FrequencySeries(zeros(self.length, dtype=psd.dtype), delta_f=psd.delta_f)
+                if self.length > len(psd):
+                    psd2[:] = np.inf
+                    psd2[0:len(psd)] = psd
+                else:
+                    psd2[:] = psd[0:self.length]
+                psd = psd2
+            if self.f_low is not None and self.f_low < self.file_f_low:
+                k = int(self.file_f_low / psd.delta_f)
+                psd[0:k] = np.inf
+            self._curr_psd[curr_pid] = psd
+            self._curr_psd_index[curr_pid] = index
+        return self._curr_psd[curr_pid]
+
+
+class FrameBufferReader(object):
+    """Memory-efficient cached frame reader that loads frame segments on demand."""
+    def __init__(self, frame_files, channel_name, sample_rate, highpass_freq=15.0):
+        self.channel_name = channel_name
+        self.sample_rate = sample_rate
+        self.delta_t = 1.0 / sample_rate
+        self.highpass_freq = highpass_freq
+        self.cache = {}
+        self.catalog = []
+
+        # Parse catalog
+        for f in frame_files:
+            base = os.path.basename(f)
+            parts = base.replace('.gwf', '').split('-')
+            try:
+                st = int(parts[-2])
+                dur = int(parts[-1])
+                self.catalog.append((st, st + dur, f))
+            except (ValueError, IndexError):
+                # Fallback: inspect file
+                self.catalog.append((0, 2000000000, f))
+        self.catalog.sort()
+
+    def get_data(self, start_time, duration):
+        end_time = start_time + duration
+        matching = [f for st, et, f in self.catalog if not (et <= start_time or st >= end_time)]
+        if not matching:
+            return None
+        key = tuple(matching)
+        if key not in self.cache:
+            # Keep cache bounded to at most 3 entries
+            if len(self.cache) >= 3:
+                self.cache.pop(next(iter(self.cache)))
+            f_st = min(st for st, et, f in self.catalog if f in matching)
+            f_et = max(et for st, et, f in self.catalog if f in matching)
+            try:
+                raw = read_frame(matching, self.channel_name, start_time=f_st, end_time=f_et)
+                ds = resample_to_delta_t(raw, self.delta_t).astype(float32)
+                if self.highpass_freq and self.highpass_freq > 0:
+                    ds = highpass(ds, self.highpass_freq)
+                ds *= pycbc.DYN_RANGE_FAC
+                self.cache[key] = ds
+            except Exception as e:
+                logging.warning("Failed to read frame data for %s [%d-%d]: %s", self.channel_name, f_st, f_et, e)
+                return None
+
+        full_ts = self.cache[key]
+        if start_time < full_ts.start_time or end_time > full_ts.end_time:
+            return None
+        return full_ts.time_slice(start_time, end_time)
+
+
+def parse_injection_range(num_inj, rangestr):
+    part = int(rangestr.split('/')[0])
+    pieces = int(rangestr.split('/')[1])
+    tmin = num_inj * part // pieces
+    tmax = num_inj * (part + 1) // pieces
+    return tmin, tmax
+
+
+def get_gc_end_time(injection):
+    try:
+        return float(injection.geocent_end_time)
+    except AttributeError:
+        return float(injection.tc)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    pycbc.add_common_pycbc_options(parser)
+    parser.add_argument('--input-file', '--injection-file', '-i', dest='input_file', required=True,
+                        help='Input HDF file defining injections')
+    parser.add_argument('--output-file', '-o', required=True,
+                        help='Output HDF file storing optimal and optimal MF SNRs')
+    parser.add_argument('--injection-fraction-range', default='0/1',
+                        help='Optional, analyze only a certain range of injections. Format PART/NUM_PARTS')
+    parser.add_argument('--cores', default=1, type=int,
+                        help='Parallelize the computation over cores (for pipeline compatibility)')
+    parser.add_argument('--f-low', type=float, default=20.0,
+                        help='Low frequency cutoff for matched filtering (default 20.0 Hz)')
+    parser.add_argument('--seg-length', type=float, default=256.0,
+                        help='Segment duration in seconds (default 256.0 s)')
+    parser.add_argument('--sample-rate', type=float, default=2048.0,
+                        help='Data sample rate in Hz (default 2048.0 Hz)')
+    parser.add_argument('--time-window', type=float, default=0.05,
+                        help='Search window around arrival time for peak MF SNR in seconds (default 0.05 s)')
+    parser.add_argument('--ifos', nargs='+', required=True,
+                        help='Detectors to analyze (e.g. H1 L1)')
+    parser.add_argument('--channel-name', nargs='*', action=MultiDetOptionAction,
+                        metavar='DETECTOR:CHANNEL',
+                        help='Channel name for each detector (e.g. H1:GWOSC-4KHZ_R1_STRAIN)')
+    parser.add_argument('--frame-files', nargs='*', action=MultiDetOptionAction,
+                        metavar='DETECTOR:FILES',
+                        help='Frame files for each detector')
+    parser.add_argument('--frame-cache', nargs='*', action=MultiDetOptionAction,
+                        metavar='DETECTOR:CACHE',
+                        help='Frame cache files for each detector')
+    parser.add_argument('--time-varying-psds', nargs='*', metavar='FILE',
+                        help='Time-varying PSD HDF files')
+    parser.add_argument('--progress', action='store_true',
+                        help='Show progress bar')
+
+    opts = parser.parse_args()
+    pycbc.init_logging(opts.verbose)
+
+    detectors = opts.ifos
+    seg_len = opts.seg_length
+    sample_rate = opts.sample_rate
+    delta_t = 1.0 / sample_rate
+    delta_f = 1.0 / seg_len
+    tlen = int(seg_len * sample_rate)
+    flen = tlen // 2 + 1
+    f_low = opts.f_low
+
+    logging.info("Loading PSDs for %s", detectors)
+    psds = {}
+    if opts.time_varying_psds:
+        for tvpsd_file in opts.time_varying_psds:
+            tvpsd = TimeVaryingPSD(tvpsd_file, flen, delta_f, f_low)
+            psds[tvpsd.detector] = tvpsd
+
+    logging.info("Initializing frame readers for %s", detectors)
+    frame_readers = {}
+    for det in detectors:
+        channel = None
+        if getattr(opts, 'channel_name', None) and det in opts.channel_name:
+            channel = opts.channel_name[det]
+        if not channel:
+            channel = f"{det}:GWOSC-4KHZ_R1_STRAIN"
+
+        files = []
+        if getattr(opts, 'frame_files', None) and det in opts.frame_files:
+            spec = opts.frame_files[det]
+            if isinstance(spec, str):
+                files = spec.split(',')
+            else:
+                files = list(spec)
+        elif getattr(opts, 'frame_cache', None) and det in opts.frame_cache:
+            cache_file = opts.frame_cache[det]
+            with open(cache_file, 'r') as cf:
+                for line in cf:
+                    parts = line.strip().split()
+                    if parts:
+                        files.append(parts[-1].replace('file://localhost', '').replace('file://', ''))
+        else:
+            cand_files = sorted(glob.glob(f"tests/search_test/frames/*{det}*.gwf"))
+            if not cand_files:
+                cand_files = sorted(glob.glob(f"/home/ahnitz/projects/claude/searchdev/tests/search_test/frames/*{det}*.gwf"))
+            if cand_files:
+                files = cand_files
+
+        if not files:
+            raise ValueError(f"No frame files found for detector {det}")
+        logging.info("Detector %s: %d frame files loaded for channel %s", det, len(files), channel)
+        frame_readers[det] = FrameBufferReader(files, channel, sample_rate, highpass_freq=15.0)
+
+    logging.info("Loading injections from %s", opts.input_file)
+    injections = pycbc.inject.InjectionSet(opts.input_file)
+    inj_table = injections.table
+
+    if "simulation_id" not in inj_table.fieldnames:
+        inj_table = inj_table.add_fields(np.arange(len(inj_table)), "simulation_id")
+
+    num_injections = len(inj_table)
+    imin, imax = parse_injection_range(num_injections, opts.injection_fraction_range)
+    inj_table = inj_table[imin:imax]
+
+    # Add output fields if not present
+    for det in detectors:
+        for col_prefix in ['optimal_snr_', 'optimal_mf_snr_']:
+            col_name = col_prefix + det
+            if col_name not in inj_table.fieldnames:
+                inj_table = inj_table.add_fields(np.zeros(len(inj_table), dtype=np.float32), col_name)
+
+    injections.table = inj_table
+    num_injections = len(inj_table)
+    logging.info("Processing %d injections (slice %d:%d) across %s", num_injections, imin, imax, detectors)
+
+    iterator = range(num_injections)
+    if opts.progress:
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(iterator, total=num_injections)
+        except ImportError:
+            pass
+
+    n_win = int(opts.time_window * sample_rate)
+
+    for idx in iterator:
+        inj = inj_table[idx]
+        tc = get_gc_end_time(inj)
+        sim_id = int(inj.simulation_id)
+        start_time = int(tc + 4.0 - seg_len)
+
+        for det in detectors:
+            psd_func = psds.get(det)
+            if psd_func is None:
+                continue
+            psd = psd_func(tc)
+            if psd is None:
+                # Detector off
+                inj_table['optimal_snr_' + det][idx] = 0.0
+                inj_table['optimal_mf_snr_' + det][idx] = 0.0
+                continue
+
+            # 1. Generate template waveform in zero noise (scaled by DYN_RANGE_FAC)
+            wave_ts = TimeSeries(zeros(tlen, dtype=float32), delta_t=delta_t, epoch=start_time)
+            injections.apply(wave_ts, det, distance_scale=1.0 / pycbc.DYN_RANGE_FAC, simulation_ids=[sim_id])
+            wave_fd = make_frequency_series(wave_ts)
+
+            # Deterministic optimal SNR
+            sig = sigma(wave_fd, psd=psd, low_frequency_cutoff=f_low)
+            inj_table['optimal_snr_' + det][idx] = float(sig)
+
+            # 2. Read detector noise around injection
+            data = frame_readers[det].get_data(start_time, int(seg_len))
+            if data is None:
+                inj_table['optimal_mf_snr_' + det][idx] = 0.0
+                continue
+
+            # Add injection to real detector data
+            data_with_inj = data.copy()
+            injections.apply(data_with_inj, det, distance_scale=1.0 / pycbc.DYN_RANGE_FAC, simulation_ids=[sim_id])
+
+            # Matched filter
+            try:
+                snr_ts = matched_filter(wave_fd, data_with_inj, psd=psd, low_frequency_cutoff=f_low, sigmasq=sig**2)
+                snr_arr = abs(snr_ts).numpy()
+                peak_snr = max(snr_arr[:n_win].max(), snr_arr[-n_win:].max())
+                inj_table['optimal_mf_snr_' + det][idx] = float(peak_snr)
+            except Exception as e:
+                logging.debug("Matched filter failed for injection %d on %s: %s", idx, det, e)
+                inj_table['optimal_mf_snr_' + det][idx] = 0.0
+
+    logging.info("Writing updated injection file to %s", opts.output_file)
+    os.makedirs(os.path.dirname(os.path.abspath(opts.output_file)), exist_ok=True)
+    pycbc.inject.InjectionSet.write(opts.output_file, inj_table)
+    logging.info("Completed optimal MF SNR calculation for %d injections", num_injections)
+
+
+if __name__ == '__main__':
+    main()

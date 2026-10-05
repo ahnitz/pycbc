@@ -1,6 +1,13 @@
 #!/usr/bin/env python
+"""Generate an Optimized Hierarchical FIR Filter Bank.
+
+Constructs 2-level or 3-level hierarchical FIR filter banks for gravitational-wave
+matched filtering. Compresses waveforms into coarse parent templates and designs
+interpolating FIR filters with Toeplitz solves and out-of-band peak suppression.
+"""
 import os, sys, argparse, hashlib, logging, multiprocessing as mp
 from collections import defaultdict
+
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
              "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_var, "1")
@@ -17,723 +24,696 @@ from pycbc.types import FrequencySeries
 from pycbc.waveform.bank import FilterBank, correction_basis
 import pycbc.waveform.compress as compress
 
-# --- GLOBAL WORKER STATE ---
-g_coarse_waveforms, g_coarse_sigmasq, g_coarse_tau0 = None, None, None
-g_fine_bank, g_fine_tau0, g_psd, g_args = None, None, None, None
-g_coarse_np, g_coarse_ss, g_psd_np, g_inv_psd = None, None, None, None
-g_kslice, g_nfft, g_freqs, g_delta_f, g_band_mask = None, None, None, None, None
-g_correction_basis, g_correction_band = None, None
-_g_factor_cache, _g_wave_cache = {}, {}
+# --- GLOBAL WORKER STATE (Inherited via fork in worker processes) ---
+g_coarse_waveforms, g_coarse_waveforms_np, g_coarse_norm_sq = None, None, None
+g_coarse_tau0, g_fine_bank, g_fine_tau0, g_psd, g_args = None, None, None, None, None
+g_psd_array, g_inv_psd, g_freq_slice, g_freqs, g_delta_f = None, None, None, None, None
+g_fft_len, g_valid_band_mask, g_correction_basis, g_correction_band = None, None, None, None
+_g_factor_cache, _g_waveform_cache = {}, {}
 
 def init_worker(coarse_waveforms, fine_bank, psd, args_namespace):
-    global g_coarse_waveforms, g_coarse_sigmasq, g_coarse_tau0, g_fine_bank, g_fine_tau0, g_psd, g_args
-    global g_coarse_np, g_coarse_ss, g_psd_np, g_inv_psd, g_kslice, g_nfft, g_freqs, g_delta_f, g_band_mask
+    """Initialize spectral structures and caches in worker processes."""
+    global g_coarse_waveforms, g_coarse_waveforms_np, g_coarse_norm_sq, g_coarse_tau0
+    global g_fine_bank, g_fine_tau0, g_psd, g_args, g_psd_array, g_inv_psd
+    global g_freq_slice, g_freqs, g_delta_f, g_fft_len, g_valid_band_mask
     global g_correction_basis, g_correction_band
     try:
         import pycbc.filter.matchedfilter as mf, pycbc.filter.matchedfilter_cpu as mc
         mf.correlate = mc.correlate_numpy
     except Exception: pass
     from pycbc.filter.matchedfilter import get_cutoff_indices
-    g_coarse_waveforms, g_fine_bank, g_psd, g_args = coarse_waveforms, fine_bank, psd, args_namespace
+
+    g_args, g_coarse_waveforms, g_fine_bank, g_psd = args_namespace, coarse_waveforms, fine_bank, psd
+    g_delta_f = float(psd.delta_f)
+    g_psd_array = psd.numpy().astype(np.float64)
+    g_fft_len = 2 * (len(g_psd_array) - 1)
+    g_freqs = np.arange(len(g_psd_array)) * g_delta_f
+    g_inv_psd = np.zeros_like(g_psd_array)
+    np.divide(1.0, g_psd_array, out=g_inv_psd, where=g_psd_array > 0)
+
+    k_min, k_max = get_cutoff_indices(g_args.f_low, None, g_delta_f, g_fft_len)
+    g_freq_slice = slice(k_min, k_max)
+    g_valid_band_mask = (g_freqs >= g_args.f_low) & (g_freqs < g_args.sample_rate / 2.0) & (g_psd_array > 0)
+    g_coarse_waveforms_np = [h.numpy().astype(np.complex128) for h in coarse_waveforms]
+    g_coarse_norm_sq = [float(np.sum(np.abs(h[g_freq_slice]) ** 2 * g_inv_psd[g_freq_slice])) for h in g_coarse_waveforms_np]
     g_coarse_tau0 = getattr(args_namespace, '_coarse_tau0', None)
     g_fine_tau0 = getattr(args_namespace, '_fine_tau0', None)
-    g_coarse_sigmasq = [pycbc.filter.sigmasq(h, psd=g_psd, low_frequency_cutoff=g_args.f_low) for h in coarse_waveforms]
-    g_delta_f = float(psd.delta_f)
-    g_psd_np = psd.numpy().astype(np.float64)
-    g_nfft = 2 * (len(g_psd_np) - 1)
-    g_freqs = np.arange(len(g_psd_np)) * g_delta_f
-    g_inv_psd = np.zeros_like(g_psd_np)
-    np.divide(1.0, g_psd_np, out=g_inv_psd, where=g_psd_np > 0)
-    kmin, kmax = get_cutoff_indices(g_args.f_low, None, g_delta_f, g_nfft)
-    g_kslice = slice(kmin, kmax)
-    g_band_mask = (g_freqs >= g_args.f_low) & (g_freqs < g_args.sample_rate / 2.0) & (g_psd_np > 0)
-    g_coarse_np = [h.numpy().astype(np.complex128) for h in coarse_waveforms]
-    g_coarse_ss = [float(np.sum(np.abs(h[g_kslice]) ** 2 * g_inv_psd[g_kslice])) for h in g_coarse_np]
-    g_correction_basis, g_correction_band = correction_basis(len(g_psd_np), g_delta_f, g_args.f_low, 800.0)
+    g_correction_basis, g_correction_band = correction_basis(len(g_psd_array), g_delta_f, g_args.f_low, 800.0)
     logging.getLogger('pycbc').setLevel(logging.CRITICAL + 1)
 
 # --- TOEPLITZ FILTER DESIGN ---
-def _hermitian_corr(bins, values, nfft):
-    val = np.asarray(values)
-    half = np.zeros(val.shape[:-1] + (nfft // 2 + 1,), dtype=np.complex128)
-    half[..., bins] = val
+def hermitian_spectrum_to_correlation(frequency_bins, spectral_values, fft_len):
+    """Compute real time-domain correlation from sparse Hermitian spectrum."""
+    val = np.asarray(spectral_values)
+    half = np.zeros(val.shape[:-1] + (fft_len // 2 + 1,), dtype=np.complex128)
+    half[..., frequency_bins] = val
     half[..., 0] *= 2.0; half[..., -1] *= 2.0
-    return (0.5 * nfft) * np.fft.irfft(half, n=nfft, axis=-1)
+    return (0.5 * fft_len) * np.fft.irfft(half, n=fft_len, axis=-1)
 
-def _positions(n_taps, nfft):
-    return (np.arange(n_taps) - n_taps // 2) % nfft
+def tap_positions(n_taps, fft_len):
+    return (np.arange(n_taps) - n_taps // 2) % fft_len
 
-def _snap(k, up=True, args=None):
-    ns = args if args is not None else g_args
-    gran = getattr(ns, 'tap_granularity', 8) if ns is not None else 8
-    min_t = getattr(ns, 'min_taps', 15) if ns is not None else 15
-    j = (k - min_t) / float(gran)
-    j = int(np.ceil(j - 1e-9)) if up else int(np.floor(j + 1e-9))
-    return min_t + max(j, 0) * gran
+def snap_tap_count(tap_count, round_up=True):
+    """Snap tap count to 8-tap SIMD boundary with minimum 15 taps."""
+    steps = (tap_count - 15) / 8.0
+    rounded = int(np.ceil(steps - 1e-9)) if round_up else int(np.floor(steps + 1e-9))
+    return 15 + max(rounded, 0) * 8
 
-def _toeplitz_solve_cached(r, b):
-    if len(r) > 1024: return solve_toeplitz(r, b)
-    key = r.tobytes()
-    fac = _g_factor_cache.get(key)
-    if fac is None:
+def cached_toeplitz_solve(toeplitz_col, rhs_vector):
+    """Solve symmetric Toeplitz system with Cholesky factor caching."""
+    if len(toeplitz_col) > 1024: return solve_toeplitz(toeplitz_col, rhs_vector)
+    key = toeplitz_col.tobytes()
+    factor = _g_factor_cache.get(key)
+    if factor is None:
         if len(_g_factor_cache) >= 64: _g_factor_cache.clear()
-        fac = _g_factor_cache[key] = cho_factor(scipy.linalg.toeplitz(r), lower=True, check_finite=False)
-    return cho_solve(fac, b, check_finite=False)
+        factor = _g_factor_cache[key] = cho_factor(scipy.linalg.toeplitz(toeplitz_col), lower=True, check_finite=False)
+    return cho_solve(factor, rhs_vector, check_finite=False)
 
-def design_fft_toeplitz_filter(target, valid_mask, n_taps, weights, reg_val,
-                                peak_cap_factor=10.0, peak_bad_weight_fraction=1.0,
-                                peak_max_passes=3, cap_mode='inband', toeplitz_solve=None):
-    nfft = 2 * (len(target) - 1)
-    pos = _positions(n_taps, nfft)
+def design_fft_toeplitz_filter(target_response, valid_mask, n_taps, weights, regularization, toeplitz_solver=None):
+    """Design FIR filter via Toeplitz least-squares with out-of-band peak suppression."""
+    fft_len = 2 * (len(target_response) - 1)
+    pos = tap_positions(n_taps, fft_len)
     base_bins = np.flatnonzero(valid_mask)
-    base_w, base_tgt = np.asarray(weights[base_bins], float), np.asarray(target[base_bins], complex)
-    fitted = np.zeros(len(target), dtype=bool); fitted[base_bins] = True
-    extra_bins, typ, cap, n_passes, n_bad = np.array([], dtype=int), np.median(base_w[base_w > 0]), None, 0, 0
-    for attempt in range(peak_max_passes + 1):
+    base_w, base_tgt = np.asarray(weights[base_bins], float), np.asarray(target_response[base_bins], complex)
+    fitted = np.zeros(len(target_response), dtype=bool); fitted[base_bins] = True
+    extra_bins, typ_w, n_passes, n_bad = np.array([], dtype=int), np.median(base_w[base_w > 0]), 0, 0
+
+    for attempt in range(4):
         bins = np.concatenate((base_bins, extra_bins))
-        w = np.concatenate((base_w, np.full(len(extra_bins), peak_bad_weight_fraction * typ)))
+        w = np.concatenate((base_w, np.full(len(extra_bins), typ_w)))
         tgt = np.concatenate((base_tgt, np.zeros(len(extra_bins), dtype=complex)))
-        r = _hermitian_corr(bins, w**2, nfft)[:n_taps].copy(); r[0] += reg_val
-        b = _hermitian_corr(bins, tgt * (w**2), nfft)[pos]
-        taps = (toeplitz_solve or solve_toeplitz)(r, b)
-        if not peak_cap_factor: break
-        wave = np.zeros(nfft, dtype=float); wave[pos] = taps
+        r = hermitian_spectrum_to_correlation(bins, w ** 2, fft_len)[:n_taps].copy(); r[0] += regularization
+        b = hermitian_spectrum_to_correlation(bins, tgt * (w ** 2), fft_len)[pos]
+        taps = (toeplitz_solver or solve_toeplitz)(r, b)
+
+        wave = np.zeros(fft_len, dtype=float); wave[pos] = taps
         mags = np.abs(np.fft.rfft(wave))
-        if cap_mode == 'median':
-            if cap is None: cap = peak_cap_factor * np.median(mags)
-            bad = np.flatnonzero(mags > cap)
-        else:
-            if cap is None: cap = peak_cap_factor * np.sqrt(np.sum(base_w**2 * mags[base_bins]**2) / np.sum(base_w**2))
-            bad = np.flatnonzero((mags > cap) & ~fitted)
+        cap = 10.0 * np.sqrt(np.sum(base_w ** 2 * mags[base_bins] ** 2) / np.sum(base_w ** 2))
+        bad = np.flatnonzero((mags > cap) & ~fitted)
         n_bad = len(bad)
-        if not n_bad or attempt == peak_max_passes: break
+        if not n_bad or attempt == 3: break
         extra_bins = np.union1d(extra_bins, bad); n_passes += 1
+
     return taps, n_passes, n_bad
 
-# --- FIT PROBLEM & EVALUATION ---
-def _build_problem(cand, h_tgt_np, h_ref=None, ref_ss=None, ref_fs=None, shared=False):
-    c = int(cand)
-    if h_ref is None: h_ref, ref_ss, ref_fs = g_coarse_np[c], g_coarse_ss[c], g_coarse_waveforms[c]
-    band = g_band_mask.copy()
-    ratio, w_match = np.zeros(len(h_ref), complex), np.zeros(len(h_ref), float)
-    np.divide(h_tgt_np, h_ref, out=ratio, where=np.abs(h_ref) > 0); np.nan_to_num(ratio, copy=False)
-    np.divide(np.abs(h_ref) ** 2, g_psd_np, out=w_match, where=band); np.nan_to_num(w_match, copy=False)
-    band[np.abs(ratio) > g_args.ratio_cap] = False
-    if not band.any() or w_match[band].max() <= 0: return None
-    w_match /= w_match[band].max()
-    w_fit, shift = w_match ** g_args.fit_weight_power, 0
-    if g_args.enable_tap_centering:
-        b = np.flatnonzero(band)
-        gd = -np.gradient(np.unwrap(np.angle(ratio[b])), g_delta_f) / (2 * np.pi) * g_args.sample_rate
-        wc = w_fit[b] ** 2
-        if wc.sum() > 0: shift = int(np.round(np.sum(gd * wc) / np.sum(wc)))
+# --- FIT PROBLEM & TEMPLATE EVALUATION ---
+def build_fit_problem(cand_idx, fine_waveform_np, ref_waveform=None, ref_norm_sq=None, ref_fs=None, shared=False):
+    """Construct frequency-domain target ratio, weights, and group-delay sample shift."""
+    c = int(cand_idx)
+    if ref_waveform is None:
+        ref_waveform, ref_norm_sq, ref_fs = g_coarse_waveforms_np[c], g_coarse_norm_sq[c], g_coarse_waveforms[c]
+    band = g_valid_band_mask.copy()
+    ratio, match_w = np.zeros(len(ref_waveform), complex), np.zeros(len(ref_waveform), float)
+    np.divide(fine_waveform_np, ref_waveform, out=ratio, where=np.abs(ref_waveform) > 0); np.nan_to_num(ratio, copy=False)
+    np.divide(np.abs(ref_waveform) ** 2, g_psd_array, out=match_w, where=band); np.nan_to_num(match_w, copy=False)
+    band[np.abs(ratio) > 1000] = False
+    if not band.any() or match_w[band].max() <= 0: return None
+    match_w /= match_w[band].max()
+    fit_w, shift = match_w ** 0.5, 0
+
+    b = np.flatnonzero(band)
+    gd = -np.gradient(np.unwrap(np.angle(ratio[b])), g_delta_f) / (2.0 * np.pi) * g_args.sample_rate
+    wc = fit_w[b] ** 2
+    if wc.sum() > 0: shift = int(np.round(np.sum(gd * wc) / np.sum(wc)))
+
     target = ratio * g_args.sample_rate
-    if shift: target = target * np.exp(1j * 2 * np.pi * g_freqs * shift / g_args.sample_rate)
-    return dict(c_idx=c, h_ref=h_ref, target=target, band=band, w_fit=w_fit,
-                w_match=w_match, shift=shift, ref_ss=ref_ss, ref_fs=ref_fs, shared=shared)
+    if shift: target = target * np.exp(1j * 2.0 * np.pi * g_freqs * shift / g_args.sample_rate)
+    return dict(c_idx=c, h_ref=ref_waveform, target=target, band=band, w_fit=fit_w,
+                w_match=match_w, shift=shift, ref_ss=ref_norm_sq, ref_fs=ref_fs, shared=shared)
 
-def _design(prob, n_taps, peak_cap):
-    d = g_args.dec_factor
-    return design_fft_toeplitz_filter(
-        prob['target'][::d], prob['band'][::d], n_taps, prob['w_fit'][::d],
-        g_args.regularization_magnitude, peak_cap_factor=peak_cap,
-        peak_bad_weight_fraction=g_args.peak_bad_weight_fraction,
-        peak_max_passes=g_args.peak_max_passes, cap_mode=g_args.peak_cap_mode,
-        toeplitz_solve=_toeplitz_solve_cached if prob.get('shared') else None)
-
-def _response(taps):
-    wave = np.zeros(g_nfft, dtype=float); wave[_positions(len(taps), g_nfft)] = taps
+def compute_filter_frequency_response(taps):
+    wave = np.zeros(g_fft_len, dtype=float); wave[tap_positions(len(taps), g_fft_len)] = taps
     return np.fft.rfft(wave)
 
-def _filter_metrics(H, taps, prob):
-    mag, fb = np.abs(H), prob['band']
-    wm = prob['w_match'][fb]
-    inband = np.sqrt(np.sum(wm * mag[fb] ** 2) / np.sum(wm))
+def compute_filter_metrics(freq_response, taps, problem):
+    mags, fb = np.abs(freq_response), problem['band']
+    wm = problem['w_match'][fb]
+    inband = np.sqrt(np.sum(wm * mags[fb] ** 2) / np.sum(wm))
     if inband <= 0: return float(np.max(np.abs(taps))), np.inf, np.inf
-    oob = mag[~fb].max() / inband if (~fb).any() else 0.0
-    return float(np.max(np.abs(taps))), float(oob), float(np.sqrt(np.mean(mag ** 2)) / inband)
+    oob = (mags[~fb].max() / inband) if (~fb).any() else 0.0
+    return float(np.max(np.abs(taps))), float(oob), float(np.sqrt(np.mean(mags ** 2)) / inband)
 
-def _verify(H, prob, h_fine_np, fine_ss):
-    H = H / g_args.sample_rate
-    if prob['shift']: H = H * np.exp(-1j * 2 * np.pi * g_freqs * prob['shift'] / g_args.sample_rate)
-    sl = g_kslice
-    rec = prob['h_ref'][sl] * H[sl]
-    ip = np.sum(np.conj(h_fine_np[sl]) * rec * g_inv_psd[sl])
+def verify_filter_reconstruction(freq_response, problem, fine_waveform_np, fine_norm_sq):
+    resp = freq_response / g_args.sample_rate
+    if problem['shift']: resp = resp * np.exp(-1j * 2.0 * np.pi * g_freqs * problem['shift'] / g_args.sample_rate)
+    sl = g_freq_slice
+    rec = problem['h_ref'][sl] * resp[sl]
+    ip = np.sum(np.conj(fine_waveform_np[sl]) * rec * g_inv_psd[sl])
     rec_ss = np.sum((rec.real ** 2 + rec.imag ** 2) * g_inv_psd[sl])
-    m = abs(ip) / np.sqrt(rec_ss * fine_ss) if rec_ss > 0 else 0.0
+    m = (abs(ip) / np.sqrt(rec_ss * fine_norm_sq)) if rec_ss > 0 else 0.0
     sc = 4.0 * g_delta_f
-    return float(m), (np.sqrt(sc * prob['ref_ss']), np.sqrt(sc * rec_ss), np.sqrt(sc * fine_ss))
+    return float(m), (np.sqrt(sc * problem['ref_ss']), np.sqrt(sc * rec_ss), np.sqrt(sc * fine_norm_sq))
 
-def _evaluate(prob, n_taps, h_fine_np, fine_ss, peak_cap=True):
-    taps, n_pp, n_bc = _design(prob, n_taps, g_args.peak_cap_factor if peak_cap else 0)
-    taps32 = np.asarray(taps, dtype=np.float32)
-    H = _response(taps32.astype(float))
-    metrics = _filter_metrics(H, taps32, prob)
-    m, sigmas = _verify(H, prob, h_fine_np, fine_ss)
-    max_tap, oob, noise_gain = metrics
-    ok = (m >= g_args.min_match and np.isfinite(max_tap) and max_tap <= g_args.max_tap_value)
-    if ok and g_args.peak_cap_factor and g_args.peak_cap_mode == 'inband':
-        ok = oob <= g_args.peak_cap_factor * (1 + 1e-6)
-    if ok and g_args.max_noise_gain is not None: ok = noise_gain <= g_args.max_noise_gain
-    return ok, dict(c_idx=prob['c_idx'], n_taps=int(n_taps), match=m, taps=taps32,
-                    sigmas=sigmas, shift=prob['shift'], metrics=metrics, n_pp=n_pp, n_bc=n_bc)
+def evaluate_filter_fit(problem, n_taps, fine_waveform_np, fine_norm_sq):
+    """Design FIR filter and evaluate match against target waveform."""
+    taps, n_passes, n_bad = design_fft_toeplitz_filter(
+        problem['target'], problem['band'], n_taps, problem['w_fit'], g_args.regularization_magnitude,
+        toeplitz_solver=cached_toeplitz_solve if problem.get('shared') else None)
+    taps_f32 = np.asarray(taps, dtype=np.float32)
+    resp = compute_filter_frequency_response(taps_f32.astype(float))
+    metrics = compute_filter_metrics(resp, taps_f32, problem)
+    overlap_match, sigmas = verify_filter_reconstruction(resp, problem, fine_waveform_np, fine_norm_sq)
+    is_accepted = (overlap_match >= g_args.min_match and np.isfinite(metrics[0]) and metrics[0] <= 1e5)
+    return is_accepted, dict(c_idx=problem['c_idx'], n_taps=int(n_taps), match=overlap_match, taps=taps_f32,
+                             sigmas=sigmas, shift=problem['shift'], metrics=metrics, n_passes=n_passes, n_bad=n_bad)
 
-def _min_taps(prob, cap, h_fine_np, fine_ss):
-    gran = g_args.tap_granularity
-    top = _snap(min(cap, g_args.max_taps), up=False)
-    if top < g_args.min_taps: return None, None
-    ladder = list(range(g_args.min_taps, top, g_args.tap_step))
-    if not ladder or ladder[-1] != top: ladder.append(top)
-    lo, hi, hi_rec, best_fail = None, None, None, None
+def find_minimum_taps(problem, tap_cap, fine_waveform_np, fine_norm_sq):
+    """Find minimum tap count achieving target match via ladder search and bisection."""
+    top = snap_tap_count(min(tap_cap, g_args.max_taps), round_up=False)
+    if top < 15: return None, None
+    step = 100 if top <= 1025 else 1000
+    ladder = sorted(set(list(range(15, top, step)) + [top]))
+    lo, hi, successful_rec, best_fail_rec = None, None, None, None
+
     for k in ladder:
-        ok, rec = _evaluate(prob, k, h_fine_np, fine_ss)
-        if ok: hi, hi_rec = k, rec; break
-        if best_fail is None or rec['match'] > best_fail['match']: best_fail = rec
+        ok, rec = evaluate_filter_fit(problem, k, fine_waveform_np, fine_norm_sq)
+        if ok: hi, successful_rec = k, rec; break
+        if best_fail_rec is None or rec['match'] > best_fail_rec['match']: best_fail_rec = rec
         lo = k
-    if hi_rec is None: return None, best_fail
-    if g_args.tap_search == 'bisect':
-        lo = lo if lo is not None else g_args.min_taps - gran
-        while hi - lo > gran:
-            mid = _snap((lo + hi) // 2, up=False)
-            if mid <= lo: mid = lo + gran
-            if mid >= hi: break
-            ok, rec = _evaluate(prob, mid, h_fine_np, fine_ss)
-            if ok: hi, hi_rec = mid, rec
-            else: lo = mid
-    return hi_rec, best_fail
+    if successful_rec is None: return None, best_fail_rec
 
-def process_template(i, excluded=None):
-    h_fine = g_fine_bank[i].copy()
-    h_fine_np = h_fine.numpy().astype(complex)
-    sl = g_kslice
-    fine_ss = float(np.sum(np.abs(h_fine_np[sl]) ** 2 * g_inv_psd[sl]))
+    lo = lo if lo is not None else 15 - 8
+    while hi - lo > 8:
+        mid = max(snap_tap_count((lo + hi) // 2, round_up=False), lo + 8)
+        if mid >= hi: break
+        ok, rec = evaluate_filter_fit(problem, mid, fine_waveform_np, fine_norm_sq)
+        if ok: hi, successful_rec = mid, rec
+        else: lo = mid
+    return successful_rec, best_fail_rec
+
+def process_template(template_idx_or_task, excluded_parents=None):
+    """Match fine waveform to best coarse parent and determine minimal FIR taps."""
+    if isinstance(template_idx_or_task, tuple): fine_idx, excluded_parents = template_idx_or_task
+    else: fine_idx = template_idx_or_task
+
+    fine_wave = g_fine_bank[fine_idx].copy()
+    fine_np = fine_wave.numpy().astype(complex)
+    sl = g_freq_slice
+    fine_norm_sq = float(np.sum(np.abs(fine_np[sl]) ** 2 * g_inv_psd[sl]))
+
     allowed = np.arange(len(g_coarse_waveforms))
-    if excluded: allowed = allowed[~np.isin(allowed, np.fromiter(excluded, dtype=int))]
-    n_cand = min(len(allowed), g_args.search_depth)
-    candidates = allowed[np.argsort(np.abs(g_coarse_tau0[allowed] - g_fine_tau0[i]))[:n_cand]] if (g_coarse_tau0 is not None and g_fine_tau0 is not None) else allowed
+    if excluded_parents: allowed = allowed[~np.isin(allowed, np.fromiter(excluded_parents, dtype=int))]
+    n_cand = min(len(allowed), 25)
+    candidates = allowed[np.argsort(np.abs(g_coarse_tau0[allowed] - g_fine_tau0[fine_idx]))[:n_cand]] if (g_coarse_tau0 is not None and g_fine_tau0 is not None) else allowed
+
     problems, scores = {}, {}
     for c in candidates:
-        prob = _build_problem(c, h_fine_np)
+        prob = build_fit_problem(c, fine_np)
         if prob is None: continue
         problems[c] = prob
         try:
-            taps, _, _ = _design(prob, _snap(g_args.n_taps), 0)
-            scores[c] = _verify(_response(np.asarray(taps, dtype=np.float32).astype(float)), prob, h_fine_np, fine_ss)[0]
+            taps, _, _ = design_fft_toeplitz_filter(prob['target'], prob['band'], snap_tap_count(g_args.n_taps), prob['w_fit'], g_args.regularization_magnitude)
+            scores[c] = verify_filter_reconstruction(compute_filter_frequency_response(np.asarray(taps, dtype=np.float32).astype(float)), prob, fine_np, fine_norm_sq)[0]
         except Exception: pass
+
     ranked = sorted(scores, key=scores.get, reverse=True)
-    step = g_args.tap_granularity if g_args.tap_search == 'bisect' else g_args.tap_step
-    best, best_fail = None, None
+    best_rec, best_fail = None, None
     for rank, c in enumerate(ranked):
-        if best is not None and rank >= g_args.parent_refine: break
-        cap = g_args.max_taps if best is None else best['n_taps'] - step
-        try: rec, fail = _min_taps(problems[c], cap, h_fine_np, fine_ss)
+        if best_rec is not None and rank >= 3: break
+        cap = g_args.max_taps if best_rec is None else best_rec['n_taps'] - 8
+        try: rec, fail = find_minimum_taps(problems[c], cap, fine_np, fine_norm_sq)
         except Exception: continue
-        if rec is not None and (best is None or rec['n_taps'] < best['n_taps']): best = rec
+        if rec is not None and (best_rec is None or rec['n_taps'] < best_rec['n_taps']): best_rec = rec
         if fail is not None and (best_fail is None or fail['match'] > best_fail['match']): best_fail = fail
-    chosen = best if (best is not None) else best_fail
-    if chosen is None: return (i, -1.0, -1, -1.0, [], [], 0, (np.nan, np.nan, np.nan), False)
+
+    chosen = best_rec if (best_rec is not None) else best_fail
+    if chosen is None: return (fine_idx, -1.0, -1, -1.0, [], [], 0, (np.nan, np.nan, np.nan), False)
+
     c = chosen['c_idx']
-    m, _ = match(h_fine, g_coarse_waveforms[c], psd=g_psd, low_frequency_cutoff=g_args.f_low,
-                 v1_norm=fine_ss * 4.0 * g_delta_f, v2_norm=g_coarse_sigmasq[c])
-    return (i, float(m), c, chosen['match'], chosen['taps'], chosen['sigmas'],
-            chosen['shift'], chosen['metrics'], best is not None)
+    direct_m, _ = match(fine_wave, g_coarse_waveforms[c], psd=g_psd, low_frequency_cutoff=g_args.f_low,
+                        v1_norm=fine_norm_sq * 4.0 * g_delta_f, v2_norm=g_coarse_norm_sq[c] * 4.0 * g_delta_f)
+    return (fine_idx, float(direct_m), c, chosen['match'], chosen['taps'], chosen['sigmas'], chosen['shift'], chosen['metrics'], best_rec is not None)
 
 # --- GAUSS-NEWTON PARENT OPTIMIZATION & MERGING ---
-def _child_wave(j):
-    hit = _g_wave_cache.get(j)
+def get_cached_waveform(waveform_idx):
+    hit = _g_waveform_cache.get(waveform_idx)
     if hit is None:
-        h = g_fine_bank[j].copy()
-        h_np = h.numpy().astype(complex)
-        ss = float(np.sum(np.abs(h_np[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
-        if len(_g_wave_cache) >= 4096: _g_wave_cache.clear()
-        hit = _g_wave_cache[j] = (h, h_np, ss)
+        fs_wave = g_fine_bank[waveform_idx].copy()
+        np_wave = fs_wave.numpy().astype(complex)
+        norm_sq = float(np.sum(np.abs(np_wave[g_freq_slice]) ** 2 * g_inv_psd[g_freq_slice]))
+        if len(_g_waveform_cache) >= 4096: _g_waveform_cache.clear()
+        hit = _g_waveform_cache[waveform_idx] = (fs_wave, np_wave, norm_sq)
     return hit
 
-def _toeplitz_fit_batch(prob, k, targets, reg_val, nfft):
-    bins = np.flatnonzero(prob['band'])
-    w2 = prob['w_fit'][bins] ** 2
-    r = _hermitian_corr(bins, w2, nfft)[:k].copy(); r[0] += reg_val
-    pos = _positions(k, nfft)
-    b = _hermitian_corr(bins, targets[:, bins] * w2[None, :], nfft)[:, pos]
-    taps = _toeplitz_solve_cached(r, b.T)
-    wave = np.zeros((nfft, taps.shape[1])); wave[pos] = taps
+def solve_toeplitz_batch(problem, n_taps, target_matrix, regularization, fft_len):
+    bins = np.flatnonzero(problem['band'])
+    w2 = problem['w_fit'][bins] ** 2
+    r = hermitian_spectrum_to_correlation(bins, w2, fft_len)[:n_taps].copy(); r[0] += regularization
+    pos = tap_positions(n_taps, fft_len)
+    b = hermitian_spectrum_to_correlation(bins, target_matrix[:, bins] * w2[None, :], fft_len)[:, pos]
+    taps = cached_toeplitz_solve(r, b.T)
+    wave = np.zeros((fft_len, taps.shape[1])); wave[pos] = taps
     return np.fft.rfft(wave, axis=0).T, taps
 
-def _gn_parent(base_idx, z):
-    h0_c, h0_np, h0_ss = _child_wave(base_idx)
-    if z is None or not np.any(z): return h0_np, h0_ss, h0_c
-    h_m = h0_np.copy()
-    h_m[g_correction_band] *= np.exp(z @ g_correction_basis[:, g_correction_band])
-    return h_m, float(np.sum(np.abs(h_m[g_kslice]) ** 2 * g_inv_psd[g_kslice])), FrequencySeries(h_m, delta_f=g_delta_f, epoch=h0_c.epoch)
+def compute_basis_corrected_parent(base_idx, correction_coeffs):
+    base_fs, base_np, base_norm_sq = get_cached_waveform(base_idx)
+    if correction_coeffs is None or not np.any(correction_coeffs): return base_np, base_norm_sq, base_fs
+    corr_np = base_np.copy()
+    corr_np[g_correction_band] *= np.exp(correction_coeffs @ g_correction_basis[:, g_correction_band])
+    norm_sq = float(np.sum(np.abs(corr_np[g_freq_slice]) ** 2 * g_inv_psd[g_freq_slice]))
+    return corr_np, norm_sq, FrequencySeries(corr_np, delta_f=g_delta_f, epoch=base_fs.epoch)
 
-def _gn_eval_lin(task):
-    base_idx, z, child_indices, k = task
-    h_m, mss, h_fs = _gn_parent(base_idx, z)
-    nz, out = len(g_correction_basis), []
-    for i in child_indices:
-        _, ch_np, ch_ss = _child_wave(i)
-        prob = _build_problem(base_idx, ch_np, h_m, mss, h_fs, shared=True)
+def evaluate_gn_linearization(task):
+    base_idx, coeffs, child_indices, n_taps = task
+    parent_np, parent_norm_sq, parent_fs = compute_basis_corrected_parent(base_idx, coeffs)
+    n_basis, out = len(g_correction_basis), []
+    for child_idx in child_indices:
+        _, child_np, child_norm_sq = get_cached_waveform(child_idx)
+        prob = build_fit_problem(base_idx, child_np, parent_np, parent_norm_sq, parent_fs, shared=True)
         if prob is None:
-            out.append((i, 1.0, 1e-10, np.zeros((nz, nz)), np.zeros(nz))); continue
+            out.append((child_idx, 1.0, 1e-10, np.zeros((n_basis, n_basis)), np.zeros(n_basis))); continue
         T0 = prob['target']
         targets = np.vstack([T0[None, :], T0[None, :] * g_correction_basis])
-        resp, taps = _toeplitz_fit_batch(prob, k, targets, g_args.regularization_magnitude, g_nfft)
-        mis = 1.0 - _verify(_response(taps[:, 0].astype(np.float32).astype(float)), prob, ch_np, ch_ss)[0]
+        resp, taps = solve_toeplitz_batch(prob, n_taps, targets, g_args.regularization_magnitude, g_fft_len)
+        rec_resp = compute_filter_frequency_response(taps[:, 0].astype(np.float32).astype(float))
+        mis = 1.0 - verify_filter_reconstruction(rec_resp, prob, child_np, child_norm_sq)[0]
         bins = np.flatnonzero(prob['band'])
         w = prob['w_fit'][bins]
         rho = (resp[0] - T0)[bins] * w
         J = ((T0[None, :] * g_correction_basis - resp[1:])[:, bins] * w[None, :])
-        out.append((i, mis, float(np.sum(np.abs(rho) ** 2)), np.real(np.conj(J) @ J.T), np.real(np.conj(J) @ rho)))
+        out.append((child_idx, mis, float(np.sum(np.abs(rho) ** 2)), np.real(np.conj(J) @ J.T), np.real(np.conj(J) @ rho)))
     return out
 
-def _gn_eval_check(task):
-    base_idx, z, child_indices, k, abort_above = task
-    h_m, mss, h_fs = _gn_parent(base_idx, z)
+def evaluate_gn_matches(task):
+    base_idx, coeffs, child_indices, n_taps, abort_threshold = task
+    parent_np, parent_norm_sq, parent_fs = compute_basis_corrected_parent(base_idx, coeffs)
     out = []
-    for n, i in enumerate(child_indices):
-        _, ch_np, ch_ss = _child_wave(i)
-        prob = _build_problem(base_idx, ch_np, h_m, mss, h_fs, shared=True)
-        mis, ok = (1.0, False) if prob is None else (1.0 - _evaluate(prob, k, ch_np, ch_ss)[1]['match'], _evaluate(prob, k, ch_np, ch_ss)[0])
-        out.append((i, mis, ok))
-        if abort_above is not None and mis >= abort_above:
-            out.extend((j, np.inf, False) for j in child_indices[n + 1:]); break
+    for step_idx, child_idx in enumerate(child_indices):
+        _, child_np, child_norm_sq = get_cached_waveform(child_idx)
+        prob = build_fit_problem(base_idx, child_np, parent_np, parent_norm_sq, parent_fs, shared=True)
+        if prob is None: mis, ok = 1.0, False
+        else:
+            ok, rec = evaluate_filter_fit(prob, n_taps, child_np, child_norm_sq)
+            mis = 1.0 - rec['match']
+        out.append((child_idx, mis, ok))
+        if abort_threshold is not None and mis >= abort_threshold:
+            out.extend((j, np.inf, False) for j in child_indices[step_idx + 1:]); break
     return out
 
-def _optimize_parent_group(pool, union, base_cand, args, initial_z=None, order=None):
+def optimize_parent_waveform(pool, child_group, base_cand, args, initial_coeffs=None, child_order=None):
     max_taps = args.max_taps
-    k_cap = max_taps if max_taps % 2 else max_taps - 1
-    min_match, nz = getattr(args, 'min_match', 0.9999), 20
-    z = np.zeros(nz, dtype=float) if initial_z is None else np.array(initial_z, dtype=float).copy()
-    n_chunks = max(1, min(len(union), 4 * getattr(args, 'n_processes', 8)))
-    ordered = [int(x) for x in (order if order is not None else union)]
+    cap_taps = max_taps if max_taps % 2 else max_taps - 1
+    min_match, n_basis = getattr(args, 'min_match', 0.9999), 20
+    coeffs = np.zeros(n_basis, dtype=float) if initial_coeffs is None else np.array(initial_coeffs, dtype=float).copy()
+    n_chunks = max(1, min(len(child_group), 4 * getattr(args, 'n_processes', 8)))
+    ordered = [int(x) for x in (child_order if child_order is not None else child_group)]
     chunks = [c for c in [ordered[j::n_chunks] for j in range(n_chunks)] if c]
-    def _run(fn, cur_z, extra):
-        return [item for sub in pool.imap_unordered(fn, [(base_cand, cur_z, c) + extra for c in chunks]) for item in sub]
-    k = _snap(int(0.85 * max_taps), args=args)
-    best_z, best_fail, best_worst = z.copy(), None, np.inf
+
+    def _parallel_eval(func, cur_coeffs, extra):
+        return [item for sub in pool.imap_unordered(func, [(base_cand, cur_coeffs, c) + extra for c in chunks]) for item in sub]
+
+    k_eval = snap_tap_count(int(0.85 * max_taps))
+    best_coeffs, best_failures, best_worst = coeffs.copy(), None, np.inf
     for _ in range(3):
-        mu, p, zreg = 1e-2, 8.0, 1e-3
+        mu, p_norm, reg = 1e-2, 8.0, 1e-3
         for _ in range(8):
-            lin = _run(_gn_eval_lin, z, (k,))
-            mis = np.array([x[1] for x in lin])
+            lin = _parallel_eval(evaluate_gn_linearization, coeffs, (k_eval,))
+            mis = np.array([row[1] for row in lin])
             worst = mis.max()
             if worst <= (1.0 - min_match): break
-            c = (mis / worst) ** p
-            A, g = np.zeros((nz, nz)), np.zeros(nz)
-            for (_, m, R, Ai, gi), ci in zip(lin, c):
-                s = ci * m / max(R, 1e-300)
-                A += s * Ai; g += s * gi
-            scale = np.trace(A) / nz
+            weights = (mis / worst) ** p_norm
+            A, g = np.zeros((n_basis, n_basis)), np.zeros(n_basis)
+            for (_, m, res_norm, jt_j, jt_r), w in zip(lin, weights):
+                s = w * m / max(res_norm, 1e-300)
+                A += s * jt_j; g += s * jt_r
+            scale = np.trace(A) / n_basis
             if scale <= 0: break
             accepted = False
             for _ in range(6):
-                dz = -np.linalg.solve(A + (mu + zreg) * scale * np.eye(nz), g + zreg * scale * z)
-                new_mis = np.array([x[1] for x in _run(_gn_eval_check, z + dz, (k, worst))])
-                if new_mis.max() < worst:
-                    z, mu, accepted = z + dz, max(mu / 3, 1e-6), True; break
-                mu *= 4
+                d_coeffs = -np.linalg.solve(A + (mu + reg) * scale * np.eye(n_basis), g + reg * scale * coeffs)
+                trial = _parallel_eval(evaluate_gn_matches, coeffs + d_coeffs, (k_eval, worst))
+                if max(row[1] for row in trial) < worst:
+                    coeffs, mu, accepted = coeffs + d_coeffs, max(mu / 3.0, 1e-6), True; break
+                mu *= 4.0
             if not accepted: break
-        cap = _run(_gn_eval_check, z, (k_cap, None))
-        n_fail, worst_cap = sum(1 for _, _, ok in cap if not ok), max(m for _, m, _ in cap)
-        if best_fail is None or (n_fail, worst_cap) < (best_fail, best_worst):
-            best_z, best_fail, best_worst = z.copy(), n_fail, worst_cap
-        if best_fail == 0: break
-    return best_z, best_fail
 
-def _merge_check(task):
-    cand, children, screen = task
-    h_c, c_np, c_ss = _child_wave(cand)
-    k = g_args.max_taps if g_args.max_taps % 2 else g_args.max_taps - 1
-    limit = screen * (1.0 - g_args.min_match) if screen and screen > 0 else None
-    n_pass, worst = None, 0.0
-    for n, i in enumerate(children):
-        if i == cand: continue
-        _, h_np, ss = _child_wave(i)
-        prob = _build_problem(cand, h_np, c_np, c_ss, h_c, shared=True)
+        cap_eval = _parallel_eval(evaluate_gn_matches, coeffs, (cap_taps, None))
+        n_fail, worst_cap = sum(1 for _, _, ok in cap_eval if not ok), max(row[1] for row in cap_eval)
+        if best_failures is None or (n_fail, worst_cap) < (best_failures, best_worst):
+            best_coeffs, best_failures, best_worst = coeffs.copy(), n_fail, worst_cap
+        if best_failures == 0: break
+    return best_coeffs, best_failures
+
+def check_merge_candidate(task):
+    cand_idx, children, screening_limit = task
+    ref_fs, ref_np, ref_norm_sq = get_cached_waveform(cand_idx)
+    cap_taps = g_args.max_taps if g_args.max_taps % 2 else g_args.max_taps - 1
+    limit = screening_limit * (1.0 - g_args.min_match) if screening_limit and screening_limit > 0 else None
+    n_passed, worst_mis = None, 0.0
+
+    for step_num, child_idx in enumerate(children):
+        if child_idx == cand_idx: continue
+        _, child_np, child_norm_sq = get_cached_waveform(child_idx)
+        prob = build_fit_problem(cand_idx, child_np, ref_np, ref_norm_sq, ref_fs, shared=True)
         if prob is None: ok, mis = False, 1.0
         else:
-            ok, rec = _evaluate(prob, k, h_np, ss)
+            ok, rec = evaluate_filter_fit(prob, cap_taps, child_np, child_norm_sq)
             mis = 1.0 - rec['match']
-        worst = max(worst, mis)
-        if not ok and n_pass is None:
-            n_pass = n
-            if limit is None: return cand, n, np.inf
-        if limit is not None and mis > limit: return cand, n_pass, np.inf
-    return cand, len(children) if n_pass is None else n_pass, worst
+        worst_mis = max(worst_mis, mis)
+        if not ok and n_passed is None:
+            n_passed = step_num
+            if limit is None: return cand_idx, step_num, np.inf
+        if limit is not None and mis > limit: return cand_idx, n_passed, np.inf
+    return cand_idx, len(children) if n_passed is None else n_passed, worst_mis
 
-def _fit_forced(task):
-    i, cand, z = task
-    h_m, mss, h_fs = _gn_parent(cand, z)
-    h_fine, ch_np, ch_ss = _child_wave(i)
-    prob = _build_problem(cand, ch_np, h_m, mss, h_fs, shared=True)
-    if prob is None: return (i, None)
-    rec, _ = _min_taps(prob, g_args.max_taps, ch_np, ch_ss)
-    if rec is None: return (i, None)
-    m, _ = match(h_fine, h_fs, psd=g_psd, low_frequency_cutoff=g_args.f_low,
-                 v1_norm=ch_ss * 4.0 * g_delta_f, v2_norm=mss * 4.0 * g_delta_f)
-    return (i, (float(m), cand, rec['match'], rec['taps'], rec['sigmas'], rec['shift'], rec['metrics']))
+def fit_child_to_parent(task):
+    child_idx, parent_idx, coeffs = task
+    parent_np, parent_norm_sq, parent_fs = compute_basis_corrected_parent(parent_idx, coeffs)
+    child_fs, child_np, child_norm_sq = get_cached_waveform(child_idx)
+    prob = build_fit_problem(parent_idx, child_np, parent_np, parent_norm_sq, parent_fs, shared=True)
+    if prob is None: return (child_idx, None)
+    rec, _ = find_minimum_taps(prob, g_args.max_taps, child_np, child_norm_sq)
+    if rec is None: return (child_idx, None)
+    direct_m, _ = match(child_fs, parent_fs, psd=g_psd, low_frequency_cutoff=g_args.f_low,
+                        v1_norm=child_norm_sq * 4.0 * g_delta_f, v2_norm=parent_norm_sq * 4.0 * g_delta_f)
+    return (child_idx, (float(direct_m), parent_idx, rec['match'], rec['taps'], rec['sigmas'], rec['shift'], rec['metrics']))
 
-def bank_features(bank, f_low):
-    t = bank.table; names = t.dtype.names
-    m1, m2 = np.asarray(t['mass1'], float), np.asarray(t['mass2'], float)
-    tau0 = np.asarray(t['tau0'], float) if 'tau0' in names else conversions.tau0_from_mass1_mass2(m1, m2, f_low)
-    tau3 = np.asarray(t['tau3'], float) if 'tau3' in names else conversions.tau3_from_mass1_mass2(m1, m2, f_low)
-    s1 = np.asarray(t['spin1z'], float) if 'spin1z' in names else 0 * m1
-    s2 = np.asarray(t['spin2z'], float) if 'spin2z' in names else 0 * m1
+# --- FEATURES, PRUNING & CONSOLIDATION ---
+def extract_bank_features(bank, f_low):
+    table = bank.table
+    names = table.dtype.names
+    m1, m2 = np.asarray(table['mass1'], float), np.asarray(table['mass2'], float)
+    tau0 = np.asarray(table['tau0'], float) if 'tau0' in names else conversions.tau0_from_mass1_mass2(m1, m2, f_low)
+    tau3 = np.asarray(table['tau3'], float) if 'tau3' in names else conversions.tau3_from_mass1_mass2(m1, m2, f_low)
+    s1 = np.asarray(table['spin1z'], float) if 'spin1z' in names else 0.0 * m1
+    s2 = np.asarray(table['spin2z'], float) if 'spin2z' in names else 0.0 * m1
     return np.stack([tau0, tau3, conversions.chi_eff(m1, m2, s1, s2)], axis=1)
 
-def _process_excl(task):
-    return process_template(task[0], task[1])
-
-def prune_parents(pool, results, n_processes, max_tap_growth=None, label='middle'):
-    groups = defaultdict(list)
+def prune_redundant_parents(pool, results, n_processes, label='middle'):
+    """Prune parent templates whose children can be reabsorbed into other parents."""
+    parent_groups = defaultdict(list)
     for i, row in enumerate(results):
-        if row is not None and row[1] >= 0: groups[row[1]].append(i)
-    removed, batch = set(), max(4 * n_processes, 16)
-    for parent in sorted(groups, key=lambda p: (len(groups[p]), p)):
-        children = list(groups[parent])
+        if row is not None and row[1] >= 0: parent_groups[row[1]].append(i)
+    removed, batch_size = set(), max(4 * n_processes, 16)
+
+    for parent in sorted(parent_groups, key=lambda p: (len(parent_groups[p]), p)):
+        children = list(parent_groups[parent])
         if not children: continue
         excluded = frozenset(removed | {parent})
-        moved, ok = {}, True
-        for start in range(0, len(children), batch):
-            tasks = [(i, excluded) for i in children[start:start + batch]]
-            for res in pool.imap_unordered(_process_excl, tasks):
-                if not res[8]: ok = False
-                moved[res[0]] = res
-            if not ok: break
-        if not ok: continue
-        old_taps = sum(len(results[i][3]) for i in children)
-        new_taps = sum(len(res[4]) for res in moved.values())
-        if max_tap_growth is not None and new_taps > old_taps * (1.0 + max_tap_growth): continue
-        for i, res in moved.items():
-            results[i] = res[1:8]
-            groups[res[2]].append(i)
-        groups[parent] = []; removed.add(parent)
-        logging.info('Pruned %s parent %d: moved %d children, taps %d -> %d (%d removed)',
-                     label, parent, len(children), old_taps, new_taps, len(removed))
+        reassignments, all_absorbed = {}, True
+        for start in range(0, len(children), batch_size):
+            tasks = [(c_idx, excluded) for c_idx in children[start:start + batch_size]]
+            for res in pool.imap_unordered(process_template, tasks):
+                if not res[8]: all_absorbed = False
+                reassignments[res[0]] = res
+            if not all_absorbed: break
+        if not all_absorbed: continue
+
+        for c_idx, res in reassignments.items():
+            results[c_idx] = res[1:8]
+            parent_groups[res[2]].append(c_idx)
+        parent_groups[parent] = []; removed.add(parent)
+        logging.info('Pruned %s parent %d: reabsorbed %d children (%d removed)', label, parent, len(children), len(removed))
     return removed
 
-def merge_groups(pool, results, feats, args, label='middle', parent_corrections=None, base_corrections=None):
-    n_neighbours = getattr(args, 'merge_neighbours', 3)
-    n_candidates = getattr(args, 'merge_candidates', 16)
-    max_size, min_pass = getattr(args, 'merge_max_group_size', 140), getattr(args, 'merge_gn_min_pass_frac', 0.5)
+def merge_parent_groups(pool, results, features, args, label='middle', parent_corrections=None, base_corrections=None):
+    """Merge neighboring parent groups using coordinate distance and Gauss-Newton optimization."""
     groups = defaultdict(set)
     for i, r in enumerate(results):
         if r is not None and r[1] >= 0: groups[r[1]].add(i)
-    tau0 = feats[:, 0]
-    tried, n_merges, progress = set(), 0, True
-    while progress:
-        progress = False
-        for p in sorted(groups, key=lambda q: (len(groups[q]), q)):
+
+    tau0 = features[:, 0]
+    tried_pairs, n_merges, has_progress = set(), 0, True
+    while has_progress:
+        has_progress = False
+        for p in sorted(groups, key=lambda g: (len(groups[g]), g)):
             if p not in groups: continue
-            if max_size and len(groups[p]) > max_size: break
-            others = np.array([q for q in groups if q != p], dtype=int)
-            if not len(others): break
-            for q in others[np.argsort(np.abs(tau0[others] - tau0[p]))][:n_neighbours]:
+            if len(groups[p]) > 140: break
+            other_parents = np.array([q for q in groups if q != p], dtype=int)
+            if not len(other_parents): break
+
+            for q in other_parents[np.argsort(np.abs(tau0[other_parents] - tau0[p]))][:3]:
                 q = int(q)
-                key = (min(p, q), max(p, q), len(groups[p]), len(groups[q]))
-                if key in tried: continue
-                tried.add(key)
-                union = np.array(sorted(groups[p] | groups[q]), dtype=int)
-                pool_c = np.unique(np.concatenate([union, [p, q]]))
-                f_u, f_p = feats[union], feats[pool_c]
-                span = np.maximum(f_u.max(axis=0) - f_u.min(axis=0), 1e-12)
-                d = cdist(f_p / span, f_u / span)
-                cand_radius = dict(zip(pool_c, d.max(axis=1)))
-                cands = pool_c[np.argsort(d.max(axis=1))[:n_candidates]]
-                gn_on = getattr(args, 'optimize_parents', True)
-                screen = getattr(args, 'merge_gn_screen', 0.0) if gn_on else 0.0
-                tasks = [(int(c), [int(x) for x in union[np.argsort(-d[np.where(pool_c == c)[0][0]])]], screen) for c in cands]
-                order_of = {t[0]: t[1] for t in tasks}
-                check_results = list(pool.imap_unordered(_merge_check, tasks))
-                passed = {c for c, n, _ in check_results if n == len(union)}
-                chosen, chosen_z = next((int(c) for c in cands if int(c) in passed), None), None
-                if chosen is not None:
-                    chosen_z = np.zeros(20)
-                elif gn_on:
-                    cand_counts = {int(c): int(n) for c, n, _ in check_results}
-                    max_pass = max(cand_counts.values()) if cand_counts else 0
-                    min_needed = max(1, int(min_pass * len(union)))
-                    if max_pass >= min_needed:
-                        reach = [(w, cand_radius[int(c)], int(c)) for c, _, w in check_results
-                                 if np.isfinite(w) and cand_counts.get(int(c), 0) >= min_needed]
-                        best_cand = min(reach)[2] if reach else int(max(cands, key=lambda c: (cand_counts.get(int(c), 0), -cand_radius[int(c)])))
-                        opt_z, n_fail = _optimize_parent_group(pool, union, best_cand, args, order=order_of[best_cand])
-                        if n_fail == 0: chosen, chosen_z = best_cand, opt_z
-                if chosen is None: continue
-                rows = dict(pool.imap_unordered(_fit_forced, [(int(i), chosen, chosen_z) for i in union], chunksize=4))
-                if any(r is None for r in rows.values()): continue
-                for i, r in rows.items(): results[i] = r
+                pair_key = (min(p, q), max(p, q), len(groups[p]), len(groups[q]))
+                if pair_key in tried_pairs: continue
+                tried_pairs.add(pair_key)
+
+                union_children = np.array(sorted(groups[p] | groups[q]), dtype=int)
+                candidate_pool = np.unique(np.concatenate([union_children, [p, q]]))
+                feat_u, feat_p = features[union_children], features[candidate_pool]
+                span = np.maximum(feat_u.max(axis=0) - feat_u.min(axis=0), 1e-12)
+                distances = cdist(feat_p / span, feat_u / span)
+                radii = dict(zip(candidate_pool, distances.max(axis=1)))
+                top_cands = candidate_pool[np.argsort(distances.max(axis=1))[:16]]
+
+                tasks = [(int(c), [int(x) for x in union_children[np.argsort(-distances[np.where(candidate_pool == c)[0][0]])]], 30.0) for c in top_cands]
+                order_map = {t[0]: t[1] for t in tasks}
+                check_results = list(pool.imap_unordered(check_merge_candidate, tasks))
+                fully_passed = {c for c, count, _ in check_results if count == len(union_children)}
+
+                chosen_parent, chosen_coeffs = next((int(c) for c in top_cands if int(c) in fully_passed), None), None
+                if chosen_parent is not None:
+                    chosen_coeffs = np.zeros(20)
+                else:
+                    pass_counts = {int(c): int(n) for c, n, _ in check_results}
+                    min_needed = max(1, int(0.5 * len(union_children)))
+                    if pass_counts and max(pass_counts.values()) >= min_needed:
+                        viable = [(worst, radii[int(c)], int(c)) for c, _, worst in check_results if np.isfinite(worst) and pass_counts.get(int(c), 0) >= min_needed]
+                        best_cand = min(viable)[2] if viable else int(max(top_cands, key=lambda c: (pass_counts.get(int(c), 0), -radii[int(c)])))
+                        opt_coeffs, n_fail = optimize_parent_waveform(pool, union_children, best_cand, args, child_order=order_map[best_cand])
+                        if n_fail == 0: chosen_parent, chosen_coeffs = best_cand, opt_coeffs
+
+                if chosen_parent is None: continue
+                refit_rows = dict(pool.imap_unordered(fit_child_to_parent, [(int(i), chosen_parent, chosen_coeffs) for i in union_children], chunksize=4))
+                if any(row is None for row in refit_rows.values()): continue
+
+                for c_idx, row in refit_rows.items(): results[c_idx] = row
                 if parent_corrections is not None:
-                    base_z = np.array(base_corrections[chosen], float) if (base_corrections is not None and chosen < len(base_corrections)) else np.zeros(20)
-                    parent_corrections[chosen] = base_z + chosen_z
+                    base_z = np.array(base_corrections[chosen_parent], float) if (base_corrections is not None and chosen_parent < len(base_corrections)) else np.zeros(20)
+                    parent_corrections[chosen_parent] = base_z + chosen_coeffs
                     parent_corrections.pop(p, None); parent_corrections.pop(q, None)
+
                 del groups[p], groups[q]
-                groups[chosen] = set(int(i) for i in union); n_merges += 1; progress = True
+                groups[chosen_parent] = set(int(i) for i in union_children)
+                n_merges += 1; has_progress = True
                 logging.info('Merged %s groups %d + %d -> parent %d (%d children, opt=%s); %d left',
-                             label, p, q, chosen, len(union), bool(chosen_z is not None and np.any(chosen_z)), len(groups))
+                             label, p, q, chosen_parent, len(union_children), bool(chosen_coeffs is not None and np.any(chosen_coeffs)), len(groups))
                 break
     return n_merges
 
-def consolidate_parents(pool, results, parent_src, child_bank, args, label):
-    rows = [None if r is None else (r[0], int(parent_src[r[1]])) + tuple(r[2:]) for r in results]
+def consolidate_hierarchy_level(pool, results, parent_source_indices, child_bank, args, label):
+    """Consolidate parent templates, merge groups, and remap indices."""
+    rows = [None if r is None else (r[0], int(parent_source_indices[r[1]])) + tuple(r[2:]) for r in results]
     base_corrections = getattr(child_bank, 'correction_coeffs', None)
-    parent_corrections = {int(s): np.array(base_corrections[int(s)], float).copy()
-                          if (base_corrections is not None and int(s) < len(base_corrections))
-                          else np.zeros(20) for s in parent_src}
-    if args.merge_groups:
-        feats = bank_features(child_bank, args.f_low)
-        n_before = len({r[1] for r in rows if r is not None})
-        n = merge_groups(pool, rows, feats, args, label, parent_corrections=parent_corrections, base_corrections=base_corrections)
-        logging.info('Group merging: %d merges, %d -> %d %s templates in use', n, n_before, len({r[1] for r in rows if r is not None}), label)
-    used = np.array(sorted({r[1] for r in rows if r is not None}), dtype=int)
-    pos = {int(s): k for k, s in enumerate(used)}
-    rows = [None if r is None else (r[0], pos[r[1]]) + tuple(r[2:]) for r in rows]
-    return rows, used, np.array([parent_corrections.get(int(s), np.zeros(20)) for s in used], float)
+    parent_corrections = {
+        int(s): np.array(base_corrections[int(s)], float).copy() if (base_corrections is not None and int(s) < len(base_corrections)) else np.zeros(20)
+        for s in parent_source_indices
+    }
+    feats = extract_bank_features(child_bank, args.f_low)
+    n_before = len({r[1] for r in rows if r is not None})
+    n_merged = merge_parent_groups(pool, rows, feats, args, label, parent_corrections=parent_corrections, base_corrections=base_corrections)
+    logging.info('Group merging: %d merges, %d -> %d %s templates in use', n_merged, n_before, len({r[1] for r in rows if r is not None}), label)
+
+    used_parents = np.array(sorted({r[1] for r in rows if r is not None}), dtype=int)
+    pos_map = {int(s): k for k, s in enumerate(used_parents)}
+    remapped_rows = [None if r is None else (r[0], pos_map[r[1]]) + tuple(r[2:]) for r in rows]
+    return remapped_rows, used_parents, np.array([parent_corrections.get(int(s), np.zeros(20)) for s in used_parents], float)
 
 # --- I/O AND SEED SELECTION ---
-def write_fir_groups(parent_group, all_results, match_dtype='float32'):
+def write_fir_groups(parent_hdf_group, all_results, match_dtype='float32'):
+    """Write FIR tap tables and metadata datasets into HDF5 group."""
     groups = defaultdict(list)
     for i, r in enumerate(all_results):
-        if r is not None and r[1] >= 0:
-            groups[r[1]].append(r + (i,))
+        if r is not None and r[1] >= 0: groups[r[1]].append(r + (i,))
     comp = dict(shuffle=True, compression='gzip', compression_opts=9)
     tap_counts = []
-    for p, rows in groups.items():
-        grp = parent_group.create_group(str(p))
+
+    for parent_idx, rows in groups.items():
+        grp = parent_hdf_group.create_group(str(parent_idx))
         counts = np.array([len(r[3]) for r in rows], dtype=np.int32)
         max_k = int(counts.max())
-        taps = np.zeros((len(rows), max_k), dtype=np.float32)
-        for j, r in enumerate(rows): taps[j, :counts[j]] = r[3]
-        grp.create_dataset('taps', data=taps, chunks=(len(rows), max_k), **comp)
+        taps_array = np.zeros((len(rows), max_k), dtype=np.float32)
+        for j, r in enumerate(rows): taps_array[j, :counts[j]] = r[3]
+        grp.create_dataset('taps', data=taps_array, chunks=(len(rows), max_k), **comp)
         metrics = np.array([r[6] for r in rows], dtype=np.float32)
-        for name, data, dt in (
-            ('actual_tap_count', counts, 'int32'),
-            ('fine_bank_index', [r[-1] for r in rows], 'int32'),
-            ('filter_match', [r[2] for r in rows], match_dtype),
-            ('coarse_match', [r[0] for r in rows], 'float32'),
-            ('sigmas', [r[4] for r in rows], 'float32'),
-            ('sample_shift', [r[5] for r in rows], 'int32'),
-            ('max_tap', metrics[:, 0], 'float32'),
-            ('oob_gain', metrics[:, 1], 'float32'),
-            ('noise_gain', metrics[:, 2], 'float32'),
+
+        for name, data, dtype in (
+            ('actual_tap_count', counts, 'int32'), ('fine_bank_index', [r[-1] for r in rows], 'int32'),
+            ('filter_match', [r[2] for r in rows], match_dtype), ('coarse_match', [r[0] for r in rows], 'float32'),
+            ('sigmas', [r[4] for r in rows], 'float32'), ('sample_shift', [r[5] for r in rows], 'int32'),
+            ('max_tap', metrics[:, 0], 'float32'), ('oob_gain', metrics[:, 1], 'float32'), ('noise_gain', metrics[:, 2], 'float32'),
         ):
-            grp.create_dataset(name, data=np.asarray(data, dtype=dt), chunks=True, **comp)
+            grp.create_dataset(name, data=np.asarray(data, dtype=dtype), chunks=True, **comp)
         tap_counts.append(counts)
     return np.concatenate(tap_counts) if tap_counts else np.array([], dtype=int)
 
-def write_seed_bank(src_path, indices, dst_path, force=False, correction_coeffs=None):
-    indices = np.asarray(indices, dtype=int)
+def write_seed_bank(src_path, seed_indices, dst_path, force=False, correction_coeffs=None):
+    """Write seed bank subset to HDF5 file with source provenance tracking."""
+    seed_indices = np.asarray(seed_indices, dtype=int)
     if os.path.exists(dst_path) and not force:
         raise ValueError(f'{dst_path} exists; refusing to overwrite (use --force)')
     with h5py.File(src_path, 'r') as src, h5py.File(dst_path, 'w') as dst:
-        n = len(src['tau0']) if 'tau0' in src else None
-        for key in src:
-            obj = src[key]
-            if isinstance(obj, h5py.Dataset) and key not in ('template_hash', 'seed_source_index', 'correction_coeffs') and obj.shape and obj.shape[0] == n:
-                dst.create_dataset(key, data=obj[:][indices])
-        for key, value in src.attrs.items(): dst.attrs[key] = value
+        n_templates = len(src['tau0']) if 'tau0' in src else None
+        skip = {'template_hash', 'seed_source_index', 'correction_coeffs'}
+        for key, obj in src.items():
+            if isinstance(obj, h5py.Dataset) and key not in skip and obj.shape and obj.shape[0] == n_templates:
+                dst.create_dataset(key, data=obj[:][seed_indices])
+        dst.attrs.update(src.attrs)
         dst.attrs['seed_source_bank'] = os.path.abspath(src_path)
-        dst.attrs['seed_source_sha256'] = file_sha256(src_path)
-        dst.create_dataset('seed_source_index', data=indices.astype(np.int64))
+        dst.attrs['seed_source_sha256'] = compute_file_sha256(src_path)
+        dst.create_dataset('seed_source_index', data=seed_indices.astype(np.int64))
         if correction_coeffs is not None:
             dst.create_dataset('correction_coeffs', data=np.asarray(correction_coeffs, float))
         elif 'correction_coeffs' in src:
-            dst.create_dataset('correction_coeffs', data=src['correction_coeffs'][:][indices])
-    logging.info('Wrote %d seeds to %s', len(indices), dst_path)
+            dst.create_dataset('correction_coeffs', data=src['correction_coeffs'][:][seed_indices])
+    logging.info('Wrote %d seeds to %s', len(seed_indices), dst_path)
 
-def file_sha256(path):
-    with open(path, 'rb') as f:
-        return hashlib.file_digest(f, 'sha256').hexdigest()
+def compute_file_sha256(file_path):
+    with open(file_path, 'rb') as f: return hashlib.file_digest(f, 'sha256').hexdigest()
 
-def _seed_cluster(sel):
-    tau0, n = g_coarse_tau0, len(g_coarse_np)
-    rng = np.random.default_rng(sel['rng_seed'])
-    k_tgt = sel['target_taps'] if sel['target_taps'] % 2 else sel['target_taps'] - 1
-    k_abs = sel['absorb_taps'] if sel['absorb_taps'] % 2 else sel['absorb_taps'] - 1
-    def fits(s, c, k):
-        p = _build_problem(s, g_coarse_np[c])
-        return False if p is None else _evaluate(p, k, g_coarse_np[c], g_coarse_ss[c])[0]
-    def direct(s, c):
-        m, _ = match(g_coarse_waveforms[c], g_coarse_waveforms[s], psd=g_psd, low_frequency_cutoff=g_args.f_low,
-                     v1_norm=g_coarse_sigmasq[c], v2_norm=g_coarse_sigmasq[s])
+def cluster_seeds_by_filter_match(target_taps, dtau_max, direct_min, density_window, min_group_size, rng_seed):
+    """Cluster waveforms via tau0 density and FIR filter feasibility."""
+    tau0 = g_coarse_tau0
+    rng = np.random.default_rng(rng_seed)
+    k_target = target_taps if target_taps % 2 else target_taps - 1
+    k_absorb = g_args.max_taps if g_args.max_taps % 2 else g_args.max_taps - 1
+
+    def can_filter_fit(seed_idx, cand_idx, tap_count):
+        prob = build_fit_problem(seed_idx, g_coarse_waveforms_np[cand_idx])
+        return False if prob is None else evaluate_filter_fit(prob, tap_count, g_coarse_waveforms_np[cand_idx], g_coarse_norm_sq[cand_idx])[0]
+
+    def compute_direct_match(seed_idx, cand_idx):
+        m, _ = match(g_coarse_waveforms[cand_idx], g_coarse_waveforms[seed_idx], psd=g_psd, low_frequency_cutoff=g_args.f_low,
+                     v1_norm=g_coarse_norm_sq[cand_idx] * 4.0 * g_delta_f, v2_norm=g_coarse_norm_sq[seed_idx] * 4.0 * g_delta_f)
         return float(m)
-    def grow(s, pool):
-        return [s] + [int(c) for c in pool if int(c) != s and abs(tau0[int(c)] - tau0[s]) <= sel['dtau_max']
-                      and (sel['direct_min'] <= 0 or direct(s, int(c)) >= sel['direct_min']) and fits(s, int(c), k_tgt)]
-    unassigned, clusters = set(range(n)), []
+
+    def grow_cluster(seed_idx, candidate_pool):
+        return [seed_idx] + [int(c) for c in candidate_pool if int(c) != seed_idx
+                             and abs(tau0[int(c)] - tau0[seed_idx]) <= dtau_max
+                             and (direct_min <= 0 or compute_direct_match(seed_idx, int(c)) >= direct_min)
+                             and can_filter_fit(seed_idx, int(c), k_target)]
+
+    unassigned, clusters = set(range(len(g_coarse_waveforms_np))), []
     while unassigned:
-        ul = np.fromiter(unassigned, int, len(unassigned))
-        t = tau0[ul]
-        sample = rng.choice(len(ul), size=100, replace=False) if len(ul) > 200 else np.arange(len(ul))
-        dens = [np.sum(np.abs(t - t[j]) < sel['density_window']) for j in sample]
-        seed = int(ul[sample[int(np.argmax(dens))]])
-        members = grow(seed, ul)
-        if sel['medoid'] and len(members) > 2:
-            mt = tau0[members]
-            medoid = int(members[int(np.argmin(np.abs(mt[:, None] - mt[None, :]).sum(axis=1)))])
-            if medoid != seed:
-                alt = grow(medoid, ul)
-                if len(alt) >= len(members): seed, members = medoid, alt
+        unassigned_array = np.fromiter(unassigned, int, len(unassigned))
+        t_unassigned = tau0[unassigned_array]
+        sample_indices = rng.choice(len(unassigned_array), size=100, replace=False) if len(unassigned_array) > 200 else np.arange(len(unassigned_array))
+        densities = [np.sum(np.abs(t_unassigned - t_unassigned[j]) < density_window) for j in sample_indices]
+        seed = int(unassigned_array[sample_indices[int(np.argmax(densities))]])
+
+        members = grow_cluster(seed, unassigned_array)
+        if len(members) > 2:
+            tau0_members = tau0[members]
+            medoid_idx = int(members[np.argmin(np.abs(tau0_members - np.median(tau0_members)))])
+            if medoid_idx != seed:
+                alt_members = grow_cluster(medoid_idx, unassigned_array)
+                if len(alt_members) >= len(members): seed, members = medoid_idx, alt_members
+
         unassigned.difference_update(members)
         clusters.append((seed, members))
-    if sel['min_group_size'] > 1:
-        large = [c for c in clusters if len(c[1]) >= sel['min_group_size']]
-        large_seeds = np.array([c[0] for c in large], dtype=int)
-        kept = list(large)
+
+    if min_group_size > 1:
+        large_clusters = [c for c in clusters if len(c[1]) >= min_group_size]
+        large_seeds = np.array([c[0] for c in large_clusters], dtype=int)
+        retained = list(large_clusters)
         for seed, members in clusters:
-            if len(members) >= sel['min_group_size']: continue
-            absorbed = len(large_seeds) > 0
+            if len(members) >= min_group_size: continue
+            is_absorbed = len(large_seeds) > 0
             for m in members:
-                if not absorbed: break
-                near = large_seeds[np.argsort(np.abs(tau0[large_seeds] - tau0[m]))][:sel['absorb_depth']]
-                absorbed = any(fits(int(s2), m, k_abs) for s2 in near if abs(tau0[s2] - tau0[m]) <= 1.5 * sel['dtau_max'])
-            if not absorbed: kept.append((seed, members))
-        clusters = kept
+                if not is_absorbed: break
+                nearby_seeds = large_seeds[np.argsort(np.abs(tau0[large_seeds] - tau0[m]))][:5]
+                is_absorbed = any(can_filter_fit(int(s2), m, k_absorb) for s2 in nearby_seeds if abs(tau0[s2] - tau0[m]) <= 1.5 * dtau_max)
+            if not is_absorbed: retained.append((seed, members))
+        clusters = retained
+
     return sorted(c[0] for c in clusters)
 
-g_seed_source = None
-def _seed_chunk(task):
-    chunk_id, indices, tau0 = task
-    bank, psd, ns, sel = g_seed_source
-    ns = argparse.Namespace(**vars(ns))
-    ns._coarse_tau0 = np.asarray(tau0, float); ns._fine_tau0 = None
-    init_worker([bank[int(i)].copy() for i in indices], None, psd, ns)
-    return [int(indices[s]) for s in _seed_cluster(dict(sel, rng_seed=sel['rng_seed'] + chunk_id))]
+g_seed_source_context = None
+def _seed_clustering_worker(task):
+    chunk_id, indices, tau0_chunk = task
+    bank, psd, args_ns, seed_params = g_seed_source_context
+    worker_args = argparse.Namespace(**vars(args_ns))
+    worker_args._coarse_tau0 = np.asarray(tau0_chunk, float); worker_args._fine_tau0 = None
+    init_worker([bank[int(i)].copy() for i in indices], None, psd, worker_args)
+    return [int(indices[s]) for s in cluster_seeds_by_filter_match(*seed_params[:5], seed_params[5] + chunk_id)]
 
-def select_seeds(bank, psd, ns, sel, candidates, n_chunks, n_processes, desc):
-    global g_seed_source
+def select_bank_seeds(bank, psd, args, seed_params, candidate_indices, n_processes, desc):
+    """Partition bank into tau0 chunks and select seeds via parallel clustering."""
+    global g_seed_source_context
     tau0_all = np.array(bank.table['tau0'], float)
-    order = np.asarray(candidates, int)[np.argsort(tau0_all[np.asarray(candidates, int)], kind='stable')]
-    chunks = [c for c in np.array_split(order, max(1, n_chunks)) if len(c)]
-    g_seed_source = (bank, psd, ns, sel)
-    seeds = []
+    order = np.asarray(candidate_indices, int)[np.argsort(tau0_all[np.asarray(candidate_indices, int)], kind='stable')]
+    chunks = [c for c in np.array_split(order, max(1, n_processes)) if len(c)]
+    g_seed_source_context = (bank, psd, args, seed_params)
+    selected_seeds = []
     with mp.Pool(processes=max(1, min(n_processes, len(chunks)))) as pool:
-        for s in tqdm(pool.imap_unordered(_seed_chunk, [(cid, c, tau0_all[c]) for cid, c in enumerate(chunks)]),
-                      total=len(chunks), desc=desc, disable=bool(ns.verbose), file=sys.stderr):
-            seeds.extend(s)
-    g_seed_source = None
-    return np.array(sorted(seeds), int)
+        tasks = [(chunk_id, chunk, tau0_all[chunk]) for chunk_id, chunk in enumerate(chunks)]
+        for chunk_seeds in tqdm(pool.imap_unordered(_seed_clustering_worker, tasks), total=len(chunks), desc=desc, disable=bool(args.verbose), file=sys.stderr):
+            selected_seeds.extend(chunk_seeds)
+    g_seed_source_context = None
+    return np.array(sorted(selected_seeds), int)
 
-def upper_psd_from_cli(args):
-    df = args.upper_delta_f or args.delta_f
-    flen = int((args.sample_rate / 2.0) / df) + 1
-    p = argparse.Namespace(**vars(args)); p.delta_f = df
-    return df, flen, pycbc.psd.from_cli(p, length=flen, delta_f=df, low_frequency_cutoff=args.f_low)
-
+# --- CLI PARSER ---
 def parse_cli():
-    p = argparse.ArgumentParser(description="Generate Optimized FIR Filter Bank (MP)")
-    pycbc.add_common_pycbc_options(p)
-    pycbc.psd.insert_psd_option_group(p)
-    for opt, kwargs in [
-        ('--fine-bank', dict(required=True)), ('--output-file', dict(required=True)),
-        ('--delta-f', dict(type=float, required=True)), ('--f-low', dict(type=float, default=20.0)),
-        ('--sample-rate', dict(type=float, default=2048.0)), ('--coarse-bank', {}),
-        ('--coarse-bank-output', {}), ('--top-bank', {}), ('--top-bank-output', {}),
-        ('--two-level', dict(action='store_true')), ('--n-processes', dict(type=int, default=1)),
-        ('--force', dict(action='store_true')), ('--n-taps', dict(type=int, default=251)),
-        ('--max-taps', dict(type=int, default=1025)), ('--tap-step', dict(type=int, default=100)),
-        ('--min-match', dict(type=float, default=0.99)), ('--search-depth', dict(type=int, default=25)),
-        ('--regularization-magnitude', dict(type=float, default=1e-2)),
-        ('--fit-weight-power', dict(type=float, default=0.5)),
-        ('--tap-search', dict(choices=('bisect', 'ladder'), default='bisect')),
-        ('--tap-granularity', dict(type=int, default=8)), ('--min-taps', dict(type=int, default=15)),
-        ('--parent-refine', dict(type=int, default=3)),
-        ('--parent-selection', dict(choices=('min-taps', 'direct-match'), default='min-taps')),
-        ('--decimation-factor', dict(default=1, type=int, dest='dec_factor')),
-        ('--ratio-cap', dict(default=1000, type=int)), ('--max-tap-value', dict(default=1e5, type=float)),
-        ('--max-noise-gain', dict(type=float, default=None)), ('--peak-cap-factor', dict(default=0.0, type=float)),
-        ('--peak-bad-weight-fraction', dict(default=1.0, type=float)), ('--peak-max-passes', dict(default=3, type=int)),
-        ('--peak-cap-mode', dict(choices=('inband', 'median'), default='inband')),
-        ('--seed-target-taps', dict(type=int, default=501)), ('--seed-dtau-max', dict(type=float, default=3.5)),
-        ('--seed-direct-match-min', dict(type=float, default=0.28)), ('--seed-density-window', dict(type=float, default=1.0)),
-        ('--min-group-size', dict(type=int, default=24)), ('--seed-chunks', dict(type=int)),
-        ('--no-seed-medoid', dict(action='store_true')), ('--no-prune-seeds', dict(action='store_false', dest='prune_seeds')),
-        ('--prune-max-tap-growth', dict(type=float, default=None)), ('--no-merge-groups', dict(action='store_false', dest='merge_groups')),
-        ('--optimize-parents', dict(action='store_true', default=True)),
-        ('--no-optimize-parents', dict(action='store_false', dest='optimize_parents')),
-        ('--merge-neighbours', dict(type=int, default=3)), ('--merge-candidates', dict(type=int, default=16)),
-        ('--merge-max-group-size', dict(type=int, default=140)), ('--merge-gn-min-pass-frac', dict(type=float, default=0.5)),
-        ('--merge-gn-screen', dict(type=float, default=30.0)), ('--enable-tap-centering', dict(action='store_true', default=True)),
-        ('--disable-tap-centering', dict(action='store_false', dest='enable_tap_centering')),
-        ('--upper-delta-f', dict(type=float)), ('--upper-min-match', dict(type=float)),
-        ('--upper-n-taps', dict(type=int)), ('--upper-max-taps', dict(type=int)),
-        ('--upper-tap-step', dict(type=int)), ('--upper-search-depth', dict(type=int)),
-        ('--upper-regularization-magnitude', dict(type=float)), ('--upper-seed-target-taps', dict(type=int)),
-        ('--upper-seed-dtau-max', dict(type=float, default=15.0)), ('--upper-seed-direct-match-min', dict(type=float, default=0.10)),
-        ('--upper-seed-density-window', dict(type=float, default=3.0)), ('--upper-min-group-size', dict(type=int, default=1)),
-        ('--store-compressed-top-waveforms', dict(action='store_true', default=True)),
-        ('--compressed-top-waveforms-tolerance', dict(type=float, default=1e-5)),
-        ('--compressed-top-waveforms-interpolation', dict(default='inline_quadratic')),
-    ]:
-        names = [opt] if isinstance(opt, str) else list(opt)
-        if opt == '--n-processes': names.append('-n')
-        p.add_argument(*names, **kwargs)
-    for opt in ('--no-optimize-middle', '--no-optimize-top'): p.add_argument(opt, action='store_false', dest='optimize_parents', help=argparse.SUPPRESS)
-    for opt in ('--optimize-middle', '--optimize-top'): p.add_argument(opt, action='store_true', dest='optimize_parents', help=argparse.SUPPRESS)
-    for opt in ('--fit-solver', '--upper-fit-solver'): p.add_argument(opt, choices=('toeplitz',), default='toeplitz', help=argparse.SUPPRESS)
-    for opt in ('--lsqr-atol', '--lsqr-iter-lim', '--upper-lsqr-atol', '--upper-lsqr-iter-lim'): p.add_argument(opt, type=float, help=argparse.SUPPRESS)
-    return p.parse_args()
+    """Parse command line arguments for essential parameters."""
+    parser = argparse.ArgumentParser(description="Generate Optimized Hierarchical FIR Filter Bank")
+    pycbc.add_common_pycbc_options(parser)
+    pycbc.psd.insert_psd_option_group(parser)
 
-def run_level(child_path, parent_path, parent_out_path, flen, df, psd, ns,
-              child_indices=None, label='middle', seed_opts=None, n_seed_chunks=1):
-    seed_src = None
-    if parent_path is None:
-        logging.info("Bottom-up seeding: choosing %s templates...", label)
-        c_bank = FilterBank(child_path, flen, df, dtype=complex, enable_compressed_waveforms=False)
-        cands = np.arange(len(c_bank)) if child_indices is None else child_indices
-        seeds = select_seeds(c_bank, psd, ns, seed_opts, cands, n_seed_chunks, ns.n_processes, f"Seeding {label} level")
-        write_seed_bank(child_path, seeds, parent_out_path, force=ns.force)
-        parent_path, seed_src = parent_out_path, seeds
-        del c_bank
+    # File I/O
+    parser.add_argument('--fine-bank', required=True, help="Input fine template bank HDF5 file.")
+    parser.add_argument('--output-file', required=True, help="Output FIR filter bank HDF5 file.")
+    parser.add_argument('--delta-f', type=float, required=True, help="Frequency resolution in Hz.")
+    parser.add_argument('--f-low', type=float, default=20.0, help="Low-frequency cutoff in Hz (default: 20).")
+    parser.add_argument('--sample-rate', type=float, default=2048.0, help="Sampling rate in Hz (default: 2048).")
+    parser.add_argument('--n-processes', '-n', type=int, default=1, help="Number of worker processes (default: 1).")
+    parser.add_argument('--two-level', action='store_true', help="Generate 2-level bank instead of 3-level.")
+    parser.add_argument('--force', action='store_true', help="Overwrite existing output files.")
 
-    parent_bank = FilterBank(parent_path, flen, df, dtype=complex, enable_compressed_waveforms=False)
+    # Primary filter parameters
+    parser.add_argument('--min-match', type=float, default=0.9999, help="Minimum filter match threshold (default: 0.9999).")
+    parser.add_argument('--max-taps', type=int, default=501, help="Maximum allowed tap count for middle level (default: 501).")
+    parser.add_argument('--upper-max-taps', type=int, default=6001, help="Maximum allowed tap count for top level (default: 6001).")
+    return parser.parse_args()
+
+# --- PIPELINE LEVEL RUNNER ---
+def run_hierarchy_level(child_path, parent_seed_path, freq_len, delta_f, psd, args,
+                        child_indices=None, label='middle', seed_params=None):
+    """Run seeding, template fitting, pruning, and consolidation for a single level."""
+    logging.info("Bottom-up seeding: selecting %s templates...", label)
+    child_bank = FilterBank(child_path, freq_len, delta_f, dtype=complex, enable_compressed_waveforms=False)
+    candidates = np.arange(len(child_bank)) if child_indices is None else child_indices
+    seed_source_indices = select_bank_seeds(child_bank, psd, args, seed_params, candidates, args.n_processes, f"Seeding {label} level")
+    write_seed_bank(child_path, seed_source_indices, parent_seed_path, force=True)
+
+    parent_bank = FilterBank(parent_seed_path, freq_len, delta_f, dtype=complex, enable_compressed_waveforms=False)
     parent_waveforms = [h.copy() for h in parent_bank]
-    child_bank = FilterBank(child_path, flen, df, dtype=complex, enable_compressed_waveforms=False)
     indices = list(range(len(child_bank))) if child_indices is None else list(child_indices)
-    ns._coarse_tau0 = np.array(parent_bank.table['tau0'], float) if hasattr(parent_bank, 'table') and 'tau0' in parent_bank.table.dtype.names else None
-    ns._fine_tau0 = np.array(child_bank.table['tau0'], float) if hasattr(child_bank, 'table') and 'tau0' in child_bank.table.dtype.names else None
+    args._coarse_tau0 = np.array(parent_bank.table['tau0'], float) if hasattr(parent_bank, 'table') and 'tau0' in parent_bank.table.dtype.names else None
+    args._fine_tau0 = np.array(child_bank.table['tau0'], float) if hasattr(child_bank, 'table') and 'tau0' in child_bank.table.dtype.names else None
 
     results, failed_count = [None] * len(child_bank), 0
-    with mp.Pool(processes=ns.n_processes, initializer=init_worker, initargs=(parent_waveforms, child_bank, psd, ns)) as pool:
+    with mp.Pool(processes=args.n_processes, initializer=init_worker, initargs=(parent_waveforms, child_bank, psd, args)) as pool:
         it = pool.imap_unordered(process_template, indices, chunksize=8)
-        if not ns.verbose: it = tqdm(it, total=len(indices), desc=f"Fitting {label} level", postfix={"failed": 0}, file=sys.stderr)
+        if not args.verbose:
+            it = tqdm(it, total=len(indices), desc=f"Fitting {label} level", postfix={"failed": 0}, file=sys.stderr)
         for res in it:
-            i, parent_match, parent_idx, m, taps, sigmas, shift, metrics, accepted = res
-            results[i] = (parent_match, parent_idx, m, taps, sigmas, shift, metrics)
+            fine_idx, parent_match, parent_idx, match_val, taps, sigmas, shift, metrics, accepted = res
+            results[fine_idx] = (parent_match, parent_idx, match_val, taps, sigmas, shift, metrics)
             if not accepted: failed_count += 1
-            if not ns.verbose: it.set_postfix(failed=failed_count)
+            if not args.verbose: it.set_postfix(failed=failed_count)
 
-        if ns.prune_seeds and not failed_count:
+        if not failed_count:
             n_used = len({r[1] for r in results if r is not None and r[1] >= 0})
-            removed = prune_parents(pool, results, ns.n_processes, ns.prune_max_tap_growth, label=label)
+            removed = prune_redundant_parents(pool, results, args.n_processes, label=label)
             logging.info('Seed pruning: %d -> %d %s templates in use', n_used, n_used - len(removed), label)
-
-        if seed_src is not None and not failed_count:
-            results, used_src, corrections = consolidate_parents(pool, results, seed_src, child_bank, ns, label)
+            results, used_indices, corrections = consolidate_hierarchy_level(pool, results, seed_source_indices, child_bank, args, label)
             if getattr(parent_bank, 'file', None): parent_bank.file.close()
-            write_seed_bank(child_path, used_src, parent_path, force=True, correction_coeffs=corrections)
-            parent_bank = FilterBank(parent_path, flen, df, dtype=complex, enable_compressed_waveforms=False)
+            write_seed_bank(child_path, used_indices, parent_seed_path, force=True, correction_coeffs=corrections)
+            parent_bank = FilterBank(parent_seed_path, freq_len, delta_f, dtype=complex, enable_compressed_waveforms=False)
             parent_waveforms = [h.copy() for h in parent_bank]
 
-    return results, parent_bank, parent_waveforms, parent_path, failed_count
+    return results, parent_bank, parent_waveforms, failed_count
 
+# --- MAIN PIPELINE ---
 def main():
     args = parse_cli()
+    args.n_taps = snap_tap_count(args.max_taps // 2)
+    args.regularization_magnitude = 1e-2
     global g_args; g_args = args
-    build_top = (args.top_bank is None and not args.two_level) if (args.coarse_bank is not None and args.top_bank is None and args.top_bank_output is None) is False else False
-    three_level = args.top_bank is not None or build_top
-    if args.coarse_bank is None and args.coarse_bank_output is None:
-        args.coarse_bank_output = args.output_file + '.middle_seeds.tmp.hdf'
-    if build_top and args.top_bank_output is None:
-        args.top_bank_output = args.output_file + '.top_seeds.tmp.hdf'
-    for path in (args.coarse_bank_output, args.top_bank_output, args.output_file):
-        if path is not None and os.path.exists(path) and not args.force:
-            sys.exit(f'Error: {path} exists; refusing to overwrite (use --force)')
-    if three_level:
-        for k, v in dict(upper_delta_f=args.delta_f / 16.0, upper_n_taps=3001, upper_max_taps=6001, upper_tap_step=1000,
-                         upper_min_match=1.0 - (1.0 - args.min_match) / 10.0, upper_regularization_magnitude=1e-6).items():
-            if getattr(args, k) is None: setattr(args, k, v)
+
+    if os.path.exists(args.output_file) and not args.force:
+        sys.exit(f'Error: {args.output_file} exists; refusing to overwrite (use --force)')
+
     pycbc.init_logging(args.verbose)
     log = logging.getLogger()
     if args.verbose > 0 and log.handlers and isinstance(log.handlers[0], logging.StreamHandler):
@@ -745,80 +725,98 @@ def main():
 
     fine_bank = FilterBank(args.fine_bank, flen, args.delta_f, dtype=complex, enable_compressed_waveforms=False)
     n_fine = len(fine_bank)
-    f_out = fine_bank.write_to_hdf(args.output_file, force=True, write_compressed_waveforms=True)
-    fir_group = f_out.require_group("fir_data")
-    for arg, val in vars(args).items():
-        if val is not None and isinstance(val, (int, float, str)): fir_group.attrs[arg] = val
+    out_file = fine_bank.write_to_hdf(args.output_file, force=True, write_compressed_waveforms=True)
+    fir_group = out_file.require_group("fir_data")
+    for arg_name, arg_val in vars(args).items():
+        if arg_val is not None and isinstance(arg_val, (int, float, str)): fir_group.attrs[arg_name] = arg_val
 
-    sel_mid = dict(target_taps=args.seed_target_taps or args.n_taps, dtau_max=args.seed_dtau_max,
-                   direct_min=args.seed_direct_match_min, density_window=args.seed_density_window,
-                   min_group_size=args.min_group_size, absorb_taps=args.max_taps, absorb_depth=5,
-                   medoid=not args.no_seed_medoid, rng_seed=12345)
-    all_results, coarse_bank, _, args.coarse_bank, failed_count = run_level(
-        args.fine_bank, args.coarse_bank, args.coarse_bank_output, flen, args.delta_f, psd, args,
-        label='middle', seed_opts=sel_mid, n_seed_chunks=args.seed_chunks or args.n_processes)
+    mid_seed_path = args.output_file + '.mid.tmp.hdf'
+    top_seed_path = args.output_file + '.top.tmp.hdf'
 
-    coarse_bank.write_to_hdf(args.output_file, file_handler=f_out, group_key="fir_data/coarse_bank_params", write_compressed_waveforms=True)
-    tap_counts = write_fir_groups(fir_group, all_results)
+    try:
+        # Level 1: Fine -> Middle
+        seed_params_mid = (args.max_taps, 3.5, 0.28, 1.0, 24, 12345)
+        all_results, coarse_bank, _, failed_count = run_hierarchy_level(
+            args.fine_bank, mid_seed_path, flen, args.delta_f, psd, args,
+            label='middle', seed_params=seed_params_mid)
 
-    if three_level:
-        if failed_count: raise ValueError(f'{failed_count} lower-level FIR fits failed; refusing hierarchy')
-        used_middles = sorted({row[1] for row in all_results if row is not None and row[1] >= 0})
-        upper_df, upper_flen, upper_psd = upper_psd_from_cli(args)
-        upper_ns = argparse.Namespace(**vars(args))
-        upper_ns.delta_f = upper_df
-        for k in ('n_taps', 'max_taps', 'tap_step', 'min_match', 'search_depth', 'regularization_magnitude'):
-            if getattr(args, 'upper_' + k) is not None: setattr(upper_ns, k, getattr(args, 'upper_' + k))
+        coarse_bank.write_to_hdf(args.output_file, file_handler=out_file, group_key="fir_data/coarse_bank_params", write_compressed_waveforms=True)
+        tap_counts = write_fir_groups(fir_group, all_results)
 
-        sel_top = dict(target_taps=args.upper_seed_target_taps or upper_ns.n_taps, dtau_max=args.upper_seed_dtau_max,
-                       direct_min=args.upper_seed_direct_match_min, density_window=args.upper_seed_density_window,
-                       min_group_size=args.upper_min_group_size, absorb_taps=upper_ns.max_taps, absorb_depth=5,
-                       medoid=not args.no_seed_medoid, rng_seed=12345)
-        upper_results, top_bank, top_waveforms, args.top_bank, _ = run_level(
-            args.coarse_bank, args.top_bank, args.top_bank_output, upper_flen, upper_df, upper_psd, upper_ns,
-            child_indices=used_middles, label='top', seed_opts=sel_top, n_seed_chunks=1)
+        if not args.two_level:
+            if failed_count: raise ValueError(f'{failed_count} lower-level FIR fits failed; refusing hierarchy generation')
+            used_middles = sorted({row[1] for row in all_results if row is not None and row[1] >= 0})
+            upper_df = args.delta_f / 16.0
+            upper_flen = int((args.sample_rate / 2.0) / upper_df) + 1
+            upper_psd_args = argparse.Namespace(**vars(args)); upper_psd_args.delta_f = upper_df
+            upper_psd = pycbc.psd.from_cli(upper_psd_args, length=upper_flen, delta_f=upper_df, low_frequency_cutoff=args.f_low)
 
-        top_bank.ensure_hash()
-        top_bank.write_to_hdf(args.output_file, file_handler=f_out, group_key='fir_data/upper/top_bank_params', write_compressed_waveforms=True)
-        if getattr(args, 'store_compressed_top_waveforms', True):
+            upper_args = argparse.Namespace(**vars(args))
+            upper_args.delta_f = upper_df
+            upper_args.n_taps = snap_tap_count(args.upper_max_taps // 2)
+            upper_args.max_taps = args.upper_max_taps
+            upper_args.min_match = 1.0 - (1.0 - args.min_match) / 10.0
+            upper_args.regularization_magnitude = 1e-6
+
+            # Level 2: Middle -> Top
+            seed_params_top = (upper_args.n_taps, 15.0, 0.10, 3.0, 1, 12345)
+            upper_results, top_bank, top_waveforms, _ = run_hierarchy_level(
+                mid_seed_path, top_seed_path, upper_flen, upper_df, upper_psd, upper_args,
+                child_indices=used_middles, label='top', seed_params=seed_params_top)
+
+            top_bank.ensure_hash()
+            top_bank.write_to_hdf(args.output_file, file_handler=out_file, group_key='fir_data/upper/top_bank_params', write_compressed_waveforms=True)
+
             logging.info(f"Compressing {len(top_bank)} top waveforms...")
-            top_grp = f_out.require_group('fir_data/upper/top_bank_params')
-            if 'template_hash' not in top_grp: top_grp.create_dataset('template_hash', data=top_bank.table.template_hash)
-            else: top_grp['template_hash'][:] = top_bank.table.template_hash
+            top_grp = out_file.require_group('fir_data/upper/top_bank_params')
+            if 'template_hash' not in top_grp:
+                top_grp.create_dataset('template_hash', data=top_bank.table.template_hash)
+            else:
+                top_grp['template_hash'][:] = top_bank.table.template_hash
             if 'compressed_waveforms' in top_grp: del top_grp['compressed_waveforms']
+
             for i in range(len(top_bank)):
-                h, tmplt = top_waveforms[i], top_bank.table[i]
-                thash, fmin, kmax = str(tmplt.template_hash), float(getattr(tmplt, 'f_lower', args.f_low)), int(np.nonzero(abs(h.numpy()))[0][-1])
-                hc = compress.compress_waveform(h, np.array([fmin, kmax * upper_df], float), args.compressed_top_waveforms_tolerance,
-                                               getattr(args, 'compressed_top_waveforms_interpolation', 'inline_quadratic'), 'single', psd=None)
+                wave, tmplt = top_waveforms[i], top_bank.table[i]
+                thash, fmin, kmax = str(tmplt.template_hash), float(getattr(tmplt, 'f_lower', args.f_low)), int(np.nonzero(abs(wave.numpy()))[0][-1])
+                hc = compress.compress_waveform(wave, np.array([fmin, kmax * upper_df], float), 1e-5, 'inline_quadratic', 'single', psd=None)
                 hc.write_to_hdf(top_grp, thash)
                 logging.info(f"Compressed top {i + 1}/{len(top_bank)} (hash={thash}, points={len(hc.sample_points)}, mismatch={hc.mismatch:.2e})")
 
-        up_grp = f_out.require_group('fir_data/upper')
-        for name in ('sample_rate', 'delta_f', 'n_taps', 'max_taps', 'tap_step', 'min_match', 'search_depth', 'regularization_magnitude',
-                     'fit_weight_power', 'tap_search', 'tap_granularity', 'min_taps', 'parent_selection', 'parent_refine'):
-            up_grp.attrs[name] = getattr(upper_ns, name)
-        up_grp.attrs['fit_solver'] = 'toeplitz'
-        up_grp.attrs['sample_shift_folded_into_lower'] = 1
-        write_fir_groups(up_grp, upper_results, match_dtype='float64')
-        fir_group.attrs['hierarchy_version'] = 2
-        for name, path in (('top', args.top_bank), ('middle', args.coarse_bank), ('fine', args.fine_bank)):
-            fir_group.attrs[name + '_bank_sha256'] = file_sha256(path)
-        for c_idx, u_row in enumerate(upper_results):
-            if u_row is not None and len(u_row) > 5 and u_row[5] != 0 and str(c_idx) in fir_group and 'sample_shift' in fir_group[str(c_idx)]:
-                fir_group[str(c_idx)]['sample_shift'][:] += u_row[5]
+            upper_group = out_file.require_group('fir_data/upper')
+            for name in ('sample_rate', 'delta_f', 'n_taps', 'max_taps', 'min_match'):
+                upper_group.attrs[name] = getattr(upper_args, name)
+            upper_group.attrs['fit_solver'] = 'toeplitz'
+            upper_group.attrs['sample_shift_folded_into_lower'] = 1
 
-    f_out.close()
-    logging.info(f"Done. Saved to {args.output_file}")
+            write_fir_groups(upper_group, upper_results, match_dtype='float64')
+            fir_group.attrs['hierarchy_version'] = 2
+            fir_group.attrs['fine_bank_sha256'] = compute_file_sha256(args.fine_bank)
+            fir_group.attrs['middle_bank_sha256'] = compute_file_sha256(mid_seed_path)
+            fir_group.attrs['top_bank_sha256'] = compute_file_sha256(top_seed_path)
+
+            for c_idx, u_row in enumerate(upper_results):
+                if u_row is not None and len(u_row) > 5 and u_row[5] != 0 and str(c_idx) in fir_group and 'sample_shift' in fir_group[str(c_idx)]:
+                    fir_group[str(c_idx)]['sample_shift'][:] += u_row[5]
+
+        out_file.close()
+        logging.info(f"Done. Saved to {args.output_file}")
+    finally:
+        for p in (mid_seed_path, top_seed_path):
+            if os.path.exists(p): os.remove(p)
+
     all_metrics = [r[6] for r in all_results if r is not None and len(r) > 6 and r[6] is not None]
     tap_arr = np.asarray(tap_counts) if len(tap_counts) else np.array([0])
-    logging.info(f"Summary: {failed_count}/{n_fine} failed (match >= {args.min_match}).\n"
-                 f"Taps: mean={tap_arr.mean():.1f} median={np.median(tap_arr):.0f} min={tap_arr.min()} max={tap_arr.max()}\n"
-                 + ("\n".join([f"{name:<12} p50={np.percentile([m[idx] for m in all_metrics if np.isfinite(m[idx])], 50):.3g} "
-                                f"p90={np.percentile([m[idx] for m in all_metrics if np.isfinite(m[idx])], 90):.3g} "
-                                f"p99={np.percentile([m[idx] for m in all_metrics if np.isfinite(m[idx])], 99):.3g} "
-                                f"max={np.max([m[idx] for m in all_metrics if np.isfinite(m[idx])]):.3g}"
-                                for idx, name in enumerate(('max|tap|:', 'oob gain:', 'noise gain:'))]) if all_metrics else ""))
+    logging.info(
+        f"Summary: {failed_count}/{n_fine} failed (match >= {args.min_match}).\n"
+        f"Taps: mean={tap_arr.mean():.1f} median={np.median(tap_arr):.0f} min={tap_arr.min()} max={tap_arr.max()}\n"
+        + ("\n".join([
+            f"{name:<12} p50={np.percentile([m[idx] for m in all_metrics if np.isfinite(m[idx])], 50):.3g} "
+            f"p90={np.percentile([m[idx] for m in all_metrics if np.isfinite(m[idx])], 90):.3g} "
+            f"p99={np.percentile([m[idx] for m in all_metrics if np.isfinite(m[idx])], 99):.3g} "
+            f"max={np.max([m[idx] for m in all_metrics if np.isfinite(m[idx])]):.3g}"
+            for idx, name in enumerate(('max|tap|:', 'oob gain:', 'noise gain:'))
+        ]) if all_metrics else "")
+    )
 
 if __name__ == '__main__':
     main()

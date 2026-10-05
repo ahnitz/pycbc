@@ -25,6 +25,9 @@ labels={'mchirp': 'Chirp Mass',
         'comb_optimal_snr': 'Combined Optimal SNR',
         'decisive_optimal_snr': 'Decisive Optimal SNR',
         'max_optimal_snr': 'Maximum Optimal SNR',
+        'comb_optimal_mf_snr': 'Combined Optimal Matched-Filter SNR',
+        'decisive_optimal_mf_snr': 'Decisive Optimal Matched-Filter SNR',
+        'max_optimal_mf_snr': 'Maximum Optimal Matched-Filter SNR',
         'redshift': 'Redshift',
         'time': 'Time (s)',
         'effective_spin': 'Effective Inspiral Spin',
@@ -151,18 +154,31 @@ if args.distance_type == 'redshift':
     dvals['redshift'] = f['injections/redshift'][:]
 
 if 'snr' in args.distance_type:  # only evaluate SNRs if needed
-    opt_snrsq_arr = \
-        [numpy.nan_to_num(f['injections/optimal_snr_%s' % ifo][:], nan=0.0) ** 2. for ifo in ifos]
-    dvals['comb_optimal_snr'] = \
-        numpy.array([numpy.sqrt(sum(opt_snrsq))
-                     for opt_snrsq in zip(*opt_snrsq_arr)])
-    # Decisive optimal SNR is the 2nd largest optimal SNR
-    dvals['decisive_optimal_snr'] = \
-        numpy.array([numpy.sqrt(sorted(opt_snrsq)[-2])
-                     for opt_snrsq in zip(*opt_snrsq_arr)])
-    dvals['max_optimal_snr'] = \
-        numpy.array([numpy.sqrt(max(opt_snrsq))
-                     for opt_snrsq in zip(*opt_snrsq_arr)])
+    if 'mf' in args.distance_type:
+        opt_snrsq_arr = \
+            [numpy.nan_to_num(f['injections/optimal_mf_snr_%s' % ifo][:], nan=0.0) ** 2. for ifo in ifos]
+        dvals['comb_optimal_mf_snr'] = \
+            numpy.array([numpy.sqrt(sum(opt_snrsq))
+                         for opt_snrsq in zip(*opt_snrsq_arr)])
+        dvals['decisive_optimal_mf_snr'] = \
+            numpy.array([numpy.sqrt(sorted(opt_snrsq)[-2])
+                         for opt_snrsq in zip(*opt_snrsq_arr)])
+        dvals['max_optimal_mf_snr'] = \
+            numpy.array([numpy.sqrt(max(opt_snrsq))
+                         for opt_snrsq in zip(*opt_snrsq_arr)])
+    else:
+        opt_snrsq_arr = \
+            [numpy.nan_to_num(f['injections/optimal_snr_%s' % ifo][:], nan=0.0) ** 2. for ifo in ifos]
+        dvals['comb_optimal_snr'] = \
+            numpy.array([numpy.sqrt(sum(opt_snrsq))
+                         for opt_snrsq in zip(*opt_snrsq_arr)])
+        # Decisive optimal SNR is the 2nd largest optimal SNR
+        dvals['decisive_optimal_snr'] = \
+            numpy.array([numpy.sqrt(sorted(opt_snrsq)[-2])
+                         for opt_snrsq in zip(*opt_snrsq_arr)])
+        dvals['max_optimal_snr'] = \
+            numpy.array([numpy.sqrt(max(opt_snrsq))
+                         for opt_snrsq in zip(*opt_snrsq_arr)])
 
 fdvals = dvals[args.distance_type][found]
 mdvals = dvals[args.distance_type][missed]
