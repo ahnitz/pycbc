@@ -196,8 +196,9 @@ parser.add_argument('--injection-category',
                     help="Category of injections to follow up: 'missed' (default), 'found', or 'all'.")
 parser.add_argument('--sort-variable',
                     default=None,
-                    choices=['optimal_snr', 'ifar'],
-                    help="Variable to sort injections by. If 'ifar', sorts ascending (worst IFAR first).")
+                    choices=['optimal_snr', 'ifar', 'stat'],
+                    help="Variable to sort injections by. If 'ifar', sorts ascending (worst IFAR first). "
+                         "If 'stat', sorts ascending (worst ranking statistic first).")
 parser.add_argument('--min-network-snr', type=float, default=None,
                     help="If given, only follow up injections with network optimal SNR >= this value.")
 wf.add_workflow_command_line_group(parser)
@@ -252,10 +253,16 @@ f = HFile(args.injection_file, 'r')
 inj_def = f['injections']
 
 # Calculate network optimal SNR for all injections
+prefix = 'optimal_mf_snr_' if getattr(args, 'distance_type', None) and 'mf' in args.distance_type else 'optimal_snr_'
 optimal_snrs = [
     inj_def[dsn][:] for dsn in inj_def.keys()
-    if dsn.startswith('optimal_snr_')
+    if dsn.startswith(prefix)
 ]
+if not optimal_snrs and prefix != 'optimal_snr_':
+    optimal_snrs = [
+        inj_def[dsn][:] for dsn in inj_def.keys()
+        if dsn.startswith('optimal_snr_')
+    ]
 if optimal_snrs:
     optimal_snrs = numpy.vstack(optimal_snrs)
     net_opt_snr_all = numpy.sqrt((optimal_snrs ** 2).sum(axis=0))
@@ -288,19 +295,23 @@ if args.min_network_snr is not None and len(inj_candidates) > 0:
     inj_candidates = inj_candidates[valid_snr]
 
 # Sort the injections
-if args.sort_variable == 'ifar':
+if args.sort_variable in ['ifar', 'stat']:
     if len(inj_candidates) > 0:
         found_idx_arr = f['found_after_vetoes/injection_index'][:]
-        try:
-            all_ifars = f['found_after_vetoes/ifar'][:]
-        except KeyError:
-            all_ifars = f['found_after_vetoes/ifar_exc'][:]
-        ifar_map = dict(zip(found_idx_arr, all_ifars))
-        # Default IFAR 0.0 for any injection not in found
-        cand_ifars = numpy.array([ifar_map.get(idx, 0.0) for idx in inj_candidates])
-        # Sort ascending by IFAR (worst IFAR first); break ties with descending network SNR
+        if args.sort_variable == 'ifar':
+            try:
+                all_vals = f['found_after_vetoes/ifar'][:]
+            except KeyError:
+                all_vals = f['found_after_vetoes/ifar_exc'][:]
+            default_val = 0.0
+        else:
+            all_vals = f['found_after_vetoes/stat'][:]
+            default_val = -numpy.inf
+        val_map = dict(zip(found_idx_arr, all_vals))
+        cand_vals = numpy.array([val_map.get(idx, default_val) for idx in inj_candidates])
+        # Sort ascending (worst IFAR/stat first); break ties with descending network SNR
         cand_snrs = net_opt_snr_all[inj_candidates]
-        sort_order = numpy.lexsort((-cand_snrs, cand_ifars))
+        sort_order = numpy.lexsort((-cand_snrs, cand_vals))
         inj_candidates = inj_candidates[sort_order]
 else:
     if args.distance_type is None:
