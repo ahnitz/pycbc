@@ -1408,7 +1408,7 @@ def get_args():
                         help="SNR-dependent term added to the chisq dof before applying --chisq-threshold.")
 
     # Clustering & Event Handling
-    parser.add_argument("--cluster-window", type=float, default=0,
+    parser.add_argument("--cluster-window", type=float, default=1.0,
                         help="Length of clustering window in seconds.")
     parser.add_argument("--finalize-events-template-rate", default=None, type=int,
                         metavar="NUM TEMPLATES", help="After NUM TEMPLATES perform event consolidation.")
