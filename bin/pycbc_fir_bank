@@ -431,7 +431,12 @@ def _snap(k, up=True):
 
 def _build_problem(c_idx, h_fine_np):
     """Fit target, masks and weights for parent c_idx (cached by caller)."""
-    h_ref = g_coarse_np[c_idx]
+    return _build_problem_ref(g_coarse_np[c_idx], g_coarse_ss[c_idx],
+                              g_coarse_waveforms[c_idx], c_idx, h_fine_np)
+
+
+def _build_problem_ref(h_ref, ref_ss, ref_fs, c_idx, h_fine_np):
+    """As _build_problem for an explicit parent (numpy array, |h|^2/S sum, series)."""
     band = g_band_mask.copy()
     ratio = np.zeros(len(h_ref), dtype=np.complex128)
     np.divide(h_fine_np, h_ref, out=ratio, where=np.abs(h_ref) > 0)
@@ -460,7 +465,7 @@ def _build_problem(c_idx, h_fine_np):
     if shift:
         target = target * np.exp(1j * 2 * np.pi * g_freqs * shift / g_args.sample_rate)
     return dict(c_idx=int(c_idx), h_ref=h_ref, target=target, band=band,
-                w_fit=w_fit, w_match=w_match, shift=shift)
+                w_fit=w_fit, w_match=w_match, shift=shift, ref_ss=ref_ss, ref_fs=ref_fs)
 
 
 def _design(prob, n_taps, peak_cap_factor):
@@ -521,7 +526,7 @@ def _verify(H, prob, h_fine_np, fine_ss):
     rec_ss = np.sum((rec.real ** 2 + rec.imag ** 2) * g_inv_psd[sl])
     m = abs(ip) / np.sqrt(rec_ss * fine_ss) if rec_ss > 0 else 0.0
     scale = 4.0 * g_delta_f
-    ref_ss = g_coarse_ss[prob['c_idx']]
+    ref_ss = prob['ref_ss']
     return float(m), (np.sqrt(scale * ref_ss), np.sqrt(scale * rec_ss),
                       np.sqrt(scale * fine_ss))
 
@@ -539,7 +544,7 @@ def _evaluate(prob, n_taps, h_fine, h_fine_np, fine_ss, stats, suppress=True):
     metrics = _filter_metrics(H, taps32, prob)
     if g_args.verify_mode == 'match':
         qa, sigmas = verify_filter_match(
-            taps32.astype(np.float64), g_coarse_waveforms[prob['c_idx']], h_fine,
+            taps32.astype(np.float64), prob['ref_fs'], h_fine,
             g_psd, g_args.f_low, sample_rate=g_args.sample_rate, shift=prob['shift'])
     else:
         qa, sigmas = _verify(H, prob, h_fine_np, fine_ss)
@@ -781,6 +786,180 @@ def prune_parents(pool, results, n_processes, max_tap_growth=None, label='middle
     return removed
 
 
+# --- GROUP MERGING (bottom-up mode: parents may be any child-bank template) ---
+#
+# After assignment (and pruning) every group is tried, smallest first, for a
+# merge with each of its --merge-neighbours tau0-nearest groups. The merged
+# group gets one parent chosen among the templates of the union (ranked by
+# minimax distance in normalised (tau0, tau3, chi_eff)); a candidate is
+# accepted only if every child of the union passes the full acceptance test
+# within --max-taps. Merged groups go back into the queue. Parents here are
+# identified by their index in the child bank.
+
+_g_wave_cache = {}
+
+
+def _child_wave(j):
+    """Child-bank template j as (series, numpy array, |h|^2/S sum), cached per worker."""
+    hit = _g_wave_cache.get(j)
+    if hit is None:
+        h = g_fine_bank[int(j)].copy()
+        h_np = h.numpy().astype(np.complex128)
+        ss = float(np.sum(np.abs(h_np[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
+        if len(_g_wave_cache) >= 4096:
+            _g_wave_cache.clear()
+        hit = _g_wave_cache[j] = (h, h_np, ss)
+    return hit
+
+
+def _merge_check(task):
+    """Can child-bank template `cand` parent every one of `children` at the cap?
+
+    Children are tried in the given order (hardest first) and the check stops at
+    the first failure. Returns (cand, number of children that passed).
+    """
+    cand, children = task
+    h_c, c_np, c_ss = _child_wave(cand)
+    k = g_args.max_taps if g_args.max_taps % 2 else g_args.max_taps - 1
+    stats = {'attempts': 0, 'suppressed': 0}
+    for n, i in enumerate(children):
+        if i == cand:
+            continue
+        h, h_np, ss = _child_wave(i)
+        prob = _build_problem_ref(c_np, c_ss, h_c, cand, h_np)
+        if prob is None:
+            return cand, n
+        ok, _ = _evaluate(prob, k, h, h_np, ss, stats)
+        if not ok:
+            return cand, n
+    return cand, len(children)
+
+
+def _fit_forced(task):
+    """Fewest-tap FIR of child i from child-bank template `cand` (stored-row form)."""
+    i, cand = task
+    h_c, c_np, c_ss = _child_wave(cand)
+    h, h_np, ss = _child_wave(i)
+    stats = {'attempts': 0, 'suppressed': 0}
+    prob = _build_problem_ref(c_np, c_ss, h_c, cand, h_np)
+    rec = _min_taps(prob, g_args.max_taps, h, h_np, ss, stats)[0] if prob is not None else None
+    if rec is None:
+        return i, None
+    m, _ = match(h, h_c, psd=g_psd, low_frequency_cutoff=g_args.f_low,
+                 v1_norm=4.0 * g_delta_f * ss, v2_norm=4.0 * g_delta_f * c_ss)
+    return i, (float(m), int(cand), rec['qa'], rec['taps'], rec['sigmas'], rec['shift'],
+               rec['metrics'])
+
+
+def bank_features(bank, f_low):
+    """(tau0, tau3, chi_eff) per template, used to rank merge candidates."""
+    from pycbc import conversions
+    t = bank.table
+    names = t.dtype.names
+    m1 = np.asarray(t['mass1'], dtype=np.float64)
+    m2 = np.asarray(t['mass2'], dtype=np.float64)
+    tau0 = (np.asarray(t['tau0'], dtype=np.float64) if 'tau0' in names
+            else conversions.tau0_from_mass1_mass2(m1, m2, f_low))
+    tau3 = conversions.tau3_from_mass1_mass2(m1, m2, f_low)
+    s1 = np.asarray(t['spin1z'], dtype=np.float64) if 'spin1z' in names else 0 * m1
+    s2 = np.asarray(t['spin2z'], dtype=np.float64) if 'spin2z' in names else 0 * m1
+    return np.stack([tau0, tau3, conversions.chi_eff(m1, m2, s1, s2)], axis=1)
+
+
+def merge_groups(pool, results, feats, n_neighbours=3, n_candidates=16, label='middle'):
+    """Merge groups under re-centred parents. `results` rows are stored rows whose
+    parent field is a child-bank index; updated in place. Returns #merges."""
+    groups = defaultdict(set)
+    for i, row in enumerate(results):
+        if row is not None and row[1] >= 0:
+            groups[row[1]].add(i)
+    tau0 = feats[:, 0]
+    tried = set()
+    n_merges = 0
+    progress = True
+    while progress:
+        progress = False
+        for p in sorted(groups, key=lambda q: (len(groups[q]), q)):
+            if p not in groups:
+                continue
+            others = np.array([q for q in groups if q != p], dtype=int)
+            if not len(others):
+                break
+            neigh = others[np.argsort(np.abs(tau0[others] - tau0[p]))][:n_neighbours]
+            for q in neigh:
+                q = int(q)
+                key = (min(p, q), max(p, q), len(groups[p]), len(groups[q]))
+                if key in tried:
+                    continue
+                tried.add(key)
+                union = np.array(sorted(groups[p] | groups[q]), dtype=int)
+                pool_c = np.unique(np.concatenate([union, [p, q]]))
+                f_u = feats[union]
+                span = f_u.max(axis=0) - f_u.min(axis=0)
+                span[span <= 0] = 1.0
+                d = np.sqrt((((feats[pool_c][:, None, :] - f_u[None, :, :]) / span) ** 2).sum(-1))
+                cands = pool_c[np.argsort(d.max(axis=1))][:n_candidates]
+                tasks = []
+                for c in cands:
+                    dc = np.sqrt((((f_u - feats[c]) / span) ** 2).sum(-1))
+                    tasks.append((int(c), [int(x) for x in union[np.argsort(-dc)]]))
+                passed = {c for c, n in pool.imap_unordered(_merge_check, tasks)
+                          if n == len(union)}
+                chosen = next((int(c) for c in cands if int(c) in passed), None)
+                if chosen is None:
+                    continue
+                rows = dict(pool.imap_unordered(_fit_forced, [(int(i), chosen) for i in union],
+                                                chunksize=4))
+                if any(r is None for r in rows.values()):
+                    logging.warning('Merge %s %d+%d via %d: forced refit failed; skipped',
+                                    label, p, q, chosen)
+                    continue
+                for i, r in rows.items():
+                    results[i] = r
+                sizes = (len(groups[p]), len(groups[q]))
+                del groups[p]
+                del groups[q]
+                groups[chosen] = set(int(i) for i in union)
+                n_merges += 1
+                progress = True
+                logging.info('Merged %s groups %d (%d) + %d (%d) -> parent %d (%d children, '
+                             'max taps %d); %d groups left', label, p, sizes[0], q, sizes[1],
+                             chosen, len(union), max(len(r[3]) for r in rows.values()),
+                             len(groups))
+                break
+    return n_merges
+
+
+def consolidate_parents(pool, results, parent_src, feats, args, label):
+    """Merge pass (if enabled) and compaction for a bottom-up level.
+
+    `parent_src[c]` is the child-bank index of parent c. Returns the rows with
+    parents renumbered 0..n-1 and the sorted child-bank indices of the parents
+    actually used (the new parent bank).
+    """
+    rows = [None if r is None else (r[0], int(parent_src[r[1]])) + tuple(r[2:])
+            for r in results]
+    if args.merge_groups:
+        n_before = len({r[1] for r in rows if r is not None})
+        n = merge_groups(pool, rows, feats, args.merge_neighbours, args.merge_candidates, label)
+        logging.info('Group merging: %d merges, %d -> %d %s templates in use', n, n_before,
+                     len({r[1] for r in rows if r is not None}), label)
+    used = np.array(sorted({r[1] for r in rows if r is not None}), dtype=int)
+    pos = {int(s): k for k, s in enumerate(used)}
+    rows = [None if r is None else (r[0], pos[r[1]]) + tuple(r[2:]) for r in rows]
+    return rows, used
+
+
+def _close_bank(bank):
+    """Close the HDF file a FilterBank keeps open (before rewriting that file)."""
+    handle = getattr(bank, 'file', None)
+    if handle is not None:
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with open(path, 'rb') as stream:
@@ -873,6 +1052,15 @@ def fit_upper_level(args, middle_bank, psd, flen, output, used_middles=None):
                                     args.prune_max_tap_growth, label='top')
             logging.info('Seed pruning: %d -> %d top templates in use',
                          n_used, n_used - len(removed))
+        top_src = getattr(args, '_top_seed_src', None)
+        if top_src is not None and not rejected:
+            results, used_top = consolidate_parents(
+                pool, results, top_src, bank_features(upper_middle, args.f_low), args, 'top')
+            _close_bank(top_bank)
+            write_seed_bank(args.coarse_bank, used_top, args.top_bank, force=True)
+            top_bank = FilterBank(args.top_bank, upper_flen, upper_df, dtype=np.complex128,
+                                  enable_compressed_waveforms=False)
+            top_waveforms = [h.copy() for h in top_bank]
 
     failed = sorted(set(rejected) | {i for i in used_middles
                                      if results[i] is None or results[i][1] < 0})
@@ -1120,6 +1308,15 @@ def main():
                              'most this fraction (default: no limit)')
     parser.add_argument('--no-seed-medoid', action='store_true',
                         help='Bottom-up seeding: skip medoid re-centring of clusters')
+    parser.add_argument('--no-merge-groups', action='store_false', dest='merge_groups',
+                        help='Bottom-up mode: skip the pass that merges each group with a tau0 '
+                             'neighbour under one re-centred parent when all children still pass '
+                             'within --max-taps')
+    parser.add_argument('--merge-neighbours', type=int, default=3,
+                        help='Group merging: number of tau0-nearest groups tried per group')
+    parser.add_argument('--merge-candidates', type=int, default=16,
+                        help='Group merging: candidate parents tried per merge (templates of the '
+                             'union nearest its centre in normalised tau0, tau3, chi_eff)')
     parser.add_argument('--seed-chunks', type=int,
                         help='Bottom-up seeding: number of tau0-contiguous chunks clustered '
                              'independently (default: --n-processes)')
@@ -1286,6 +1483,7 @@ def main():
     psd = pycbc.psd.from_cli(args, length=flen, delta_f=args.delta_f,
                              low_frequency_cutoff=args.f_low)
 
+    middle_seed_src = None
     if args.coarse_bank is None:
         logging.info("Bottom-up seeding: choosing middle templates from the fine bank...")
         seed_src = FilterBank(args.fine_bank, flen, args.delta_f, dtype=np.complex128,
@@ -1295,6 +1493,7 @@ def main():
                              args.n_processes, 'Seeding middle level')
         write_seed_bank(args.fine_bank, seeds, args.coarse_bank_output, force=args.force)
         args.coarse_bank = args.coarse_bank_output
+        middle_seed_src = seeds
         del seed_src
 
     logging.info("Loading coarse bank references...")
@@ -1329,13 +1528,10 @@ def main():
     f_out = fine_bank.write_to_hdf(args.output_file, force=True,
                                    write_compressed_waveforms=True)
 
-    # 2. Write Coarse Bank to Subgroup
-    coarse_bank.write_to_hdf(args.output_file, file_handler=f_out,
-                             group_key="fir_data/coarse_bank_params",
-                             write_compressed_waveforms=True)
+    # 2. The coarse (middle) bank is written to fir_data/coarse_bank_params
+    #    after fitting: in bottom-up mode merging and compaction change it.
 
     # 3. Add Metadata attributes
-    # We use require_group because the previous step created 'fir_data/coarse_bank_params'
     fir_group = f_out.require_group("fir_data")
     for arg, val in vars(args).items():
         if val is not None and isinstance(val, (int, float, str)):
@@ -1397,6 +1593,20 @@ def main():
                 logging.info('Seed pruning: %d -> %d middle templates in use',
                              n_used, n_used - len(removed))
 
+            if middle_seed_src is not None and not failed_count:
+                all_results, used_src = consolidate_parents(
+                    pool, all_results, middle_seed_src, bank_features(fine_bank, args.f_low),
+                    args, 'middle')
+                all_metrics = [r[6] if r is not None else None for r in all_results]
+                _close_bank(coarse_bank)
+                write_seed_bank(args.fine_bank, used_src, args.coarse_bank, force=True)
+                coarse_bank = FilterBank(args.coarse_bank, flen, args.delta_f,
+                                         dtype=np.complex128, enable_compressed_waveforms=False)
+
+        coarse_bank.write_to_hdf(args.output_file, file_handler=f_out,
+                                 group_key="fir_data/coarse_bank_params",
+                                 write_compressed_waveforms=True)
+
         # --- PHASE 3: Write Results ---
         logging.info("All templates processed. Writing grouped results to HDF5...")
 
@@ -1420,6 +1630,7 @@ def main():
                 write_seed_bank(args.coarse_bank, top_seeds, args.top_bank_output,
                                 force=args.force)
                 args.top_bank = args.top_bank_output
+                args._top_seed_src = top_seeds
                 del mid_src
             upper_results = fit_upper_level(args, coarse_bank, psd, flen, f_out,
                                             used_middles=used_middles)
