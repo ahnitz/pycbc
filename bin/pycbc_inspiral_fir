@@ -336,18 +336,19 @@ def process_and_record_triggers(
         phys_t = np.clip(t_idxs - local_shifts, 0, len(renorm_factor) - 1)
         r = renorm_factor[phys_t]
         snrs_renorm = snrs * r
-        if not is_asym:
-            thresh = primary_snr_threshold
-            if thresh is not None and thresh > 0:
-                keep = np.abs(snrs_renorm) >= thresh
-                if not np.all(keep):
-                    ids_local = ids_local[keep]
-                    t_idxs = t_idxs[keep]
-                    snrs = snrs[keep]
-                    snrs_renorm = snrs_renorm[keep]
-                    tstarts = tstarts[keep]
     else:
         snrs_renorm = snrs
+
+    if len(ids_local) > 0 and not is_asym:
+        thresh = primary_snr_threshold
+        if thresh is not None and thresh > 0:
+            keep = np.abs(snrs_renorm) >= thresh
+            if not np.all(keep):
+                ids_local = ids_local[keep]
+                t_idxs = t_idxs[keep]
+                snrs = snrs[keep]
+                snrs_renorm = snrs_renorm[keep]
+                tstarts = tstarts[keep]
 
     n_trig = len(ids_local)
     if n_trig > 0:
