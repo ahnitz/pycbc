@@ -220,14 +220,21 @@ class RatioPowerChisq(SingleDetPowerChisq):
             norm_pad = spa_tmplt_norm(psd_pad, n_half_pad, df_pad, self.flow)
             bins = power_chisq_bins_from_sigmasq_series(norm_pad, self.num_bins, kmin_pad, kmax_pad)
             dof = (len(bins) - 1) * 2 - 2
-            self.bins_cache[bins_key] = (bins, dof)
-        bins, dof = self.bins_cache[bins_key]
+            raw_wb = np.diff(norm_pad[bins])
+            tot_wb = np.sum(raw_wb)
+            if tot_wb > 0:
+                inv_wb = np.where(raw_wb > 0, tot_wb / np.maximum(raw_wb, 1e-12), float(len(bins)-1)).astype(np.float32)
+            else:
+                inv_wb = np.full(len(bins)-1, float(len(bins)-1), dtype=np.float32)
+            k_freqs = np.arange(bins[0], bins[-1], dtype=np.float32)
+            bin_starts = bins[:-1] - bins[0]
+            self.bins_cache[bins_key] = (bins, dof, inv_wb, k_freqs, bin_starts)
+        bins, dof, inv_wb, k_freqs, bin_starts = self.bins_cache[bins_key]
 
         taps_coarse, counts_coarse, _ = bank.get_firs(coarse_idx) if (coarse_idx is not None and hasattr(bank, 'get_firs')) else (None, None, None)
 
         ref_f_cache = {}
         iterations = 0
-        tids2_arr = np.zeros(1, dtype=np.int32)
         snrvs_arr = np.zeros(1, dtype=complex64)
 
         for idx in sort_order:
@@ -278,8 +285,13 @@ class RatioPowerChisq(SingleDetPowerChisq):
             if ratio_pad is not None:
                 corr_factor = 1.0 / (rescale * self.n_pad)
                 self.corr.data[:] = (ratio_pad * ref_f_pad) * corr_factor
-                tids2_arr[0] = dt
-                chi = power_chisq_at_points_from_precomputed(self.corr, snrvs_arr, 1.0, bins, tids2_arr)
+                
+                # Exact integer power weighted chisq:
+                phases = np.exp((2j * np.pi * dt / self.n_pad) * k_freqs).astype(np.complex64)
+                phased_corr = self.corr.data[bins[0]:bins[-1]] * phases
+                z_b = np.add.reduceat(phased_corr, bin_starts)
+                chi_val = max(0.0, float(np.sum((np.abs(z_b)**2) * inv_wb) - abs(snrvs_arr[0])**2))
+                chi = [chi_val]
             else:
                 chi = [0.0]
 
