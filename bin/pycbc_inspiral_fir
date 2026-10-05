@@ -769,6 +769,7 @@ def process_top_template_task(task_args):
                     window_duration=getattr(args, 'dynamic_snr_window', 8.0),
                     hollow_duration=getattr(args, 'dynamic_snr_hollow', 0.5),
                     variance_floor=getattr(args, 'dynamic_snr_variance_floor', 1.0),
+                    max_boost_factor=getattr(args, 'dynamic_snr_max_boost', None),
                 )
             else:
                 renorm_factors[ifo] = None
@@ -1363,7 +1364,9 @@ def get_args():
     group.add_argument('--dynamic-snr-hollow', type=float, default=0.5,
                        help="Hollow exclusion half-width in seconds for dynamic SNR renormalization (default: 0.5).")
     group.add_argument('--dynamic-snr-variance-floor', type=float, default=1.0,
-                       help="Variance floor for dynamic SNR renormalization (default: 1.0).")
+                       help="Variance floor for dynamic SNR renormalization (default: 1.0; set < 1.0 for two-sided boost).")
+    group.add_argument('--dynamic-snr-max-boost', type=float, default=None,
+                       help="Maximum SNR boost factor safety ceiling for dynamic SNR renormalization (default: None).")
     group.add_argument('--disable-dynamic-snr-renorm', action='store_true',
                        help="Disable dynamic SNR renormalization.")
 

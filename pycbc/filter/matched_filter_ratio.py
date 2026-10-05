@@ -211,11 +211,13 @@ class MatchedFilterRatioControl(object):
         return plan, Array(qt, copy=False), q
 
 
-def get_dynamic_snr_renorm_factor(series, dt=None, window_duration=8.0, hollow_duration=0.5, variance_floor=1.0, scale=None):
+def get_dynamic_snr_renorm_factor(series, dt=None, window_duration=8.0, hollow_duration=0.5, variance_floor=1.0, scale=None, max_boost_factor=None):
     """Compute rolling window hollow dynamic SNR renormalization envelope.
 
     Downweights non-stationary noise excursions and glitch tails while preserving
     short gravitational-wave signal peaks by excluding a central hollow window.
+    Supports two-sided renormalization when variance_floor < 1.0, allowing
+    effective SNR enhancement during pristine quiet periods up to max_boost_factor.
 
     Parameters
     ----------
@@ -230,17 +232,20 @@ def get_dynamic_snr_renorm_factor(series, dt=None, window_duration=8.0, hollow_d
         Half-width of the inner hollow exclusion window (seconds, default: 0.5s,
         giving an excluded region of +/- 0.5s around each sample).
     variance_floor : float, optional
-        Minimum variance threshold to renormalize (default: 1.0, ensuring we only
-        downweight non-stationary excess noise and never amplify quiet noise).
+        Minimum variance threshold to renormalize (default: 1.0). When set < 1.0
+        (e.g. 0.5 or 0.25), allows effective SNR enhancement during quiet periods.
     scale : float, optional
         Amplitude scaling factor if series is an internally scaled buffer where
         z(t) = series(t) / scale. If None, series is assumed to already be a
         complex SNR series where Var(Re(z)) = Var(Im(z)) = 1.0 in stationary Gaussian noise.
+    max_boost_factor : float, optional
+        Safety ceiling for the maximum allowable SNR boost factor (default: None,
+        meaning bounded only by 1.0 / sqrt(variance_floor)). Recommended: 1.25–1.50.
 
     Returns
     -------
     renorm_factor : ndarray (float32 or float64)
-        1D array of renormalization scale factors in (0.0, 1.0].
+        1D array of renormalization scale factors in (0.0, max_boost_factor or 1/sqrt(variance_floor)].
     """
     if os.environ.get('PYCBC_DISABLE_DYNAMIC_SNR_RENORM', '0') == '1':
         return np.ones(len(series), dtype=np.float32)
@@ -286,20 +291,24 @@ def get_dynamic_snr_renorm_factor(series, dt=None, window_duration=8.0, hollow_d
     sum_hollow = (cumsum[r_out] - cumsum[l_out]) - (cumsum[r_in] - cumsum[l_in])
     cnt_hollow = (r_out - l_out) - (r_in - l_in)
 
+    floor_safe = max(float(variance_floor), 1e-12)
     var_est = sum_hollow / np.maximum(cnt_hollow, 1)
-    var_eff = np.where(np.isfinite(var_est), np.maximum(var_est, variance_floor), variance_floor)
+    var_eff = np.where(np.isfinite(var_est), np.maximum(var_est, floor_safe), floor_safe)
     renorm_factor = np.where(np.isfinite(var_eff), 1.0 / np.sqrt(var_eff), 1.0)
+    if max_boost_factor is not None:
+        renorm_factor = np.clip(renorm_factor, 0.0, float(max_boost_factor))
 
     if arr.dtype == np.complex128:
         return renorm_factor.astype(np.float64)
     return renorm_factor.astype(np.float32)
 
 
-def dynamic_snr_renormalize(series, dt=None, window_duration=8.0, hollow_duration=0.5, variance_floor=1.0, scale=None):
+def dynamic_snr_renormalize(series, dt=None, window_duration=8.0, hollow_duration=0.5, variance_floor=1.0, scale=None, max_boost_factor=None):
     """Dynamically renormalize SNR series using a rolling window with hollow exclusion.
 
     Downweights non-stationary noise excursions and glitch tails while preserving
     short gravitational-wave signal peaks by excluding a central hollow window.
+    Supports two-sided renormalization when variance_floor < 1.0 and max_boost_factor is set.
 
     Parameters
     ----------
@@ -313,15 +322,16 @@ def dynamic_snr_renormalize(series, dt=None, window_duration=8.0, hollow_duratio
         Half-width of the inner hollow exclusion window (seconds, default: 0.5s,
         giving an excluded region of +/- 0.5s around each sample).
     variance_floor : float, optional
-        Minimum variance threshold to renormalize (default: 1.0, ensuring we only
-        downweight non-stationary excess noise and never amplify quiet noise).
+        Minimum variance threshold to renormalize (default: 1.0).
     scale : float, optional
         Amplitude scaling factor if series is an internally scaled buffer.
+    max_boost_factor : float, optional
+        Safety ceiling for maximum allowable SNR boost factor (default: None).
 
     Returns
     -------
     renormalized_series : same type as series
-        Series scaled by 1.0 / sqrt(max(estimated_variance, variance_floor)).
+        Series scaled by renorm factor.
     """
     if os.environ.get('PYCBC_DISABLE_DYNAMIC_SNR_RENORM', '0') == '1':
         return series
@@ -336,6 +346,7 @@ def dynamic_snr_renormalize(series, dt=None, window_duration=8.0, hollow_duratio
         hollow_duration=hollow_duration,
         variance_floor=variance_floor,
         scale=scale,
+        max_boost_factor=max_boost_factor,
     )
     return series * factor
 

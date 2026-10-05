@@ -205,6 +205,65 @@ class TestDynamicSNRRenormalize(unittest.TestCase):
         finally:
             del os.environ['PYCBC_DISABLE_DYNAMIC_SNR_RENORM']
 
+    def test_two_sided_quiet_amplification(self):
+        """Test Stage 5 two-sided renorm: quiet detector noise (< 1.0) is boosted up to max_boost_factor."""
+        N = 16 * self.sample_rate
+        # Local variance 0.25 (std = 0.5) -> unconstrained factor would be 1/sqrt(0.25) = 2.0
+        quiet = (0.5 * np.random.randn(N) + 0.5j * np.random.randn(N)).astype(np.complex64)
+
+        # Baseline variance_floor=1.0 prevents any boost
+        rf_baseline = get_dynamic_snr_renorm_factor(quiet, self.dt, variance_floor=1.0)
+        self.assertTrue(np.all(rf_baseline <= 1.0001))
+
+        # Two-sided renorm: variance_floor=0.25 with max_boost_factor=1.35
+        rf_boosted = get_dynamic_snr_renorm_factor(
+            quiet, self.dt, variance_floor=0.25, max_boost_factor=1.35
+        )
+        # Factor should be strictly capped by safety ceiling 1.35
+        self.assertTrue(np.all(rf_boosted <= 1.3501))
+        # Interior samples should show boost above 1.0
+        interior = rf_boosted[int(4.0 / self.dt):int(12.0 / self.dt)]
+        self.assertGreater(np.mean(interior), 1.25)
+
+    def test_safety_boost_ceiling_clipping(self):
+        """Test that safety ceiling strictly clips boost even in zero or near-zero data."""
+        zeros = np.zeros(2048, dtype=np.complex64)
+        rf_zeros = get_dynamic_snr_renorm_factor(
+            zeros, self.dt, variance_floor=0.1, max_boost_factor=1.40
+        )
+        self.assertTrue(np.all(np.isfinite(rf_zeros)))
+        self.assertTrue(np.allclose(rf_zeros, 1.40))
+
+        # Renormalizing zeros must still produce exact zeros
+        res_zeros = dynamic_snr_renormalize(
+            zeros, self.dt, variance_floor=0.1, max_boost_factor=1.40
+        )
+        np.testing.assert_array_equal(res_zeros, zeros)
+
+    def test_two_sided_glitch_downweighting_preserved(self):
+        """Test that non-stationary glitches are still suppressed when two-sided boost is active."""
+        N = 16 * self.sample_rate
+        noise = (np.random.randn(N) + 1j * np.random.randn(N)).astype(np.complex64)
+        center = N // 2
+        g_start = center + int(1.0 / self.dt)
+        g_end = center + int(3.0 / self.dt)
+        noise[g_start:g_end] *= 10.0
+
+        rf = get_dynamic_snr_renorm_factor(
+            noise, self.dt, variance_floor=0.25, max_boost_factor=1.50
+        )
+        factor_during_glitch = np.mean(rf[g_start:g_end])
+        self.assertLess(factor_during_glitch, 0.25)
+
+    def test_zero_or_negative_variance_floor_robustness(self):
+        """Test that variance_floor <= 0 is safely clamped to positive floor without divide-by-zero."""
+        zeros = np.zeros(2048, dtype=np.complex64)
+        rf_zero_floor = get_dynamic_snr_renorm_factor(
+            zeros, self.dt, variance_floor=0.0, max_boost_factor=1.50
+        )
+        self.assertTrue(np.all(np.isfinite(rf_zero_floor)))
+        self.assertTrue(np.all(rf_zero_floor <= 1.50))
+
 
 if __name__ == '__main__':
     unittest.main()
