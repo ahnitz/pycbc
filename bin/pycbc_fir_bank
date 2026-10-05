@@ -24,7 +24,7 @@ import pycbc
 import pycbc.psd
 from pycbc.filter import match, sigma
 from pycbc.types import TimeSeries
-from pycbc.waveform.bank import FilterBank
+from pycbc.waveform.bank import FilterBank, correction_basis
 
 mp.set_start_method('fork', force=True) 
 
@@ -46,6 +46,8 @@ g_nfft = None
 g_freqs = None
 g_delta_f = None
 g_band_mask = None
+g_correction_basis = None
+g_correction_band = None
 
 def init_worker(coarse_waveforms, fine_bank, psd, args_namespace):
     """
@@ -54,6 +56,7 @@ def init_worker(coarse_waveforms, fine_bank, psd, args_namespace):
     """
     global g_coarse_waveforms, g_coarse_sigmasq, g_coarse_tau0, g_fine_bank, g_fine_tau0, g_psd, g_args
     global g_coarse_np, g_coarse_ss, g_psd_np, g_inv_psd, g_kslice, g_nfft, g_freqs, g_delta_f, g_band_mask
+    global g_correction_basis, g_correction_band
     try:
         import pycbc.filter.matchedfilter as mf
         import pycbc.filter.matchedfilter_cpu as mc
@@ -81,6 +84,8 @@ def init_worker(coarse_waveforms, fine_bank, psd, args_namespace):
     g_coarse_np = [h.numpy().astype(np.complex128) for h in coarse_waveforms]
     g_coarse_ss = [float(np.sum(np.abs(h[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
                    for h in g_coarse_np]
+    g_correction_basis, g_correction_band = correction_basis(
+        len(g_psd_np), g_delta_f, g_args.f_low, 800.0)
     # Silence worker logging
     logging.getLogger('pycbc').setLevel(logging.CRITICAL + 1)
 
@@ -421,12 +426,14 @@ def _positions(n_taps, nfft):
     return (np.arange(n_taps) - n_taps // 2) % nfft
 
 
-def _snap(k, up=True):
+def _snap(k, up=True, args=None):
     """Snap a tap count onto the odd grid min_taps + j * tap_granularity."""
-    gran = g_args.tap_granularity
-    j = (k - g_args.min_taps) / float(gran)
+    ns = args if args is not None else g_args
+    gran = getattr(ns, 'tap_granularity', 8) if ns is not None else 8
+    min_t = getattr(ns, 'min_taps', 15) if ns is not None else 15
+    j = (k - min_t) / float(gran)
     j = int(np.ceil(j - 1e-9)) if up else int(np.floor(j + 1e-9))
-    return g_args.min_taps + max(j, 0) * gran
+    return min_t + max(j, 0) * gran
 
 
 def _build_problem(c_idx, h_fine_np):
@@ -812,6 +819,174 @@ def _child_wave(j):
     return hit
 
 
+def _toeplitz_fit_batch(prob, k, targets, reg_val, nfft):
+    bins = np.flatnonzero(prob['band'])
+    w2 = prob['w_fit'][bins] ** 2
+    fw = np.zeros(nfft)
+    np.add.at(fw, bins, w2)
+    np.add.at(fw, (nfft - bins) % nfft, w2)
+    r = (0.5 * np.fft.ifft(fw).real * nfft)[:k].copy()
+    r[0] += reg_val
+    pos = (np.arange(k) - k // 2) % nfft
+    fd = np.zeros((len(targets), nfft), dtype=np.complex128)
+    for j, t in enumerate(targets):
+        np.add.at(fd[j], bins, t[bins] * w2)
+        np.add.at(fd[j], (nfft - bins) % nfft, np.conj(t[bins]) * w2)
+    b = (0.5 * np.fft.ifft(fd, axis=1).real * nfft)[:, pos]
+    taps = solve_toeplitz(r, b.T)
+    wave = np.zeros((nfft, len(targets)))
+    wave[pos] = taps
+    return np.fft.rfft(wave, axis=0).T
+
+
+def _gn_apply_correction(h0, z):
+    if z is None or not np.any(z):
+        return h0
+    h_m = h0.copy()
+    h_m[g_correction_band] *= np.exp(z @ g_correction_basis[:, g_correction_band])
+    return h_m
+
+
+def _gn_eval_lin(task):
+    base_idx, z, child_indices, k = task
+    h0_c, h0_np, _ = _child_wave(base_idx)
+    h_m = _gn_apply_correction(h0_np, z)
+    mss = float(np.sum(np.abs(h_m[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
+    st = {'attempts': 0, 'suppressed': 0}
+    nz = len(g_correction_basis)
+    out = []
+    for i in child_indices:
+        h_ch, ch_np, ch_ss = _child_wave(i)
+        prob = _build_problem_ref(h_m, mss, None, base_idx, ch_np)
+        if prob is None:
+            out.append((i, 1.0, 1e-10, np.zeros((nz, nz)), np.zeros(nz)))
+            continue
+        ok, rec = _evaluate(prob, k, h_ch, ch_np, ch_ss, st)
+        mis = 1.0 - rec['qa']
+        T0 = prob['target']
+        targets = [T0] + [T0 * c for c in g_correction_basis]
+        resp = _toeplitz_fit_batch(prob, k, targets, g_args.regularization_magnitude, g_nfft)
+        bins = np.flatnonzero(prob['band'])
+        w = prob['w_fit'][bins]
+        rho = (resp[0] - T0)[bins] * w
+        J = ((T0[None, :] * g_correction_basis - resp[1:])[:, bins] * w[None, :])
+        R = float(np.sum(np.abs(rho) ** 2))
+        A = np.real(np.conj(J) @ J.T)
+        g = np.real(np.conj(J) @ rho)
+        out.append((i, mis, R, A, g))
+    return out
+
+
+def _gn_eval_mism(task):
+    base_idx, z, child_indices, k = task
+    h0_c, h0_np, _ = _child_wave(base_idx)
+    h_m = _gn_apply_correction(h0_np, z)
+    mss = float(np.sum(np.abs(h_m[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
+    st = {'attempts': 0, 'suppressed': 0}
+    out = []
+    for i in child_indices:
+        h_ch, ch_np, ch_ss = _child_wave(i)
+        prob = _build_problem_ref(h_m, mss, None, base_idx, ch_np)
+        if prob is None:
+            out.append(1.0)
+            continue
+        rec = _evaluate(prob, k, h_ch, ch_np, ch_ss, st)[1]
+        out.append(1.0 - rec['qa'])
+    return out
+
+
+def _gn_eval_taps(task):
+    base_idx, z, child_indices, max_taps = task
+    h0_c, h0_np, _ = _child_wave(base_idx)
+    h_m = _gn_apply_correction(h0_np, z)
+    mss = float(np.sum(np.abs(h_m[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
+    st = {'attempts': 0, 'suppressed': 0}
+    out = []
+    for i in child_indices:
+        h_ch, ch_np, ch_ss = _child_wave(i)
+        prob = _build_problem_ref(h_m, mss, None, base_idx, ch_np)
+        rec = _min_taps(prob, max_taps, h_ch, ch_np, ch_ss, st)[0] if prob is not None else None
+        out.append(rec['n_taps'] if rec is not None else 99999)
+    return out
+
+
+def _optimize_middle_group(pool, union, base_cand, args, initial_z=None):
+    max_taps = args.max_taps
+    min_match = getattr(args, 'min_match', 0.9999)
+    nz = 20
+    z = np.zeros(nz, dtype=np.float64) if initial_z is None else np.array(initial_z, dtype=np.float64).copy()
+    n_proc = getattr(args, 'n_processes', 8)
+    chunks = [list(c) for c in np.array_split(union, min(len(union), 4 * n_proc))]
+
+    def _eval_all_lin(cur_z, k):
+        tasks = [(base_cand, cur_z, c, k) for c in chunks]
+        res = pool.imap_unordered(_gn_eval_lin, tasks)
+        return [item for sub in res for item in sub]
+
+    def _eval_all_mism(cur_z, k):
+        tasks = [(base_cand, cur_z, c, k) for c in chunks]
+        res = pool.imap_unordered(_gn_eval_mism, tasks)
+        return [item for sub in res for item in sub]
+
+    def _eval_all_taps(cur_z):
+        tasks = [(base_cand, cur_z, c, max_taps) for c in chunks]
+        res = pool.imap_unordered(_gn_eval_taps, tasks)
+        return np.array([item for sub in res for item in sub])
+
+    t_init = _eval_all_taps(z)
+    if t_init.max() <= max_taps:
+        return z, t_init
+
+    k = _snap(int(0.85 * min(int(t_init.max()), max_taps)), args=args)
+    best_z = z.copy()
+    best_taps = t_init
+
+    for rnd in range(3):
+        mu = 1e-2
+        p = 8.0
+        zreg = 1e-3
+        for it in range(8):
+            lin = _eval_all_lin(z, k)
+            mis = np.array([x[1] for x in lin])
+            worst = mis.max()
+            if worst <= (1.0 - min_match):
+                break
+            c = (mis / worst) ** p
+            A = np.zeros((nz, nz))
+            g = np.zeros(nz)
+            for (i, m, R, Ai, gi), ci in zip(lin, c):
+                s = ci * m / max(R, 1e-300)
+                A += s * Ai
+                g += s * gi
+            scale = np.trace(A) / nz
+            if scale <= 0:
+                break
+            accepted = False
+            for _ in range(6):
+                dz = -np.linalg.solve(A + (mu + zreg) * scale * np.eye(nz), g + zreg * scale * z)
+                new_mis = np.array(_eval_all_mism(z + dz, k))
+                if new_mis.max() < worst:
+                    z = z + dz
+                    mu = max(mu / 3, 1e-6)
+                    accepted = True
+                    break
+                mu *= 4
+            if not accepted:
+                break
+
+        t_cur = _eval_all_taps(z)
+        if (t_cur > max_taps).sum() < (best_taps > max_taps).sum() or (
+            (t_cur > max_taps).sum() == (best_taps > max_taps).sum() and t_cur.max() < best_taps.max()
+        ):
+            best_z = z.copy()
+            best_taps = t_cur
+        if best_taps.max() <= max_taps:
+            break
+        k = _snap(int(0.85 * min(int(t_cur.max()), max_taps)), args=args)
+
+    return best_z, best_taps
+
+
 def _merge_check(task):
     """Can child-bank template `cand` parent every one of `children` at the cap?
 
@@ -837,8 +1012,17 @@ def _merge_check(task):
 
 def _fit_forced(task):
     """Fewest-tap FIR of child i from child-bank template `cand` (stored-row form)."""
-    i, cand = task
+    if len(task) == 3:
+        i, cand, z = task
+    else:
+        i, cand = task
+        z = None
     h_c, c_np, c_ss = _child_wave(cand)
+    if z is not None and np.any(z):
+        c_np = _gn_apply_correction(c_np, z)
+        c_ss = float(np.sum(np.abs(c_np[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
+        from pycbc.types import FrequencySeries
+        h_c = FrequencySeries(c_np, delta_f=g_delta_f, epoch=h_c.epoch)
     h, h_np, ss = _child_wave(i)
     stats = {'attempts': 0, 'suppressed': 0}
     prob = _build_problem_ref(c_np, c_ss, h_c, cand, h_np)
@@ -866,9 +1050,12 @@ def bank_features(bank, f_low):
     return np.stack([tau0, tau3, conversions.chi_eff(m1, m2, s1, s2)], axis=1)
 
 
-def merge_groups(pool, results, feats, n_neighbours=3, n_candidates=16, label='middle'):
+def merge_groups(pool, results, feats, args, label='middle',
+                 parent_corrections=None, optimize_middle=True):
     """Merge groups under re-centred parents. `results` rows are stored rows whose
     parent field is a child-bank index; updated in place. Returns #merges."""
+    n_neighbours = getattr(args, 'merge_neighbours', 3)
+    n_candidates = getattr(args, 'merge_candidates', 16)
     groups = defaultdict(set)
     for i, row in enumerate(results):
         if row is not None and row[1] >= 0:
@@ -898,17 +1085,30 @@ def merge_groups(pool, results, feats, n_neighbours=3, n_candidates=16, label='m
                 span = f_u.max(axis=0) - f_u.min(axis=0)
                 span[span <= 0] = 1.0
                 d = np.sqrt((((feats[pool_c][:, None, :] - f_u[None, :, :]) / span) ** 2).sum(-1))
+                cand_radius = {int(c): float(d[idx].max()) for idx, c in enumerate(pool_c)}
                 cands = pool_c[np.argsort(d.max(axis=1))][:n_candidates]
                 tasks = []
                 for c in cands:
                     dc = np.sqrt((((f_u - feats[c]) / span) ** 2).sum(-1))
                     tasks.append((int(c), [int(x) for x in union[np.argsort(-dc)]]))
-                passed = {c for c, n in pool.imap_unordered(_merge_check, tasks)
-                          if n == len(union)}
+                check_results = list(pool.imap_unordered(_merge_check, tasks))
+                passed = {c for c, n in check_results if n == len(union)}
                 chosen = next((int(c) for c in cands if int(c) in passed), None)
+                chosen_z = None
+                if chosen is not None:
+                    chosen_z = parent_corrections.get(chosen, np.zeros(20)) if parent_corrections is not None else np.zeros(20)
+                elif optimize_middle and label == 'middle':
+                    cand_counts = {int(c): int(n) for c, n in check_results}
+                    best_cand = max(cands, key=lambda c: (cand_counts.get(int(c), 0), -cand_radius[int(c)]))
+                    best_cand = int(best_cand)
+                    init_z = parent_corrections.get(best_cand, None) if parent_corrections is not None else None
+                    opt_z, opt_taps = _optimize_middle_group(pool, union, best_cand, args, initial_z=init_z)
+                    if opt_taps.max() <= args.max_taps:
+                        chosen = best_cand
+                        chosen_z = opt_z
                 if chosen is None:
                     continue
-                rows = dict(pool.imap_unordered(_fit_forced, [(int(i), chosen) for i in union],
+                rows = dict(pool.imap_unordered(_fit_forced, [(int(i), chosen, chosen_z) for i in union],
                                                 chunksize=4))
                 if any(r is None for r in rows.values()):
                     logging.warning('Merge %s %d+%d via %d: forced refit failed; skipped',
@@ -916,6 +1116,12 @@ def merge_groups(pool, results, feats, n_neighbours=3, n_candidates=16, label='m
                     continue
                 for i, r in rows.items():
                     results[i] = r
+                if parent_corrections is not None:
+                    parent_corrections[chosen] = chosen_z
+                    if p in parent_corrections and p != chosen:
+                        del parent_corrections[p]
+                    if q in parent_corrections and q != chosen:
+                        del parent_corrections[q]
                 sizes = (len(groups[p]), len(groups[q]))
                 del groups[p]
                 del groups[q]
@@ -923,8 +1129,9 @@ def merge_groups(pool, results, feats, n_neighbours=3, n_candidates=16, label='m
                 n_merges += 1
                 progress = True
                 logging.info('Merged %s groups %d (%d) + %d (%d) -> parent %d (%d children, '
-                             'max taps %d); %d groups left', label, p, sizes[0], q, sizes[1],
+                             'max taps %d, opt=%s); %d groups left', label, p, sizes[0], q, sizes[1],
                              chosen, len(union), max(len(r[3]) for r in rows.values()),
+                             bool(chosen_z is not None and np.any(chosen_z)),
                              len(groups))
                 break
     return n_merges
@@ -939,15 +1146,20 @@ def consolidate_parents(pool, results, parent_src, feats, args, label):
     """
     rows = [None if r is None else (r[0], int(parent_src[r[1]])) + tuple(r[2:])
             for r in results]
+    parent_corrections = {int(s): np.zeros(20, dtype=np.float64) for s in parent_src}
+    opt_mid = getattr(args, 'optimize_middle', True) and label == 'middle'
     if args.merge_groups:
         n_before = len({r[1] for r in rows if r is not None})
-        n = merge_groups(pool, rows, feats, args.merge_neighbours, args.merge_candidates, label)
+        n = merge_groups(pool, rows, feats, args, label,
+                         parent_corrections=parent_corrections, optimize_middle=opt_mid)
         logging.info('Group merging: %d merges, %d -> %d %s templates in use', n, n_before,
                      len({r[1] for r in rows if r is not None}), label)
     used = np.array(sorted({r[1] for r in rows if r is not None}), dtype=int)
     pos = {int(s): k for k, s in enumerate(used)}
     rows = [None if r is None else (r[0], pos[r[1]]) + tuple(r[2:]) for r in rows]
-    return rows, used
+    corr_matrix = np.array([parent_corrections.get(int(s), np.zeros(20, dtype=np.float64))
+                            for s in used], dtype=np.float64)
+    return rows, used, corr_matrix
 
 
 def _close_bank(bank):
@@ -1054,7 +1266,7 @@ def fit_upper_level(args, middle_bank, psd, flen, output, used_middles=None):
                          n_used, n_used - len(removed))
         top_src = getattr(args, '_top_seed_src', None)
         if top_src is not None and not rejected:
-            results, used_top = consolidate_parents(
+            results, used_top, _ = consolidate_parents(
                 pool, results, top_src, bank_features(upper_middle, args.f_low), args, 'top')
             _close_bank(top_bank)
             write_seed_bank(args.coarse_bank, used_top, args.top_bank, force=True)
@@ -1240,7 +1452,7 @@ def select_seeds(bank, psd, ns, sel, candidates, n_chunks, n_processes, desc):
     return np.array(sorted(seeds), dtype=int)
 
 
-def write_seed_bank(src_path, indices, dst_path, force=False):
+def write_seed_bank(src_path, indices, dst_path, force=False, correction_coeffs=None):
     """Write rows `indices` of template bank `src_path` to a new bank file."""
     import h5py
     if os.path.exists(dst_path) and not force:
@@ -1249,7 +1461,7 @@ def write_seed_bank(src_path, indices, dst_path, force=False):
         n = len(src['tau0'])
         for key in src:
             obj = src[key]
-            if (isinstance(obj, h5py.Dataset) and key not in ('template_hash', 'seed_source_index')
+            if (isinstance(obj, h5py.Dataset) and key not in ('template_hash', 'seed_source_index', 'correction_coeffs')
                     and obj.shape and obj.shape[0] == n):
                 dst.create_dataset(key, data=obj[:][indices])
         for key, value in src.attrs.items():
@@ -1257,6 +1469,10 @@ def write_seed_bank(src_path, indices, dst_path, force=False):
         dst.attrs['seed_source_bank'] = os.path.abspath(src_path)
         dst.attrs['seed_source_sha256'] = file_sha256(src_path)
         dst.create_dataset('seed_source_index', data=np.asarray(indices, dtype=np.int64))
+        if correction_coeffs is not None:
+            dst.create_dataset('correction_coeffs', data=np.asarray(correction_coeffs, dtype=np.float64))
+        elif 'correction_coeffs' in src:
+            dst.create_dataset('correction_coeffs', data=src['correction_coeffs'][:][indices])
     logging.info('Wrote %d seeds to %s', len(indices), dst_path)
 
 
@@ -1312,6 +1528,8 @@ def main():
                         help='Bottom-up mode: skip the pass that merges each group with a tau0 '
                              'neighbour under one re-centred parent when all children still pass '
                              'within --max-taps')
+    parser.add_argument('--no-optimize-middle', action='store_false', dest='optimize_middle',
+                        help='Skip continuous Gauss-Newton middle waveform optimization during group merging')
     parser.add_argument('--merge-neighbours', type=int, default=3,
                         help='Group merging: number of tau0-nearest groups tried per group')
     parser.add_argument('--merge-candidates', type=int, default=16,
@@ -1427,6 +1645,8 @@ def main():
                         help="Disable group-delay phase centering.")
     pycbc.psd.insert_psd_option_group(parser)
     args = parser.parse_args()
+    global g_args
+    g_args = args
     if args.coarse_bank is not None and args.coarse_bank_output is not None:
         parser.error('give only one of --coarse-bank / --coarse-bank-output')
     if args.top_bank is not None and args.top_bank_output is not None:
@@ -1594,12 +1814,13 @@ def main():
                              n_used, n_used - len(removed))
 
             if middle_seed_src is not None and not failed_count:
-                all_results, used_src = consolidate_parents(
+                all_results, used_src, middle_corrections = consolidate_parents(
                     pool, all_results, middle_seed_src, bank_features(fine_bank, args.f_low),
                     args, 'middle')
                 all_metrics = [r[6] if r is not None else None for r in all_results]
                 _close_bank(coarse_bank)
-                write_seed_bank(args.fine_bank, used_src, args.coarse_bank, force=True)
+                write_seed_bank(args.fine_bank, used_src, args.coarse_bank, force=True,
+                                correction_coeffs=middle_corrections)
                 coarse_bank = FilterBank(args.coarse_bank, flen, args.delta_f,
                                          dtype=np.complex128, enable_compressed_waveforms=False)
 

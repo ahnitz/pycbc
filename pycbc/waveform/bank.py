@@ -44,6 +44,32 @@ import hashlib
 import warnings
 
 
+def correction_basis(flen, delta_f, f_low=20.0, f_final=800.0):
+    """Analytic correction basis C(f) for middle waveform optimization."""
+    freqs = np.arange(flen) * delta_f
+    band = (freqs >= f_low) & (freqs <= f_final)
+    f = np.where(band, freqs, f_low)
+    lf = np.log(f)
+    cent = np.linspace(np.log(f_low), np.log(f_final), 8)
+    wid = cent[1] - cent[0]
+    bumps = [np.exp(-0.5 * ((lf - c) / wid) ** 2) for c in cent]
+    pn = [f ** p for p in (-5. / 3, -1., -2. / 3, -1. / 3, 1. / 3, 2. / 3)] + [lf]
+    ph = [b / np.max(np.abs(b[band] - np.mean(b[band]))) for b in pn + bumps]
+    am = bumps[::2] + [bumps[-1]]
+    C = np.array([1j * p for p in ph] + [a.astype(np.complex128) for a in am])
+    return C, band
+
+
+def apply_waveform_correction(h, z, f_low=20.0, f_final=800.0):
+    """Apply analytic smooth correction exp(z @ C(f)) to FrequencySeries h."""
+    if z is None or not np.any(z):
+        return h
+    C, band = correction_basis(len(h), float(h.delta_f), f_low, f_final)
+    h_np = h.numpy().copy()
+    h_np[band] *= np.exp(z @ C)[band]
+    return FrequencySeries(h_np, delta_f=h.delta_f, epoch=h.epoch)
+
+
 def sigma_cached(self, psd):
     """ Cache sigma calculate for use in tandem with the FilterBank class
     """
@@ -332,7 +358,7 @@ class TemplateBank(object):
                 # Auto-detection: Ignore subgroups (like 'fir_data'), only read Datasets
                 fileparams = []
                 for k in root.keys():
-                    if isinstance(root.get(k), h5py.Dataset):
+                    if isinstance(root.get(k), h5py.Dataset) and k != 'correction_coeffs':
                         fileparams.append(k)
                 logging.info("WARNING: no parameters attribute found. "
                     "Assuming that %s " %(', '.join(fileparams)) +
@@ -343,8 +369,9 @@ class TemplateBank(object):
             for param in fileparams:
                 try:
                     param = param.decode()
-                    tmp_params.append(param)
                 except AttributeError:
+                    pass
+                if param != 'correction_coeffs':
                     tmp_params.append(param)
             fileparams = tmp_params
 
@@ -382,6 +409,7 @@ class TemplateBank(object):
 
             # add the compressed waveforms, if they exist IN THIS GROUP
             self.has_compressed_waveforms = 'compressed_waveforms' in root
+            self.correction_coeffs = root['correction_coeffs'][:] if 'correction_coeffs' in root else None
         else:
             raise ValueError("Unsupported template bank file extension %s" %(
                 ext))
@@ -519,6 +547,12 @@ class TemplateBank(object):
                                         load_now=True)
                 # We write to root (which is scoped to the destination group)
                 compressed_waveform.write_to_hdf(root, tmplt_hash)
+
+        # 5. Copy correction coeffs if present
+        if hasattr(self, 'correction_coeffs') and self.correction_coeffs is not None:
+            if 'correction_coeffs' in root:
+                del root['correction_coeffs']
+            root.create_dataset('correction_coeffs', data=self.correction_coeffs[start_index:stop_index])
         return f
 
     def end_frequency(self, index):
@@ -983,6 +1017,12 @@ class FilterBank(TemplateBank):
         # Add sigmasq as a method of this instance
         htilde.sigmasq = types.MethodType(sigma_cached, htilde)
         htilde._sigmasq = {}
+
+        if hasattr(self, 'correction_coeffs') and self.correction_coeffs is not None and index < len(self.correction_coeffs):
+            z = self.correction_coeffs[index]
+            if np.any(z != 0):
+                htilde = apply_waveform_correction(htilde, z, f_low=f_low, f_final=800.0)
+
         return htilde
 
 
