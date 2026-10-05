@@ -22,7 +22,7 @@ from tqdm import tqdm
 import pycbc
 import pycbc.psd
 from pycbc.filter import match, sigma
-from pycbc.types import TimeSeries
+from pycbc.types import FrequencySeries, TimeSeries
 from pycbc.waveform.bank import FilterBank, correction_basis
 
 mp.set_start_method('fork', force=True) 
@@ -106,6 +106,10 @@ def _hermitian_corr(bins, values, nfft):
     return (0.5 * nfft) * np.fft.irfft(half, n=nfft, axis=-1)
 
 
+def _positions(n_taps, nfft):
+    return (np.arange(n_taps) - n_taps // 2) % nfft
+
+
 def design_fft_toeplitz_filter(target, valid_mask, n_taps, weights, reg_val,
                                 peak_cap_factor=10.0, peak_bad_weight_fraction=1.0,
                                 peak_max_passes=3, cap_mode='inband', toeplitz_solve=None):
@@ -130,8 +134,7 @@ def design_fft_toeplitz_filter(target, valid_mask, n_taps, weights, reg_val,
         raise ValueError('FIR tap count must be below fit-grid FFT length')
     if reg_val < 0:
         raise ValueError('regularization must be nonnegative')
-    center = n_taps // 2
-    positions = (np.arange(n_taps) - center) % nfft
+    positions = _positions(n_taps, nfft)
     base_bins = np.flatnonzero(valid_mask)
     base_weights = np.asarray(weights[base_bins], dtype=np.float64)
     base_target = np.asarray(target[base_bins], dtype=np.complex128)
@@ -238,9 +241,6 @@ def verify_filter_match(taps, h_ref, h_fine, psd, f_low, sample_rate=None, shift
 #        gain (--max-noise-gain).
 #
 # The tap search returns the fewest taps that pass both.
-
-def _positions(n_taps, nfft):
-    return (np.arange(n_taps) - n_taps // 2) % nfft
 
 
 def _snap(k, up=True, args=None):
@@ -549,7 +549,7 @@ def write_fir_groups(parent_group, all_results, match_dtype='float32'):
 
 def stored_row(result):
     """Worker result tuple -> row kept for writing (see write_fir_groups)."""
-    (i, parent_match, parent, fit, taps, sigmas, _n_pp, _n_bc, shift,
+    (_i, parent_match, parent, fit, taps, sigmas, _n_pp, _n_bc, shift,
      _attempts, _suppressed, metrics, _accepted) = result
     return (parent_match, parent, fit, taps, sigmas, shift, metrics)
 
@@ -665,7 +665,7 @@ def _toeplitz_fit_batch(prob, k, targets, reg_val, nfft):
     w2 = prob['w_fit'][bins] ** 2
     r = _hermitian_corr(bins, w2, nfft)[:k].copy()
     r[0] += reg_val
-    pos = (np.arange(k) - k // 2) % nfft
+    pos = _positions(k, nfft)
     b = _hermitian_corr(bins, targets[:, bins] * w2[None, :], nfft)[:, pos]
     taps = _toeplitz_solve_cached(r, b.T)
     wave = np.zeros((nfft, taps.shape[1]))
@@ -688,7 +688,6 @@ def _gn_parent(base_idx, z):
         return h0_np, h0_ss, h0_c
     h_m = _gn_apply_correction(h0_np, z)
     mss = float(np.sum(np.abs(h_m[g_kslice]) ** 2 * g_inv_psd[g_kslice]))
-    from pycbc.types import FrequencySeries
     return h_m, mss, FrequencySeries(h_m, delta_f=g_delta_f, epoch=h0_c.epoch)
 
 
@@ -788,11 +787,11 @@ def _optimize_parent_group(pool, union, base_cand, args, initial_z=None, order=N
     k = _snap(int(0.85 * max_taps), args=args)
     best_z, best_fail, best_worst = z.copy(), None, np.inf
 
-    for rnd in range(3):
+    for _ in range(3):
         mu = 1e-2
         p = 8.0
         zreg = 1e-3
-        for it in range(8):
+        for _ in range(8):
             lin = _lin(z, k)
             mis = np.array([x[1] for x in lin])
             worst = mis.max()
@@ -801,7 +800,7 @@ def _optimize_parent_group(pool, union, base_cand, args, initial_z=None, order=N
             c = (mis / worst) ** p
             A = np.zeros((nz, nz))
             g = np.zeros(nz)
-            for (i, m, R, Ai, gi), ci in zip(lin, c):
+            for (_, m, R, Ai, gi), ci in zip(lin, c):
                 s = ci * m / max(R, 1e-300)
                 A += s * Ai
                 g += s * gi
@@ -870,11 +869,7 @@ def _merge_check(task):
 
 def _fit_forced(task):
     """Fewest-tap FIR of child i from child-bank template `cand` (stored-row form)."""
-    if len(task) == 3:
-        i, cand, z = task
-    else:
-        i, cand = task
-        z = None
+    i, cand, z = task
     c_np, c_ss, h_c = _gn_parent(cand, z)
     h, h_np, ss = _child_wave(i)
     stats = {'attempts': 0, 'suppressed': 0}
@@ -1067,10 +1062,9 @@ def upper_namespace(args):
     """Copy of args with the --upper-* overrides applied (top->middle fit)."""
     upper = argparse.Namespace(**vars(args))
     upper.delta_f = args.upper_delta_f or args.delta_f
-    upper.fit_solver = args.upper_fit_solver
     for name in ('n_taps', 'max_taps', 'tap_step', 'min_match', 'search_depth',
-                 'regularization_magnitude', 'lsqr_atol', 'lsqr_iter_lim',
-                 'parent_refine', 'tap_granularity', 'min_taps', 'fit_weight_power'):
+                 'regularization_magnitude', 'parent_refine', 'tap_granularity',
+                 'min_taps', 'fit_weight_power'):
         value = getattr(args, 'upper_' + name, None)
         if value is not None:
             setattr(upper, name, value)
@@ -1086,7 +1080,7 @@ def upper_psd_from_cli(args):
                                                     low_frequency_cutoff=args.f_low)
 
 
-def fit_upper_level(args, middle_bank, psd, flen, output, used_middles=None):
+def fit_upper_level(args, output, used_middles=None):
     """Fit top->middle in the same output file as middle->fine.
 
     Only middle templates listed in used_middles (those with fine children)
@@ -1094,13 +1088,7 @@ def fit_upper_level(args, middle_bank, psd, flen, output, used_middles=None):
     """
     if args.top_bank is None:
         return
-    upper_df = args.upper_delta_f or args.delta_f
-    upper_flen = int((args.sample_rate / 2.0) / upper_df) + 1
-    if abs((upper_flen - 1) * upper_df - args.sample_rate / 2.0) > 1e-8:
-        raise ValueError('upper delta_f must divide the Nyquist frequency')
-    upper_psd = pycbc.psd.from_cli(args, length=upper_flen,
-                                    delta_f=upper_df,
-                                    low_frequency_cutoff=args.f_low)
+    upper_df, upper_flen, upper_psd = upper_psd_from_cli(args)
     upper_middle = FilterBank(args.coarse_bank, upper_flen, upper_df,
                               dtype=np.complex128,
                               enable_compressed_waveforms=False)
@@ -1197,10 +1185,11 @@ def fit_upper_level(args, middle_bank, psd, flen, output, used_middles=None):
     group = output.require_group('fir_data/upper')
     for name in ('sample_rate', 'delta_f', 'n_taps', 'max_taps', 'tap_step',
                  'min_match', 'search_depth', 'regularization_magnitude',
-                 'fit_solver', 'fit_weight_power', 'tap_search', 'tap_granularity',
+                 'fit_weight_power', 'tap_search', 'tap_granularity',
                  'min_taps', 'parent_selection', 'parent_refine', 'verify_mode',
                  'peak_cap_mode', 'peak_cap_factor', 'max_tap_value'):
         group.attrs[name] = getattr(upper, name)
+    group.attrs['fit_solver'] = 'toeplitz'
     group.attrs['sample_shift_folded_into_lower'] = 1
     write_fir_groups(group, results, match_dtype='float64')
     output['fir_data'].attrs['hierarchy_version'] = 2
@@ -1325,12 +1314,11 @@ def select_seeds(bank, psd, ns, sel, candidates, n_chunks, n_processes, desc):
     chunks = [c for c in np.array_split(order, max(1, n_chunks)) if len(c)]
     tasks = [(cid, c, tau0_all[c]) for cid, c in enumerate(chunks)]
     g_seed_source = (bank, psd, ns, sel)   # inherited by the forked workers
-    seeds, attempts = [], 0
+    seeds = []
     with mp.Pool(processes=max(1, min(n_processes, len(tasks)))) as pool:
         for cid, s, a in tqdm(pool.imap_unordered(_seed_chunk, tasks), total=len(tasks),
                               desc=desc, disable=bool(ns.verbose), file=sys.stderr):
             seeds.extend(s)
-            attempts += a
             logging.info('%s: chunk %d -> %d seeds (%d designs)', desc, cid, len(s), a)
     g_seed_source = None
     return np.array(sorted(seeds), dtype=int)
@@ -1460,8 +1448,8 @@ def main():
     parser.add_argument('--min-match', type=float, default=0.99)
     parser.add_argument('--upper-delta-f', type=float,
                         help='Frequency grid for the upper fit; may be finer than --delta-f')
-    parser.add_argument('--upper-fit-solver', choices=('dense', 'fft-lsqr', 'toeplitz'),
-                        default='toeplitz')
+    parser.add_argument('--upper-fit-solver', choices=('toeplitz',), default='toeplitz',
+                        help=argparse.SUPPRESS)
     parser.add_argument('--upper-min-match', type=float,
                         help='Top-to-middle FIR fit target (defaults to --min-match)')
     parser.add_argument('--upper-n-taps', type=int)
@@ -1474,15 +1462,12 @@ def main():
     parser.add_argument('--regularization-magnitude', default=1e-2, type=float,
                         help='Ridge regularisation of the tap fit. 1e-2 keeps taps small and the '
                              'out-of-band gain low at little tap-count cost.')
-    parser.add_argument('--fit-solver', choices=('dense', 'fft-lsqr', 'toeplitz'), default='toeplitz')
-    parser.add_argument('--lsqr-atol', type=float, default=1e-11,
-                        help="LSQR atol/btol tolerance.")
-    parser.add_argument('--lsqr-iter-lim', type=int, default=2000,
-                        help="LSQR max iterations per solve.")
-    parser.add_argument('--upper-lsqr-atol', type=float, default=1e-11,
-                        help="Upper LSQR atol/btol tolerance.")
-    parser.add_argument('--upper-lsqr-iter-lim', type=int, default=2000,
-                        help="Upper LSQR max iterations per solve.")
+    parser.add_argument('--fit-solver', choices=('toeplitz',), default='toeplitz',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--lsqr-atol', type=float, default=1e-11, help=argparse.SUPPRESS)
+    parser.add_argument('--lsqr-iter-lim', type=int, default=2000, help=argparse.SUPPRESS)
+    parser.add_argument('--upper-lsqr-atol', type=float, default=1e-11, help=argparse.SUPPRESS)
+    parser.add_argument('--upper-lsqr-iter-lim', type=int, default=2000, help=argparse.SUPPRESS)
     parser.add_argument('--decimation-factor', default=1, type=int, dest='dec_factor')
     parser.add_argument('--search-depth', default=25, type=int,
                         help="Number of tau0-nearest coarse templates considered as parents")
@@ -1672,7 +1657,6 @@ def main():
     total_attempts_suppressed = 0
     job_list = range(n_fine)
     all_results = [None] * n_fine
-    all_metrics = [None] * n_fine
     failed_idx = []
 
     try:
@@ -1688,7 +1672,6 @@ def main():
                 (i, coarse_match, c_idx, qa_match, final_taps_data, sigmas, n_peak_passes, n_bins_capped,
                  shift, n_attempts_total, n_attempts_suppressed, metrics, accepted) = result
                 all_results[i] = (coarse_match, c_idx, qa_match, final_taps_data, sigmas, shift, metrics)
-                all_metrics[i] = metrics
 
                 if not accepted:
                     failed_count += 1
@@ -1715,14 +1698,12 @@ def main():
                 n_used = len({r[1] for r in all_results if r is not None and r[1] >= 0})
                 removed = prune_parents(pool, all_results, args.n_processes,
                                         args.prune_max_tap_growth, label='middle')
-                all_metrics = [r[6] if r is not None else None for r in all_results]
                 logging.info('Seed pruning: %d -> %d middle templates in use',
                              n_used, n_used - len(removed))
 
             if middle_seed_src is not None and not failed_count:
                 all_results, used_src, middle_corrections = consolidate_parents(
                     pool, all_results, middle_seed_src, fine_bank, args, 'middle')
-                all_metrics = [r[6] if r is not None else None for r in all_results]
                 _close_bank(coarse_bank)
                 write_seed_bank(args.fine_bank, used_src, args.coarse_bank, force=True,
                                 correction_coeffs=middle_corrections)
@@ -1758,8 +1739,7 @@ def main():
                 args.top_bank = args.top_bank_output
                 args._top_seed_src = top_seeds
                 del mid_src
-            upper_results = fit_upper_level(args, coarse_bank, psd, flen, f_out,
-                                            used_middles=used_middles)
+            upper_results = fit_upper_level(args, f_out, used_middles=used_middles)
             if upper_results is not None:
                 for c_idx, u_row in enumerate(upper_results):
                     if u_row is not None and len(u_row) > 5:
@@ -1795,7 +1775,8 @@ def main():
     if len(tap_counts):
         summary_msg += (f"Taps: mean={np.mean(tap_counts):.1f} median={np.median(tap_counts):.0f} "
                         f"min={np.min(tap_counts)} max={np.max(tap_counts)}\n")
-    m = np.array([x for x in all_metrics if x is not None], dtype=np.float64).reshape(-1, 3)
+    m = np.array([r[6] for r in all_results if r is not None and r[6] is not None],
+                 dtype=np.float64).reshape(-1, 3)
     summary_msg += f"max|tap|:    {_pct(m[:, 0])}\n"
     summary_msg += f"oob gain:    {_pct(m[:, 1])}\n"
     summary_msg += f"noise gain:  {_pct(m[:, 2])}\n"
