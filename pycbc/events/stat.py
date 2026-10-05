@@ -1025,21 +1025,24 @@ class ExpFitStatistic(PhaseTDStatistic):
         self.single_coinc_volume_weight = self.kwargs.get("single_coinc_volume_weight", False)
         self.single_coinc_downweight = 0.0
 
-        if self.single_coinc_volume_weight:
+        if self.single_coinc_volume_weight is not False and self.single_coinc_volume_weight is not None:
             if isinstance(self.single_coinc_volume_weight, bool):
-                self.single_coinc_downweight = float(-numpy.log(0.035))
+                if self.single_coinc_volume_weight:
+                    self.single_coinc_downweight = float(-numpy.log(0.035))
             else:
                 self.single_coinc_downweight = float(self.single_coinc_volume_weight)
                 if self.single_coinc_downweight < 0:
                     raise ValueError("single_coinc_volume_weight must be non-negative")
-        elif self.single_coinc_volume_ratio:
+        elif self.single_coinc_volume_ratio is not False and self.single_coinc_volume_ratio is not None:
             if isinstance(self.single_coinc_volume_ratio, bool):
-                ratio = 0.035
+                if self.single_coinc_volume_ratio:
+                    ratio = 0.035
+                    self.single_coinc_downweight = float(-numpy.log(ratio))
             else:
                 ratio = float(self.single_coinc_volume_ratio)
-            if ratio <= 0:
-                raise ValueError("single_coinc_volume_ratio must be positive")
-            self.single_coinc_downweight = float(-numpy.log(ratio))
+                if ratio <= 0:
+                    raise ValueError("single_coinc_volume_ratio must be positive")
+                self.single_coinc_downweight = float(-numpy.log(ratio))
 
         if self.single_coinc_downweight > 0 and not any(
             f[0] == "in_coinc_time" for f in self.single_dtype
