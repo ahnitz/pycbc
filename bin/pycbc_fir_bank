@@ -7,11 +7,11 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 mp.set_start_method('fork', force=True)
 
-import numpy as np, scipy.linalg
+import h5py, numpy as np, scipy.linalg
 from scipy.linalg import solve_toeplitz, cho_factor, cho_solve
 from scipy.spatial.distance import cdist
 from tqdm import tqdm
-import pycbc, pycbc.psd
+import pycbc, pycbc.psd, pycbc.conversions as conversions
 from pycbc.filter import match
 from pycbc.types import FrequencySeries
 from pycbc.waveform.bank import FilterBank, correction_basis
@@ -374,7 +374,6 @@ def _fit_forced(task):
     return (i, (float(m), cand, rec['match'], rec['taps'], rec['sigmas'], rec['shift'], rec['metrics']))
 
 def bank_features(bank, f_low):
-    from pycbc import conversions
     t = bank.table; names = t.dtype.names
     m1, m2 = np.asarray(t['mass1'], float), np.asarray(t['mass2'], float)
     tau0 = np.asarray(t['tau0'], float) if 'tau0' in names else conversions.tau0_from_mass1_mass2(m1, m2, f_low)
@@ -524,7 +523,6 @@ def write_fir_groups(parent_group, all_results, match_dtype='float32'):
     return np.concatenate(tap_counts) if tap_counts else np.array([], dtype=int)
 
 def write_seed_bank(src_path, indices, dst_path, force=False, correction_coeffs=None):
-    import h5py
     indices = np.asarray(indices, dtype=int)
     if os.path.exists(dst_path) and not force:
         raise ValueError(f'{dst_path} exists; refusing to overwrite (use --force)')
@@ -545,10 +543,8 @@ def write_seed_bank(src_path, indices, dst_path, force=False, correction_coeffs=
     logging.info('Wrote %d seeds to %s', len(indices), dst_path)
 
 def file_sha256(path):
-    digest = hashlib.sha256()
-    with open(path, 'rb') as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b''): digest.update(chunk)
-    return digest.hexdigest()
+    with open(path, 'rb') as f:
+        return hashlib.file_digest(f, 'sha256').hexdigest()
 
 def _seed_cluster(sel):
     tau0, n = g_coarse_tau0, len(g_coarse_np)
@@ -679,6 +675,49 @@ def parse_cli():
     for opt in ('--lsqr-atol', '--lsqr-iter-lim', '--upper-lsqr-atol', '--upper-lsqr-iter-lim'): p.add_argument(opt, type=float, help=argparse.SUPPRESS)
     return p.parse_args()
 
+def run_level(child_path, parent_path, parent_out_path, flen, df, psd, ns,
+              child_indices=None, label='middle', seed_opts=None, n_seed_chunks=1):
+    seed_src = None
+    if parent_path is None:
+        logging.info("Bottom-up seeding: choosing %s templates...", label)
+        c_bank = FilterBank(child_path, flen, df, dtype=complex, enable_compressed_waveforms=False)
+        cands = np.arange(len(c_bank)) if child_indices is None else child_indices
+        seeds = select_seeds(c_bank, psd, ns, seed_opts, cands, n_seed_chunks, ns.n_processes, f"Seeding {label} level")
+        write_seed_bank(child_path, seeds, parent_out_path, force=ns.force)
+        parent_path, seed_src = parent_out_path, seeds
+        del c_bank
+
+    parent_bank = FilterBank(parent_path, flen, df, dtype=complex, enable_compressed_waveforms=False)
+    parent_waveforms = [h.copy() for h in parent_bank]
+    child_bank = FilterBank(child_path, flen, df, dtype=complex, enable_compressed_waveforms=False)
+    indices = list(range(len(child_bank))) if child_indices is None else list(child_indices)
+    ns._coarse_tau0 = np.array(parent_bank.table['tau0'], float) if hasattr(parent_bank, 'table') and 'tau0' in parent_bank.table.dtype.names else None
+    ns._fine_tau0 = np.array(child_bank.table['tau0'], float) if hasattr(child_bank, 'table') and 'tau0' in child_bank.table.dtype.names else None
+
+    results, failed_count = [None] * len(child_bank), 0
+    with mp.Pool(processes=ns.n_processes, initializer=init_worker, initargs=(parent_waveforms, child_bank, psd, ns)) as pool:
+        it = pool.imap_unordered(process_template, indices, chunksize=8)
+        if not ns.verbose: it = tqdm(it, total=len(indices), desc=f"Fitting {label} level", postfix={"failed": 0}, file=sys.stderr)
+        for res in it:
+            i, parent_match, parent_idx, m, taps, sigmas, shift, metrics, accepted = res
+            results[i] = (parent_match, parent_idx, m, taps, sigmas, shift, metrics)
+            if not accepted: failed_count += 1
+            if not ns.verbose: it.set_postfix(failed=failed_count)
+
+        if ns.prune_seeds and not failed_count:
+            n_used = len({r[1] for r in results if r is not None and r[1] >= 0})
+            removed = prune_parents(pool, results, ns.n_processes, ns.prune_max_tap_growth, label=label)
+            logging.info('Seed pruning: %d -> %d %s templates in use', n_used, n_used - len(removed), label)
+
+        if seed_src is not None and not failed_count:
+            results, used_src, corrections = consolidate_parents(pool, results, seed_src, child_bank, ns, label)
+            if getattr(parent_bank, 'file', None): parent_bank.file.close()
+            write_seed_bank(child_path, used_src, parent_path, force=True, correction_coeffs=corrections)
+            parent_bank = FilterBank(parent_path, flen, df, dtype=complex, enable_compressed_waveforms=False)
+            parent_waveforms = [h.copy() for h in parent_bank]
+
+    return results, parent_bank, parent_waveforms, parent_path, failed_count
+
 def main():
     args = parse_cli()
     global g_args; g_args = args
@@ -704,51 +743,20 @@ def main():
     logging.info(f"Setup: Rate={args.sample_rate}, df={args.delta_f}, flen={flen}")
     psd = pycbc.psd.from_cli(args, length=flen, delta_f=args.delta_f, low_frequency_cutoff=args.f_low)
 
-    middle_seed_src = None
-    if args.coarse_bank is None:
-        logging.info("Bottom-up seeding: choosing middle templates from the fine bank...")
-        seed_src = FilterBank(args.fine_bank, flen, args.delta_f, dtype=complex, enable_compressed_waveforms=False)
-        sel = dict(target_taps=args.seed_target_taps or args.n_taps, dtau_max=args.seed_dtau_max,
-                   direct_min=args.seed_direct_match_min, density_window=args.seed_density_window,
-                   min_group_size=args.min_group_size, absorb_taps=args.max_taps, absorb_depth=5,
-                   medoid=not args.no_seed_medoid, rng_seed=12345)
-        seeds = select_seeds(seed_src, psd, args, sel, np.arange(len(seed_src)), args.seed_chunks or args.n_processes, args.n_processes, 'Seeding middle level')
-        write_seed_bank(args.fine_bank, seeds, args.coarse_bank_output, force=args.force)
-        args.coarse_bank, middle_seed_src = args.coarse_bank_output, seeds
-        del seed_src
-
-    coarse_bank = FilterBank(args.coarse_bank, flen, args.delta_f, dtype=complex, enable_compressed_waveforms=False)
-    coarse_waveforms = [h.copy() for h in coarse_bank]
     fine_bank = FilterBank(args.fine_bank, flen, args.delta_f, dtype=complex, enable_compressed_waveforms=False)
     n_fine = len(fine_bank)
-    args._coarse_tau0 = np.array(coarse_bank.table['tau0'], float) if hasattr(coarse_bank, 'table') and 'tau0' in coarse_bank.table.dtype.names else None
-    args._fine_tau0 = np.array(fine_bank.table['tau0'], float) if hasattr(fine_bank, 'table') and 'tau0' in fine_bank.table.dtype.names else None
-
     f_out = fine_bank.write_to_hdf(args.output_file, force=True, write_compressed_waveforms=True)
     fir_group = f_out.require_group("fir_data")
     for arg, val in vars(args).items():
         if val is not None and isinstance(val, (int, float, str)): fir_group.attrs[arg] = val
 
-    all_results, failed_count = [None] * n_fine, 0
-    with mp.Pool(processes=args.n_processes, initializer=init_worker, initargs=(coarse_waveforms, fine_bank, psd, args)) as pool:
-        it = pool.imap_unordered(process_template, range(n_fine), chunksize=8)
-        if not args.verbose: it = tqdm(it, total=n_fine, desc="Designing Filters", postfix={"failed": 0}, file=sys.stderr)
-        for res in it:
-            i, parent_match, parent_idx, m, taps, sigmas, shift, metrics, accepted = res
-            all_results[i] = (parent_match, parent_idx, m, taps, sigmas, shift, metrics)
-            if not accepted: failed_count += 1
-            if not args.verbose: it.set_postfix(failed=failed_count)
-
-        if args.prune_seeds and not failed_count:
-            n_used = len({r[1] for r in all_results if r is not None and r[1] >= 0})
-            removed = prune_parents(pool, all_results, args.n_processes, args.prune_max_tap_growth, label='middle')
-            logging.info('Seed pruning: %d -> %d middle templates in use', n_used, n_used - len(removed))
-
-        if middle_seed_src is not None and not failed_count:
-            all_results, used_src, middle_corrections = consolidate_parents(pool, all_results, middle_seed_src, fine_bank, args, 'middle')
-            if getattr(coarse_bank, 'file', None): coarse_bank.file.close()
-            write_seed_bank(args.fine_bank, used_src, args.coarse_bank, force=True, correction_coeffs=middle_corrections)
-            coarse_bank = FilterBank(args.coarse_bank, flen, args.delta_f, dtype=complex, enable_compressed_waveforms=False)
+    sel_mid = dict(target_taps=args.seed_target_taps or args.n_taps, dtau_max=args.seed_dtau_max,
+                   direct_min=args.seed_direct_match_min, density_window=args.seed_density_window,
+                   min_group_size=args.min_group_size, absorb_taps=args.max_taps, absorb_depth=5,
+                   medoid=not args.no_seed_medoid, rng_seed=12345)
+    all_results, coarse_bank, _, args.coarse_bank, failed_count = run_level(
+        args.fine_bank, args.coarse_bank, args.coarse_bank_output, flen, args.delta_f, psd, args,
+        label='middle', seed_opts=sel_mid, n_seed_chunks=args.seed_chunks or args.n_processes)
 
     coarse_bank.write_to_hdf(args.output_file, file_handler=f_out, group_key="fir_data/coarse_bank_params", write_compressed_waveforms=True)
     tap_counts = write_fir_groups(fir_group, all_results)
@@ -762,37 +770,13 @@ def main():
         for k in ('n_taps', 'max_taps', 'tap_step', 'min_match', 'search_depth', 'regularization_magnitude'):
             if getattr(args, 'upper_' + k) is not None: setattr(upper_ns, k, getattr(args, 'upper_' + k))
 
-        if args.top_bank is None:
-            logging.info(f"Bottom-up seeding: choosing top templates from {len(used_middles)} used middles...")
-            mid_src = FilterBank(args.coarse_bank, upper_flen, upper_df, dtype=complex, enable_compressed_waveforms=False)
-            sel_top = dict(target_taps=args.upper_seed_target_taps or upper_ns.n_taps, dtau_max=args.upper_seed_dtau_max,
-                           direct_min=args.upper_seed_direct_match_min, density_window=args.upper_seed_density_window,
-                           min_group_size=args.upper_min_group_size, absorb_taps=upper_ns.max_taps, absorb_depth=5,
-                           medoid=not args.no_seed_medoid, rng_seed=12345)
-            top_seeds = select_seeds(mid_src, upper_psd, upper_ns, sel_top, used_middles, 1, 1, 'Seeding top level')
-            write_seed_bank(args.coarse_bank, top_seeds, args.top_bank_output, force=args.force)
-            args.top_bank, args._top_seed_src = args.top_bank_output, top_seeds
-            del mid_src
-
-        upper_middle = FilterBank(args.coarse_bank, upper_flen, upper_df, dtype=complex, enable_compressed_waveforms=False)
-        top_bank = FilterBank(args.top_bank, upper_flen, upper_df, dtype=complex, enable_compressed_waveforms=False)
-        top_waveforms = [h.copy() for h in top_bank]
-        upper_ns._coarse_tau0 = np.array(top_bank.table['tau0'], float) if hasattr(top_bank, 'table') and 'tau0' in top_bank.table.dtype.names else None
-        upper_ns._fine_tau0 = np.array(upper_middle.table['tau0'], float) if hasattr(upper_middle, 'table') and 'tau0' in upper_middle.table.dtype.names else None
-
-        upper_results = [None] * len(upper_middle)
-        with mp.Pool(processes=args.n_processes, initializer=init_worker, initargs=(top_waveforms, upper_middle, upper_psd, upper_ns)) as pool:
-            for res in tqdm(pool.imap_unordered(process_template, used_middles), total=len(used_middles), desc="Fitting upper level", disable=bool(args.verbose), file=sys.stderr):
-                i, parent_match, parent_idx, m, taps, sigmas, shift, metrics, accepted = res
-                upper_results[i] = (parent_match, parent_idx, m, taps, sigmas, shift, metrics)
-            if args.prune_seeds:
-                prune_parents(pool, upper_results, args.n_processes, args.prune_max_tap_growth, label='top')
-            if getattr(args, '_top_seed_src', None) is not None:
-                upper_results, used_top, top_corrections = consolidate_parents(pool, upper_results, args._top_seed_src, upper_middle, upper_ns, 'top')
-                if getattr(top_bank, 'file', None): top_bank.file.close()
-                write_seed_bank(args.coarse_bank, used_top, args.top_bank, force=True, correction_coeffs=top_corrections)
-                top_bank = FilterBank(args.top_bank, upper_flen, upper_df, dtype=complex, enable_compressed_waveforms=False)
-                top_waveforms = [h.copy() for h in top_bank]
+        sel_top = dict(target_taps=args.upper_seed_target_taps or upper_ns.n_taps, dtau_max=args.upper_seed_dtau_max,
+                       direct_min=args.upper_seed_direct_match_min, density_window=args.upper_seed_density_window,
+                       min_group_size=args.upper_min_group_size, absorb_taps=upper_ns.max_taps, absorb_depth=5,
+                       medoid=not args.no_seed_medoid, rng_seed=12345)
+        upper_results, top_bank, top_waveforms, args.top_bank, _ = run_level(
+            args.coarse_bank, args.top_bank, args.top_bank_output, upper_flen, upper_df, upper_psd, upper_ns,
+            child_indices=used_middles, label='top', seed_opts=sel_top, n_seed_chunks=1)
 
         top_bank.ensure_hash()
         top_bank.write_to_hdf(args.output_file, file_handler=f_out, group_key='fir_data/upper/top_bank_params', write_compressed_waveforms=True)
