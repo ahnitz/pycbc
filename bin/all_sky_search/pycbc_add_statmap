@@ -61,6 +61,10 @@ parser.add_argument('--hierarchical-removal-against', type=str,
                          'triggers that are louder than either the "inclusive"'
                          ' (little-dogs-in) background, or the "exclusive" '
                          '(little-dogs-out) background. [default="none"]')
+parser.add_argument('--coinc-time-single-downweight-factor', type=float, default=1.0,
+                    help="Factor by which to increase FAR (decrease IFAR) for single-detector "
+                         "candidates occurring during multi-detector coincident time "
+                         "[default=1.0]")
 significance.insert_significance_option_group(parser)
 parser.add_argument('--output-file', help="name of output file")
 
@@ -401,18 +405,57 @@ del ifo_combo_key
 
 logging.info('Combining false alarm rates from all available backgrounds')
 
-# Convert dictionary of whether the ifo combination is available at trigger
-# time into a 2D mask
-# Iterating over all_ifo_combos ensures that ordering remains the same
-isincombo_mask = np.array([list(is_in_combo_time[ct]) for ct in all_ifo_combos])
+def compute_combined_fars(combos, ifos, in_combo_time, in_fars, fg_data, downweight_factor=1.0):
+    """
+    Combines FARs across available backgrounds preserving physical coincidence parity:
+    - Multi-detector coincidences (>= 2 active IFOs) only accumulate FAR from multi-detector backgrounds (len(ct) >= 4).
+    - Single-detector candidates (1 active IFO) only accumulate FAR from that single detector's background.
+    - If downweight_factor > 1.0, single-detector candidates occurring during multi-detector time have their FAR multiplied by downweight_factor.
+    """
+    stat_arr = fg_data['stat'][:] if hasattr(fg_data['stat'], '__getitem__') else fg_data['stat']
+    n_trigs = len(stat_arr)
+    n_active = np.zeros(n_trigs, dtype=int)
+    for ifo in ifos:
+        if f'{ifo}/time' in fg_data:
+            n_active += (fg_data[f'{ifo}/time'][:] > 0).astype(int)
+        elif f'foreground/{ifo}/time' in fg_data:
+            n_active += (fg_data[f'foreground/{ifo}/time'][:] > 0).astype(int)
+
+    compat_mask = np.zeros((len(combos), n_trigs), dtype=bool)
+    for ct_idx, ct in enumerate(combos):
+        ct_n_ifos = len(ct) // 2
+        if ct_n_ifos >= 2:
+            compat_mask[ct_idx] = (n_active >= 2)
+        elif ct_n_ifos == 1:
+            t_ifo = fg_data[f'{ct}/time'][:] if f'{ct}/time' in fg_data else fg_data[f'foreground/{ct}/time'][:]
+            compat_mask[ct_idx] = (n_active == 1) & (t_ifo > 0)
+        else:
+            compat_mask[ct_idx] = True
+
+    isincombo_mask = np.array([list(in_combo_time[ct]) for ct in combos])
+    active_mask = (isincombo_mask > 0) & compat_mask
+
+    adjusted_fars = np.copy(in_fars)
+    if downweight_factor > 1.0:
+        in_multi_time = np.any([in_combo_time[ct] > 0 for ct in combos if len(ct) // 2 >= 2], axis=0)
+        sngl_in_multi = (n_active == 1) & in_multi_time
+        for ct_idx, ct in enumerate(combos):
+            if len(ct) // 2 == 1:
+                adjusted_fars[ct_idx][sngl_in_multi] *= downweight_factor
+
+    return np.sum(active_mask * adjusted_fars, axis=0)
 
 # Create n_combos by n_triggers arrays of FARs
 fg_fars = np.array([list(far[ct]) for ct in all_ifo_combos])
 fg_fars_exc = np.array([list(far_exc[ct]) for ct in all_ifo_combos])
 
-# Combine the FARs with the mask to obtain the new ifars
-fg_fars_out = np.sum(isincombo_mask * fg_fars, axis=0)
-fg_fars_exc_out = np.sum(isincombo_mask * fg_fars_exc, axis=0)
+# Combine the FARs with the compatibility mask to obtain the new ifars
+fg_fars_out = compute_combined_fars(all_ifo_combos, all_ifos, is_in_combo_time,
+                                    fg_fars, f['foreground'],
+                                    args.coinc_time_single_downweight_factor)
+fg_fars_exc_out = compute_combined_fars(all_ifo_combos, all_ifos, is_in_combo_time,
+                                        fg_fars_exc, f['foreground'],
+                                        args.coinc_time_single_downweight_factor)
 
 # Apply any limits as appropriate
 fg_fars_out = significance.apply_far_limit(
@@ -427,7 +470,7 @@ fg_fars_exc_out = significance.apply_far_limit(
 fg_ifar = conv.sec_to_year(1. / fg_fars_out)
 fg_ifar_exc = conv.sec_to_year(1. / fg_fars_exc_out)
 fg_time = f.attrs['foreground_time']
-del isincombo_mask, fg_fars, fg_fars_exc, _
+del fg_fars, fg_fars_exc, _
 
 f.attrs['foreground_time_exc'] = f.attrs['foreground_time']
 if not injection_style:
@@ -700,10 +743,10 @@ while True:
         is_in_combo_time[key][idx_within_segment] = \
             np.ones_like(idx_within_segment)
 
-    isincombo_mask = np.array([list(is_in_combo_time[ct])
-                               for ct in all_ifo_combos])
     fg_fars = np.array([list(far[ct]) for ct in all_ifo_combos])
-    fg_fars_out = np.sum(isincombo_mask * fg_fars, axis=0)
+    fg_fars_out = compute_combined_fars(all_ifo_combos, all_ifos, is_in_combo_time,
+                                        fg_fars, combined_fg_data.data,
+                                        args.coinc_time_single_downweight_factor)
     fg_fars_out = significance.apply_far_limit(
         fg_fars_out,
         significance_dict,
