@@ -61,10 +61,11 @@ parser.add_argument('--hierarchical-removal-against', type=str,
                          'triggers that are louder than either the "inclusive"'
                          ' (little-dogs-in) background, or the "exclusive" '
                          '(little-dogs-out) background. [default="none"]')
-parser.add_argument('--coinc-time-single-downweight-factor', type=float, default=1.0,
-                    help="Factor by which to increase FAR (decrease IFAR) for single-detector "
-                         "candidates occurring during multi-detector coincident time "
-                         "[default=1.0]")
+parser.add_argument('--isolate-backgrounds', action='store_true', default=False,
+                    help="Isolate false alarm rates so multi-detector coincidences only "
+                         "accumulate FAR from multi-detector backgrounds, and single-detector "
+                         "candidates only accumulate FAR from single-detector backgrounds. "
+                         "[default=False]")
 significance.insert_significance_option_group(parser)
 parser.add_argument('--output-file', help="name of output file")
 
@@ -405,13 +406,19 @@ del ifo_combo_key
 
 logging.info('Combining false alarm rates from all available backgrounds')
 
-def compute_combined_fars(combos, ifos, in_combo_time, in_fars, fg_data, downweight_factor=1.0):
+def compute_combined_fars(combos, ifos, in_combo_time, in_fars, fg_data, isolate_backgrounds=False):
     """
-    Combines FARs across available backgrounds preserving physical coincidence parity:
+    Combines FARs across available backgrounds.
+    If isolate_backgrounds is True:
     - Multi-detector coincidences (>= 2 active IFOs) only accumulate FAR from multi-detector backgrounds (len(ct) >= 4).
     - Single-detector candidates (1 active IFO) only accumulate FAR from that single detector's background.
-    - If downweight_factor > 1.0, single-detector candidates occurring during multi-detector time have their FAR multiplied by downweight_factor.
+    If isolate_backgrounds is False (default):
+    - Sums FARs across all active background times matching upstream PyCBC behavior.
     """
+    isincombo_mask = np.array([list(in_combo_time[ct]) for ct in combos])
+    if not isolate_backgrounds:
+        return np.sum(isincombo_mask * in_fars, axis=0)
+
     stat_arr = fg_data['stat'][:] if hasattr(fg_data['stat'], '__getitem__') else fg_data['stat']
     n_trigs = len(stat_arr)
     n_active = np.zeros(n_trigs, dtype=int)
@@ -432,18 +439,8 @@ def compute_combined_fars(combos, ifos, in_combo_time, in_fars, fg_data, downwei
         else:
             compat_mask[ct_idx] = True
 
-    isincombo_mask = np.array([list(in_combo_time[ct]) for ct in combos])
     active_mask = (isincombo_mask > 0) & compat_mask
-
-    adjusted_fars = np.copy(in_fars)
-    if downweight_factor > 1.0:
-        in_multi_time = np.any([in_combo_time[ct] > 0 for ct in combos if len(ct) // 2 >= 2], axis=0)
-        sngl_in_multi = (n_active == 1) & in_multi_time
-        for ct_idx, ct in enumerate(combos):
-            if len(ct) // 2 == 1:
-                adjusted_fars[ct_idx][sngl_in_multi] *= downweight_factor
-
-    return np.sum(active_mask * adjusted_fars, axis=0)
+    return np.sum(active_mask * in_fars, axis=0)
 
 # Create n_combos by n_triggers arrays of FARs
 fg_fars = np.array([list(far[ct]) for ct in all_ifo_combos])
@@ -452,10 +449,10 @@ fg_fars_exc = np.array([list(far_exc[ct]) for ct in all_ifo_combos])
 # Combine the FARs with the compatibility mask to obtain the new ifars
 fg_fars_out = compute_combined_fars(all_ifo_combos, all_ifos, is_in_combo_time,
                                     fg_fars, f['foreground'],
-                                    args.coinc_time_single_downweight_factor)
+                                    args.isolate_backgrounds)
 fg_fars_exc_out = compute_combined_fars(all_ifo_combos, all_ifos, is_in_combo_time,
                                         fg_fars_exc, f['foreground'],
-                                        args.coinc_time_single_downweight_factor)
+                                        args.isolate_backgrounds)
 
 # Apply any limits as appropriate
 fg_fars_out = significance.apply_far_limit(
@@ -746,7 +743,7 @@ while True:
     fg_fars = np.array([list(far[ct]) for ct in all_ifo_combos])
     fg_fars_out = compute_combined_fars(all_ifo_combos, all_ifos, is_in_combo_time,
                                         fg_fars, combined_fg_data.data,
-                                        args.coinc_time_single_downweight_factor)
+                                        args.isolate_backgrounds)
     fg_fars_out = significance.apply_far_limit(
         fg_fars_out,
         significance_dict,

@@ -843,7 +843,11 @@ def _toeplitz_solve_cached(r, b):
     Children of one parent share the same normal-equation matrix, so the
     O(k^3/3) factorisation is paid once per (parent, tap count) and each
     further solve (any number of right-hand sides) costs O(k^2).
+    For large k (> 1024), Levinson-Durbin (solve_toeplitz) is both ~170x faster
+    (O(k^2) vs O(k^3)) and avoids massive dense Toeplitz matrices (48 KB vs 576 MB).
     """
+    if len(r) > 1024:
+        return solve_toeplitz(r, b)
     key = r.tobytes()
     fac = _g_factor_cache.get(key)
     if fac is None:

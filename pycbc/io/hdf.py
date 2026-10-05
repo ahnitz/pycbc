@@ -1437,6 +1437,9 @@ class ReadByTemplate(object):
         self.ifo = ifo if ifo is not None else tuple(self.file.keys())[0]
         self.valid = None
         self.bank = HFile(bank, 'r') if bank else {}
+        self.segment_name = segment_name
+        self.veto_files = veto_files
+        self.gating_veto_windows = gating_veto_windows
 
         # Determine the segments which define the boundaries of valid times
         # to use triggers

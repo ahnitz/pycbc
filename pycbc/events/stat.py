@@ -45,6 +45,8 @@ _allowed_statistic_features = [
     "chirp_mass",
     "sensitive_volume",
     "normalize_fit_rate",
+    "single_coinc_volume_ratio",
+    "single_coinc_volume_weight",
 ]
 
 
@@ -1018,6 +1020,26 @@ class ExpFitStatistic(PhaseTDStatistic):
             for kname in self.kde_names:
                 self.assign_kdes(kname)
 
+        # Single-detector candidate volume normalization during coincident time
+        self.single_coinc_volume_ratio = self.kwargs.get("single_coinc_volume_ratio", False)
+        self.single_coinc_volume_weight = self.kwargs.get("single_coinc_volume_weight", False)
+        self.single_coinc_downweight = 0.0
+
+        if self.single_coinc_volume_weight:
+            if isinstance(self.single_coinc_volume_weight, bool):
+                self.single_coinc_downweight = float(-numpy.log(0.035))
+            else:
+                self.single_coinc_downweight = float(self.single_coinc_volume_weight)
+        elif self.single_coinc_volume_ratio:
+            if isinstance(self.single_coinc_volume_ratio, bool):
+                ratio = 0.035
+            else:
+                ratio = float(self.single_coinc_volume_ratio)
+            self.single_coinc_downweight = float(-numpy.log(ratio))
+
+        if self.single_coinc_downweight > 0:
+            self.single_dtype.append(("in_coinc_time", bool))
+
     def assign_template_bins(self, key):
         """
         Assign bin ID values
@@ -1410,6 +1432,81 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         return numpy.array(lognoisel, ndmin=1, dtype=numpy.float32)
 
+    def get_coinc_segments(self, trigs=None):
+        """
+        Return the segment list where multiple detectors were operating concurrently.
+        """
+        if getattr(self, "_coinc_segs", None) is not None:
+            return self._coinc_segs
+
+        from pycbc.events import veto
+        from igwn_segments import segmentlist
+
+        coinc_segs = None
+
+        # 1. Explicit coinc_segments file passed via kwargs
+        if "coinc_segments" in self.kwargs and self.kwargs["coinc_segments"]:
+            seg_file = self.kwargs["coinc_segments"]
+            seg_name = self.kwargs.get("coinc_segment_name", None)
+            coinc_segs = veto.select_segments_by_definer(seg_file, segment_name=seg_name)
+
+        # 2. Extract active segments from trigs if available
+        if coinc_segs is None and trigs is not None:
+            trig_file = getattr(trigs, "file", None)
+            if trig_file is None and hasattr(trigs, "keys"):
+                trig_file = trigs
+
+            if trig_file is not None:
+                search_ifos = [
+                    k for k in trig_file.keys()
+                    if hasattr(trig_file[k], "__getitem__") and "search" in trig_file[k]
+                    and "start_time" in trig_file[k]["search"]
+                ]
+                if len(search_ifos) >= 2:
+                    ifo_segs_dict = {}
+                    for ifo in search_ifos:
+                        if ifo == getattr(trigs, "ifo", None) and hasattr(trigs, "segs"):
+                            ifo_segs_dict[ifo] = trigs.segs
+                        else:
+                            s = trig_file[f"{ifo}/search/start_time"][:]
+                            e = trig_file[f"{ifo}/search/end_time"][:]
+                            ifo_segs = veto.start_end_to_segments(s, e).coalesce()
+                            veto_files = getattr(trigs, "veto_files", None)
+                            seg_names = getattr(trigs, "segment_name", None)
+                            if veto_files:
+                                for vfile, vname in zip(veto_files, seg_names or []):
+                                    vsegs = veto.select_segments_by_definer(vfile, ifo=ifo, segment_name=vname)
+                                    ifo_segs = (ifo_segs - vsegs).coalesce()
+                            ifo_segs_dict[ifo] = ifo_segs
+
+                    coinc_segs = segmentlist(ifo_segs_dict[search_ifos[0]])
+                    for ifo in search_ifos[1:]:
+                        coinc_segs = (coinc_segs & ifo_segs_dict[ifo]).coalesce()
+
+        self._coinc_segs = coinc_segs
+        return self._coinc_segs
+
+    def check_in_coinc_time(self, trigs, times):
+        """
+        Check which trigger times fall within multi-detector coincident time.
+        """
+        if len(times) == 0:
+            return numpy.zeros(0, dtype=bool)
+
+        if trigs is not None and isinstance(trigs, dict) and "in_coinc_time" in trigs:
+            return numpy.array(trigs["in_coinc_time"][:], dtype=bool)
+
+        coinc_segs = self.get_coinc_segments(trigs)
+        if coinc_segs is None or len(coinc_segs) == 0:
+            return numpy.zeros(len(times), dtype=bool)
+
+        from pycbc.events import veto
+        starts, ends = veto.segments_to_start_end(coinc_segs)
+        inds = veto.indices_within_times(times, starts, ends)
+        in_coinc = numpy.zeros(len(times), dtype=bool)
+        in_coinc[inds] = True
+        return in_coinc
+
     def single(self, trigs):
         """
         Calculate the necessary single detector information
@@ -1483,6 +1580,11 @@ class ExpFitStatistic(PhaseTDStatistic):
             dq_rate = self.find_dq_noise_rate(trigs, singles['dq_state'])
             dq_rate = numpy.maximum(dq_rate, 1)
             sngl_stat += numpy.log(dq_rate)
+
+        if self.single_coinc_downweight > 0:
+            singles["in_coinc_time"] = self.check_in_coinc_time(
+                trigs, singles["end_time"]
+            )
 
         singles["snglstat"] = sngl_stat
         return numpy.array(singles, ndmin=1)
@@ -1599,6 +1701,22 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         # Combine the signal and noise rates
         loglr = ln_s - ln_noise_rate
+
+        # Single-detector volume normalization:
+        # Downweight single-detector candidates occurring during multi-detector coincident time
+        if self.single_coinc_downweight > 0:
+            if "in_coinc_time" in sngls.dtype.names:
+                in_coinc = sngls["in_coinc_time"].astype(bool)
+                if isinstance(loglr, numpy.ndarray):
+                    loglr[in_coinc] -= self.single_coinc_downweight
+                elif in_coinc:
+                    loglr -= self.single_coinc_downweight
+            elif "end_time" in sngls.dtype.names:
+                in_coinc = self.check_in_coinc_time(None, sngls["end_time"])
+                if isinstance(loglr, numpy.ndarray):
+                    loglr[in_coinc] -= self.single_coinc_downweight
+                elif in_coinc:
+                    loglr -= self.single_coinc_downweight
 
         # Apply statistic correction
         loglr += self.stat_correction
