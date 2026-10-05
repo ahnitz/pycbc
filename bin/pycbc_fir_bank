@@ -571,7 +571,7 @@ def _min_taps(prob, k_cap, h_fine, h_fine_np, fine_ss, stats):
     while k <= k_cap:
         ladder.append(k)
         k = _snap(k + g_args.tap_step)
-    top = _snap(k_cap, up=False)
+    top = k_cap if k_cap % 2 else k_cap - 1   # the cap itself is allowed (odd)
     if not ladder or ladder[-1] < top:
         ladder.append(top)
     lo, hi, hi_rec = None, None, None
@@ -602,10 +602,11 @@ def _min_taps(prob, k_cap, h_fine, h_fine_np, fine_ss, stats):
     return hi_rec, best_fail
 
 
-def process_template(i):
+def process_template(i, excluded=None):
     """Find the parent and FIR with the fewest taps that pass acceptance.
 
-    Candidate parents are the --search-depth nearest in tau0. They are ranked
+    Candidate parents are the --search-depth nearest in tau0 (never any in
+    `excluded`). They are ranked
     either by how well a quick --n-taps fit reconstructs the template
     (--parent-selection min-taps) or by direct template match (direct-match).
     The top --parent-refine candidates each get the full minimum-tap search,
@@ -618,11 +619,14 @@ def process_template(i):
     fine_ss = float(np.sum(np.abs(h_fine_np[sl]) ** 2 * g_inv_psd[sl]))
     stats = {'attempts': 0, 'suppressed': 0}
 
-    n_cand = min(len(g_coarse_waveforms), g_args.search_depth)
+    allowed = np.arange(len(g_coarse_waveforms))
+    if excluded:
+        allowed = allowed[~np.isin(allowed, np.fromiter(excluded, dtype=int))]
+    n_cand = min(len(allowed), g_args.search_depth)
     if g_coarse_tau0 is not None and g_fine_tau0 is not None:
-        candidates = np.argsort(np.abs(g_coarse_tau0 - g_fine_tau0[i]))[:n_cand]
+        candidates = allowed[np.argsort(np.abs(g_coarse_tau0[allowed] - g_fine_tau0[i]))[:n_cand]]
     else:
-        candidates = np.arange(len(g_coarse_waveforms))
+        candidates = allowed
 
     problems = {}
 
@@ -719,6 +723,64 @@ def write_fir_groups(parent_group, all_results, match_dtype='float32'):
     return np.concatenate(tap_counts) if tap_counts else np.array([], dtype=int)
 
 
+def stored_row(result):
+    """Worker result tuple -> row kept for writing (see write_fir_groups)."""
+    (i, parent_match, parent, fit, taps, sigmas, _n_pp, _n_bc, shift,
+     _attempts, _suppressed, metrics, _accepted) = result
+    return (parent_match, parent, fit, taps, sigmas, shift, metrics)
+
+
+def _process_excl(task):
+    i, excluded = task
+    return process_template(i, excluded)
+
+
+def prune_parents(pool, results, n_processes, max_tap_growth=None, label='middle'):
+    """Remove redundant parents (seeds) after assignment.
+
+    Parents are visited from the smallest group up. A parent is removed when
+    every one of its children can be re-fit from some other remaining parent
+    and still pass the full acceptance test (including --max-taps); those
+    children are then moved. With max_tap_growth, a removal is only accepted
+    if the moved children's total taps grow by at most that fraction.
+    `results` (stored rows) is updated in place; returns the removed parents.
+    """
+    groups = defaultdict(list)
+    for i, row in enumerate(results):
+        if row is not None and row[1] >= 0:
+            groups[row[1]].append(i)
+    removed = set()
+    batch = max(4 * n_processes, 16)
+    for parent in sorted(groups, key=lambda p: (len(groups[p]), p)):
+        children = list(groups[parent])
+        if not children:
+            continue
+        excluded = frozenset(removed | {parent})
+        moved, ok = {}, True
+        for start in range(0, len(children), batch):
+            tasks = [(i, excluded) for i in children[start:start + batch]]
+            for res in pool.imap_unordered(_process_excl, tasks):
+                if not res[12]:
+                    ok = False
+                moved[res[0]] = res
+            if not ok:
+                break
+        if not ok:
+            continue
+        old_taps = sum(len(results[i][3]) for i in children)
+        new_taps = sum(len(res[4]) for res in moved.values())
+        if max_tap_growth is not None and new_taps > old_taps * (1.0 + max_tap_growth):
+            continue
+        for i, res in moved.items():
+            results[i] = stored_row(res)
+            groups[res[2]].append(i)
+        groups[parent] = []
+        removed.add(parent)
+        logging.info('Pruned %s parent %d: moved %d children, taps %d -> %d (%d removed so far)',
+                     label, parent, len(children), old_taps, new_taps, len(removed))
+    return removed
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with open(path, 'rb') as stream:
@@ -805,6 +867,12 @@ def fit_upper_level(args, middle_bank, psd, flen, output, used_middles=None):
                          metrics[0], metrics[1], metrics[2], accepted)
             if not accepted:
                 rejected.append(i)
+        if args.prune_seeds and not rejected:
+            n_used = len({r[1] for r in results if r is not None and r[1] >= 0})
+            removed = prune_parents(pool, results, args.n_processes,
+                                    args.prune_max_tap_growth, label='top')
+            logging.info('Seed pruning: %d -> %d top templates in use',
+                         n_used, n_used - len(removed))
 
     failed = sorted(set(rejected) | {i for i in used_middles
                                      if results[i] is None or results[i][1] < 0})
@@ -877,8 +945,8 @@ def _seed_cluster(sel):
     tau0 = g_coarse_tau0
     n = len(g_coarse_np)
     rng = np.random.default_rng(sel['rng_seed'])
-    k_target = _snap(sel['target_taps'], up=False)
-    k_absorb = _snap(sel['absorb_taps'], up=False)
+    k_target = sel['target_taps'] if sel['target_taps'] % 2 else sel['target_taps'] - 1
+    k_absorb = sel['absorb_taps'] if sel['absorb_taps'] % 2 else sel['absorb_taps'] - 1
     stats = {'attempts': 0, 'suppressed': 0}
 
     def fits(seed, cand, k):
@@ -1044,6 +1112,12 @@ def main():
     parser.add_argument('--min-group-size', type=int, default=24,
                         help='Bottom-up seeding: drop clusters smaller than this if all members can be '
                              'fit (within --max-taps) from a seed of a larger cluster')
+    parser.add_argument('--no-prune-seeds', action='store_false', dest='prune_seeds',
+                        help='Skip the pass that removes parents whose children can all be '
+                             're-fit from other parents within the acceptance limits')
+    parser.add_argument('--prune-max-tap-growth', type=float, default=None,
+                        help='Only prune a parent if its moved children\'s total taps grow by at '
+                             'most this fraction (default: no limit)')
     parser.add_argument('--no-seed-medoid', action='store_true',
                         help='Bottom-up seeding: skip medoid re-centring of clusters')
     parser.add_argument('--seed-chunks', type=int,
@@ -1314,6 +1388,14 @@ def main():
                                  f"max_tap={metrics[0]:.3g} oob={metrics[1]:.3g} noise={metrics[2]:.3g} "
                                  f"accepted={accepted} attempts={n_attempts_total}")
                     log.handlers[0].flush() # Flush stdout
+
+            if args.prune_seeds and not failed_count:
+                n_used = len({r[1] for r in all_results if r is not None and r[1] >= 0})
+                removed = prune_parents(pool, all_results, args.n_processes,
+                                        args.prune_max_tap_growth, label='middle')
+                all_metrics = [r[6] if r is not None else None for r in all_results]
+                logging.info('Seed pruning: %d -> %d middle templates in use',
+                             n_used, n_used - len(removed))
 
         # --- PHASE 3: Write Results ---
         logging.info("All templates processed. Writing grouped results to HDF5...")
