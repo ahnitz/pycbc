@@ -110,7 +110,7 @@ class MatchedFilterRatioControl(object):
         scale = (norm * stilde.delta_t) / self.decimation_factor
         # The cached IFFT output is overwritten by the next reference; upper
         # series must survive while all of its middle children are processed.
-        return np.asarray(snr.numpy(), dtype=np.complex64).copy() * scale, h_norm
+        return (snr.numpy() * scale).astype(np.complex64, copy=False), h_norm
 
     def process_segment(self, stilde, psd, ref_template, filters_f, n_taps, indices,
                         valid_slice=None, reference_series=None,

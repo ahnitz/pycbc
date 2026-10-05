@@ -35,7 +35,7 @@ from pycbc.vetoes.chisq import (
 )
 from pycbc.vetoes.sgchisq import SingleDetSGChisq
 from pycbc.waveform.bank import RatioFilterBank
-from pycbc.waveform.spa_tmplt import spa_tmplt_norm
+from pycbc.filter.matchedfilter import sigmasq_series
 
 tstart = time.time()
 TIMERS = collections.defaultdict(float)
@@ -96,12 +96,16 @@ class UpperReferenceBatch:
         n_req = len(self.sorted_ids)
         if ifo is not None:
             buf_key = (ifo, self.series_length)
-            buf = UpperReferenceBatch._BUFFERS.get(buf_key)
-            if buf is None or buf.shape[0] < n_req:
+            buf_entry = UpperReferenceBatch._BUFFERS.get(buf_key)
+            if buf_entry is None or buf_entry[0].shape[0] < n_req:
                 alloc_rows = max(n_req, 32)
                 buf = np.zeros((alloc_rows, self.series_length), dtype=np.complex64)
-                UpperReferenceBatch._BUFFERS[buf_key] = buf
+                buf_entry = [buf, 0, 0]
+                UpperReferenceBatch._BUFFERS[buf_key] = buf_entry
+            buf, prev_start, prev_stop = buf_entry
             out = buf[:n_req]
+            if prev_stop > prev_start:
+                out[:, prev_start:prev_stop] = 0
         else:
             out = np.zeros((n_req, self.series_length), dtype=np.complex64)
 
@@ -159,11 +163,15 @@ class UpperReferenceBatch:
                 )
 
         if valid_slice is not None:
-            out[:, :v_start] = 0
-            out[:, v_stop:] = 0
             np.multiply(out[:, v_start:v_stop], scales[:, None], out=out[:, v_start:v_stop])
+            if ifo is not None:
+                buf_entry[1] = v_start
+                buf_entry[2] = v_stop
         else:
             np.multiply(out, scales[:, None], out=out)
+            if ifo is not None:
+                buf_entry[1] = 0
+                buf_entry[2] = self.series_length
 
         return dict(zip(self.sorted_ids, out))
 
@@ -190,6 +198,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
         self.plan = pycbc.fft.FFT(self.invec, self.outvec)
         self.corr = FrequencySeries(zeros(self.n_pad, dtype=complex64), delta_f=self.df_pad)
         self.bins_cache = {}
+        self.psd_cache = {}
         self.ratio_cache = {}
 
     def compute(self, ids_local, t_idxs, snrs, fine_indices, tstarts, stilde, bank, ref_snr, filters_f, coarse_idx, args, snr_amp=None):
@@ -209,27 +218,15 @@ class RatioPowerChisq(SingleDetPowerChisq):
 
         sort_order = np.argsort(snr_amp)[::-1]
 
-        bins_key = id(stilde.psd)
-        if bins_key not in self.bins_cache:
-            df_pad = self.df_pad
-            kmin_pad = int(self.flow / df_pad)
-            kmax_pad = min(int(self.f_final / df_pad), self.n_pad // 2)
+        df_pad = self.df_pad
+        n_half_pad = self.n_pad // 2 + 1
+        psd_key = id(stilde.psd)
+        if psd_key not in self.psd_cache:
             dec = max(1, int(round(df_pad / stilde.delta_f)))
-            n_half_pad = self.n_pad // 2 + 1
-            psd_pad = FrequencySeries(stilde.psd[::dec][:n_half_pad], delta_f=df_pad)
-            norm_pad = spa_tmplt_norm(psd_pad, n_half_pad, df_pad, self.flow)
-            bins = power_chisq_bins_from_sigmasq_series(norm_pad, self.num_bins, kmin_pad, kmax_pad)
-            dof = (len(bins) - 1) * 2 - 2
-            raw_wb = np.diff(norm_pad[bins])
-            tot_wb = np.sum(raw_wb)
-            if tot_wb > 0:
-                inv_wb = np.where(raw_wb > 0, tot_wb / np.maximum(raw_wb, 1e-12), float(len(bins)-1)).astype(np.float32)
-            else:
-                inv_wb = np.full(len(bins)-1, float(len(bins)-1), dtype=np.float32)
-            k_freqs = np.arange(bins[0], bins[-1], dtype=np.float32)
-            bin_starts = bins[:-1] - bins[0]
-            self.bins_cache[bins_key] = (bins, dof, inv_wb, k_freqs, bin_starts)
-        bins, dof, inv_wb, k_freqs, bin_starts = self.bins_cache[bins_key]
+            self.psd_cache[psd_key] = FrequencySeries(
+                stilde.psd[::dec][:n_half_pad].astype(float32), delta_f=df_pad
+            )
+        psd_pad = self.psd_cache[psd_key]
 
         taps_coarse, counts_coarse, _ = bank.get_firs(coarse_idx) if (coarse_idx is not None and hasattr(bank, 'get_firs')) else (None, None, None)
 
@@ -283,6 +280,34 @@ class RatioPowerChisq(SingleDetPowerChisq):
 
             ratio_pad = self.ratio_cache[ratio_key]
             if ratio_pad is not None:
+                bins_key = (psd_key, target_global_id)
+                if bins_key not in self.bins_cache:
+                    kmin_pad = int(self.flow / df_pad)
+                    tmpl = bank[target_global_id]
+                    dec = max(1, int(round(df_pad / tmpl.delta_f)))
+                    tmpl_pad = FrequencySeries(tmpl[::dec][:n_half_pad], delta_f=df_pad)
+                    f_end = getattr(tmpl, 'end_frequency', None) or self.f_final
+                    kmax_pad = min(int(f_end / df_pad), n_half_pad - 1)
+
+                    s_vec = sigmasq_series(
+                        tmpl_pad, psd_pad,
+                        low_frequency_cutoff=self.flow,
+                        high_frequency_cutoff=kmax_pad * df_pad
+                    ).numpy()
+                    s_vec[kmax_pad:] = s_vec[kmax_pad - 1]
+                    bins = power_chisq_bins_from_sigmasq_series(s_vec, self.num_bins, kmin_pad, kmax_pad)
+                    dof = (len(bins) - 1) * 2 - 2
+                    raw_wb = np.diff(s_vec[bins])
+                    tot_wb = np.sum(raw_wb)
+                    if tot_wb > 0:
+                        inv_wb = np.where(raw_wb > 0, tot_wb / np.maximum(raw_wb, 1e-12), float(len(bins)-1)).astype(np.float32)
+                    else:
+                        inv_wb = np.full(len(bins)-1, float(len(bins)-1), dtype=np.float32)
+                    k_freqs = np.arange(bins[0], bins[-1], dtype=np.float32)
+                    bin_starts = bins[:-1] - bins[0]
+                    self.bins_cache[bins_key] = (bins, dof, inv_wb, k_freqs, bin_starts)
+                bins, dof, inv_wb, k_freqs, bin_starts = self.bins_cache[bins_key]
+
                 corr_factor = 1.0 / (rescale * self.n_pad)
                 self.corr.data[:] = (ratio_pad * ref_f_pad) * corr_factor
                 
@@ -294,6 +319,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
                 chi = [chi_val]
             else:
                 chi = [0.0]
+                dof = 2 * num_b - 2
 
             same_tmpl_window = (global_ids == target_global_id) & (abs(t_idxs - t_idx) <= self.chisq_window_samp)
             update_mask = same_tmpl_window & (~assigned_mask) & (snr_amp >= cthresh)
@@ -865,6 +891,8 @@ def process_top_template_task(task_args):
     del top_template
     UpperReferenceBatch.clear_buffers()
     power_chisq.ratio_cache.clear()
+    power_chisq.bins_cache.clear()
+    power_chisq.psd_cache.clear()
 
     collapsed_trigs = {}
     for ifo in instruments:

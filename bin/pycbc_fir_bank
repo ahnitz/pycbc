@@ -19,7 +19,7 @@ from scipy.linalg import solve_toeplitz, cho_factor, cho_solve
 from scipy.spatial.distance import cdist
 from tqdm import tqdm
 import pycbc, pycbc.psd, pycbc.conversions as conversions
-from pycbc.filter import match
+from pycbc.filter import match, get_cutoff_indices
 from pycbc.types import FrequencySeries
 from pycbc.waveform.bank import FilterBank, correction_basis
 import pycbc.waveform.compress as compress
@@ -691,15 +691,36 @@ def run_hierarchy_level(child_path, parent_seed_path, freq_len, delta_f, psd, ar
             if not accepted: failed_count += 1
             if not args.verbose: it.set_postfix(failed=failed_count)
 
-        if not failed_count:
-            n_used = len({r[1] for r in results if r is not None and r[1] >= 0})
-            removed = prune_redundant_parents(pool, results, args.n_processes, label=label)
-            logging.info('Seed pruning: %d -> %d %s templates in use', n_used, n_used - len(removed), label)
-            results, used_indices, corrections = consolidate_hierarchy_level(pool, results, seed_source_indices, child_bank, args, label)
-            if getattr(parent_bank, 'file', None): parent_bank.file.close()
-            write_seed_bank(child_path, used_indices, parent_seed_path, force=True, correction_coeffs=corrections)
-            parent_bank = FilterBank(parent_seed_path, freq_len, delta_f, dtype=complex, enable_compressed_waveforms=False)
-            parent_waveforms = [h.copy() for h in parent_bank]
+        if failed_count:
+            failed_indices = [idx for idx in indices if results[idx] is None or not (results[idx][2] >= args.min_match)]
+            logging.info("Self-healing: promoting %d unabsorbed %s template(s) to parent seeds", len(failed_indices), label)
+            identity_taps = np.zeros(15, dtype=np.float32)
+            identity_taps[7] = float(args.sample_rate)
+            identity_metrics = (float(args.sample_rate), 1.0, 1.0)
+            psd_arr = psd.numpy() if hasattr(psd, 'numpy') else np.asarray(psd)
+            k_min, k_max = get_cutoff_indices(args.f_low, None, delta_f, freq_len)
+            inv_psd = np.zeros_like(psd_arr)
+            np.divide(1.0, psd_arr, out=inv_psd, where=psd_arr > 0)
+            sl = slice(k_min, k_max)
+
+            for f_idx in failed_indices:
+                new_parent_pos = len(seed_source_indices)
+                src_seed = candidates[f_idx] if child_indices is not None else f_idx
+                seed_source_indices = np.append(seed_source_indices, src_seed)
+                f_np = child_bank[f_idx].numpy().astype(complex)
+                norm_sq = float(np.sum(np.abs(f_np[sl]) ** 2 * inv_psd[sl]))
+                sigma_val = float(np.sqrt(4.0 * delta_f * norm_sq))
+                results[f_idx] = (1.0, new_parent_pos, 1.0, identity_taps, (sigma_val, sigma_val, sigma_val), 0, identity_metrics)
+            failed_count = 0
+
+        n_used = len({r[1] for r in results if r is not None and r[1] >= 0})
+        removed = prune_redundant_parents(pool, results, args.n_processes, label=label)
+        logging.info('Seed pruning: %d -> %d %s templates in use', n_used, n_used - len(removed), label)
+        results, used_indices, corrections = consolidate_hierarchy_level(pool, results, seed_source_indices, child_bank, args, label)
+        if getattr(parent_bank, 'file', None): parent_bank.file.close()
+        write_seed_bank(child_path, used_indices, parent_seed_path, force=True, correction_coeffs=corrections)
+        parent_bank = FilterBank(parent_seed_path, freq_len, delta_f, dtype=complex, enable_compressed_waveforms=False)
+        parent_waveforms = [h.copy() for h in parent_bank]
 
     return results, parent_bank, parent_waveforms, failed_count
 
@@ -734,7 +755,7 @@ def main():
 
     try:
         # Level 1: Fine -> Middle
-        seed_params_mid = (args.max_taps, 3.5, 0.28, 1.0, 24, 12345)
+        seed_params_mid = (args.max_taps, 3.5 * min(1.0, args.max_taps / 501.0), 0.28, 1.0, 24, 12345)
         all_results, coarse_bank, _, failed_count = run_hierarchy_level(
             args.fine_bank, mid_seed_path, flen, args.delta_f, psd, args,
             label='middle', seed_params=seed_params_mid)
