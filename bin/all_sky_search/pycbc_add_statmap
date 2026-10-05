@@ -661,7 +661,7 @@ while True:
                  '& combined foreground '.format(maxtime, max_ifar, maxcombo))
     where_combined = np.flatnonzero(combined_fg_data.data['stat'] ==
                          sep_fg_data[maxcombo].data['stat'][:][max_ifar_idx])
-    sep_fg_data[maxcombo] = sep_fg_data[maxcombo].remove(max_ifar_idx)
+    sep_fg_data[maxcombo] = sep_fg_data[maxcombo].remove([max_ifar_idx])
 
     # Add to final dataset and remove from continuing dataset
     final_combined_fg = final_combined_fg + \

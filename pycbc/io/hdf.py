@@ -321,6 +321,7 @@ class DictArray(object):
     def remove(self, idx):
         """ Return a new DictArray that does not contain the indexed values
         """
+        idx = np.atleast_1d(idx)
         if len(idx) == 0:
             return self
         data = {}
