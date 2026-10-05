@@ -1030,14 +1030,20 @@ class ExpFitStatistic(PhaseTDStatistic):
                 self.single_coinc_downweight = float(-numpy.log(0.035))
             else:
                 self.single_coinc_downweight = float(self.single_coinc_volume_weight)
+                if self.single_coinc_downweight < 0:
+                    raise ValueError("single_coinc_volume_weight must be non-negative")
         elif self.single_coinc_volume_ratio:
             if isinstance(self.single_coinc_volume_ratio, bool):
                 ratio = 0.035
             else:
                 ratio = float(self.single_coinc_volume_ratio)
+            if ratio <= 0:
+                raise ValueError("single_coinc_volume_ratio must be positive")
             self.single_coinc_downweight = float(-numpy.log(ratio))
 
-        if self.single_coinc_downweight > 0:
+        if self.single_coinc_downweight > 0 and not any(
+            f[0] == "in_coinc_time" for f in self.single_dtype
+        ):
             self.single_dtype.append(("in_coinc_time", bool))
 
     def assign_template_bins(self, key):
@@ -1441,6 +1447,7 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         from pycbc.events import veto
         from igwn_segments import segmentlist
+        import itertools
 
         coinc_segs = None
 
@@ -1453,6 +1460,8 @@ class ExpFitStatistic(PhaseTDStatistic):
         # 2. Extract active segments from trigs if available
         if coinc_segs is None and trigs is not None:
             trig_file = getattr(trigs, "file", None)
+            if trig_file is None and isinstance(trigs, dict):
+                trig_file = trigs.get("file", None)
             if trig_file is None and hasattr(trigs, "keys"):
                 trig_file = trigs
 
@@ -1471,20 +1480,42 @@ class ExpFitStatistic(PhaseTDStatistic):
                             s = trig_file[f"{ifo}/search/start_time"][:]
                             e = trig_file[f"{ifo}/search/end_time"][:]
                             ifo_segs = veto.start_end_to_segments(s, e).coalesce()
-                            veto_files = getattr(trigs, "veto_files", None)
-                            seg_names = getattr(trigs, "segment_name", None)
+                            veto_files = getattr(trigs, "veto_files", None) or (
+                                trigs.get("veto_files", None) if isinstance(trigs, dict) else None
+                            )
+                            seg_names = getattr(trigs, "segment_name", None) or (
+                                trigs.get("segment_name", None) if isinstance(trigs, dict) else None
+                            )
                             if veto_files:
                                 for vfile, vname in zip(veto_files, seg_names or []):
                                     vsegs = veto.select_segments_by_definer(vfile, ifo=ifo, segment_name=vname)
                                     ifo_segs = (ifo_segs - vsegs).coalesce()
+
+                            gating_vetos = getattr(trigs, "gating_veto_windows", None) or (
+                                trigs.get("gating_veto_windows", None) if isinstance(trigs, dict) else None
+                            ) or {}
+                            if ifo in gating_vetos:
+                                gv = gating_vetos[ifo].split(",")
+                                gb, ga = float(gv[0]), float(gv[1])
+                                if not (gb == 0 and ga == 0):
+                                    ag_key = f"{ifo}/gating/auto/time"
+                                    fg_key = f"{ifo}/gating/file/time"
+                                    ag_times = numpy.unique(trig_file[ag_key][:]) if ag_key in trig_file else []
+                                    fg_times = trig_file[fg_key][:] if fg_key in trig_file else []
+                                    gt = numpy.concatenate((ag_times, fg_times)) if (len(ag_times) or len(fg_times)) else []
+                                    if len(gt):
+                                        gsegs = veto.start_end_to_segments(gt + gb, gt + ga).coalesce()
+                                        ifo_segs = (ifo_segs - gsegs).coalesce()
                             ifo_segs_dict[ifo] = ifo_segs
 
-                    coinc_segs = segmentlist(ifo_segs_dict[search_ifos[0]])
-                    for ifo in search_ifos[1:]:
-                        coinc_segs = (coinc_segs & ifo_segs_dict[ifo]).coalesce()
+                    coinc_segs = segmentlist()
+                    for ifo1, ifo2 in itertools.combinations(search_ifos, 2):
+                        pair_segs = (ifo_segs_dict[ifo1] & ifo_segs_dict[ifo2]).coalesce()
+                        coinc_segs = (coinc_segs | pair_segs).coalesce()
 
-        self._coinc_segs = coinc_segs
-        return self._coinc_segs
+        if coinc_segs is not None:
+            self._coinc_segs = coinc_segs
+        return coinc_segs
 
     def check_in_coinc_time(self, trigs, times):
         """

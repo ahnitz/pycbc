@@ -656,6 +656,10 @@ class SingleDetTriggers(object):
             logger.info('%i triggers remain after vetoes',
                         self.mask_size)
 
+        self.file = self.trigs_f
+        self.veto_files = [veto_file] if veto_file else []
+        self.segment_name = [segment_name] if segment_name else []
+
     def __getitem__(self, key):
         # Is key in the TRIGGER_MERGE file?
         try:
@@ -686,6 +690,10 @@ class SingleDetTriggers(object):
                 else:
                     mtrigs[k] = self.trigs[k][:]
         mtrigs['ifo'] = self.ifo
+        mtrigs['file'] = self.trigs_f
+        mtrigs['veto_files'] = getattr(self, 'veto_files', [])
+        mtrigs['segment_name'] = getattr(self, 'segment_name', [])
+        mtrigs['gating_veto_windows'] = getattr(self, 'gating_veto_windows', {})
         return mtrigs
 
     @classmethod
