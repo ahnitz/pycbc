@@ -68,7 +68,9 @@ for f in opts.trigger_files:
     logging.info(f"{coinc_key} background time (y): {bg_time}")
 
     # If fitting / extrapolation is done
-    if sig_dict[sig_key]['method'] == 'trigger_fit':
+    if (sig_dict[sig_key]['method'] == 'trigger_fit' and
+            sig_dict[sig_key]['fit_threshold'] is not None and
+            sig_dict[sig_key]['fit_function'] is not None):
         fitted.append(sig_key)
         fit_thresh = sig_dict[sig_key]['fit_threshold']
         far_tuple = significance.get_far(stat_exc,
