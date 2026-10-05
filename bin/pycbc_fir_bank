@@ -957,7 +957,7 @@ def _gn_eval_check(task):
     return out
 
 
-def _optimize_middle_group(pool, union, base_cand, args, initial_z=None, order=None):
+def _optimize_parent_group(pool, union, base_cand, args, initial_z=None, order=None):
     """Deform parent `base_cand` (20 smooth log-amplitude / phase terms) so that
     every child of `union` passes at --max-taps.
 
@@ -1107,7 +1107,7 @@ def bank_features(bank, f_low):
 
 
 def merge_groups(pool, results, feats, args, label='middle',
-                 parent_corrections=None, optimize_middle=True, optimize_top=True):
+                 parent_corrections=None, base_corrections=None):
     """Merge groups under re-centred parents. `results` rows are stored rows whose
     parent field is a child-bank index; updated in place. Returns #merges."""
     n_neighbours = getattr(args, 'merge_neighbours', 3)
@@ -1144,7 +1144,7 @@ def merge_groups(pool, results, feats, args, label='middle',
                 cand_radius = {int(c): float(d[idx].max()) for idx, c in enumerate(pool_c)}
                 cands = pool_c[np.argsort(d.max(axis=1))][:n_candidates]
                 tasks = []
-                gn_on = (optimize_middle and label == 'middle') or (optimize_top and label == 'top')
+                gn_on = getattr(args, 'optimize_parents', True)
                 screen = getattr(args, 'merge_gn_screen', 0.0) if gn_on else 0.0
                 for c in cands:
                     dc = np.sqrt((((f_u - feats[c]) / span) ** 2).sum(-1))
@@ -1168,7 +1168,7 @@ def merge_groups(pool, results, feats, args, label='middle',
                                                                   -cand_radius[int(c)])))
                     if best_cand is not None:
                         # start from the undeformed template the screen measured
-                        opt_z, n_fail = _optimize_middle_group(pool, union, best_cand, args,
+                        opt_z, n_fail = _optimize_parent_group(pool, union, best_cand, args,
                                                                order=order_of[best_cand])
                         if n_fail == 0:
                             chosen = best_cand
@@ -1184,10 +1184,9 @@ def merge_groups(pool, results, feats, args, label='middle',
                 for i, r in rows.items():
                     results[i] = r
                 if parent_corrections is not None:
-                    base_z = np.zeros(20, dtype=np.float64)
-                    base_corrections = getattr(args, '_src_correction_coeffs', None)
-                    if base_corrections is not None and chosen < len(base_corrections):
-                        base_z = np.array(base_corrections[chosen], dtype=np.float64)
+                    base_z = (np.array(base_corrections[chosen], dtype=np.float64)
+                              if (base_corrections is not None and chosen < len(base_corrections))
+                              else np.zeros(20, dtype=np.float64))
                     parent_corrections[chosen] = base_z + chosen_z
                     if p in parent_corrections and p != chosen:
                         del parent_corrections[p]
@@ -1208,30 +1207,28 @@ def merge_groups(pool, results, feats, args, label='middle',
     return n_merges
 
 
-def consolidate_parents(pool, results, parent_src, feats, args, label):
+def consolidate_parents(pool, results, parent_src, child_bank, args, label):
     """Merge pass (if enabled) and compaction for a bottom-up level.
 
     `parent_src[c]` is the child-bank index of parent c. Returns the rows with
-    parents renumbered 0..n-1 and the sorted child-bank indices of the parents
-    actually used (the new parent bank).
+    parents renumbered 0..n-1, the sorted child-bank indices of the parents
+    actually used (the new parent bank), and their correction coefficients.
     """
     rows = [None if r is None else (r[0], int(parent_src[r[1]])) + tuple(r[2:])
             for r in results]
-    base_corrections = getattr(args, '_src_correction_coeffs', None)
-    parent_corrections = {}
-    for s in parent_src:
-        s_int = int(s)
-        if base_corrections is not None and s_int < len(base_corrections):
-            parent_corrections[s_int] = np.array(base_corrections[s_int], dtype=np.float64).copy()
-        else:
-            parent_corrections[s_int] = np.zeros(20, dtype=np.float64)
-    opt_mid = getattr(args, 'optimize_middle', True) and label == 'middle'
-    opt_top = getattr(args, 'optimize_top', True) and label == 'top'
+    base_corrections = getattr(child_bank, 'correction_coeffs', None)
+    parent_corrections = {
+        int(s): np.array(base_corrections[int(s)], dtype=np.float64).copy()
+        if (base_corrections is not None and int(s) < len(base_corrections))
+        else np.zeros(20, dtype=np.float64)
+        for s in parent_src
+    }
     if args.merge_groups:
+        feats = bank_features(child_bank, args.f_low)
         n_before = len({r[1] for r in rows if r is not None})
         n = merge_groups(pool, rows, feats, args, label,
                          parent_corrections=parent_corrections,
-                         optimize_middle=opt_mid, optimize_top=opt_top)
+                         base_corrections=base_corrections)
         logging.info('Group merging: %d merges, %d -> %d %s templates in use', n, n_before,
                      len({r[1] for r in rows if r is not None}), label)
     used = np.array(sorted({r[1] for r in rows if r is not None}), dtype=int)
@@ -1346,12 +1343,8 @@ def fit_upper_level(args, middle_bank, psd, flen, output, used_middles=None):
                          n_used, n_used - len(removed))
         top_src = getattr(args, '_top_seed_src', None)
         if top_src is not None and not rejected:
-            src_corrections = None
-            if hasattr(upper_middle, 'correction_coeffs') and upper_middle.correction_coeffs is not None:
-                src_corrections = upper_middle.correction_coeffs
-            upper._src_correction_coeffs = src_corrections
             results, used_top, top_corrections = consolidate_parents(
-                pool, results, top_src, bank_features(upper_middle, args.f_low), upper, 'top')
+                pool, results, top_src, upper_middle, upper, 'top')
             _close_bank(top_bank)
             write_seed_bank(args.coarse_bank, used_top, args.top_bank, force=True,
                             correction_coeffs=top_corrections)
@@ -1613,14 +1606,19 @@ def main():
                         help='Bottom-up mode: skip the pass that merges each group with a tau0 '
                              'neighbour under one re-centred parent when all children still pass '
                              'within --max-taps')
-    parser.add_argument('--no-optimize-middle', action='store_false', dest='optimize_middle',
-                        help='Skip continuous Gauss-Newton middle waveform optimization during group merging')
-    parser.add_argument('--optimize-middle', action='store_true', dest='optimize_middle', default=True,
-                        help='Enable continuous Gauss-Newton middle waveform optimization during group merging (default: enabled)')
-    parser.add_argument('--no-optimize-top', action='store_false', dest='optimize_top',
-                        help='Skip continuous Gauss-Newton top waveform optimization during group merging')
-    parser.add_argument('--optimize-top', action='store_true', dest='optimize_top', default=True,
-                        help='Enable continuous Gauss-Newton top waveform optimization during group merging (default: enabled)')
+    parser.add_argument('--no-optimize-parents', action='store_false', dest='optimize_parents',
+                        help='Skip continuous Gauss-Newton parent waveform optimization during group merging')
+    parser.add_argument('--optimize-parents', action='store_true', dest='optimize_parents', default=True,
+                        help='Enable continuous Gauss-Newton parent waveform optimization during group merging (default: enabled)')
+    # Backward compatibility aliases
+    parser.add_argument('--no-optimize-middle', action='store_false', dest='optimize_parents',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--optimize-middle', action='store_true', dest='optimize_parents',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--no-optimize-top', action='store_false', dest='optimize_parents',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--optimize-top', action='store_true', dest='optimize_parents',
+                        help=argparse.SUPPRESS)
     parser.add_argument('--merge-gn-screen', type=float, default=30.0,
                         help='Only attempt the Gauss-Newton parent deformation for a merge if some '
                              'undeformed candidate parent keeps every child within this multiple of '
@@ -1911,8 +1909,7 @@ def main():
 
             if middle_seed_src is not None and not failed_count:
                 all_results, used_src, middle_corrections = consolidate_parents(
-                    pool, all_results, middle_seed_src, bank_features(fine_bank, args.f_low),
-                    args, 'middle')
+                    pool, all_results, middle_seed_src, fine_bank, args, 'middle')
                 all_metrics = [r[6] if r is not None else None for r in all_results]
                 _close_bank(coarse_bank)
                 write_seed_bank(args.fine_bank, used_src, args.coarse_bank, force=True,
