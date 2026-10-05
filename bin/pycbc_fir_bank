@@ -656,7 +656,6 @@ def parse_cli():
     parser.add_argument('--f-low', type=float, default=20.0, help="Low-frequency cutoff in Hz (default: 20).")
     parser.add_argument('--sample-rate', type=float, default=2048.0, help="Sampling rate in Hz (default: 2048).")
     parser.add_argument('--n-processes', '-n', type=int, default=1, help="Number of worker processes (default: 1).")
-    parser.add_argument('--two-level', action='store_true', help="Generate 2-level bank instead of 3-level.")
     parser.add_argument('--force', action='store_true', help="Overwrite existing output files.")
 
     # Primary filter parameters
@@ -743,60 +742,59 @@ def main():
         coarse_bank.write_to_hdf(args.output_file, file_handler=out_file, group_key="fir_data/coarse_bank_params", write_compressed_waveforms=True)
         tap_counts = write_fir_groups(fir_group, all_results)
 
-        if not args.two_level:
-            if failed_count: raise ValueError(f'{failed_count} lower-level FIR fits failed; refusing hierarchy generation')
-            used_middles = sorted({row[1] for row in all_results if row is not None and row[1] >= 0})
-            upper_df = args.delta_f / 16.0
-            upper_flen = int((args.sample_rate / 2.0) / upper_df) + 1
-            upper_psd_args = argparse.Namespace(**vars(args)); upper_psd_args.delta_f = upper_df
-            upper_psd = pycbc.psd.from_cli(upper_psd_args, length=upper_flen, delta_f=upper_df, low_frequency_cutoff=args.f_low)
+        if failed_count: raise ValueError(f'{failed_count} lower-level FIR fits failed; refusing hierarchy generation')
+        used_middles = sorted({row[1] for row in all_results if row is not None and row[1] >= 0})
+        upper_df = args.delta_f / 16.0
+        upper_flen = int((args.sample_rate / 2.0) / upper_df) + 1
+        upper_psd_args = argparse.Namespace(**vars(args)); upper_psd_args.delta_f = upper_df
+        upper_psd = pycbc.psd.from_cli(upper_psd_args, length=upper_flen, delta_f=upper_df, low_frequency_cutoff=args.f_low)
 
-            upper_args = argparse.Namespace(**vars(args))
-            upper_args.delta_f = upper_df
-            upper_args.n_taps = snap_tap_count(args.upper_max_taps // 2)
-            upper_args.max_taps = args.upper_max_taps
-            upper_args.min_match = 1.0 - (1.0 - args.min_match) / 10.0
-            upper_args.regularization_magnitude = 1e-6
+        upper_args = argparse.Namespace(**vars(args))
+        upper_args.delta_f = upper_df
+        upper_args.n_taps = snap_tap_count(args.upper_max_taps // 2)
+        upper_args.max_taps = args.upper_max_taps
+        upper_args.min_match = 1.0 - (1.0 - args.min_match) / 10.0
+        upper_args.regularization_magnitude = 1e-6
 
-            # Level 2: Middle -> Top
-            seed_params_top = (upper_args.n_taps, 15.0, 0.10, 3.0, 1, 12345)
-            upper_results, top_bank, top_waveforms, _ = run_hierarchy_level(
-                mid_seed_path, top_seed_path, upper_flen, upper_df, upper_psd, upper_args,
-                child_indices=used_middles, label='top', seed_params=seed_params_top)
+        # Level 2: Middle -> Top
+        seed_params_top = (upper_args.n_taps, 15.0, 0.10, 3.0, 1, 12345)
+        upper_results, top_bank, top_waveforms, _ = run_hierarchy_level(
+            mid_seed_path, top_seed_path, upper_flen, upper_df, upper_psd, upper_args,
+            child_indices=used_middles, label='top', seed_params=seed_params_top)
 
-            top_bank.ensure_hash()
-            top_bank.write_to_hdf(args.output_file, file_handler=out_file, group_key='fir_data/upper/top_bank_params', write_compressed_waveforms=True)
+        top_bank.ensure_hash()
+        top_bank.write_to_hdf(args.output_file, file_handler=out_file, group_key='fir_data/upper/top_bank_params', write_compressed_waveforms=True)
 
-            logging.info(f"Compressing {len(top_bank)} top waveforms...")
-            top_grp = out_file.require_group('fir_data/upper/top_bank_params')
-            if 'template_hash' not in top_grp:
-                top_grp.create_dataset('template_hash', data=top_bank.table.template_hash)
-            else:
-                top_grp['template_hash'][:] = top_bank.table.template_hash
-            if 'compressed_waveforms' in top_grp: del top_grp['compressed_waveforms']
+        logging.info(f"Compressing {len(top_bank)} top waveforms...")
+        top_grp = out_file.require_group('fir_data/upper/top_bank_params')
+        if 'template_hash' not in top_grp:
+            top_grp.create_dataset('template_hash', data=top_bank.table.template_hash)
+        else:
+            top_grp['template_hash'][:] = top_bank.table.template_hash
+        if 'compressed_waveforms' in top_grp: del top_grp['compressed_waveforms']
 
-            for i in range(len(top_bank)):
-                wave, tmplt = top_waveforms[i], top_bank.table[i]
-                thash, fmin, kmax = str(tmplt.template_hash), float(getattr(tmplt, 'f_lower', args.f_low)), int(np.nonzero(abs(wave.numpy()))[0][-1])
-                hc = compress.compress_waveform(wave, np.array([fmin, kmax * upper_df], float), 1e-5, 'inline_quadratic', 'single', psd=None)
-                hc.write_to_hdf(top_grp, thash)
-                logging.info(f"Compressed top {i + 1}/{len(top_bank)} (hash={thash}, points={len(hc.sample_points)}, mismatch={hc.mismatch:.2e})")
+        for i in range(len(top_bank)):
+            wave, tmplt = top_waveforms[i], top_bank.table[i]
+            thash, fmin, kmax = str(tmplt.template_hash), float(getattr(tmplt, 'f_lower', args.f_low)), int(np.nonzero(abs(wave.numpy()))[0][-1])
+            hc = compress.compress_waveform(wave, np.array([fmin, kmax * upper_df], float), 1e-5, 'inline_quadratic', 'single', psd=None)
+            hc.write_to_hdf(top_grp, thash)
+            logging.info(f"Compressed top {i + 1}/{len(top_bank)} (hash={thash}, points={len(hc.sample_points)}, mismatch={hc.mismatch:.2e})")
 
-            upper_group = out_file.require_group('fir_data/upper')
-            for name in ('sample_rate', 'delta_f', 'n_taps', 'max_taps', 'min_match'):
-                upper_group.attrs[name] = getattr(upper_args, name)
-            upper_group.attrs['fit_solver'] = 'toeplitz'
-            upper_group.attrs['sample_shift_folded_into_lower'] = 1
+        upper_group = out_file.require_group('fir_data/upper')
+        for name in ('sample_rate', 'delta_f', 'n_taps', 'max_taps', 'min_match'):
+            upper_group.attrs[name] = getattr(upper_args, name)
+        upper_group.attrs['fit_solver'] = 'toeplitz'
+        upper_group.attrs['sample_shift_folded_into_lower'] = 1
 
-            write_fir_groups(upper_group, upper_results, match_dtype='float64')
-            fir_group.attrs['hierarchy_version'] = 2
-            fir_group.attrs['fine_bank_sha256'] = compute_file_sha256(args.fine_bank)
-            fir_group.attrs['middle_bank_sha256'] = compute_file_sha256(mid_seed_path)
-            fir_group.attrs['top_bank_sha256'] = compute_file_sha256(top_seed_path)
+        write_fir_groups(upper_group, upper_results, match_dtype='float64')
+        fir_group.attrs['hierarchy_version'] = 2
+        fir_group.attrs['fine_bank_sha256'] = compute_file_sha256(args.fine_bank)
+        fir_group.attrs['middle_bank_sha256'] = compute_file_sha256(mid_seed_path)
+        fir_group.attrs['top_bank_sha256'] = compute_file_sha256(top_seed_path)
 
-            for c_idx, u_row in enumerate(upper_results):
-                if u_row is not None and len(u_row) > 5 and u_row[5] != 0 and str(c_idx) in fir_group and 'sample_shift' in fir_group[str(c_idx)]:
-                    fir_group[str(c_idx)]['sample_shift'][:] += u_row[5]
+        for c_idx, u_row in enumerate(upper_results):
+            if u_row is not None and len(u_row) > 5 and u_row[5] != 0 and str(c_idx) in fir_group and 'sample_shift' in fir_group[str(c_idx)]:
+                fir_group[str(c_idx)]['sample_shift'][:] += u_row[5]
 
         out_file.close()
         logging.info(f"Done. Saved to {args.output_file}")
