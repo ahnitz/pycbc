@@ -67,7 +67,14 @@ class MatchedFilterRatioControl(object):
         self._engine_mode = os.environ.get('PYCBC_RATIO_ENGINE', mode).lower()
         self._engine_fd = float(os.environ.get(
             'PYCBC_RATIO_ENGINE_FD', false_dismissal))
-        self._coarse_band_hz = float(os.environ.get('PYCBC_RATIO_BAND_HZ', coarse_band_hz))
+        env_band = os.environ.get('PYCBC_RATIO_BAND_HZ')
+        if env_band:
+            parts = [float(x.strip()) for x in env_band.split(',') if x.strip()]
+            self._coarse_band_hz = tuple(int(x) for x in parts) if len(parts) > 1 else parts[0]
+        elif isinstance(coarse_band_hz, (tuple, list)):
+            self._coarse_band_hz = tuple(int(x) for x in coarse_band_hz)
+        else:
+            self._coarse_band_hz = float(coarse_band_hz)
         self._device = os.environ.get('PYCBC_RATIO_DEVICE') or None
         self._first_stage_snr = float(os.environ.get(
             'PYCBC_RATIO_FIRST_STAGE_SNR', first_stage_snr))
