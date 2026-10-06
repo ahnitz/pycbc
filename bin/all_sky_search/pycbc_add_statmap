@@ -287,21 +287,30 @@ if np.any(singles_mask):
     cidx_singles = singles_indices[cidx_singles_local]
 
 if len(cidx_multi) > 0 and len(cidx_singles) > 0:
+    fg_cluster_stat = f[f'foreground/{args.cluster_stat}'][:]
     multi_times = coinc_mean_times[cidx_multi]
     single_times = coinc_mean_times[cidx_singles]
-    sorted_multi_times = np.sort(multi_times)
-    surv_singles = []
+    
+    surv_multi = set(cidx_multi)
+    surv_singles = set(cidx_singles)
+    
+    # Cross-compare multi-detector coincidences and singles within args.cluster_window
     for s_idx, s_t in zip(cidx_singles, single_times):
-        pos = np.searchsorted(sorted_multi_times, s_t)
-        near = False
-        if pos < len(sorted_multi_times) and abs(sorted_multi_times[pos] - s_t) < args.cluster_window:
-            near = True
-        if pos > 0 and abs(sorted_multi_times[pos - 1] - s_t) < args.cluster_window:
-            near = True
-        if not near:
-            surv_singles.append(s_idx)
-    surv_singles = np.array(surv_singles, dtype=int)
-    cidx = np.sort(np.concatenate([cidx_multi, surv_singles]))
+        nearby_multi_mask = (np.abs(multi_times - s_t) < args.cluster_window)
+        if np.any(nearby_multi_mask):
+            nearby_m_indices = cidx_multi[nearby_multi_mask]
+            s_stat = fg_cluster_stat[s_idx]
+            max_m_stat = np.max(fg_cluster_stat[nearby_m_indices])
+            if max_m_stat >= s_stat:
+                # Coincidence is louder than or equal to single: suppress single
+                surv_singles.discard(s_idx)
+            else:
+                # Single is louder than coincidence: single survives and suppresses inferior coincidence(s)
+                for m_idx in nearby_m_indices:
+                    if fg_cluster_stat[m_idx] < s_stat:
+                        surv_multi.discard(m_idx)
+                        
+    cidx = np.sort(np.array(list(surv_multi | surv_singles), dtype=int))
 elif len(cidx_multi) > 0:
     cidx = np.sort(cidx_multi)
 elif len(cidx_singles) > 0:
