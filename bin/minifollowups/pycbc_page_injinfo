@@ -95,9 +95,33 @@ derived['chip'] = conv.chi_p(m1, m2, s1x, s1y, s2x, s2y)
 
 if 'optimal_snr' in ' '.join(list(f['injections'].keys())):
     ifolist = f.attrs['ifos'].split(' ')
+    opt_snrs = []
     for ifo in ifolist:
-        labels['optimal_snr_%s' % ifo] = 'Opt.&nbsp;SNR %s' % ifo
-        params += ['optimal_snr_%s' % ifo]
+        key = 'optimal_snr_%s' % ifo
+        if key in f['injections']:
+            labels[key] = 'Opt.&nbsp;SNR %s' % ifo
+            params += [key]
+            val = f['injections'][key][iidx]
+            opt_snrs.append(numpy.nan_to_num(val, nan=0.0))
+    if len(opt_snrs) > 1:
+        derived['net_opt_snr'] = numpy.sqrt(sum(s**2 for s in opt_snrs))
+        labels['net_opt_snr'] = 'Net&nbsp;Opt.&nbsp;SNR'
+        params += ['net_opt_snr']
+
+    mf_snrs = []
+    has_mf = any(('optimal_mf_snr_%s' % ifo) in f['injections'] for ifo in ifolist)
+    if has_mf:
+        for ifo in ifolist:
+            key = 'optimal_mf_snr_%s' % ifo
+            if key in f['injections']:
+                labels[key] = 'MF&nbsp;SNR %s' % ifo
+                params += [key]
+                val = f['injections'][key][iidx]
+                mf_snrs.append(numpy.nan_to_num(val, nan=0.0))
+        if len(mf_snrs) > 1:
+            derived['net_mf_snr'] = numpy.sqrt(sum(s**2 for s in mf_snrs))
+            labels['net_mf_snr'] = 'Net&nbsp;MF&nbsp;SNR'
+            params += ['net_mf_snr']
 else:
     eff_dist = {}
     for ifo in ['H1', 'L1', 'V1']:
