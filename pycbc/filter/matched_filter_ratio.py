@@ -137,10 +137,10 @@ class MatchedFilterRatioControl(object):
             self._cached_hnorm_key = (id(ref_template), id(psd))
 
         profile = profile_template if profile_template is not None else ref_template
-        if self._engine_mode in ('hier', 'check') and getattr(self, '_ap_ref_key', None) != (id(profile), id(psd)):
+        if self._engine_mode in ('hier', 'check') and getattr(self, '_ap_ref_key', None) != id(profile):
             if self._td_bank is not None:
                 self._td_bank.set_reference_from_template(stilde, psd, profile, f_high=self.f_high)
-                self._ap_ref_key = (id(profile), id(psd))
+                self._ap_ref_key = id(profile)
 
         if reference_series is None:
             if self._ref_direct:

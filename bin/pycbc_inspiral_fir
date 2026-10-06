@@ -845,7 +845,7 @@ def process_top_template_task(task_args):
             )
             local_timers['upper_fir'] += time.perf_counter() - t0
 
-        t_seg_start = time.time()
+        t_seg_start = time.perf_counter()
         t_seg_fine_start = local_timers['fine_fir']
         t_seg_chi_start = local_timers['power_chisq']
         t_seg_asym_start = local_timers['asym_followup']
@@ -895,7 +895,7 @@ def process_top_template_task(task_args):
                     renorm_factors=renorm_factors,
                 )
 
-        t_seg_dur = max(time.time() - t_seg_start, 1e-6)
+        t_seg_dur = max(time.perf_counter() - t_seg_start, 1e-6)
         n_tmpl_seg = sum(len(g[2]) for g in top_groups)
         stilde_ref = segments[active_ifos[0]][s_num]
         total_analyzed_dur = len(active_ifos) * (stilde_ref.analyze.stop - stilde_ref.analyze.start) * stilde_ref.delta_t

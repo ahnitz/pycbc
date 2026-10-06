@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 """ Plot search sensitivity as a function of significance.
 """
 import argparse
@@ -32,7 +32,9 @@ parser.add_argument('--bin-type', choices=['spin', 'mchirp', 'total_mass',
 # plot everything together
 parser.add_argument('--bins', nargs='+',
                     help="Required. Parameter bin boundaries, ex. 1.3 2.6 4.1")
-parser.add_argument('--sig-type', choices=['ifar', 'fap', 'stat'],
+parser.add_argument('--sig-type', choices=['ifar', 'fap', 'stat',
+                                           'optimal_snr', 'optimal_mf_snr',
+                                           'mf_snr', 'snr'],
                     default='ifar',
                     help="x-axis significance measure. Default 'ifar'")
 parser.add_argument('--exclusive-sig', action='store_true',
@@ -175,6 +177,34 @@ for fi in args.injection_file:
                 sig = f['found_after_vetoes/fap'][:]
             except KeyError:  # multiifo inj files may not have inclusive FAP
                 sig = numpy.array([])
+        elif args.sig_type in ['optimal_snr', 'snr']:
+            if 'ifos' in f.attrs:
+                ifos = f.attrs['ifos'].split(' ')
+            else:
+                ifos = [k.replace('optimal_snr_', '') for k in f['injections'].keys() if k.startswith('optimal_snr_')]
+                if not ifos:
+                    ifos = ['H1', 'L1']
+            opt_snrsq_arr = [numpy.nan_to_num(f['injections/optimal_snr_%s' % ifo][:], nan=0.0) ** 2.
+                             for ifo in ifos if ('optimal_snr_%s' % ifo) in f['injections']]
+            if not opt_snrsq_arr:
+                raise RuntimeError("No optimal_snr datasets found in injection file!")
+            comb_opt_snr = numpy.sqrt(sum(opt_snrsq_arr))
+            sig_exc = comb_opt_snr[foundi]
+            sig = None
+        elif args.sig_type in ['optimal_mf_snr', 'mf_snr']:
+            if 'ifos' in f.attrs:
+                ifos = f.attrs['ifos'].split(' ')
+            else:
+                ifos = [k.replace('optimal_mf_snr_', '') for k in f['injections'].keys() if k.startswith('optimal_mf_snr_')]
+                if not ifos:
+                    ifos = ['H1', 'L1']
+            opt_snrsq_arr = [numpy.nan_to_num(f['injections/optimal_mf_snr_%s' % ifo][:], nan=0.0) ** 2.
+                             for ifo in ifos if ('optimal_mf_snr_%s' % ifo) in f['injections']]
+            if not opt_snrsq_arr:
+                raise RuntimeError("No optimal_mf_snr datasets found in injection file!")
+            comb_mf_snr = numpy.sqrt(sum(opt_snrsq_arr))
+            sig_exc = comb_mf_snr[foundi]
+            sig = None
         else:
             raise RuntimeError('Unrecognized --sig-type value!')
 
@@ -194,12 +224,12 @@ for fi in args.injection_file:
 
 # Parameter bin legend labels
 labels = {
-    'mchirp'     : "$ M_{\\rm chirp} \in [%5.2f, %5.2f] M_\odot $",
-    'eta'        : "$ \\eta \in [%5.2f, %5.2f] $",
-    'total_mass' : "$ M_{\\rm total} \in [%5.2f, %5.2f] M_\odot $",
-    'max_mass'   : "$ {\\rm max}(m_1, m_2) \in [%5.2f, %5.2f] M_\odot $",
-    'spin'       : "$ \\chi_{\\rm eff} \in [%5.2f, %5.2f] $",
-    'template_duration' : "$ \\tau \in [%5.2f, %5.2f] s $"
+    'mchirp'     : r"$ M_{\rm chirp} \in [%5.2f, %5.2f] M_\odot $",
+    'eta'        : r"$ \eta \in [%5.2f, %5.2f] $",
+    'total_mass' : r"$ M_{\rm total} \in [%5.2f, %5.2f] M_\odot $",
+    'max_mass'   : r"$ {\rm max}(m_1, m_2) \in [%5.2f, %5.2f] M_\odot $",
+    'spin'       : r"$ \chi_{\rm eff} \in [%5.2f, %5.2f] $",
+    'template_duration' : r"$ \tau \in [%5.2f, %5.2f] s $"
 }
 
 ylabel = xlabel = ""
@@ -223,6 +253,18 @@ elif args.sig_type == 'fap':
         x_values = [float(v) for v in args.sig_bins]
     else:  # From ~0.3 down to 1e-6
         x_values = 10. ** numpy.arange(-0.5, -6, -0.5)
+elif args.sig_type in ['optimal_snr', 'snr']:
+    xlabel = 'Combined Optimal SNR'
+    if args.sig_bins:
+        x_values = [float(v) for v in args.sig_bins]
+    else:
+        x_values = numpy.arange(6.0, 16.25, 0.25)
+elif args.sig_type in ['optimal_mf_snr', 'mf_snr']:
+    xlabel = 'Combined Realized Matched-Filter SNR'
+    if args.sig_bins:
+        x_values = [float(v) for v in args.sig_bins]
+    else:
+        x_values = numpy.arange(6.0, 16.25, 0.25)
 
 if args.hdf_out:
     plotdict = {}
@@ -230,7 +272,8 @@ if args.hdf_out:
 
 # Switches for plotting inclusive/exclusive significance
 color = iter(plt.cm.rainbow(numpy.linspace(0, 1, len(args.bins)-1)))
-if not args.exclusive_sig:
+has_inc_sig = len(found['sig']) > 0 and found['sig'][0] is not None
+if not args.exclusive_sig and has_inc_sig:
     fvalues = [found['sig'], found['sig_exc']]
     do_labels = [True, False]
     alphas = [.8, .3]
@@ -276,7 +319,7 @@ for j in range(len(args.bins)-1):
             logging.info('Thresholding on significance at %5.2f' % x_val)
             # Count found inj towards sensitivity if IFAR/stat exceeds threshold
             # or if FAP value is less than threshold
-            if args.sig_type == 'ifar' or args.sig_type == 'stat':
+            if args.sig_type in ['ifar', 'stat', 'optimal_snr', 'optimal_mf_snr', 'mf_snr', 'snr']:
                 loud = binfsig >= x_val
                 quiet = binfsig < x_val
             elif args.sig_type == 'fap':
@@ -351,7 +394,7 @@ ax = plt.gca()
 if args.log_dist:
     ax.set_yscale('log')
 
-if args.sig_type != 'stat':
+if args.sig_type not in ['stat', 'optimal_snr', 'optimal_mf_snr', 'mf_snr', 'snr']:
     ax.set_xscale('log')
 
 if args.sig_type == 'fap':
