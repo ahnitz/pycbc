@@ -251,7 +251,7 @@ def get_cached_waveform(waveform_idx):
         fs_wave = g_fine_bank[waveform_idx].copy()
         np_wave = fs_wave.numpy().astype(complex)
         norm_sq = float(np.sum(np.abs(np_wave[g_freq_slice]) ** 2 * g_inv_psd[g_freq_slice]))
-        if len(_g_waveform_cache) >= 4096: _g_waveform_cache.clear()
+        if len(_g_waveform_cache) >= 64: _g_waveform_cache.clear()
         hit = _g_waveform_cache[waveform_idx] = (fs_wave, np_wave, norm_sq)
     return hit
 
@@ -501,7 +501,7 @@ def consolidate_hierarchy_level(pool, results, parent_source_indices, child_bank
     }
     feats = extract_bank_features(child_bank, args.f_low)
     n_before = len({r[1] for r in rows if r is not None})
-    n_merged = merge_parent_groups(pool, rows, feats, args, label, parent_corrections=parent_corrections, base_corrections=base_corrections)
+    n_merged = 0 if label == 'top' else merge_parent_groups(pool, rows, feats, args, label, parent_corrections=parent_corrections, base_corrections=base_corrections)
     logging.info('Group merging: %d merges, %d -> %d %s templates in use', n_merged, n_before, len({r[1] for r in rows if r is not None}), label)
 
     used_parents = np.array(sorted({r[1] for r in rows if r is not None}), dtype=int)
@@ -642,6 +642,12 @@ def select_bank_seeds(bank, psd, args, seed_params, candidate_indices, n_process
     g_seed_source_context = None
     return np.array(sorted(selected_seeds), int)
 
+def parse_freq(val):
+    if '/' in str(val):
+        num, den = str(val).split('/')
+        return float(num) / float(den)
+    return float(val)
+
 # --- CLI PARSER ---
 def parse_cli():
     """Parse command line arguments for essential parameters."""
@@ -653,6 +659,8 @@ def parse_cli():
     parser.add_argument('--fine-bank', required=True, help="Input fine template bank HDF5 file.")
     parser.add_argument('--output-file', required=True, help="Output FIR filter bank HDF5 file.")
     parser.add_argument('--delta-f', type=float, required=True, help="Frequency resolution in Hz.")
+    parser.add_argument('--upper-delta-f', type=parse_freq, default=None,
+                        help="Frequency resolution in Hz for upper level and top waveform compression (e.g. 1/512 or 0.001953125).")
     parser.add_argument('--f-low', type=float, default=20.0, help="Low-frequency cutoff in Hz (default: 20).")
     parser.add_argument('--sample-rate', type=float, default=2048.0, help="Sampling rate in Hz (default: 2048).")
     parser.add_argument('--n-processes', '-n', type=int, default=1, help="Number of worker processes (default: 1).")
@@ -681,7 +689,8 @@ def run_hierarchy_level(child_path, parent_seed_path, freq_len, delta_f, psd, ar
     args._fine_tau0 = np.array(child_bank.table['tau0'], float) if hasattr(child_bank, 'table') and 'tau0' in child_bank.table.dtype.names else None
 
     results, failed_count = [None] * len(child_bank), 0
-    with mp.Pool(processes=args.n_processes, initializer=init_worker, initargs=(parent_waveforms, child_bank, psd, args)) as pool:
+    n_procs = min(args.n_processes, 14) if label == 'top' else args.n_processes
+    with mp.Pool(processes=n_procs, initializer=init_worker, initargs=(parent_waveforms, child_bank, psd, args)) as pool:
         it = pool.imap_unordered(process_template, indices, chunksize=8)
         if not args.verbose:
             it = tqdm(it, total=len(indices), desc=f"Fitting {label} level", postfix={"failed": 0}, file=sys.stderr)
@@ -768,7 +777,7 @@ def main():
 
         if failed_count: raise ValueError(f'{failed_count} lower-level FIR fits failed; refusing hierarchy generation')
         used_middles = sorted({row[1] for row in all_results if row is not None and row[1] >= 0})
-        upper_df = args.delta_f / 16.0
+        upper_df = args.upper_delta_f if args.upper_delta_f is not None else (args.delta_f / 16.0)
         upper_flen = int((args.sample_rate / 2.0) / upper_df) + 1
         upper_psd_args = argparse.Namespace(**vars(args)); upper_psd_args.delta_f = upper_df
         upper_psd = pycbc.psd.from_cli(upper_psd_args, length=upper_flen, delta_f=upper_df, low_frequency_cutoff=args.f_low)
