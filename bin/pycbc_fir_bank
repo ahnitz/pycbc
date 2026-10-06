@@ -761,6 +761,9 @@ def main():
             label='middle', seed_params=seed_params_mid)
 
         coarse_bank.write_to_hdf(args.output_file, file_handler=out_file, group_key="fir_data/coarse_bank_params", write_compressed_waveforms=True)
+        coarse_grp = out_file['fir_data/coarse_bank_params']
+        if 'approximant' in coarse_grp: del coarse_grp['approximant']
+        coarse_grp.create_dataset('approximant', data=np.array(['FIR_INTERMEDIATE'] * len(coarse_bank), dtype='S'))
         tap_counts = write_fir_groups(fir_group, all_results)
 
         if failed_count: raise ValueError(f'{failed_count} lower-level FIR fits failed; refusing hierarchy generation')
@@ -788,6 +791,8 @@ def main():
 
         logging.info(f"Compressing {len(top_bank)} top waveforms...")
         top_grp = out_file.require_group('fir_data/upper/top_bank_params')
+        if 'approximant' in top_grp: del top_grp['approximant']
+        top_grp.create_dataset('approximant', data=np.array(['FIR_COMPRESSED'] * len(top_bank), dtype='S'))
         if 'template_hash' not in top_grp:
             top_grp.create_dataset('template_hash', data=top_bank.table.template_hash)
         else:
