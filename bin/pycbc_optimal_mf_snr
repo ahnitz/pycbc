@@ -82,11 +82,17 @@ class TimeVaryingPSD(object):
 
 class FrameBufferReader(object):
     """Memory-efficient cached frame reader that loads frame segments on demand."""
-    def __init__(self, frame_files, channel_name, sample_rate, highpass_freq=15.0):
+    def __init__(self, frame_files, channel_name, sample_rate, highpass_freq=15.0,
+                 autogating_threshold=45.0, autogating_cluster=2.0,
+                 autogating_width=0.25, autogating_taper=0.25):
         self.channel_name = channel_name
         self.sample_rate = sample_rate
         self.delta_t = 1.0 / sample_rate
         self.highpass_freq = highpass_freq
+        self.autogating_threshold = autogating_threshold
+        self.autogating_cluster = autogating_cluster
+        self.autogating_width = autogating_width
+        self.autogating_taper = autogating_taper
         self.cache = {}
         self.catalog = []
 
@@ -121,15 +127,34 @@ class FrameBufferReader(object):
                 if self.highpass_freq and self.highpass_freq > 0:
                     ds = highpass(ds, self.highpass_freq)
                 ds *= pycbc.DYN_RANGE_FAC
+
+                # Precondition with autogating to eliminate large instrumental glitches
+                if self.autogating_threshold is not None and self.autogating_threshold > 0:
+                    from pycbc.strain.strain import detect_loud_glitches, gate_data
+                    glitches = detect_loud_glitches(
+                        ds, psd_duration=4.0, psd_stride=2.0,
+                        threshold=self.autogating_threshold,
+                        cluster_window=self.autogating_cluster,
+                        low_freq_cutoff=20.0, corrupt_time=2.0
+                    )
+                    if len(glitches) > 0:
+                        logging.info("Autogating %d glitches in %s [%d-%d]", len(glitches), self.channel_name, f_st, f_et)
+                        gate_params = [(gt, self.autogating_width, self.autogating_taper) for gt in glitches]
+                        ds = gate_data(ds, gate_params)
+
                 self.cache[key] = ds
             except Exception as e:
                 logging.warning("Failed to read frame data for %s [%d-%d]: %s", self.channel_name, f_st, f_et, e)
                 return None
 
         full_ts = self.cache[key]
-        if start_time < full_ts.start_time or end_time > full_ts.end_time:
+        f_st = int(full_ts.start_time)
+        f_et = int(full_ts.end_time)
+        safe_start = max(f_st, min(f_et - duration, start_time))
+        safe_end = safe_start + duration
+        if safe_start < full_ts.start_time or safe_end > full_ts.end_time:
             return None
-        return full_ts.time_slice(start_time, end_time)
+        return full_ts.time_slice(safe_start, safe_end)
 
 
 def parse_injection_range(num_inj, rangestr):
@@ -177,6 +202,14 @@ def main():
     parser.add_argument('--frame-cache', nargs='*', action=MultiDetOptionAction,
                         metavar='DETECTOR:CACHE',
                         help='Frame cache files for each detector')
+    parser.add_argument('--autogating-threshold', type=float, default=45.0,
+                        help='Glitch autogating threshold in sigma (default 45.0; matching search pipeline; set <= 0 to disable)')
+    parser.add_argument('--autogating-cluster', type=float, default=2.0,
+                        help='Cluster window for autogating in seconds (default 2.0)')
+    parser.add_argument('--autogating-width', type=float, default=0.25,
+                        help='Autogate zeroed half-width in seconds (default 0.25)')
+    parser.add_argument('--autogating-taper', type=float, default=0.25,
+                        help='Autogate taper duration in seconds (default 0.25)')
     parser.add_argument('--time-varying-psds', nargs='*', metavar='FILE',
                         help='Time-varying PSD HDF files')
     parser.add_argument('--progress', action='store_true',
@@ -234,7 +267,13 @@ def main():
         if not files:
             raise ValueError(f"No frame files found for detector {det}")
         logging.info("Detector %s: %d frame files loaded for channel %s", det, len(files), channel)
-        frame_readers[det] = FrameBufferReader(files, channel, sample_rate, highpass_freq=15.0)
+        frame_readers[det] = FrameBufferReader(
+            files, channel, sample_rate, highpass_freq=15.0,
+            autogating_threshold=opts.autogating_threshold,
+            autogating_cluster=opts.autogating_cluster,
+            autogating_width=opts.autogating_width,
+            autogating_taper=opts.autogating_taper
+        )
 
     logging.info("Loading injections from %s", opts.input_file)
     injections = pycbc.inject.InjectionSet(opts.input_file)
@@ -272,7 +311,8 @@ def main():
         inj = inj_table[idx]
         tc = get_gc_end_time(inj)
         sim_id = int(inj.simulation_id)
-        start_time = int(tc + 4.0 - seg_len)
+        # Position injection arrival time comfortably in the interior of the segment
+        ideal_start_time = int(tc - seg_len / 2.0)
 
         for det in detectors:
             psd_func = psds.get(det)
@@ -285,7 +325,16 @@ def main():
                 inj_table['optimal_mf_snr_' + det][idx] = 0.0
                 continue
 
-            # 1. Generate template waveform in zero noise (scaled by DYN_RANGE_FAC)
+            # 1. Read detector noise around injection
+            data = frame_readers[det].get_data(ideal_start_time, int(seg_len))
+            if data is None:
+                inj_table['optimal_snr_' + det][idx] = 0.0
+                inj_table['optimal_mf_snr_' + det][idx] = 0.0
+                continue
+
+            start_time = int(data.start_time)
+
+            # 2. Generate template waveform in zero noise (scaled by DYN_RANGE_FAC)
             wave_ts = TimeSeries(zeros(tlen, dtype=float32), delta_t=delta_t, epoch=start_time)
             injections.apply(wave_ts, det, distance_scale=1.0 / pycbc.DYN_RANGE_FAC, simulation_ids=[sim_id])
             wave_fd = make_frequency_series(wave_ts)
@@ -294,21 +343,23 @@ def main():
             sig = sigma(wave_fd, psd=psd, low_frequency_cutoff=f_low)
             inj_table['optimal_snr_' + det][idx] = float(sig)
 
-            # 2. Read detector noise around injection
-            data = frame_readers[det].get_data(start_time, int(seg_len))
-            if data is None:
-                inj_table['optimal_mf_snr_' + det][idx] = 0.0
-                continue
-
-            # Add injection to real detector data
+            # 3. Add injection to real detector data
             data_with_inj = data.copy()
             injections.apply(data_with_inj, det, distance_scale=1.0 / pycbc.DYN_RANGE_FAC, simulation_ids=[sim_id])
 
-            # Matched filter
+            # 4. Matched filter: shift template merger to t=0 so peak occurs at physical arrival time tc
             try:
-                snr_ts = matched_filter(wave_fd, data_with_inj, psd=psd, low_frequency_cutoff=f_low, sigmasq=sig**2)
-                snr_arr = abs(snr_ts).numpy()
-                peak_snr = max(snr_arr[:n_win].max(), snr_arr[-n_win:].max())
+                shift_time = float(tc - start_time)
+                freqs = wave_fd.sample_frequencies.numpy()
+                phase_shift = np.exp(2j * np.pi * freqs * shift_time).astype(np.complex64)
+                wave_fd_shifted = FrequencySeries(wave_fd.numpy() * phase_shift,
+                                                 delta_f=wave_fd.delta_f, epoch=0)
+
+                snr_ts = matched_filter(wave_fd_shifted, data_with_inj, psd=psd, low_frequency_cutoff=f_low, sigmasq=sig**2)
+                tc_idx = int(round((tc - float(snr_ts.start_time)) * sample_rate))
+                idx_min = max(0, tc_idx - n_win)
+                idx_max = min(len(snr_ts), tc_idx + n_win)
+                peak_snr = abs(snr_ts[idx_min:idx_max]).numpy().max()
                 inj_table['optimal_mf_snr_' + det][idx] = float(peak_snr)
             except Exception as e:
                 logging.debug("Matched filter failed for injection %d on %s: %s", idx, det, e)
