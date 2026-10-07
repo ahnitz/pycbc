@@ -34,6 +34,7 @@ from pycbc.vetoes.chisq import (
     power_chisq_bins_from_sigmasq_series,
 )
 from pycbc.vetoes.sgchisq import SingleDetSGChisq
+from pycbc.vetoes.autochisq import SingleDetAutoChisq, autochisq_from_precomputed
 from pycbc.waveform.bank import RatioFilterBank
 from pycbc.waveform.spa_tmplt import spa_tmplt_norm
 from pycbc.filter.matchedfilter import sigmasq_series
@@ -265,25 +266,9 @@ class RatioPowerChisq(SingleDetPowerChisq):
         self.coarse_w_cache.clear()
         self.ref_f_cache.clear()
 
-    def compute(self, ids_local, t_idxs, snrs, fine_indices, tstarts, stilde, bank, ref_snr, filters_f, coarse_idx, args, snr_amp=None):
-        global_ids = fine_indices[ids_local]
-        if snr_amp is None:
-            snr_amp = abs(snrs)
-        num_trigs = len(snrs)
-        num_b = int(self.num_bins) if self.num_bins is not None else 64
-        chisq_vals = np.full(num_trigs, 2 * num_b - 2, dtype=float32)
-        chisq_dof_vals = np.full(num_trigs, 2 * num_b - 2, dtype=np.int32)
-        assigned_mask = np.zeros(num_trigs, dtype=bool)
-
-        cthresh = self.snr_threshold
-        above_thresh = np.flatnonzero(snr_amp >= cthresh)
-        if len(above_thresh) == 0:
-            return chisq_vals, chisq_dof_vals
-
-        sort_order = np.argsort(snr_amp)[::-1]
-
-        # Use native block length from filters_f (uninflated)
-        block_len = len(filters_f[0])
+    def coarse_weight(self, stilde, coarse_idx, block_len):
+        """(psd key, whitened top x upper spectrum of a middle group) on a block's
+        frequency grid: (top_dec * upper_f) / sqrt(psd), None without a top template."""
         df = self.sample_rate / block_len
         n_half = block_len // 2 + 1
         psd_key = id(stilde.psd)
@@ -313,6 +298,31 @@ class RatioPowerChisq(SingleDetPowerChisq):
                 self.coarse_w_cache[coarse_key] = (coarse_dec / np.sqrt(psd_safe)).astype(np.complex64)
             else:
                 self.coarse_w_cache[coarse_key] = None
+        return psd_key, self.coarse_w_cache[coarse_key]
+
+    def compute(self, ids_local, t_idxs, snrs, fine_indices, tstarts, stilde, bank, ref_snr, filters_f, coarse_idx, args, snr_amp=None):
+        global_ids = fine_indices[ids_local]
+        if snr_amp is None:
+            snr_amp = abs(snrs)
+        num_trigs = len(snrs)
+        num_b = int(self.num_bins) if self.num_bins is not None else 64
+        chisq_vals = np.full(num_trigs, 2 * num_b - 2, dtype=float32)
+        chisq_dof_vals = np.full(num_trigs, 2 * num_b - 2, dtype=np.int32)
+        assigned_mask = np.zeros(num_trigs, dtype=bool)
+
+        cthresh = self.snr_threshold
+        above_thresh = np.flatnonzero(snr_amp >= cthresh)
+        if len(above_thresh) == 0:
+            return chisq_vals, chisq_dof_vals
+
+        sort_order = np.argsort(snr_amp)[::-1]
+
+        # Use native block length from filters_f (uninflated)
+        block_len = len(filters_f[0])
+        df = self.sample_rate / block_len
+        n_half = block_len // 2 + 1
+        psd_key = self.coarse_weight(stilde, coarse_idx, block_len)[0]
+        coarse_key = (psd_key, coarse_idx)
 
         iterations = 0
 
@@ -412,6 +422,80 @@ class RatioPowerChisq(SingleDetPowerChisq):
 # 2. Trigger Management & Followup Helpers
 # -----------------------------------------------------------------------------
 
+class RatioAutoChisq(SingleDetAutoChisq):
+    """pycbc's auto-chisq on the SNR series the ratio filter reconstructs.
+
+    Options, statistic and degrees of freedom are SingleDetAutoChisq's; only its
+    two inputs are built differently, from the block spectra the power chisq
+    uses. Over an N-sample block of the middle series with FFT D, the template's
+    SNR is IFFT(filters_f * D) / rescale, and its autocorrelation is the IFFT of
+    its whitened power |coarse_w * conj(filters_f)|^2. Each trigger gets a block
+    centred on it, so its lags stay inside the block's valid samples.
+    """
+    def __init__(self, power_chisq, args):
+        if args.autochi_stride > 0 and args.autochi_reverse_template:
+            raise ValueError("--autochi-reverse-template is not supported by pycbc_inspiral_fir")
+        super(RatioAutoChisq, self).__init__(
+            args.autochi_stride, args.autochi_number_points,
+            onesided=args.autochi_onesided, twophase=args.autochi_two_phase,
+            take_maximum_value=args.autochi_max_valued,
+            maximal_value_dof=args.autochi_max_valued_dof)
+        self.power_chisq = power_chisq
+        self.autocors = {}
+        self.valid_ranges = {}
+
+    def clear(self):
+        self.autocors.clear()
+        self.valid_ranges.clear()
+
+    def valid_range(self, td_bank, local_id):
+        """[start, stop) of the valid samples in a block of the template's library group."""
+        key = id(td_bank)
+        if key not in self.valid_ranges:
+            self.valid_ranges[key] = {
+                int(i): (g['c_bad'], g['c_bad'] + g['n_valid'])
+                for g in td_bank.groups for i in g['template_indices']}
+        return self.valid_ranges[key][int(local_id)]
+
+    def autocorrelation(self, stilde, coarse_idx, local_id, filters_f, band):
+        N = len(filters_f[local_id])
+        psd_key, coarse_w = self.power_chisq.coarse_weight(stilde, coarse_idx, N)
+        key = (psd_key, coarse_idx, local_id)
+        if key not in self.autocors:
+            power = np.zeros(N)
+            power[band] = np.abs(coarse_w[band] * np.conj(filters_f[local_id][band])) ** 2
+            autocor = np.fft.ifft(power)
+            self.autocors[key] = autocor / autocor[0]
+        return self.autocors[key]
+
+    def values(self, ids_local, t_idxs, stilde, coarse_idx, ref_snr, filters_f,
+               td_bank, fine_indices, bank, args):
+        """Auto-chisq of each trigger; 0 where its lags would leave the series."""
+        out = np.zeros(len(ids_local), dtype=float32)
+        reach = self.stride * self.num_points
+        for k, (local_id, t) in enumerate(zip(ids_local, t_idxs)):
+            N = len(filters_f[local_id])
+            start = min(max(int(t) - N // 2, 0), len(ref_snr) - N)
+            valid_start, valid_stop = self.valid_range(td_bank, local_id)
+            if t - reach - start < valid_start or t + reach - start >= valid_stop:
+                continue
+            df = self.power_chisq.sample_rate / N
+            band = slice(int(self.power_chisq.flow / df),
+                         min(int(self.power_chisq.f_final / df), N // 2))
+            rescale = float(bank.snr_rescale(int(fine_indices[local_id]),
+                                             method=args.template_normalization_method))
+            corr = np.zeros(N, dtype=np.complex128)
+            corr[band] = filters_f[local_id][band] * np.fft.fft(ref_snr[start:start + N])[band]
+            snr = np.fft.ifft(corr)[t - start - reach:t - start + reach + 1] / rescale
+            _, achisq = autochisq_from_precomputed(
+                snr, snr, self.autocorrelation(stilde, coarse_idx, local_id, filters_f, band),
+                [reach], stride=self.stride, num_points=self.num_points,
+                oneside=self.one_sided, twophase=self.two_phase,
+                maxvalued=self.take_maximum_value)
+            out[k] = achisq[0]
+        return out
+
+
 def process_and_record_triggers(
     ids_local, t_idxs, snrs, tstarts,
     stilde, h_norm, coarse_idx, fine_indices,
@@ -422,6 +506,8 @@ def process_and_record_triggers(
     timers=None,
     renorm_factor=None,
     primary_snr_threshold=6.0,
+    autochisq=None,
+    td_bank=None,
 ):
     """Filter triggers for analysis boundary, evaluate chisq, and append batch record."""
     if len(ids_local) > 0 and getattr(stilde, 'analyze', None) is not None:
@@ -483,6 +569,12 @@ def process_and_record_triggers(
             's_num': np.full(n_trig, s_num, dtype=np.int32),
             'is_asym': np.full(n_trig, is_asym, dtype=bool),
         }
+        if autochisq is not None and autochisq.do:
+            t_auto0 = time.perf_counter()
+            batch['cont_chisq'] = autochisq.values(
+                ids_local, t_idxs, stilde, coarse_idx, ref_snr, filters_f,
+                td_bank, fine_indices, bank, args)
+            (timers if timers is not None else TIMERS)['auto_chisq'] += time.perf_counter() - t_auto0
         ifo_trigs = triggers[ifo]
         for col, arr in batch.items():
             ifo_trigs[col].append(arr)
@@ -726,11 +818,12 @@ def followup_asym_candidates(
     ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
     timers=None,
     renorm_factors=None,
+    autochisq=None,
 ):
     """Follow up primary candidate triggers in secondary detectors within asymmetric windows."""
     t_asym0 = time.perf_counter()
     t_clock = timers if timers is not None else TIMERS
-    chi_asym_before = t_clock['power_chisq']
+    chi_asym_before = t_clock['power_chisq'] + t_clock['auto_chisq']
 
     for ifo_A in active_ifos:
         a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
@@ -769,6 +862,8 @@ def followup_asym_candidates(
             timers=timers,
             renorm_factor=rf_A,
             primary_snr_threshold=primary_snr_threshold,
+            autochisq=autochisq,
+            td_bank=group_engine._td_bank,
         )
 
         sr_A = ifo_sample_rates[ifo_A]
@@ -831,10 +926,12 @@ def followup_asym_candidates(
                     timers=timers,
                     renorm_factor=rf_B,
                     primary_snr_threshold=args.asym_secondary_snr_threshold,
+                    autochisq=autochisq,
+                    td_bank=group_engine._td_bank,
                 )
 
 
-    chi_asym_now = t_clock['power_chisq']
+    chi_asym_now = t_clock['power_chisq'] + t_clock['auto_chisq']
     asym_dur = (time.perf_counter() - t_asym0) - (chi_asym_now - chi_asym_before)
     t_clock['asym_followup'] += asym_dur
 
@@ -990,6 +1087,7 @@ def process_top_template_task(task_args):
         top_template=top_template,
         upper_f_by_coarse=upper_f_by_coarse,
     )
+    autochisq = RatioAutoChisq(power_chisq, args)
 
     for s_num in range(num_segs):
         active_ifos = [ifo for ifo in instruments if s_num < len(segments[ifo])]
@@ -1106,6 +1204,8 @@ def process_top_template_task(task_args):
                         timers=local_timers,
                         renorm_factor=renorm_factors.get(ifo),
                         primary_snr_threshold=primary_snr_threshold,
+                        autochisq=autochisq,
+                        td_bank=group_engine._td_bank,
                     )
                 else:
                     std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
@@ -1119,6 +1219,7 @@ def process_top_template_task(task_args):
                     ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
                     timers=local_timers,
                     renorm_factors=renorm_factors,
+                    autochisq=autochisq,
                 )
 
         t_seg_dur = max(time.perf_counter() - t_seg_start, 1e-6)
@@ -1144,6 +1245,7 @@ def process_top_template_task(task_args):
     del top_template
     UpperReferenceBatch.clear_buffers()
     power_chisq.clear()
+    autochisq.clear()
 
     collapsed_trigs = {}
     for ifo in instruments:
@@ -1493,6 +1595,8 @@ def ingest_ifo_triggers(
         ingest_cols = ['time_index', 'snr', 'sigmasq', 'chisq', 'chisq_dof', 'sg_chisq', 'psd_var_val']
     else:
         ingest_cols = ['time_index', 'snr', 'sigmasq', 'chisq', 'chisq_dof', 'sg_chisq']
+    if args.autochi_stride > 0:
+        ingest_cols.append('cont_chisq')   # EventManager writes cont_chisq_dof
 
     logging.info("[%s] Ingesting triggers for %d templates into EventManager...", ifo, len(unique_gids))
     for t_idx, (gid, s_idx, e_idx) in enumerate(zip(unique_gids, start_indices, end_indices)):
@@ -1546,6 +1650,7 @@ def log_performance_summary(run_time, tsetup, instruments, segments, bank, outpu
         ("Fine FIR Filtering (Primary)", TIMERS.get('fine_fir', 0.0)),
         ("Asymmetric Followup Filtering", TIMERS.get('asym_followup', 0.0)),
         ("Power Chisq Calculation", TIMERS.get('power_chisq', 0.0)),
+        ("Auto Chisq Calculation", TIMERS.get('auto_chisq', 0.0)),
         ("Sine-Gaussian Chisq", TIMERS.get('sg_chisq', 0.0)),
         ("Event Ingestion & Clustering", TIMERS.get('event_ingest', 0.0)),
         ("Event Finalize & HDF Output", TIMERS.get('event_finalize', 0.0)),
@@ -1687,6 +1792,32 @@ def get_args():
     parser.add_argument("--chisq-threshold", type=float, default=0,
                         help="Maximum reduced chisq a trigger may have; 0 disables the cut.")
     parser.add_argument("--chisq-window", type=float, default=1.0)
+    # Auto-chisq, with the options of pycbc_inspiral (see RatioAutoChisq).
+    parser.add_argument("--autochi-number-points", type=int, default=0,
+                        help="The number of points to use, in both directions if "
+                             "doing a two-sided auto-chisq, to calculate the "
+                             "auto-chisq statistic.")
+    parser.add_argument("--autochi-stride", type=int, default=0,
+                        help="The gap, in sample points, between the points at "
+                             "which to calculate auto-chisq.")
+    parser.add_argument("--autochi-two-phase", action="store_true", default=False,
+                        help="If given auto-chisq will be calculated by testing "
+                             "against both phases of the SNR time-series. If not "
+                             "given, only the phase matching the trigger will be used.")
+    parser.add_argument("--autochi-onesided", action='store', default=None,
+                        choices=['left', 'right'],
+                        help="Decide whether to calculate auto-chisq using points "
+                             "on both sides of the trigger or only on one side.")
+    parser.add_argument("--autochi-reverse-template", action="store_true", default=False,
+                        help="Not supported by pycbc_inspiral_fir; accepted so "
+                             "pycbc_inspiral configurations parse.")
+    parser.add_argument("--autochi-max-valued", action="store_true", default=False,
+                        help="If given, store only the maximum value of the "
+                             "auto-chisq over all points tested.")
+    parser.add_argument("--autochi-max-valued-dof", action="store", metavar="INT", type=int,
+                        help="If using --autochi-max-valued this value denotes the "
+                             "pre-calculated mean value that will be stored as the "
+                             "auto-chisq degrees-of-freedom value.")
     parser.add_argument("--chisq-iterations", type=int, default=100)
     parser.add_argument("--chisq-delta", type=float, default=0,
                         help="SNR-dependent term added to the chisq dof before applying --chisq-threshold.")
@@ -1723,10 +1854,6 @@ def get_args():
 def main():
     parser, args = get_args()
     pycbc.init_logging(args.verbose)
-
-    # Autochi dummy options required by EventManager attribute access
-    for k in ('autochi_number_points', 'autochi_onesided', 'autochi_two_phase', 'autochi_max_valued_dof'):
-        setattr(args, k, 0 if 'number' in k else False)
 
     if isinstance(args.channel_name, dict) and len(args.channel_name) > 0:
         instruments = sorted(list(args.channel_name.keys()))
