@@ -55,7 +55,8 @@ class UpperReferenceBatch:
     def clear_buffers(cls):
         cls._BUFFERS.clear()
 
-    def __init__(self, taps, counts, middle_ids, series_length, scales=None):
+    def __init__(self, taps, counts, middle_ids, series_length, scales=None,
+                 tap_sample_rate=2048, data_sample_rate=1024):
         import matchedfilter
         from matchedfilter import _automatic_series_layout
 
@@ -67,6 +68,8 @@ class UpperReferenceBatch:
         self.scales = np.asarray(scales, dtype=np.float32)[sort_order] if scales is not None else None
         self.bank = matchedfilter.TimeDomainFilterBank(
             taps[sort_order], tap_counts=counts_arr[sort_order],
+            tap_sample_rate=tap_sample_rate,
+            data_sample_rate=data_sample_rate,
             engine='corr'
         )
 
@@ -115,11 +118,14 @@ class UpperReferenceBatch:
         if valid_slice is not None:
             vs = 0 if valid_slice.start is None else int(valid_slice.start)
             ve = self.series_length if valid_slice.stop is None else int(valid_slice.stop)
+            if ve > self.series_length:
+                vs //= 2
+                ve //= 2
             if vs < 0:
                 vs = max(0, self.series_length + vs)
             if ve < 0:
                 ve = max(0, self.series_length + ve)
-            pad_val = int(pad) if pad is not None else 4096
+            pad_val = int(pad // 2) if pad is not None else 2048
             v_start = max(0, vs - pad_val)
             v_stop = min(self.series_length, ve + pad_val)
         else:
@@ -278,10 +284,22 @@ class RatioPowerChisq(SingleDetPowerChisq):
 
             cache_key = (tstart, block_len)
             if cache_key not in self.ref_f_cache:
-                ref = ref_snr[tstart : tstart + block_len]
-                if ref is None or len(ref) < block_len:
-                    continue
-                self.ref_f_cache[cache_key] = np.fft.fft(ref).astype(np.complex64)
+                is_half = (tstart >= len(ref_snr) or len(ref_snr) <= 524288)
+                if is_half:
+                    tstart_half = tstart // 2
+                    k_len = block_len // 2
+                    ref = ref_snr[tstart_half : tstart_half + k_len]
+                    if ref is None or len(ref) < k_len:
+                        continue
+                    ref_k = np.fft.fft(ref).astype(np.complex64)
+                    ref_f_buf = np.zeros(block_len, dtype=np.complex64)
+                    ref_f_buf[:k_len] = ref_k * 2.0
+                    self.ref_f_cache[cache_key] = ref_f_buf
+                else:
+                    ref = ref_snr[tstart : tstart + block_len]
+                    if ref is None or len(ref) < block_len:
+                        continue
+                    self.ref_f_cache[cache_key] = np.fft.fft(ref).astype(np.complex64)
             ref_f = self.ref_f_cache[cache_key]
 
             # Reconstruct fine template power bins via ratio filter multiplication
@@ -431,12 +449,29 @@ def process_and_record_triggers(
 def sample_asym_bins(group_engine, ref_snr, local_id, t_center,
                      sample_rate=2048.0, bin_width=0.1, num_bins=100, valid_slice=None):
     """Sample peak SNR in each bin across an asymmetric window around t_center."""
+    decim = getattr(group_engine, 'decimation_factor', 1)
     bs = int(round(bin_width * float(sample_rate or 2048.0)))
-    win_start_samp = (t_center - bs // 2) - (num_bins // 2) * bs
-    win_end_samp = win_start_samp + num_bins * bs
+    if decim > 1:
+        bs_eff = max(1, bs // decim)
+        t_center_eff = t_center // decim
+    else:
+        bs_eff = bs
+        t_center_eff = t_center
 
-    v_start = 0 if valid_slice is None else valid_slice.start
-    v_stop = len(ref_snr) if valid_slice is None else valid_slice.stop
+    win_start_samp = (t_center_eff - bs_eff // 2) - (num_bins // 2) * bs_eff
+    win_end_samp = win_start_samp + num_bins * bs_eff
+
+    if valid_slice is None:
+        v_start = 0
+        v_stop = len(ref_snr)
+    else:
+        vs = 0 if valid_slice.start is None else valid_slice.start
+        ve = len(ref_snr) if valid_slice.stop is None else valid_slice.stop
+        if decim > 1 and ve > len(ref_snr):
+            v_start = vs // decim
+            v_stop = ve // decim
+        else:
+            v_start, v_stop = vs, ve
 
     asym_start = max(win_start_samp, v_start)
     asym_stop = min(win_end_samp, v_stop)
@@ -452,7 +487,7 @@ def sample_asym_bins(group_engine, ref_snr, local_id, t_center,
     res = group_engine._td_bank.filter_series(
         ref_snr,
         valid_slice=slice(asym_start, asym_stop),
-        binsize=bs,
+        binsize=bs_eff,
         threshold=0.0,
         template_index=local_id
     )
@@ -704,7 +739,7 @@ def process_top_template_task(task_args):
         high_frequency_cutoff=args.high_frequency_cutoff,
         batch_size=args.batch_size,
         tap_sample_rate=bank.sample_rate,
-        engine_sample_rate=sample_rate,
+        engine_sample_rate=sample_rate // 2,
         engine=args.ratio_filter_engine,
         false_dismissal=args.ratio_filter_false_dismissal,
         coarse_band_hz=args.ratio_filter_band,
@@ -749,8 +784,11 @@ def process_top_template_task(task_args):
 
     t_up_prep = time.perf_counter()
     any_seg = next(segments[i][0] for i in instruments if len(segments[i]) > 0)
+    nyq_len = ((len(any_seg) - 1) * 2) // 2
     upper_batch = UpperReferenceBatch(
-        taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2, scales=all_scales
+        taps_u, counts_u, middle_ids, nyq_len, scales=all_scales,
+        tap_sample_rate=bank.sample_rate,
+        data_sample_rate=sample_rate // 2,
     )
     local_timers['upper_prep'] += time.perf_counter() - t_up_prep
 
@@ -771,7 +809,7 @@ def process_top_template_task(task_args):
             high_frequency_cutoff=args.high_frequency_cutoff,
             batch_size=args.batch_size,
             tap_sample_rate=bank.sample_rate,
-            engine_sample_rate=sample_rate,
+            engine_sample_rate=sample_rate // 2,
             engine=args.ratio_filter_engine,
             false_dismissal=args.ratio_filter_false_dismissal,
             coarse_band_hz=args.ratio_filter_band,
@@ -823,8 +861,8 @@ def process_top_template_task(task_args):
             st = segments[ifo][s_num]
             t_ref0 = time.perf_counter()
             series, norm = engine.make_reference_series(st, st.psd, top_template)
-            dt_sample = float(st.delta_t)
-            amp_scale = float(st.delta_t / engine.decimation_factor)
+            dt_sample = float(st.delta_t * engine.decimation_factor)
+            amp_scale = float(st.delta_t)
             if not getattr(args, 'disable_dynamic_snr_renorm', False):
                 renorm_factors[ifo] = get_dynamic_snr_renorm_factor(
                     series, dt=dt_sample, scale=amp_scale,

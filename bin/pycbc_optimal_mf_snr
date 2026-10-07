@@ -93,68 +93,91 @@ class FrameBufferReader(object):
         self.autogating_cluster = autogating_cluster
         self.autogating_width = autogating_width
         self.autogating_taper = autogating_taper
-        self.cache = {}
+        self.current_ts = None
         self.catalog = []
 
         # Parse catalog
         for f in frame_files:
-            base = os.path.basename(f)
+            clean_f = f.replace('file://localhost', '').replace('file://', '')
+            base = os.path.basename(clean_f)
             parts = base.replace('.gwf', '').split('-')
             try:
                 st = int(parts[-2])
                 dur = int(parts[-1])
-                self.catalog.append((st, st + dur, f))
+                self.catalog.append((st, st + dur, clean_f))
             except (ValueError, IndexError):
                 # Fallback: inspect file
-                self.catalog.append((0, 2000000000, f))
+                self.catalog.append((0, 2000000000, clean_f))
         self.catalog.sort()
 
     def get_data(self, start_time, duration):
         end_time = start_time + duration
-        matching = [f for st, et, f in self.catalog if not (et <= start_time or st >= end_time)]
+        pad = 16.0
+
+        # Check cache hit
+        if self.current_ts is not None:
+            if self.current_ts.start_time <= start_time and self.current_ts.end_time >= end_time:
+                return self.current_ts.time_slice(start_time, end_time)
+
+        # Buffer up to 1024s into the future to amortize read/resample/highpass across adjacent injections
+        buf_duration = max(duration, 1024.0)
+        req_st = start_time - pad
+        req_et = start_time + buf_duration + pad
+
+        matching = [f for st, et, f in self.catalog if not (et <= req_st or st >= req_et)]
         if not matching:
             return None
-        key = tuple(matching)
-        if key not in self.cache:
-            # Keep cache bounded to at most 3 entries
-            if len(self.cache) >= 3:
-                self.cache.pop(next(iter(self.cache)))
-            f_st = min(st for st, et, f in self.catalog if f in matching)
-            f_et = max(et for st, et, f in self.catalog if f in matching)
-            try:
-                raw = read_frame(matching, self.channel_name, start_time=f_st, end_time=f_et)
-                ds = resample_to_delta_t(raw, self.delta_t).astype(float32)
-                if self.highpass_freq and self.highpass_freq > 0:
-                    ds = highpass(ds, self.highpass_freq)
-                ds *= pycbc.DYN_RANGE_FAC
 
-                # Precondition with autogating to eliminate large instrumental glitches
-                if self.autogating_threshold is not None and self.autogating_threshold > 0:
-                    from pycbc.strain.strain import detect_loud_glitches, gate_data
-                    glitches = detect_loud_glitches(
-                        ds, psd_duration=4.0, psd_stride=2.0,
-                        threshold=self.autogating_threshold,
-                        cluster_window=self.autogating_cluster,
-                        low_freq_cutoff=20.0, corrupt_time=2.0
-                    )
-                    if len(glitches) > 0:
-                        logging.info("Autogating %d glitches in %s [%d-%d]", len(glitches), self.channel_name, f_st, f_et)
-                        gate_params = [(gt, self.autogating_width, self.autogating_taper) for gt in glitches]
-                        ds = gate_data(ds, gate_params)
-
-                self.cache[key] = ds
-            except Exception as e:
-                logging.warning("Failed to read frame data for %s [%d-%d]: %s", self.channel_name, f_st, f_et, e)
-                return None
-
-        full_ts = self.cache[key]
-        f_st = int(full_ts.start_time)
-        f_et = int(full_ts.end_time)
-        safe_start = max(f_st, min(f_et - duration, start_time))
-        safe_end = safe_start + duration
-        if safe_start < full_ts.start_time or safe_end > full_ts.end_time:
+        f_st = min(st for st, et, f in self.catalog if f in matching)
+        f_et = max(et for st, et, f in self.catalog if f in matching)
+        load_st = max(f_st, req_st)
+        load_et = min(f_et, req_et)
+        if load_et - load_st < duration:
             return None
-        return full_ts.time_slice(safe_start, safe_end)
+
+        try:
+            raw = read_frame(matching, self.channel_name, start_time=load_st, end_time=load_et)
+            raw_arr = raw.numpy()
+            if np.isnan(raw_arr).all():
+                return None
+            if np.isnan(raw_arr).any():
+                raw_arr = np.nan_to_num(raw_arr, nan=0.0)
+                raw = TimeSeries(raw_arr, delta_t=raw.delta_t, epoch=raw.start_time)
+
+            ds = resample_to_delta_t(raw, self.delta_t).astype(float32)
+            if self.highpass_freq and self.highpass_freq > 0:
+                ds = highpass(ds, self.highpass_freq)
+            ds *= pycbc.DYN_RANGE_FAC
+
+            # Precondition with autogating to eliminate large instrumental glitches
+            if self.autogating_threshold is not None and self.autogating_threshold > 0:
+                from pycbc.strain.strain import detect_loud_glitches, gate_data
+                glitches = detect_loud_glitches(
+                    ds, psd_duration=4.0, psd_stride=2.0,
+                    threshold=self.autogating_threshold,
+                    cluster_window=self.autogating_cluster,
+                    low_freq_cutoff=20.0, corrupt_time=2.0
+                )
+                if len(glitches) > 0:
+                    logging.info("Autogating %d glitches in %s [%d-%d]", len(glitches), self.channel_name, load_st, load_et)
+                    gate_params = [(gt, self.autogating_width, self.autogating_taper) for gt in glitches]
+                    ds = gate_data(ds, gate_params)
+
+            # Drop filter corrupt time at ends
+            safe_st = int(load_st + pad)
+            safe_et = int(load_et - pad)
+            if safe_et - safe_st >= duration:
+                ds = ds.time_slice(safe_st, safe_et)
+            self.current_ts = ds
+
+            # Return requested slice
+            if self.current_ts.start_time <= start_time and self.current_ts.end_time >= end_time:
+                return self.current_ts.time_slice(start_time, end_time)
+            safe_start = max(self.current_ts.start_time, min(self.current_ts.end_time - duration, start_time))
+            return self.current_ts.time_slice(safe_start, safe_start + duration)
+        except Exception as e:
+            logging.debug("Failed to read frame data for %s [%d-%d]: %s", self.channel_name, load_st, load_et, e)
+            return None
 
 
 def parse_injection_range(num_inj, rangestr):
