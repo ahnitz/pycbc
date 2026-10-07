@@ -1108,8 +1108,10 @@ def prepare_segment_geometry(args, instruments, segments, gwstrain_start_time, n
         for s_num, st in enumerate(segments[ifo]):
             seg_starts[(ifo, s_num)] = getattr(st, 'seg_slice', slice(0)).start if getattr(st, 'seg_slice', None) is not None else 0
 
+    # Follow-up needs a second detector with overlapping data in the segment;
+    # otherwise a segment's primaries are recorded directly.
     can_asym_by_seg = {}
-    if args.asym_windowing and len(instruments) > 1:
+    if len(instruments) > 1:
         for s_num in range(num_segs):
             active_ifos = [ifo for ifo in instruments if s_num < len(segments[ifo])]
             if len(active_ifos) <= 1:
@@ -1369,8 +1371,10 @@ def get_args():
 
     # Multi-detector & Asymmetric Windowing Options
     asym_group = parser.add_argument_group("Asymmetric Windowing Options")
+    # Asymmetric follow-up is always on; the flag is accepted so existing
+    # command lines and workflow configurations keep working.
     asym_group.add_argument("--asym-windowing", action="store_true",
-                            help="Enable asymmetric windowing across detectors.")
+                            help=argparse.SUPPRESS)
     asym_group.add_argument("--asym-snr-threshold", type=float, default=6.0,
                             help="SNR threshold in primary detector to trigger asymmetric windowing in other detectors.")
     asym_group.add_argument("--asym-secondary-snr-threshold", type=float, default=None,
@@ -1398,7 +1402,8 @@ def get_args():
     parser.add_argument("--bank-file", type=str, required=True,
                         help="Path to the HDF5 Ratio Bank file.")
     parser.add_argument('--snr-threshold', type=float, default=None,
-                        help="SNR threshold for trigger generation.")
+                        help="Ignored: the primary threshold is --asym-snr-threshold. "
+                             "Accepted for compatibility with existing configurations.")
     parser.add_argument("--newsnr-threshold", type=float, metavar='THRESHOLD',
                         help="Cut triggers with NewSNR less than THRESHOLD")
     parser.add_argument("--low-frequency-cutoff", type=float,
@@ -1558,11 +1563,8 @@ def main():
                     )
                     bank.template_thinning(combined_rej)
 
-        if args.asym_windowing:
-            primary_snr_threshold = args.asym_snr_threshold if args.asym_snr_threshold is not None else (args.snr_threshold if args.snr_threshold is not None else 6.0)
-        else:
-            primary_snr_threshold = args.snr_threshold if args.snr_threshold is not None else 5.5
-        logging.info("Primary SNR threshold: %.2f (asym_windowing=%s)", primary_snr_threshold, args.asym_windowing)
+        primary_snr_threshold = args.asym_snr_threshold
+        logging.info("Primary SNR threshold: %.2f", primary_snr_threshold)
 
 
         sg_chisq = SingleDetSGChisq.from_cli(args, bank, str(args.chisq_bins))
