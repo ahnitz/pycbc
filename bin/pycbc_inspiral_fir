@@ -276,7 +276,11 @@ class RatioPowerChisq(SingleDetPowerChisq):
             rescale = float(bank.snr_rescale(target_global_id, method=args.template_normalization_method))
             dt = t_idx - tstart
 
-            cache_key = (tstart, block_len)
+            # ref_snr is one middle group's series in one detector's segment;
+            # the cache spans all of them for a top template, so the key must
+            # say which. Keyed on the block alone, a later group or detector with
+            # a block at the same start reused the first one's spectrum.
+            cache_key = (id(stilde), coarse_idx, tstart, block_len)
             if cache_key not in self.ref_f_cache:
                 ref = ref_snr[tstart : tstart + block_len]
                 if ref is None or len(ref) < block_len:
