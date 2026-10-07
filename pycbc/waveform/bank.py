@@ -1332,7 +1332,9 @@ class RatioFilterBank(FilterBank):
         else:
             self.coarse_indices = np.array([], dtype=int)
 
-        # Also thin the fine template bank
+        # Keep every group that holds a fine template within the window.  The
+        # selection is per group only: each kept group is filtered with all its
+        # templates, exactly as in the full search.
         m1_fine = self.table['mass1']
         m2_fine = self.table['mass2']
         tau0_fine, _ = pycbc.pnutils.mass1_mass2_to_tau0_tau3(m1_fine, m2_fine, fref)
@@ -1578,12 +1580,9 @@ class RatioFilterBank(FilterBank):
         else:
             sample_shifts = np.zeros(len(fine_indices), dtype=np.int32)
 
-        if getattr(self, 'fine_keep', None) is not None:
-            fine_mask = np.isin(fine_indices, list(self.fine_keep))
-            taps = taps[fine_mask]
-            actual_tap_counts = actual_tap_counts[fine_mask]
-            fine_indices = fine_indices[fine_mask]
-            sample_shifts = sample_shifts[fine_mask]
+        # Injection thinning selects whole groups (template_thinning); it must
+        # never drop fine templates inside a kept group, or peak identification
+        # in an injection run would differ from the full search and bias it.
 
         if len(fine_indices) > 0:
             sort_idx = np.argsort(actual_tap_counts)
