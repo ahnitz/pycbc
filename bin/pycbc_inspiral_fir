@@ -300,7 +300,8 @@ class RatioPowerChisq(SingleDetPowerChisq):
                 self.coarse_w_cache[coarse_key] = None
         return psd_key, self.coarse_w_cache[coarse_key]
 
-    def compute(self, ids_local, t_idxs, snrs, fine_indices, tstarts, stilde, bank, ref_snr, filters_f, coarse_idx, args, snr_amp=None):
+    def compute(self, ids_local, t_idxs, snrs, fine_indices, tstarts, stilde, bank, ref_snr, filters_f, coarse_idx, args, snr_amp=None,
+                autochisq=None, td_bank=None):
         global_ids = fine_indices[ids_local]
         if snr_amp is None:
             snr_amp = abs(snrs)
@@ -308,12 +309,14 @@ class RatioPowerChisq(SingleDetPowerChisq):
         num_b = int(self.num_bins) if self.num_bins is not None else 64
         chisq_vals = np.full(num_trigs, 2 * num_b - 2, dtype=float32)
         chisq_dof_vals = np.full(num_trigs, 2 * num_b - 2, dtype=np.int32)
+        # auto-chisq, when on, follows the same rules; others keep its dof (reduced value 1)
+        auto_vals = np.full(num_trigs, autochisq.dof, dtype=float32) if autochisq is not None else None
         assigned_mask = np.zeros(num_trigs, dtype=bool)
 
         cthresh = self.snr_threshold
         above_thresh = np.flatnonzero(snr_amp >= cthresh)
         if len(above_thresh) == 0:
-            return chisq_vals, chisq_dof_vals
+            return chisq_vals, chisq_dof_vals, auto_vals
 
         sort_order = np.argsort(snr_amp)[::-1]
 
@@ -412,10 +415,15 @@ class RatioPowerChisq(SingleDetPowerChisq):
             update_mask = same_tmpl_window & (~assigned_mask) & (snr_amp >= cthresh)
             chisq_vals[update_mask] = float(chi_val)
             chisq_dof_vals[update_mask] = 2 * p - 2
+            if autochisq is not None:
+                auto = autochisq.value(stilde, coarse_idx, ref_snr, filters_f, local_id,
+                                       t_idx, rescale, td_bank)
+                if auto is not None:
+                    auto_vals[update_mask] = auto
             assigned_mask[update_mask] = True
             iterations += 1
 
-        return chisq_vals, chisq_dof_vals
+        return chisq_vals, chisq_dof_vals, auto_vals
 
 
 # -----------------------------------------------------------------------------
@@ -431,6 +439,10 @@ class RatioAutoChisq(SingleDetAutoChisq):
     SNR is IFFT(filters_f * D) / rescale, and its autocorrelation is the IFFT of
     its whitened power |coarse_w * conj(filters_f)|^2. Each trigger gets a block
     centred on it, so its lags stay inside the block's valid samples.
+
+    It is evaluated inside RatioPowerChisq.compute, so it follows the power
+    chisq's rules: --chisq-snr-threshold, one value per --chisq-window cluster
+    of a template, and --chisq-iterations. Other triggers keep its dof.
     """
     def __init__(self, power_chisq, args):
         if args.autochi_stride > 0 and args.autochi_reverse_template:
@@ -440,9 +452,17 @@ class RatioAutoChisq(SingleDetAutoChisq):
             onesided=args.autochi_onesided, twophase=args.autochi_two_phase,
             take_maximum_value=args.autochi_max_valued,
             maximal_value_dof=args.autochi_max_valued_dof)
+        if self.do and not power_chisq.do:
+            raise ValueError("auto-chisq is computed with the power chisq: it needs --chisq-bins")
+        if self.do:
+            # The dof EventManager writes as cont_chisq_dof (SingleDetAutoChisq's
+            # constructor sets it inconsistently and relies on values() to fix it).
+            self.dof = (args.autochi_max_valued_dof or args.autochi_number_points
+                        * (1 if args.autochi_onesided else 2) * (2 if args.autochi_two_phase else 1))
         self.power_chisq = power_chisq
         self.autocors = {}
         self.valid_ranges = {}
+        self.elapsed = 0.0          # time spent here, kept out of the power chisq's
 
     def clear(self):
         self.autocors.clear()
@@ -468,32 +488,28 @@ class RatioAutoChisq(SingleDetAutoChisq):
             self.autocors[key] = autocor / autocor[0]
         return self.autocors[key]
 
-    def values(self, ids_local, t_idxs, stilde, coarse_idx, ref_snr, filters_f,
-               td_bank, fine_indices, bank, args):
-        """Auto-chisq of each trigger; 0 where its lags would leave the series."""
-        out = np.zeros(len(ids_local), dtype=float32)
+    def value(self, stilde, coarse_idx, ref_snr, filters_f, local_id, t, rescale, td_bank):
+        """Auto-chisq of one trigger, or None if its lags would leave the series."""
+        t0 = time.perf_counter()
         reach = self.stride * self.num_points
-        for k, (local_id, t) in enumerate(zip(ids_local, t_idxs)):
-            N = len(filters_f[local_id])
-            start = min(max(int(t) - N // 2, 0), len(ref_snr) - N)
-            valid_start, valid_stop = self.valid_range(td_bank, local_id)
-            if t - reach - start < valid_start or t + reach - start >= valid_stop:
-                continue
-            df = self.power_chisq.sample_rate / N
-            band = slice(int(self.power_chisq.flow / df),
-                         min(int(self.power_chisq.f_final / df), N // 2))
-            rescale = float(bank.snr_rescale(int(fine_indices[local_id]),
-                                             method=args.template_normalization_method))
-            corr = np.zeros(N, dtype=np.complex128)
-            corr[band] = filters_f[local_id][band] * np.fft.fft(ref_snr[start:start + N])[band]
-            snr = np.fft.ifft(corr)[t - start - reach:t - start + reach + 1] / rescale
-            _, achisq = autochisq_from_precomputed(
-                snr, snr, self.autocorrelation(stilde, coarse_idx, local_id, filters_f, band),
-                [reach], stride=self.stride, num_points=self.num_points,
-                oneside=self.one_sided, twophase=self.two_phase,
-                maxvalued=self.take_maximum_value)
-            out[k] = achisq[0]
-        return out
+        N = len(filters_f[local_id])
+        start = min(max(int(t) - N // 2, 0), len(ref_snr) - N)
+        valid_start, valid_stop = self.valid_range(td_bank, local_id)
+        if t - reach - start < valid_start or t + reach - start >= valid_stop:
+            return None
+        df = self.power_chisq.sample_rate / N
+        band = slice(int(self.power_chisq.flow / df),
+                     min(int(self.power_chisq.f_final / df), N // 2))
+        corr = np.zeros(N, dtype=np.complex128)
+        corr[band] = filters_f[local_id][band] * np.fft.fft(ref_snr[start:start + N])[band]
+        snr = np.fft.ifft(corr)[t - start - reach:t - start + reach + 1] / rescale
+        _, achisq = autochisq_from_precomputed(
+            snr, snr, self.autocorrelation(stilde, coarse_idx, local_id, filters_f, band),
+            [reach], stride=self.stride, num_points=self.num_points,
+            oneside=self.one_sided, twophase=self.two_phase,
+            maxvalued=self.take_maximum_value)
+        self.elapsed += time.perf_counter() - t0
+        return float(achisq[0])
 
 
 def process_and_record_triggers(
@@ -541,20 +557,26 @@ def process_and_record_triggers(
 
     n_trig = len(ids_local)
     if n_trig > 0:
+        auto_on = autochisq is not None and autochisq.do
         if power_chisq.do and np.any(abs(snrs_renorm) >= power_chisq.snr_threshold):
             t_chi0 = time.perf_counter()
-            chi, chi_dof = power_chisq.compute(
+            auto0 = autochisq.elapsed if auto_on else 0.0
+            chi, chi_dof, auto = power_chisq.compute(
                 ids_local, t_idxs, snrs,
                 fine_indices, tstarts, stilde, bank,
                 ref_snr, filters_f, coarse_idx, args,
-                snr_amp=abs(snrs_renorm))
+                snr_amp=abs(snrs_renorm),
+                autochisq=autochisq if auto_on else None, td_bank=td_bank)
+            auto_dur = autochisq.elapsed - auto0 if auto_on else 0.0
             chi_dur = time.perf_counter() - t_chi0
             t_clock = timers if timers is not None else TIMERS
-            t_clock['power_chisq'] += chi_dur
+            t_clock['power_chisq'] += chi_dur - auto_dur
+            t_clock['auto_chisq'] += auto_dur
         else:
             num_b = int(getattr(power_chisq, 'num_bins', 64) or 64) if power_chisq is not None else 64
             chi = np.full(n_trig, 2 * num_b - 2, dtype=float32)
             chi_dof = np.full(n_trig, 2 * num_b - 2, dtype=np.int32)
+            auto = np.full(n_trig, autochisq.dof, dtype=float32) if auto_on else None
 
         local_shifts = shifts[ids_local] if shifts is not None else 0
         time_offset = (-stilde.analyze.start + stilde.cumulative_index) if getattr(stilde, 'analyze', None) is not None else 0
@@ -569,12 +591,8 @@ def process_and_record_triggers(
             's_num': np.full(n_trig, s_num, dtype=np.int32),
             'is_asym': np.full(n_trig, is_asym, dtype=bool),
         }
-        if autochisq is not None and autochisq.do:
-            t_auto0 = time.perf_counter()
-            batch['cont_chisq'] = autochisq.values(
-                ids_local, t_idxs, stilde, coarse_idx, ref_snr, filters_f,
-                td_bank, fine_indices, bank, args)
-            (timers if timers is not None else TIMERS)['auto_chisq'] += time.perf_counter() - t_auto0
+        if auto_on:
+            batch['cont_chisq'] = auto
         ifo_trigs = triggers[ifo]
         for col, arr in batch.items():
             ifo_trigs[col].append(arr)
