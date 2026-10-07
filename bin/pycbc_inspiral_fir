@@ -993,6 +993,7 @@ def process_top_template_task(task_args):
         false_dismissal=args.ratio_filter_false_dismissal,
         coarse_band_hz=args.ratio_filter_band,
         first_stage_snr=args.ratio_filter_first_stage_snr,
+        peak_window=args.cluster_window,
     )
 
     local_timers = collections.defaultdict(float)
@@ -1059,6 +1060,7 @@ def process_top_template_task(task_args):
             false_dismissal=args.ratio_filter_false_dismissal,
             coarse_band_hz=args.ratio_filter_band,
             first_stage_snr=args.ratio_filter_first_stage_snr,
+            peak_window=args.cluster_window,
         )
         t_fp0 = time.perf_counter()
         filters_f, _ = group_engine.prepare_filters(taps, counts)

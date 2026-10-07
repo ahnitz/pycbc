@@ -29,7 +29,7 @@ class MatchedFilterRatioControl(object):
                  high_frequency_cutoff=None,
                  tap_sample_rate=2048, engine_sample_rate=2048,
                  engine='matchedfilter-hierarchical', false_dismissal=1e-3,
-                 coarse_band_hz=0, first_stage_snr=0, **kwargs):
+                 coarse_band_hz=0, first_stage_snr=0, peak_window=None, **kwargs):
         if _mf is None:
             raise ImportError(
                 "matchedfilter is required for ratio/FIR filtering but is not installed"
@@ -43,6 +43,10 @@ class MatchedFilterRatioControl(object):
         self.engine_sr = int(engine_sample_rate)
 
         self.threshold_sq = float(snr_threshold**2)
+        # Granularity of the primary peak search, in seconds: one peak is reported per span this
+        # long (pycbc passes its per-template cluster window), so how matchedfilter blocks the
+        # series is its own choice and does not change which peaks survive clustering.
+        self.peak_binsize = int(round(float(peak_window) * self.engine_sr)) if peak_window else None
 
         # Taps are generated at tap_sample_rate but filtered against data at
         # engine_sample_rate; the ratio must be an exact integer.
@@ -155,7 +159,7 @@ class MatchedFilterRatioControl(object):
             if len(self.ref_snr) != (len(stilde) - 1) * 2:
                 raise ValueError('reference series length does not match data segment')
 
-        res = self._td_bank.filter_series(self.ref_snr, windows=valid_slice)
+        res = self._td_bank.filter_series(self.ref_snr, windows=valid_slice, binsize=self.peak_binsize)
         self.ref_snr = None
         local_idxs = res.template_indices
         t_idxs = res.sample_indices
