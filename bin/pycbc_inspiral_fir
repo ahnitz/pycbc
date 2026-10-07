@@ -239,7 +239,11 @@ class RatioPowerChisq(SingleDetPowerChisq):
 
         if psd_key not in self.psd_cache:
             dec = max(1, int(round(df / stilde.delta_f)))
-            self.psd_cache[psd_key] = stilde.psd[::dec][:n_half].numpy()
+            p_pts = stilde.psd[::dec]
+            m_p = min(len(p_pts), n_half)
+            psd_buf = np.zeros(n_half, dtype=np.float32)
+            psd_buf[:m_p] = p_pts[:m_p].numpy()
+            self.psd_cache[psd_key] = psd_buf
         psd_pad = self.psd_cache[psd_key]
 
         # Reconstruct coarse spectrum weight: coarse_w = (top_dec * upper_f) / sqrt(psd)
@@ -254,7 +258,10 @@ class RatioPowerChisq(SingleDetPowerChisq):
                 upper_f = self.upper_f_by_coarse.get(coarse_idx)
                 if upper_f is not None:
                     step_u = max(1, len(upper_f) // block_len)
-                    upper_dec = np.conj(upper_f[::step_u][:n_half])
+                    u_pts = np.conj(upper_f[::step_u])
+                    m_u = min(len(u_pts), n_half)
+                    upper_dec = np.zeros(n_half, dtype=np.complex64)
+                    upper_dec[:m_u] = u_pts[:m_u]
                     coarse_dec = top_dec * upper_dec
                 else:
                     coarse_dec = top_dec
@@ -309,7 +316,9 @@ class RatioPowerChisq(SingleDetPowerChisq):
                 if coarse_w is None:
                     continue
                 ratio = filters_f[local_id]
-                ratio_dec = np.conj(ratio[:n_half])
+                m_r = min(len(ratio), n_half)
+                ratio_dec = np.zeros(n_half, dtype=np.complex64)
+                ratio_dec[:m_r] = np.conj(ratio[:m_r])
                 fine_w = coarse_w * ratio_dec
 
                 kmin = int(self.flow / df)
