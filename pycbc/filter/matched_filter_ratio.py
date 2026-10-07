@@ -121,6 +121,37 @@ class MatchedFilterRatioControl(object):
         # series must survive while all of its middle children are processed.
         return (snr.numpy() * scale).astype(np.complex64, copy=False), h_norm
 
+    def prepare_chisq_filters(self, fir_taps, tap_counts, block_length, reach=0):
+        """Template spectra on the chisq block: length block_length, the convention of filters_f.
+
+        The chisq is computed on a block of its own, centred on each trigger, so its
+        resolution is pycbc's choice and independent of how matchedfilter blocks the
+        series for filtering. The block must hold every filter with room for the lags
+        evaluated around the trigger (`reach` either side, for the auto-chisq);
+        otherwise this raises rather than lengthen the block, since its length is part
+        of the statistic.
+        """
+        n = int(block_length)
+        bank = _mf.TimeDomainFilterBank(
+            fir_taps, tap_counts=np.asarray(tap_counts, dtype=np.int64),
+            tap_sample_rate=self.tap_sr, data_sample_rate=self.engine_sr,
+            engine='matchedfilter', fft_lengths=[n])
+        for g in bank.groups:
+            centre = n // 2
+            lo, hi = g['c_bad'], g['c_bad'] + g['n_valid']
+            if g['n'] != n or centre - reach < lo or centre + reach >= hi:
+                raise ValueError(
+                    "--chisq-block-length %d is too short for this template group: its "
+                    "longest ratio filter needs valid lags [%d, %d) around the block centre "
+                    "+-%d" % (n, lo, hi, reach))
+        self._chisq_bank = bank
+        return bank.filters_f
+
+    @property
+    def chisq_bank(self):
+        """The flat bank holding the chisq spectra (block layout and valid margins)."""
+        return self._chisq_bank
+
     def process_segment(self, stilde, psd, ref_template, filters_f, n_taps, indices,
                         valid_slice=None, reference_series=None,
                         profile_template=None):

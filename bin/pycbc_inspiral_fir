@@ -235,6 +235,14 @@ class UpperReferenceBatch:
         return {self.sorted_ids[r]: out[r] for r in sel}
 
 
+def _valid_lags(td_bank, local_id):
+    """[start, stop) of the valid lags of a template's block in a TimeDomainFilterBank."""
+    for g in td_bank.groups:
+        if int(local_id) in set(int(i) for i in g['template_indices']):
+            return g['c_bad'], g['c_bad'] + g['n_valid']
+    raise KeyError(local_id)
+
+
 class RatioPowerChisq(SingleDetPowerChisq):
     """Calculates fast power chisq for ratio/FIR filtering using reconstructed
     frequency-domain template spectra and exact integer-power bin weighting."""
@@ -320,7 +328,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
 
         sort_order = np.argsort(snr_amp)[::-1]
 
-        # Use native block length from filters_f (uninflated)
+        # The chisq block: its own length (--chisq-block-length), not the filter's
         block_len = len(filters_f[0])
         df = self.sample_rate / block_len
         n_half = block_len // 2 + 1
@@ -344,7 +352,15 @@ class RatioPowerChisq(SingleDetPowerChisq):
             tstart = int(tstarts[idx])
 
             rescale = float(bank.snr_rescale(target_global_id, method=args.template_normalization_method))
+            # The chisq block is centred on the trigger (clipped to the series); its lag
+            # must lie in the block's valid samples, which holds for any trigger inside
+            # the analysed span.
+            tstart = min(max(t_idx - block_len // 2, 0), len(ref_snr) - block_len)
             dt = t_idx - tstart
+            if td_bank is not None:
+                lo, hi = autochisq.valid_range(td_bank, local_id) if autochisq is not None else _valid_lags(td_bank, local_id)
+                if dt < lo or dt >= hi:
+                    continue
 
             # ref_snr is one middle group's series in one detector's segment;
             # the cache spans all of them for a top template, so the key must
@@ -881,7 +897,7 @@ def followup_asym_candidates(
             renorm_factor=rf_A,
             primary_snr_threshold=primary_snr_threshold,
             autochisq=autochisq,
-            td_bank=group_engine._td_bank,
+            td_bank=group_engine.chisq_bank,
         )
 
         sr_A = ifo_sample_rates[ifo_A]
@@ -945,7 +961,7 @@ def followup_asym_candidates(
                     renorm_factor=rf_B,
                     primary_snr_threshold=args.asym_secondary_snr_threshold,
                     autochisq=autochisq,
-                    td_bank=group_engine._td_bank,
+                    td_bank=group_engine.chisq_bank,
                 )
 
 
@@ -1043,6 +1059,22 @@ def process_top_template_task(task_args):
     if hasattr(upper_batch, 'bank') and hasattr(upper_batch.bank, 'filters_f'):
         for row, mid in enumerate(upper_batch.sorted_ids):
             upper_f_by_coarse[int(mid)] = upper_batch.bank.filters_f[row]
+        # The power chisq samples each middle filter's response on its own block's grid by
+        # decimating this spectrum, which needs it on a grid at least as fine. Middle filters
+        # the upper stage blocks more finely than that get their spectrum recomputed from the
+        # taps on a multiple of the chisq length (exact DTFT samples; same convention).
+        nc = int(args.chisq_block_length)
+        short = [row for row in range(len(upper_batch.sorted_ids))
+                 if len(upper_batch.bank.filters_f[row]) < nc]
+        if short:
+            from matchedfilter import TimeDomainFilterBank
+            rows = np.asarray(short)
+            src = upper_batch.sort_order[rows]
+            fine_grid = TimeDomainFilterBank(
+                taps_u[src], tap_counts=np.asarray(counts_u, dtype=np.int64)[src],
+                engine='matchedfilter', fft_lengths=[nc * (1 << k) for k in range(6)])
+            for j, row in enumerate(short):
+                upper_f_by_coarse[int(upper_batch.sorted_ids[row])] = fine_grid.filters_f[j]
 
     top_groups = []
     for mid in middle_ids:
@@ -1063,7 +1095,11 @@ def process_top_template_task(task_args):
             peak_window=args.cluster_window,
         )
         t_fp0 = time.perf_counter()
-        filters_f, _ = group_engine.prepare_filters(taps, counts)
+        group_engine.prepare_filters(taps, counts)
+        # The chisq has its own block (--chisq-block-length), centred on each trigger:
+        # independent of how matchedfilter blocks the series for filtering.
+        reach = args.autochi_stride * args.autochi_number_points if args.autochi_stride > 0 else 0
+        filters_f = group_engine.prepare_chisq_filters(taps, counts, args.chisq_block_length, reach=reach)
         local_timers['filter_prep'] += time.perf_counter() - t_fp0
         top_groups.append((coarse_idx, counts, fine_indices,
                            group_engine, filters_f, shifts,
@@ -1223,7 +1259,7 @@ def process_top_template_task(task_args):
                         renorm_factor=renorm_factors.get(ifo),
                         primary_snr_threshold=primary_snr_threshold,
                         autochisq=autochisq,
-                        td_bank=group_engine._td_bank,
+                        td_bank=group_engine.chisq_bank,
                     )
                 else:
                     std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
@@ -1808,6 +1844,11 @@ def get_args():
     parser.add_argument("--chisq-threshold", type=float, default=0,
                         help="Maximum reduced chisq a trigger may have; 0 disables the cut.")
     parser.add_argument("--chisq-window", type=float, default=1.0)
+    parser.add_argument("--chisq-block-length", type=int, default=4096,
+                        help="Length in samples of the block the power chisq (and auto-chisq) is "
+                             "computed on, centred on each trigger. Sets the chisq's frequency "
+                             "resolution; it must hold the longest ratio filter plus the "
+                             "auto-chisq lags, and is independent of the filter's own blocking.")
     # Auto-chisq, with the options of pycbc_inspiral (see RatioAutoChisq).
     parser.add_argument("--autochi-number-points", type=int, default=0,
                         help="The number of points to use, in both directions if "
