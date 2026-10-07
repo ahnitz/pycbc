@@ -451,7 +451,7 @@ def sample_asym_bins(group_engine, ref_snr, local_id, t_center,
 
     res = group_engine._td_bank.filter_series(
         ref_snr,
-        valid_slice=slice(asym_start, asym_stop),
+        windows=slice(asym_start, asym_stop),
         binsize=bs,
         threshold=0.0,
         template_index=local_id
