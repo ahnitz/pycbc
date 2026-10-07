@@ -114,7 +114,7 @@ class MatchedFilterRatioControl(object):
                 ref_template, stilde, psd=psd,
                 low_frequency_cutoff=ref_template.f_lower,
                 high_frequency_cutoff=self.f_high, h_norm=h_norm)
-        scale = norm * stilde.delta_t
+        scale = (norm * stilde.delta_t) / self.decimation_factor
         # The cached IFFT output is overwritten by the next reference; upper
         # series must survive while all of its middle children are processed.
         return (snr.numpy() * scale).astype(np.complex64, copy=False), h_norm
@@ -151,24 +151,13 @@ class MatchedFilterRatioControl(object):
                     low_frequency_cutoff=ref_template.f_lower,
                     high_frequency_cutoff=self.f_high, h_norm=h_norm)
             self.ref_snr = snr.numpy()
-            self.ref_snr *= (norm * stilde.delta_t)
+            self.ref_snr *= (norm * stilde.delta_t) / self.decimation_factor
         else:
             self.ref_snr = reference_series if isinstance(reference_series, np.ndarray) and reference_series.dtype == np.complex64 else np.asarray(reference_series, dtype=np.complex64)
-            expected_len = ((len(stilde) - 1) * 2) // self.decimation_factor
-            if len(self.ref_snr) != expected_len:
-                raise ValueError(f'reference series length {len(self.ref_snr)} does not match expected {expected_len}')
+            if len(self.ref_snr) != (len(stilde) - 1) * 2:
+                raise ValueError('reference series length does not match data segment')
 
-        if valid_slice is not None and self.decimation_factor > 1:
-            vs = 0 if valid_slice.start is None else int(valid_slice.start)
-            ve = len(self.ref_snr) * self.decimation_factor if valid_slice.stop is None else int(valid_slice.stop)
-            if ve > len(self.ref_snr):
-                eng_valid_slice = slice(vs // self.decimation_factor, ve // self.decimation_factor)
-            else:
-                eng_valid_slice = valid_slice
-        else:
-            eng_valid_slice = valid_slice
-
-        res = self._td_bank.filter_series(self.ref_snr, valid_slice=eng_valid_slice)
+        res = self._td_bank.filter_series(self.ref_snr, valid_slice=valid_slice)
         self.ref_snr = None
         local_idxs = res.template_indices
         t_idxs = res.sample_indices
@@ -196,10 +185,7 @@ class MatchedFilterRatioControl(object):
         N = (len(stilde) - 1) * 2
         kmin, kmax = get_cutoff_indices(
             ref_template.f_lower, self.f_high, stilde.delta_f, N)
-        size = N // self.decimation_factor
-        if kmax > size:
-            raise ValueError(f"High cutoff index {kmax} exceeds decimated size {size}")
-        plan, qt, q = self._get_ref_plan(size, kmax)
+        plan, qt, q = self._get_ref_plan(N, kmax)
         # Only the low strip is cleared per call.  correlate writes solely
         # [kmin:kmax] and execute() reads qt and writes q, so nothing ever
         # dirties the region above kmax -- and kmax derives from self.f_high,
