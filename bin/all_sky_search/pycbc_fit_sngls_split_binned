@@ -317,11 +317,12 @@ for x in range(args.split_one_nbins):
         time_inbin = []
         # getting triggers that are in these templates
         for idx in id_in_both:
-            vals_inbin += list(stat[mask_start_idx[idx]:mask_end_idx[idx]])
-            time_inbin += list(time[mask_start_idx[idx]:mask_end_idx[idx]])
+            s_sl = slice(mask_start_idx[idx], mask_end_idx[idx])
+            vals_inbin.append(stat[s_sl])
+            time_inbin.append(time[s_sl])
 
-        vals_inbin = np.array(vals_inbin)
-        time_inbin = np.array(time_inbin)
+        vals_inbin = np.concatenate(vals_inbin) if vals_inbin else np.array([], dtype=stat.dtype)
+        time_inbin = np.concatenate(time_inbin) if time_inbin else np.array([], dtype=time.dtype)
 
         count_pruned = 0
         logging.info(
@@ -415,9 +416,9 @@ for x in range(args.split_one_nbins):
             if len(indices_all_conditions) == 0: continue
             vals_inbin = []
             for idx in indices_all_conditions:
-                vals_inbin += list(stat[mask_start_idx[idx]:mask_end_idx[idx]])
+                vals_inbin.append(stat[mask_start_idx[idx]:mask_end_idx[idx]])
 
-            vals_inbin = np.array(vals_inbin)
+            vals_inbin = np.concatenate(vals_inbin) if vals_inbin else np.array([], dtype=stat.dtype)
             vals_above_thresh = vals_inbin[vals_inbin >= args.stat_fit_threshold]
             if not len(vals_above_thresh):
                 logging.info('No triggers above threshold')

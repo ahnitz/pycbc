@@ -123,9 +123,14 @@ if args.additional_event_times:
     for ifo in ifos:
         rm_idx = veto.indices_within_times(all_trigs.data['%s/time' % ifo],
                                            rm_start_times, rm_end_times)
-        manual_rm_idx += list(rm_idx)
+        if len(rm_idx) > 0:
+            manual_rm_idx.append(rm_idx)
+    if manual_rm_idx:
+        manual_rm_idx = numpy.unique(numpy.concatenate(manual_rm_idx))
+    else:
+        manual_rm_idx = numpy.array([], dtype=int)
     logging.info("Removing %d triggers", len(manual_rm_idx))
-    all_trigs = all_trigs.remove(manual_rm_idx)
+    all_trigs = all_trigs.remove(manual_rm_idx, in_place=True)
 
 logging.info("%s triggers remain" % len(all_trigs.stat))
 
@@ -152,7 +157,7 @@ if max_slide is not None:
     keep_mask = (all_trigs.timeslide_id == 0) | (numpy.abs(all_trigs.timeslide_id) <= max_slide)
     logging.info("Culling coinc triggers to |timeslide_id| <= %d: keeping %d of %d triggers",
                  max_slide, keep_mask.sum(), len(all_trigs.stat))
-    all_trigs = all_trigs.select(keep_mask)
+    all_trigs = all_trigs.select(keep_mask, in_place=True)
 
 fore_locs = all_trigs.timeslide_id == 0
 
@@ -208,7 +213,7 @@ else:
     del all_trigs
     import gc
     gc.collect()
-    exc_zero_trigs = exc_zero_trigs.cluster(args.cluster_window)
+    exc_zero_trigs = exc_zero_trigs.cluster(args.cluster_window, in_place=True)
 
 all_trigs = all_trigs_clustered
 

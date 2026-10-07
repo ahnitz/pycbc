@@ -309,25 +309,31 @@ class DictArray(object):
                 logger.info('%s does not exist in other data', k)
         return self._return(data=data)
 
-    def select(self, idx):
+    def select(self, idx, in_place=False):
         """ Return a new DictArray containing only the indexed values
         """
+        if in_place:
+            for k in list(self.data.keys()):
+                self.data[k] = np.asarray(self.data[k][idx])
+                setattr(self, k, self.data[k])
+            return self
+
         data = {}
         for k in self.data:
             # Make sure each entry is an array (not a scalar)
-            data[k] = np.array(self.data[k][idx])
+            data[k] = np.asarray(self.data[k][idx])
         return self._return(data=data)
 
-    def remove(self, idx):
+    def remove(self, idx, in_place=False):
         """ Return a new DictArray that does not contain the indexed values
         """
         idx = np.atleast_1d(idx)
         if len(idx) == 0:
             return self
-        data = {}
-        for k in self.data:
-            data[k] = np.delete(self.data[k], np.array(idx, dtype=int))
-        return self._return(data=data)
+        idx = np.asarray(idx, dtype=int)
+        mask = np.ones(len(self), dtype=bool)
+        mask[idx] = False
+        return self.select(mask, in_place=in_place)
 
     def save(self, outname):
         f = HFile(outname, "w")
@@ -361,7 +367,7 @@ class StatmapData(DictArray):
     def _return(self, data):
         return self.__class__(data=data, attrs=self.attrs, seg=self.seg)
 
-    def cluster(self, window):
+    def cluster(self, window, in_place=False):
         """ Cluster the dict array, assuming it has the relevant Coinc colums,
         time1, time2, stat, and timeslide_id
         """
@@ -372,7 +378,7 @@ class StatmapData(DictArray):
         interval = self.attrs['timeslide_interval']
         cid = cluster_coincs(self.stat, self.time1, self.time2,
                                  self.timeslide_id, interval, window)
-        return self.select(cid)
+        return self.select(cid, in_place=in_place)
 
     def save(self, outname):
         super(StatmapData, self).save(outname)
@@ -399,7 +405,7 @@ class MultiifoStatmapData(StatmapData):
         return self.__class__(data=data, attrs=self.attrs, seg=self.seg,
                               ifos=ifolist)
 
-    def cluster(self, window):
+    def cluster(self, window, in_place=False):
         """ Cluster the dict array, assuming it has the relevant Coinc colums,
         time1, time2, stat, and timeslide_id
         """
@@ -416,7 +422,7 @@ class MultiifoStatmapData(StatmapData):
                              self.timeslide_id,
                              interval,
                              window)
-        return self.select(cid)
+        return self.select(cid, in_place=in_place)
 
 
 class FileData(object):

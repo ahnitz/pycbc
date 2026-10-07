@@ -2031,6 +2031,12 @@ def main():
             }
             logging.info("Injection rejection per injection window, chirp-time window %.2f s, "
                          "f_lower %.1f Hz", inj_reject['window'], fref)
+
+        # Free raw time-domain strain buffers now that segments and PSDs are formed
+        for ifo in instruments:
+            if hasattr(gwstrain[ifo], '_data'):
+                gwstrain[ifo]._data = np.array([], dtype=gwstrain[ifo].dtype)
+
         total_valid_segs = sum(len(segments[ifo]) for ifo in instruments)
         if total_valid_segs == 0:
             logging.info("Zero valid segments to analyze across all instruments. Skipping filtering.")

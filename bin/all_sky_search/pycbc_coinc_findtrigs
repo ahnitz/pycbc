@@ -146,6 +146,7 @@ for i in range(len(args.trigger_files)):
         for ifo in matched_ifos:
             file_ifo_pairs.append((dest, ifo))
 
+bank_tids = None
 for dest, ifo in file_ifo_pairs:
     logging.info('Opening trigger file for %s: %s' % (ifo, dest))
     reader = ReadByTemplate(dest,
@@ -157,7 +158,19 @@ for dest, ifo in file_ifo_pairs:
     trigs.ifos.append(ifo)
 
     # We don't have that many triggers, see if we can skip some templates
-    if len(reader.file[ifo]['template_id']) < 2**27:
+    if 'template_boundaries' in reader.file[ifo]:
+        if bank_tids is None:
+            bank_hashes = HFile(args.template_bank, "r")['template_hash'][:]
+            bank_tids = bank_hashes.argsort()
+        tb = reader.file[ifo]['template_boundaries'][:]
+        num_trigs = len(reader.file[ifo]['template_id'])
+        fb = numpy.append(tb[bank_tids], num_trigs)
+        has_trigs_sorted = fb[1:] > fb[:-1]
+        uniq = numpy.sort(bank_tids[has_trigs_sorted]).astype(numpy.int64)
+        if tids_with_trigs is None:
+            tids_with_trigs = numpy.arange(0, num_templates, dtype=numpy.int64)
+        tids_with_trigs = numpy.intersect1d(tids_with_trigs, uniq)
+    elif len(reader.file[ifo]['template_id']) < 2**27:
         uniq = numpy.unique(reader.file[ifo]['template_id'][:]).astype(numpy.int64)
         if tids_with_trigs is None:
             tids_with_trigs = numpy.arange(0, num_templates, dtype=numpy.int64)
