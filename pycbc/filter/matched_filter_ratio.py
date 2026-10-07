@@ -26,7 +26,7 @@ class MatchedFilterRatioControl(object):
     """
 
     def __init__(self, snr_threshold, delta_f,
-                 high_frequency_cutoff=None, batch_size=None,
+                 high_frequency_cutoff=None,
                  tap_sample_rate=2048, engine_sample_rate=2048,
                  engine='matchedfilter-hierarchical', false_dismissal=1e-3,
                  coarse_band_hz=0, first_stage_snr=0, **kwargs):
@@ -43,7 +43,6 @@ class MatchedFilterRatioControl(object):
         self.engine_sr = int(engine_sample_rate)
 
         self.threshold_sq = float(snr_threshold**2)
-        self.batch_size = batch_size
 
         # Taps are generated at tap_sample_rate but filtered against data at
         # engine_sample_rate; the ratio must be an exact integer.
@@ -98,7 +97,6 @@ class MatchedFilterRatioControl(object):
             first_stage_snr=self._first_stage_snr,
             coarse_band_hz=self._coarse_band_hz,
             device=self._device,
-            max_batch_size=self.batch_size,
             fft_lengths=fft_lengths,
         )
         n_taps_max = int(np.max(tap_counts))

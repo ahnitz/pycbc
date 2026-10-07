@@ -987,7 +987,6 @@ def process_top_template_task(task_args):
         snr_threshold=primary_snr_threshold,
         delta_f=delta_f,
         high_frequency_cutoff=args.high_frequency_cutoff,
-        batch_size=args.batch_size,
         tap_sample_rate=bank.sample_rate,
         engine_sample_rate=sample_rate,
         engine=args.ratio_filter_engine,
@@ -1054,8 +1053,7 @@ def process_top_template_task(task_args):
             snr_threshold=primary_snr_threshold,
             delta_f=delta_f,
             high_frequency_cutoff=args.high_frequency_cutoff,
-            batch_size=args.batch_size,
-            tap_sample_rate=bank.sample_rate,
+                tap_sample_rate=bank.sample_rate,
             engine_sample_rate=sample_rate,
             engine=args.ratio_filter_engine,
             false_dismissal=args.ratio_filter_false_dismissal,
@@ -1767,8 +1765,6 @@ def get_args():
     group = parser.add_argument_group("Ratio Filter Options")
     group.add_argument('--high-frequency-cutoff', type=float,
                        help="High frequency cutoff (defaults to Nyquist).")
-    group.add_argument('--batch-size', type=int, default=None,
-                       help="Number of filters to process in one FFT batch (default: auto-sized based on L2 cache).")
     group.add_argument('--ratio-filter-engine', default='matchedfilter-hierarchical',
                        choices=('matchedfilter-hierarchical', 'matchedfilter'),
                        help="Which back end runs the innermost correlate.")
