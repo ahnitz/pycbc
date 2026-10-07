@@ -696,7 +696,12 @@ class Workflow(object):
         # Other options
         planner_args['cluster'] = ['label,horizontal']
         planner_args['relative_dir'] = 'work'
-        planner_args['cleanup'] = 'inplace'
+        cleanup = 'inplace'
+        if hasattr(self, 'cp') and self.cp and self.cp.has_option('workflow', 'cleanup'):
+            cleanup = self.cp.get('workflow', 'cleanup')
+        elif getattr(self, 'cache_file', None):
+            cleanup = 'none'
+        planner_args['cleanup'] = cleanup
         # This quietens the planner a bit. We cannot set the verbosity
         # directly, which would be better. So be careful, if changing the
         # pegasus.mode property, it will change the verbosity (a lot).
@@ -793,7 +798,8 @@ class SubWorkflow(dax.SubWorkflow):
 
     def set_subworkflow_properties(self, output_map_file,
                                    staging_site,
-                                   cache_file):
+                                   cache_file,
+                                   cleanup=None):
 
         self.add_planner_arg('pegasus.dir.storage.mapper.replica.file',
                              os.path.basename(output_map_file.name))
@@ -817,7 +823,9 @@ class SubWorkflow(dax.SubWorkflow):
         bname = os.path.splitext(os.path.basename(self.file))[0]
         self.add_planner_arg('basename',  bname)
         self.add_planner_arg('output_sites', ['local'])
-        self.add_planner_arg('cleanup', 'inplace')
+        if cleanup is None:
+            cleanup = 'none' if cache_file else 'inplace'
+        self.add_planner_arg('cleanup', cleanup)
         self.add_planner_arg('cluster', ['label', 'horizontal'])
         self.add_planner_arg('verbose', 3)
 

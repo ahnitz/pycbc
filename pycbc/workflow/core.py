@@ -835,10 +835,14 @@ class Workflow(pegasus_workflow.Workflow):
         self.output_map_file = output_map_file
 
         if self.in_workflow:
+            cleanup = None
+            if hasattr(self, 'cp') and self.cp and self.cp.has_option('workflow', 'cleanup'):
+                cleanup = self.cp.get('workflow', 'cleanup')
             self._as_job.set_subworkflow_properties(
                 output_map_file,
                 staging_site=self.staging_site,
-                cache_file=self.cache_file
+                cache_file=self.cache_file,
+                cleanup=cleanup
             )
             self._as_job.add_planner_args(**self._as_job.pycbc_planner_args)
 
