@@ -3,6 +3,8 @@ from . frame import (locations_to_cache, read_frame,
                      DataBuffer, StatusBuffer, iDQBuffer)
 
 from . store import (read_store)
+from . gwosc_hdf import (read_frame_gwosc_hdf, is_gwosc_hdf_file,
+                         get_gwosc_hdf_metadata)
 
 
 # Status flags for the calibration state vector

@@ -104,6 +104,16 @@ def _is_gwf(file_path):
     return False
 
 
+def _is_hdf5(file_path):
+    """Test if a file is an HDF5 file by checking magic bytes."""
+    try:
+        with open(file_path, 'rb') as f:
+            return f.read(8) == b'\x89HDF\r\n\x1a\n'
+    except (IOError, OSError):
+        pass
+    return False
+
+
 def locations_to_cache(locations, latest=False):
     """ Return a cumulative cache file build from the list of locations
 
@@ -146,6 +156,16 @@ def locations_to_cache(locations, latest=False):
                 cache = lal.CacheImport(file_path)
             elif file_extension == ".gwf" or _is_gwf(file_path):
                 cache = lalframe.FrOpen(str(dir_name), str(file_name)).cache
+            elif file_extension in [".hdf5", ".h5", ".hdf"] or _is_hdf5(file_path):
+                import tempfile
+                from pycbc.frame.gwosc_hdf import get_gwosc_hdf_metadata
+                meta = get_gwosc_hdf_metadata(file_path)
+                abs_path = os.path.abspath(file_path)
+                line = f"{meta['obs']} {meta['desc']} {int(meta['start_time'])} {int(meta['duration'])} file://localhost{abs_path}\n"
+                with tempfile.NamedTemporaryFile('w') as tf:
+                    tf.write(line)
+                    tf.flush()
+                    cache = lal.CacheImport(tf.name)
             else:
                 raise TypeError("Invalid location name")
 
@@ -198,6 +218,42 @@ def read_frame(location, channels, start_time=None,
         locations = location
     else:
         locations = [location]
+
+    # Check if location contains GWOSC HDF5 files or cache pointing to HDF5
+    from pycbc.frame.gwosc_hdf import is_gwosc_hdf_file, read_frame_gwosc_hdf, extract_files_from_cache
+    import urllib.parse
+
+    is_hdf = False
+    for loc in locations:
+        if isinstance(loc, str):
+            loc_path = urllib.parse.urlsplit(loc).path
+            _, ext = os.path.splitext(loc_path)
+            if ext.lower() in ('.cache', '.lcf') and os.path.isfile(loc_path):
+                entries = extract_files_from_cache(loc_path)
+                if entries and is_gwosc_hdf_file(entries[0]):
+                    is_hdf = True
+                    break
+            elif ext.lower() in ('.hdf5', '.h5', '.hdf') or is_gwosc_hdf_file(loc_path):
+                is_hdf = True
+                break
+        elif hasattr(loc, '__iter__'):
+            try:
+                for e in loc:
+                    url = getattr(e, 'path', None) or getattr(e, 'url', None) or str(e)
+                    if is_gwosc_hdf_file(str(url)):
+                        is_hdf = True
+                        break
+            except Exception:
+                pass
+            if is_hdf:
+                break
+
+    if is_hdf:
+        return read_frame_gwosc_hdf(
+            locations, channels, start_time=start_time,
+            end_time=end_time, duration=duration,
+            check_integrity=check_integrity, sieve=sieve
+        )
 
     cum_cache = locations_to_cache(locations)
     if sieve:
