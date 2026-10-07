@@ -1213,14 +1213,20 @@ class StrainSegments(object):
         # Per kept segment: None, or the merged injection windows (in analyze
         # coordinates) when merge_injection_windows is set.
         analyze_windows_red = []
+        # Parallel to analyze_windows: (start, stop, row) per injection, its
+        # own clipped window and its row in strain.injections.table, so a
+        # caller can tell which injection a window belongs to after merging.
+        analyze_injections_red = []
         trig_start_idx = (trigger_start - int(strain.start_time)) * strain.sample_rate
         trig_end_idx = (trigger_end - int(strain.start_time)) * strain.sample_rate
 
         filter_injections = (filter_inj_only or injection_window is not None) and hasattr(strain, 'injections')
         if filter_injections:
             end_times = strain.injections.end_times()
-            end_times = [time for time in end_times if float(time) < trigger_end and float(time) > trigger_start]
-            inj_idx = [(float(time) - float(strain.start_time)) * strain.sample_rate for time in end_times]
+            inj_rows = [row for row, time in enumerate(end_times)
+                        if float(time) < trigger_end and float(time) > trigger_start]
+            inj_idx = [(float(end_times[row]) - float(strain.start_time)) * strain.sample_rate
+                       for row in inj_rows]
 
         for seg, ana in zip(self.segment_slices, self.analyze_slices):
             start = ana.start
@@ -1240,10 +1246,12 @@ class StrainSegments(object):
                 analyze_this = False
                 inj_pad = int((injection_window if injection_window is not None else 8) * strain.sample_rate)
                 matching_injs = []
-                for inj_id in inj_idx:
+                matching_rows = []
+                for inj_row, inj_id in zip(inj_rows, inj_idx):
                     if (cum_start - inj_pad) < inj_id < (cum_end + inj_pad):
                         analyze_this = True
                         matching_injs.append(inj_id)
+                        matching_rows.append(inj_row)
 
                 if not analyze_this:
                     continue
@@ -1251,12 +1259,14 @@ class StrainSegments(object):
                 if injection_window is not None and matching_injs:
                     win_points = int(injection_window * strain.sample_rate)
                     windows = []
-                    for inj_id in matching_injs:
+                    per_injection = []
+                    for inj_row, inj_id in zip(matching_rows, matching_injs):
                         inj_pos = int(inj_id - seg.start)
                         w_start = max(start, inj_pos - win_points)
                         w_stop = min(stop, inj_pos + win_points)
                         if w_start < w_stop:
                             windows.append([w_start, w_stop])
+                            per_injection.append((int(w_start), int(w_stop), int(inj_row)))
 
                     if not windows:
                         continue
@@ -1278,21 +1288,25 @@ class StrainSegments(object):
                         segment_slices_red.append(seg)
                         analyze_slices_red.append(slice(start, stop))
                         analyze_windows_red.append([(int(a), int(b)) for a, b in merged_windows])
+                        analyze_injections_red.append(per_injection)
                         continue
                     for w_start, w_stop in merged_windows:
                         segment_slices_red.append(seg)
                         analyze_slices_red.append(slice(w_start, w_stop))
                         analyze_windows_red.append(None)
+                        analyze_injections_red.append(None)
                     continue
 
             if start < stop:
                 segment_slices_red.append(seg)
                 analyze_slices_red.append(slice(start, stop))
                 analyze_windows_red.append(None)
+                analyze_injections_red.append(None)
 
         self.segment_slices = segment_slices_red
         self.analyze_slices = analyze_slices_red
         self.analyze_windows = analyze_windows_red
+        self.analyze_injections = analyze_injections_red
 
     def _get_inpaint_invpsd(self):
         if self._inpaint_invpsd is None:
@@ -1328,7 +1342,9 @@ class StrainSegments(object):
             from collections import Counter
             slice_counts = Counter((s.start, s.stop) for s in self.segment_slices)
             windows = getattr(self, 'analyze_windows', None) or [None] * len(self.segment_slices)
-            for seg_slice, ana, wins in zip(self.segment_slices, self.analyze_slices, windows):
+            injections = getattr(self, 'analyze_injections', None) or [None] * len(self.segment_slices)
+            for seg_slice, ana, wins, injs in zip(self.segment_slices, self.analyze_slices,
+                                                  windows, injections):
                 key = (seg_slice.start, seg_slice.stop)
                 if key in cached_freq_segs:
                     freq_seg = cached_freq_segs[key].copy()
@@ -1366,6 +1382,7 @@ class StrainSegments(object):
 
                 freq_seg.analyze = ana
                 freq_seg.analyze_windows = wins
+                freq_seg.analyze_injections = injs
                 freq_seg.cumulative_index = seg_slice.start + ana.start
                 freq_seg.seg_slice = seg_slice
                 self._fourier_segments.append(freq_seg)

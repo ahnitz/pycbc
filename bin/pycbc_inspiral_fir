@@ -85,13 +85,16 @@ class UpperReferenceBatch:
             })
 
     def run(self, top_series, valid_slice=None, ifo=None, pad=4096, scales=None,
-            windows=None):
+            windows=None, rows=None):
         """Return middle-id to SNR series, scaled like direct middle filtering.
 
         valid_slice, or windows (a list of (start, stop) pairs) when given,
         selects where the middle series is needed; each is widened by pad and
         only blocks intersecting the result are computed. Blocks are computed
         independently, so every computed sample equals the whole-range value.
+
+        rows, when given, is the collection of middle ids to compute; the
+        others are skipped entirely and left out of the returned mapping.
         """
         if len(top_series) != self.series_length:
             raise ValueError('top reference length changed between segments')
@@ -103,6 +106,10 @@ class UpperReferenceBatch:
 
         L = self.series_length
         n_req = len(self.sorted_ids)
+        if rows is None:
+            want = np.ones(n_req, dtype=bool)
+        else:
+            want = np.isin(self.sorted_ids, np.asarray(list(rows), dtype=int))
         if ifo is not None:
             buf_key = (ifo, L)
             buf_entry = UpperReferenceBatch._BUFFERS.get(buf_key)
@@ -111,10 +118,25 @@ class UpperReferenceBatch:
                 buf = np.zeros((alloc_rows, L), dtype=np.complex64)
                 buf_entry = [buf, []]
                 UpperReferenceBatch._BUFFERS[buf_key] = buf_entry
-            buf, prev = buf_entry
+            buf, dirty = buf_entry
             out = buf[:n_req]
-            for s0, s1 in prev:
-                out[:, s0:s1] = 0
+            # dirty holds (row mask, regions) for what earlier calls wrote.
+            # Clear it only for the rows written now; skipped rows keep their
+            # record so a later call that does compute them clears it then.
+            kept_dirty = []
+            for d_mask, d_regions in dirty:
+                if d_mask.size != n_req:
+                    # written for another row layout: treat every row as dirty
+                    d_mask = np.ones(n_req, dtype=bool)
+                hit = d_mask & want
+                if hit.any():
+                    hit_rows = np.flatnonzero(hit)
+                    for s0, s1 in d_regions:
+                        out[hit_rows, s0:s1] = 0
+                rest = d_mask & ~want
+                if rest.any():
+                    kept_dirty.append((rest, d_regions))
+            dirty[:] = kept_dirty
         else:
             out = np.zeros((n_req, L), dtype=np.complex64)
 
@@ -150,7 +172,14 @@ class UpperReferenceBatch:
             cplan = p['cplan']
             st = p['st']
             lo, hi = p['valid']
-            g_dest = out[p['g_slice']]
+            g0 = p['g_slice'].start
+            # contiguous runs of wanted rows inside this plan's row range
+            local = np.flatnonzero(want[p['g_slice']])
+            if local.size == 0:
+                continue
+            cuts = np.flatnonzero(np.diff(local) != 1) + 1
+            runs = [(int(r[0]), int(r[-1]) + 1) for r in np.split(local, cuts)]
+            gaps = []
             if iv is not None:
                 b_start = st + lo
                 b_end = np.minimum(st + hi, L)
@@ -162,42 +191,47 @@ class UpperReferenceBatch:
                         cov_start = b_start[k_indices[0]]
                         cov_end = b_end[k_indices[-1]]
                         if cov_start > v_start:
-                            g_dest[:, v_start:cov_start] = 0
+                            gaps.append((v_start, cov_start))
                         if cov_end < v_stop:
-                            g_dest[:, cov_end:v_stop] = 0
+                            gaps.append((cov_end, v_stop))
                         keep |= k
                     else:
-                        g_dest[:, v_start:v_stop] = 0
+                        gaps.append((v_start, v_stop))
                 st_run = st[keep] if keep.any() else np.empty(0, dtype=np.uintp)
             else:
                 st_run = st
                 if ifo is not None:
-                    g_dest[:, :lo] = 0
+                    gaps.append((0, lo))
                     if st_run.size > 0:
                         last_end = min(L, st_run[-1] + hi)
                         if last_end < L:
-                            g_dest[:, last_end:] = 0
+                            gaps.append((last_end, L))
 
-            if st_run.size == 0:
-                continue          # nothing to compute; the C layer rejects an empty block list
-            if cplan._gpu is not None:
-                cplan._continuous_gpu(ser, st_run, 0, p['g_cnt'], g_dest)
-            else:
-                cplan._execution_plan().correlate_series_continuous(
-                    ser, st_run, lo, hi, 0, p['g_cnt'], g_dest
-                )
+            for r0, r1 in runs:
+                dest = out[g0 + r0:g0 + r1]
+                for a, b in gaps:
+                    dest[:, a:b] = 0
+                if st_run.size == 0:
+                    continue      # nothing to compute; the C layer rejects an empty block list
+                if cplan._gpu is not None:
+                    cplan._continuous_gpu(ser, st_run, r0, r1 - r0, dest)
+                else:
+                    cplan._execution_plan().correlate_series_continuous(
+                        ser, st_run, lo, hi, r0, r1 - r0, dest
+                    )
 
-        if iv is not None:
-            for v_start, v_stop in iv:
-                np.multiply(out[:, v_start:v_stop], scales[:, None], out=out[:, v_start:v_stop])
-            if ifo is not None:
-                buf_entry[1] = [tuple(x) for x in iv]
-        else:
-            np.multiply(out, scales[:, None], out=out)
-            if ifo is not None:
-                buf_entry[1] = [(0, L)]
+        regions = [tuple(x) for x in iv] if iv is not None else [(0, L)]
+        sel = np.flatnonzero(want)
+        cuts = np.flatnonzero(np.diff(sel) != 1) + 1
+        for run in (np.split(sel, cuts) if sel.size else []):
+            r0, r1 = int(run[0]), int(run[-1]) + 1
+            for v_start, v_stop in regions:
+                np.multiply(out[r0:r1, v_start:v_stop], scales[r0:r1, None],
+                            out=out[r0:r1, v_start:v_stop])
+        if ifo is not None:
+            buf_entry[1].append((want.copy(), regions))
 
-        return dict(zip(self.sorted_ids, out))
+        return {self.sorted_ids[r]: out[r] for r in sel}
 
 
 class RatioPowerChisq(SingleDetPowerChisq):
@@ -458,14 +492,80 @@ def process_and_record_triggers(
 def segment_windows(stilde, margin=0):
     """Injection windows of a merged segment, widened by margin samples and
     clipped to the segment's analysis range, or None for a whole segment.
+    An empty list means nothing in the segment is to be searched.
 
     Clipping keeps every computed sample inside the region a search without
     injections computes, so all values read downstream are identical to it."""
     wins = getattr(stilde, 'analyze_windows', None)
-    if not wins:
+    if wins is None:
         return None
     a0, a1 = stilde.analyze.start, stilde.analyze.stop
     return [(max(a0, a - margin), min(a1, b + margin)) for a, b in wins]
+
+
+def drop_unfindable_injections(segments, inj_filter_rejector, instruments):
+    """Apply the rejector's optimal-SNR cut once every segment has its PSD.
+
+    Each injection's optimal SNR is computed per detector from the injected
+    signal and the PSD of the segment(s) it falls in. An injection whose best
+    value over all detectors is below the threshold loses its analysis window
+    in every detector; a segment left with no injection window is then not
+    searched at all. The injection stays in the data."""
+    rejs = {ifo: (inj_filter_rejector or {}).get(ifo) for ifo in instruments}
+    thr = {r.optimal_snr_threshold for r in rejs.values()
+           if r is not None and r.optimal_snr_threshold is not None}
+    if not thr:
+        return
+    if len(thr) > 1:
+        raise ValueError('--injection-filter-rejector-optimal-snr-threshold must be '
+                         'the same for every detector')
+    thr = thr.pop()
+    # Keyed by row in the injection file: each detector's analyze_injections
+    # rows index its own injected subset, mapped through its rejector.
+    snr = collections.defaultdict(dict)       # file row -> {ifo: optimal SNR}
+    for ifo in instruments:
+        rej = rejs.get(ifo)
+        if rej is None:
+            continue
+        for st in segments[ifo]:
+            for _, _, row in (getattr(st, 'analyze_injections', None) or []):
+                fid = int(rej.injection_ids[row])
+                value = rej.optimal_snr(fid, st.psd)
+                if value is None:
+                    raise ValueError('no stored signal for injection %d in %s; was the '
+                                     'rejector passed when the injections were made?' % (fid, ifo))
+                snr[fid][ifo] = max(snr[fid].get(ifo, 0.0), value)
+    keep = {fid for fid, by_ifo in snr.items() if max(by_ifo.values()) >= thr}
+    for fid in sorted(snr):
+        logging.info("Injection %d optimal SNR %s: %s", fid,
+                     " ".join("%s %.2f" % kv for kv in sorted(snr[fid].items())),
+                     "analyze" if fid in keep else "skip")
+    for ifo in instruments:
+        ids = rejs[ifo].injection_ids if rejs.get(ifo) is not None else None
+        for st in segments[ifo]:
+            injs = getattr(st, 'analyze_injections', None)
+            if injs is None or ids is None:
+                continue
+            kept = [w for w in injs if int(ids[w[2]]) in keep]
+            merged = []
+            for a, b in sorted((w[0], w[1]) for w in kept):
+                if merged and a <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], b)
+                else:
+                    merged.append([a, b])
+            st.analyze_injections = kept
+            st.analyze_windows = [(int(a), int(b)) for a, b in merged]
+    logging.info("Optimal SNR threshold %.2f: analyzing %d of %d injections",
+                 thr, len(keep), len(snr))
+
+
+def injection_group_windows(stilde, inj_tau, tau_lo, tau_hi, margin=0):
+    """Windows of the injections in inj_tau, (start, stop, tau0) per injection,
+    whose chirp time lies in [tau_lo, tau_hi], each widened by margin samples
+    and clipped to the segment's analysis range."""
+    a0, a1 = stilde.analyze.start, stilde.analyze.stop
+    return [(max(a0, a - margin), min(a1, b + margin))
+            for a, b, tau in inj_tau if tau_lo <= tau <= tau_hi]
 
 
 def injection_guard_samples(args, sample_rate, block_len):
@@ -492,7 +592,7 @@ def asym_half_span(args, sample_rate, num_bins):
 def analyzed_samples(stilde):
     """Samples searched for primary triggers: the windows if any, else analyze."""
     wins = getattr(stilde, 'analyze_windows', None)
-    if wins:
+    if wins is not None:
         return sum(b - a for a, b in wins)
     return stilde.analyze.stop - stilde.analyze.start
 
@@ -765,6 +865,7 @@ def process_top_template_task(task_args):
     flow = ctx['flow']
     effective_asym_num_bins = ctx['effective_asym_num_bins']
     coarse_keep = ctx['coarse_keep']
+    inj_reject = ctx.get('inj_reject')
 
     # Independent engine per worker task ensuring isolated FFT buffers
     engine = MatchedFilterRatioControl(
@@ -857,6 +958,18 @@ def process_top_template_task(task_args):
         del upper_batch
         return top_idx, {ifo: {} for ifo in instruments}, worker_asym, dict(local_timers)
 
+    # Chirp-time rejection per injection window: a middle group is filtered
+    # only near injections whose chirp time lies within the rejector window of
+    # one of its fine templates.
+    group_tau = {}
+    rej_pairs = [0, 0]                    # (group, segment) pairs kept, total
+    if inj_reject is not None:
+        tau0_fine = inj_reject['tau0_fine']
+        cw = inj_reject['window']
+        for g_entry in top_groups:
+            t_g = tau0_fine[g_entry[2]]
+            group_tau[g_entry[0]] = (float(t_g.min()) - cw, float(t_g.max()) + cw)
+
     top_pad = max(
         [4096] + [
             int(g.n)
@@ -884,6 +997,29 @@ def process_top_template_task(task_args):
             continue
 
         can_asym_seg = can_asym_by_seg.get(s_num, False)
+
+        kept = None                       # None: every group, as without rejection
+        seg_inj = {}
+        if inj_reject is not None:
+            for ifo in active_ifos:
+                injs = getattr(segments[ifo][s_num], 'analyze_injections', None)
+                seg_inj[ifo] = None if injs is None else [
+                    (a, b, inj_reject['tau0_inj'][ifo][row]) for a, b, row in injs]
+            if all(v is not None for v in seg_inj.values()):
+                seg_tau = [t for v in seg_inj.values() for _, _, t in v]
+                kept = {cid for cid, (lo, hi) in group_tau.items()
+                        if any(lo <= t <= hi for t in seg_tau)}
+            rej_pairs[0] += len(top_groups) if kept is None else len(kept)
+            rej_pairs[1] += len(top_groups)
+            if kept is not None and not kept:
+                continue                  # nothing near this segment's injections
+
+        def group_windows(ifo, cid, margin):
+            st_g = segments[ifo][s_num]
+            if kept is None:
+                return segment_windows(st_g, margin)
+            lo, hi = group_tau[cid]
+            return injection_group_windows(st_g, seg_inj[ifo], lo, hi, margin)
 
         middle_series = {}
         norms = {}
@@ -921,9 +1057,13 @@ def process_top_template_task(task_args):
                 sr_i = ifo_sample_rates[ifo]
                 margin = (injection_guard_samples(args, sr_i, top_pad)
                           + asym_half_span(args, sr_i, effective_asym_num_bins))
-                mid_windows = segment_windows(st, margin)
+                if kept is None:
+                    mid_windows = segment_windows(st, margin)
+                else:
+                    mid_windows = [w for cid in kept for w in group_windows(ifo, cid, margin)]
             middle_series[ifo] = upper_batch.run(
-                series, valid_slice=v_slice, ifo=ifo, pad=top_pad, windows=mid_windows
+                series, valid_slice=v_slice, ifo=ifo, pad=top_pad, windows=mid_windows,
+                rows=kept,
             )
             local_timers['upper_fir'] += time.perf_counter() - t0
 
@@ -934,6 +1074,8 @@ def process_top_template_task(task_args):
 
         for g_entry in top_groups:
             coarse_idx, counts, fine_indices, group_engine, filters_f, shifts, local_arange = g_entry
+            if kept is not None and coarse_idx not in kept:
+                continue
             std_trigs = {}
             h_norms = {ifo: norms[ifo] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
 
@@ -942,8 +1084,8 @@ def process_top_template_task(task_args):
                 h_norm = h_norms[ifo]
                 ref_snr = middle_series[ifo][coarse_idx]
                 t_fine0 = time.perf_counter()
-                fine_windows = segment_windows(
-                    stilde, injection_guard_samples(args, ifo_sample_rates[ifo], top_pad))
+                fine_windows = group_windows(
+                    ifo, coarse_idx, injection_guard_samples(args, ifo_sample_rates[ifo], top_pad))
                 ids_local, t_idxs, snrs, tstarts, _ = group_engine.process_segment(
                     stilde, stilde.psd, h_norm, filters_f, counts,
                     local_arange,
@@ -980,7 +1122,7 @@ def process_top_template_task(task_args):
                 )
 
         t_seg_dur = max(time.perf_counter() - t_seg_start, 1e-6)
-        n_tmpl_seg = sum(len(g[2]) for g in top_groups)
+        n_tmpl_seg = sum(len(g[2]) for g in top_groups if kept is None or g[0] in kept)
         stilde_ref = segments[active_ifos[0]][s_num]
         total_analyzed_dur = len(active_ifos) * analyzed_samples(stilde_ref) * stilde_ref.delta_t
         tperf_seg = total_analyzed_dur / t_seg_dur * n_tmpl_seg
@@ -992,6 +1134,10 @@ def process_top_template_task(task_args):
         del norms
         del renorm_factors
 
+
+    if inj_reject is not None:
+        logging.info("[Top %d] injection rejection: %d of %d (group, segment) pairs filtered",
+                     top_idx, rej_pairs[0], rej_pairs[1])
 
     del top_groups
     del upper_batch
@@ -1616,6 +1762,7 @@ def main():
          psd_var, sample_rate, flen, delta_f) = setup_strain_and_segments(
             args, instruments, inj_filter_rejector, flow
         )
+        drop_unfindable_injections(segments, inj_filter_rejector, instruments)
 
         logging.info("Initializing Ratio Filter Bank...")
         bank = RatioFilterBank(
@@ -1721,6 +1868,28 @@ def main():
                         'composed upper and lower FIRs' % edge_margin)
 
         coarse_keep = set(bank.coarse_indices) if len(bank.coarse_indices) < len(bank.coarse_keys) else None
+
+        # Chirp-time rejection per injection window: a middle group is filtered
+        # only near the injections whose chirp time lies within the rejector
+        # window of one of its fine templates, and a top template only in
+        # segments where one of its groups is. Needs --injection-window, which
+        # provides the per-injection windows of each segment.
+        inj_reject = None
+        rejs = [r for r in (inj_filter_rejector or {}).values()
+                if r is not None and r.enabled and r.chirp_time_window is not None]
+        if rejs and args.injection_window is not None:
+            from pycbc.pnutils import mass1_mass2_to_tau0_tau3
+            fref = rejs[0].f_lower
+            tau0 = lambda tbl: np.asarray(mass1_mass2_to_tau0_tau3(tbl['mass1'], tbl['mass2'], fref)[0])
+            inj_reject = {
+                'window': max(float(r.chirp_time_window) for r in rejs),
+                'tau0_fine': tau0(bank.table),
+                # per detector, indexed like the rows of analyze_injections
+                'tau0_inj': {ifo: tau0(gwstrain[ifo].injections.table)
+                             for ifo in instruments if hasattr(gwstrain[ifo], 'injections')},
+            }
+            logging.info("Injection rejection per injection window, chirp-time window %.2f s, "
+                         "f_lower %.1f Hz", inj_reject['window'], fref)
         total_valid_segs = sum(len(segments[ifo]) for ifo in instruments)
         if total_valid_segs == 0:
             logging.info("Zero valid segments to analyze across all instruments. Skipping filtering.")
@@ -1784,6 +1953,7 @@ def main():
             'flow': flow,
             'effective_asym_num_bins': effective_asym_num_bins,
             'coarse_keep': coarse_keep,
+            'inj_reject': inj_reject,
         }
 
         total_cores = max(1, int(getattr(args, 'cores', 1) or 1))
