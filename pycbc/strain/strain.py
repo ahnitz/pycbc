@@ -1106,7 +1106,8 @@ class StrainSegments(object):
     def __init__(self, strain, segment_length=None, segment_start_pad=0,
                  segment_end_pad=0, trigger_start=None, trigger_end=None,
                  filter_inj_only=False, injection_window=None,
-                 allow_zero_padding=False, inpaint_edges=False):
+                 allow_zero_padding=False, inpaint_edges=False,
+                 merge_injection_windows=False):
         """ Determine how to chop up the strain data into smaller segments
             for analysis.
         """
@@ -1209,6 +1210,9 @@ class StrainSegments(object):
         #Remove segments that are outside trig start and end
         segment_slices_red = []
         analyze_slices_red = []
+        # Per kept segment: None, or the merged injection windows (in analyze
+        # coordinates) when merge_injection_windows is set.
+        analyze_windows_red = []
         trig_start_idx = (trigger_start - int(strain.start_time)) * strain.sample_rate
         trig_end_idx = (trigger_end - int(strain.start_time)) * strain.sample_rate
 
@@ -1267,17 +1271,28 @@ class StrainSegments(object):
                         else:
                             merged_windows.append(cur)
 
+                    if merge_injection_windows:
+                        # Keep the segment once, with the full analysis range a
+                        # search without injections would use, and carry the
+                        # windows for callers that can restrict work to them.
+                        segment_slices_red.append(seg)
+                        analyze_slices_red.append(slice(start, stop))
+                        analyze_windows_red.append([(int(a), int(b)) for a, b in merged_windows])
+                        continue
                     for w_start, w_stop in merged_windows:
                         segment_slices_red.append(seg)
                         analyze_slices_red.append(slice(w_start, w_stop))
+                        analyze_windows_red.append(None)
                     continue
 
             if start < stop:
                 segment_slices_red.append(seg)
                 analyze_slices_red.append(slice(start, stop))
+                analyze_windows_red.append(None)
 
         self.segment_slices = segment_slices_red
         self.analyze_slices = analyze_slices_red
+        self.analyze_windows = analyze_windows_red
 
     def _get_inpaint_invpsd(self):
         if self._inpaint_invpsd is None:
@@ -1312,7 +1327,8 @@ class StrainSegments(object):
             cached_freq_segs = {}
             from collections import Counter
             slice_counts = Counter((s.start, s.stop) for s in self.segment_slices)
-            for seg_slice, ana in zip(self.segment_slices, self.analyze_slices):
+            windows = getattr(self, 'analyze_windows', None) or [None] * len(self.segment_slices)
+            for seg_slice, ana, wins in zip(self.segment_slices, self.analyze_slices, windows):
                 key = (seg_slice.start, seg_slice.stop)
                 if key in cached_freq_segs:
                     freq_seg = cached_freq_segs[key].copy()
@@ -1349,6 +1365,7 @@ class StrainSegments(object):
                         freq_seg = base_seg
 
                 freq_seg.analyze = ana
+                freq_seg.analyze_windows = wins
                 freq_seg.cumulative_index = seg_slice.start + ana.start
                 freq_seg.seg_slice = seg_slice
                 self._fourier_segments.append(freq_seg)
@@ -1368,7 +1385,8 @@ class StrainSegments(object):
                     filter_inj_only=opt.filter_inj_only,
                     injection_window=opt.injection_window,
                     allow_zero_padding=opt.allow_zero_padding,
-                    inpaint_edges=getattr(opt, 'inpaint_edges', False))
+                    inpaint_edges=getattr(opt, 'inpaint_edges', False),
+                    merge_injection_windows=getattr(opt, 'merge_injection_windows', False))
 
     @classmethod
     def insert_segment_option_group(cls, parser):
@@ -1423,7 +1441,8 @@ class StrainSegments(object):
                    filter_inj_only=opt.filter_inj_only,
                    injection_window=opt.injection_window,
                    allow_zero_padding=opt.allow_zero_padding,
-                   inpaint_edges=getattr(opt, 'inpaint_edges', False))
+                   inpaint_edges=getattr(opt, 'inpaint_edges', False),
+                   merge_injection_windows=getattr(opt, 'merge_injection_windows', False))
 
     @classmethod
     def from_cli_multi_ifos(cls, opt, strain_dict, ifos):

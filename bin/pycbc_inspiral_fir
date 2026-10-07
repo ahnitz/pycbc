@@ -84,8 +84,15 @@ class UpperReferenceBatch:
                 'valid': cplan.valid,
             })
 
-    def run(self, top_series, valid_slice=None, ifo=None, pad=4096, scales=None):
-        """Return middle-id to SNR series, scaled like direct middle filtering."""
+    def run(self, top_series, valid_slice=None, ifo=None, pad=4096, scales=None,
+            windows=None):
+        """Return middle-id to SNR series, scaled like direct middle filtering.
+
+        valid_slice, or windows (a list of (start, stop) pairs) when given,
+        selects where the middle series is needed; each is widened by pad and
+        only blocks intersecting the result are computed. Blocks are computed
+        independently, so every computed sample equals the whole-range value.
+        """
         if len(top_series) != self.series_length:
             raise ValueError('top reference length changed between segments')
 
@@ -94,68 +101,85 @@ class UpperReferenceBatch:
         elif len(scales) == len(self.sorted_ids):
             scales = scales[self.sort_order]
 
+        L = self.series_length
         n_req = len(self.sorted_ids)
         if ifo is not None:
-            buf_key = (ifo, self.series_length)
+            buf_key = (ifo, L)
             buf_entry = UpperReferenceBatch._BUFFERS.get(buf_key)
             if buf_entry is None or buf_entry[0].shape[0] < n_req:
                 alloc_rows = max(n_req, 32)
-                buf = np.zeros((alloc_rows, self.series_length), dtype=np.complex64)
-                buf_entry = [buf, 0, 0]
+                buf = np.zeros((alloc_rows, L), dtype=np.complex64)
+                buf_entry = [buf, []]
                 UpperReferenceBatch._BUFFERS[buf_key] = buf_entry
-            buf, prev_start, prev_stop = buf_entry
+            buf, prev = buf_entry
             out = buf[:n_req]
-            if prev_stop > prev_start:
-                out[:, prev_start:prev_stop] = 0
+            for s0, s1 in prev:
+                out[:, s0:s1] = 0
         else:
-            out = np.zeros((n_req, self.series_length), dtype=np.complex64)
+            out = np.zeros((n_req, L), dtype=np.complex64)
 
         ser = np.ascontiguousarray(top_series, dtype=np.complex64)
 
-        if valid_slice is not None:
+        pad_val = int(pad) if pad is not None else 4096
+        if windows is not None:
+            raw = [(int(a), int(b)) for a, b in windows]
+        elif valid_slice is not None:
             vs = 0 if valid_slice.start is None else int(valid_slice.start)
-            ve = self.series_length if valid_slice.stop is None else int(valid_slice.stop)
+            ve = L if valid_slice.stop is None else int(valid_slice.stop)
             if vs < 0:
-                vs = max(0, self.series_length + vs)
+                vs = max(0, L + vs)
             if ve < 0:
-                ve = max(0, self.series_length + ve)
-            pad_val = int(pad) if pad is not None else 4096
-            v_start = max(0, vs - pad_val)
-            v_stop = min(self.series_length, ve + pad_val)
+                ve = max(0, L + ve)
+            raw = [(vs, ve)]
         else:
-            v_start = 0
-            v_stop = self.series_length
+            raw = None
+
+        if raw is not None:
+            iv = []
+            for a, b in sorted((max(0, a - pad_val), min(L, b + pad_val)) for a, b in raw):
+                if b <= a:
+                    continue
+                if iv and a <= iv[-1][1]:
+                    iv[-1][1] = max(iv[-1][1], b)
+                else:
+                    iv.append([a, b])
+        else:
+            iv = None
 
         for p in self._plan:
             cplan = p['cplan']
             st = p['st']
             lo, hi = p['valid']
             g_dest = out[p['g_slice']]
-            if valid_slice is not None:
+            if iv is not None:
                 b_start = st + lo
-                b_end = np.minimum(st + hi, self.series_length)
-                keep = (b_start < v_stop) & (b_end > v_start)
-                if keep.any():
-                    st_run = st[keep]
-                    k_indices = np.flatnonzero(keep)
-                    cov_start = b_start[k_indices[0]]
-                    cov_end = b_end[k_indices[-1]]
-                    if cov_start > v_start:
-                        g_dest[:, v_start:cov_start] = 0
-                    if cov_end < v_stop:
-                        g_dest[:, cov_end:v_stop] = 0
-                else:
-                    st_run = np.empty(0, dtype=np.uintp)
-                    g_dest[:, v_start:v_stop] = 0
+                b_end = np.minimum(st + hi, L)
+                keep = np.zeros(st.size, dtype=bool)
+                for v_start, v_stop in iv:
+                    k = (b_start < v_stop) & (b_end > v_start)
+                    if k.any():
+                        k_indices = np.flatnonzero(k)
+                        cov_start = b_start[k_indices[0]]
+                        cov_end = b_end[k_indices[-1]]
+                        if cov_start > v_start:
+                            g_dest[:, v_start:cov_start] = 0
+                        if cov_end < v_stop:
+                            g_dest[:, cov_end:v_stop] = 0
+                        keep |= k
+                    else:
+                        g_dest[:, v_start:v_stop] = 0
+                st_run = st[keep] if keep.any() else np.empty(0, dtype=np.uintp)
             else:
                 st_run = st
                 if ifo is not None:
                     g_dest[:, :lo] = 0
                     if st_run.size > 0:
-                        last_end = min(self.series_length, st_run[-1] + hi)
-                        if last_end < self.series_length:
+                        last_end = min(L, st_run[-1] + hi)
+                        if last_end < L:
                             g_dest[:, last_end:] = 0
 
+            if st_run.size == 0:
+                continue          # nothing to compute; the C layer rejects an empty block list
             if cplan._gpu is not None:
                 cplan._continuous_gpu(ser, st_run, 0, p['g_cnt'], g_dest)
             else:
@@ -163,16 +187,15 @@ class UpperReferenceBatch:
                     ser, st_run, lo, hi, 0, p['g_cnt'], g_dest
                 )
 
-        if valid_slice is not None:
-            np.multiply(out[:, v_start:v_stop], scales[:, None], out=out[:, v_start:v_stop])
+        if iv is not None:
+            for v_start, v_stop in iv:
+                np.multiply(out[:, v_start:v_stop], scales[:, None], out=out[:, v_start:v_stop])
             if ifo is not None:
-                buf_entry[1] = v_start
-                buf_entry[2] = v_stop
+                buf_entry[1] = [tuple(x) for x in iv]
         else:
             np.multiply(out, scales[:, None], out=out)
             if ifo is not None:
-                buf_entry[1] = 0
-                buf_entry[2] = self.series_length
+                buf_entry[1] = [(0, L)]
 
         return dict(zip(self.sorted_ids, out))
 
@@ -430,6 +453,48 @@ def process_and_record_triggers(
         for col, arr in batch.items():
             ifo_trigs[col].append(arr)
 
+
+
+def segment_windows(stilde, margin=0):
+    """Injection windows of a merged segment, widened by margin samples and
+    clipped to the segment's analysis range, or None for a whole segment.
+
+    Clipping keeps every computed sample inside the region a search without
+    injections computes, so all values read downstream are identical to it."""
+    wins = getattr(stilde, 'analyze_windows', None)
+    if not wins:
+        return None
+    a0, a1 = stilde.analyze.start, stilde.analyze.stop
+    return [(max(a0, a - margin), min(a1, b + margin)) for a, b in wins]
+
+
+def injection_guard_samples(args, sample_rate, block_len):
+    """Guard band searched around each injection window, in samples.
+
+    A trigger's fate depends on neighbours: a block's peak search spans the
+    block's valid region, clustering compares triggers within cluster_window,
+    and chisq is shared by a template's triggers within chisq_window. Searching
+    this much further keeps every trigger inside a window identical to the
+    search without injections; the guard band's own triggers are kept too,
+    as they also are identical to it."""
+    cw = float(args.cluster_window or 0.0)
+    xw = float(getattr(args, 'chisq_window', 1.0) or 0.0)
+    return int(np.ceil((cw + xw) * float(sample_rate))) + 2 * int(block_len)
+
+
+def asym_half_span(args, sample_rate, num_bins):
+    """How far an asym follow-up reaches from its primary, in samples, plus
+    light travel between detectors."""
+    bs = int(round(args.asym_bin_width * float(sample_rate)))
+    return (num_bins // 2 + 1) * bs + int(0.1 * float(sample_rate))
+
+
+def analyzed_samples(stilde):
+    """Samples searched for primary triggers: the windows if any, else analyze."""
+    wins = getattr(stilde, 'analyze_windows', None)
+    if wins:
+        return sum(b - a for a, b in wins)
+    return stilde.analyze.stop - stilde.analyze.start
 
 
 def sample_asym_bins(group_engine, ref_snr, local_id, t_center,
@@ -843,9 +908,22 @@ def process_top_template_task(task_args):
             norms[ifo] = norm
 
             t0 = time.perf_counter()
-            v_slice = getattr(st, 'analyze', None) if not os.environ.get('PYCBC_UNCONSTRAINED_UPPER') else None
+            unconstrained = bool(os.environ.get('PYCBC_UNCONSTRAINED_UPPER'))
+            v_slice = getattr(st, 'analyze', None) if not unconstrained else None
+            # With injection windows, the middle series is needed only where the
+            # primary search, the asym follow-up (unchanged, over the full
+            # analysis range) and chisq read it: each window widened by the
+            # follow-up's half-span plus light travel, then pad for filter context.
+            mid_windows = None
+            if not unconstrained:
+                # The primary search reaches the guard band past each window;
+                # follow-ups of those primaries read one half-span further.
+                sr_i = ifo_sample_rates[ifo]
+                margin = (injection_guard_samples(args, sr_i, top_pad)
+                          + asym_half_span(args, sr_i, effective_asym_num_bins))
+                mid_windows = segment_windows(st, margin)
             middle_series[ifo] = upper_batch.run(
-                series, valid_slice=v_slice, ifo=ifo, pad=top_pad
+                series, valid_slice=v_slice, ifo=ifo, pad=top_pad, windows=mid_windows
             )
             local_timers['upper_fir'] += time.perf_counter() - t0
 
@@ -864,10 +942,12 @@ def process_top_template_task(task_args):
                 h_norm = h_norms[ifo]
                 ref_snr = middle_series[ifo][coarse_idx]
                 t_fine0 = time.perf_counter()
+                fine_windows = segment_windows(
+                    stilde, injection_guard_samples(args, ifo_sample_rates[ifo], top_pad))
                 ids_local, t_idxs, snrs, tstarts, _ = group_engine.process_segment(
                     stilde, stilde.psd, h_norm, filters_f, counts,
                     local_arange,
-                    valid_slice=stilde.analyze,
+                    valid_slice=stilde.analyze if fine_windows is None else fine_windows,
                     reference_series=ref_snr,
                     profile_template=top_template,
                 )
@@ -902,7 +982,7 @@ def process_top_template_task(task_args):
         t_seg_dur = max(time.perf_counter() - t_seg_start, 1e-6)
         n_tmpl_seg = sum(len(g[2]) for g in top_groups)
         stilde_ref = segments[active_ifos[0]][s_num]
-        total_analyzed_dur = len(active_ifos) * (stilde_ref.analyze.stop - stilde_ref.analyze.start) * stilde_ref.delta_t
+        total_analyzed_dur = len(active_ifos) * analyzed_samples(stilde_ref) * stilde_ref.delta_t
         tperf_seg = total_analyzed_dur / t_seg_dur * n_tmpl_seg
         s_fine = local_timers['fine_fir'] - t_seg_fine_start
         s_chi = local_timers['power_chisq'] - t_seg_chi_start
@@ -1296,7 +1376,7 @@ def ingest_ifo_triggers(
 def log_performance_summary(run_time, tsetup, instruments, segments, bank, output_path, cores=1):
     """Log formatted timing breakdown and write timing JSON output."""
     total_analyzed_det_sec = sum(
-        sum((segments[ifo][s].analyze.stop - segments[ifo][s].analyze.start) * segments[ifo][s].delta_t
+        sum(analyzed_samples(segments[ifo][s]) * segments[ifo][s].delta_t
             for s in range(len(segments[ifo])))
         for ifo in instruments
     )
@@ -1526,6 +1606,12 @@ def main():
                 if 'f_lower' in f:
                     flow = float(np.min(f['f_lower'][:]))
 
+        # With --injection-window, keep each segment once with its full analysis
+        # range and the injection windows attached (StrainSegments otherwise
+        # duplicates the segment per window and narrows analyze to it, which
+        # reruns the top and middle stages per window and clips the asym
+        # follow-up). Only the primary search is restricted to the windows.
+        args.merge_injection_windows = True
         (segments, gwstrain, gating_info, gwstrain_start_time,
          psd_var, sample_rate, flen, delta_f) = setup_strain_and_segments(
             args, instruments, inj_filter_rejector, flow
