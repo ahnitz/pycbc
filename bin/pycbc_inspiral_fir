@@ -792,7 +792,7 @@ def analyzed_samples(stilde):
 def sample_asym_bins(group_engine, ref_snr, local_id, t_center,
                      sample_rate=2048.0, bin_width=0.1, num_bins=100, valid_slice=None):
     """Sample peak SNR in each bin across an asymmetric window around t_center."""
-    bs = int(round(bin_width * float(sample_rate or 2048.0)))
+    bs = max(1, int(round(bin_width * float(sample_rate or 2048.0))))
     win_start_samp = (t_center - bs // 2) - (num_bins // 2) * bs
     win_end_samp = win_start_samp + num_bins * bs
 

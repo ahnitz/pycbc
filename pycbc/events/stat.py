@@ -47,6 +47,7 @@ _allowed_statistic_features = [
     "normalize_fit_rate",
     "single_coinc_volume_ratio",
     "single_coinc_volume_weight",
+    "rayleigh_subthreshold",
 ]
 
 
@@ -1049,6 +1050,11 @@ class ExpFitStatistic(PhaseTDStatistic):
         ):
             self.single_dtype.append(("in_coinc_time", bool))
 
+        # Rayleigh (sqrt(chisq_2)) low-SNR noise model below threshold
+        self.rayleigh_subthresh = bool(
+            self.kwargs.get("rayleigh_subthreshold", False)
+        )
+
     def assign_template_bins(self, key):
         """
         Assign bin ID values
@@ -1428,7 +1434,27 @@ class ExpFitStatistic(PhaseTDStatistic):
             + numpy.log(ratei)
         )
 
-        if not numpy.isinf(self.alphabelow):
+        if self.rayleigh_subthresh:
+            bt = sngl_stat < thresh
+            if numpy.any(bt):
+                # Smooth Rayleigh (sqrt(chisq_2)) model matching at thresh:
+                # d/drho [ln(dR/drho)] = 1/thresh - thresh / sigma0^2 = -alphai
+                # => sigma0^2 = thresh^2 / (alphai * thresh + 1)
+                # ln(dR/drho) = ln(ratei) + ln(alphai) + ln(rho / thresh) - (rho^2 - thresh^2) / (2 * sigma0^2)
+                rho_bt = numpy.maximum(sngl_stat[bt], 1e-4)
+                th_bt = thresh[bt] if isinstance(thresh, numpy.ndarray) else thresh
+                al_bt = alphai[bt] if isinstance(alphai, numpy.ndarray) else alphai
+                rt_bt = ratei[bt] if isinstance(ratei, numpy.ndarray) else ratei
+
+                sigmasq0 = (th_bt ** 2) / (al_bt * th_bt + 1.0)
+                lognoiselbt = (
+                    numpy.log(rt_bt)
+                    + numpy.log(al_bt)
+                    + numpy.log(rho_bt / th_bt)
+                    - (rho_bt ** 2 - th_bt ** 2) / (2.0 * sigmasq0)
+                )
+                lognoisel[bt] = lognoiselbt
+        elif not numpy.isinf(self.alphabelow):
             # Above the threshold we use the usual fit coefficient (alphai)
             # below threshold use specified alphabelow
             bt = sngl_stat < thresh
