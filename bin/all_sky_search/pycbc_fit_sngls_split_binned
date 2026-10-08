@@ -332,13 +332,19 @@ for x in range(args.split_one_nbins):
         )
         logging.info('Currently have %d triggers', len(vals_inbin))
         while count_pruned < args.prune_number:
+            if len(vals_inbin) == 0:
+                break
             # Getting loudest statistic value in split
             max_val_arg = vals_inbin.argmax()
             max_statval = vals_inbin[max_val_arg]
+            if max_statval <= 0:
+                break
 
             remove = np.nonzero(
                 abs(time_inbin[max_val_arg] - time) < args.prune_window
             )[0]
+            if remove.size == 0:
+                break
             # Remove from inbin triggers as well in case there
             # are more pruning iterations
             remove_inbin = np.nonzero(
@@ -348,7 +354,7 @@ for x in range(args.split_one_nbins):
                 'Prune %d: removing %d triggers around %.2f, %d in this split',
                 count_pruned,
                 remove.size,
-                time[max_val_arg],
+                time_inbin[max_val_arg],
                 remove_inbin.size
             )
             # Set pruned triggers' stat values to zero, as above for vetoes
@@ -359,9 +365,14 @@ for x in range(args.split_one_nbins):
             count_pruned += 1
 
 logging.info('Setting up plotting and fitting limit values')
-minplot = max(stat[np.nonzero(stat)].min(), args.plot_lower_stat_limit)
+nonzeros = np.nonzero(stat)[0]
+if nonzeros.size:
+    minplot = max(stat[nonzeros].min(), args.plot_lower_stat_limit)
+    max_fit = 1.05 * stat.max()
+else:
+    minplot = args.plot_lower_stat_limit
+    max_fit = max(10.0, 1.05 * minplot)
 min_fit = max(minplot, args.stat_fit_threshold)
-max_fit = 1.05 * stat.max()
 if args.plot_max_x:
     maxplot = args.plot_max_x
 else:
@@ -453,7 +464,8 @@ for x in range(args.split_one_nbins):
 
             del vals_inbin, vals_above_thresh
 
-        maxyval = max(maxyval, cum_counts.max())
+        if 'cum_counts' in locals() and getattr(cum_counts, 'size', 0) > 0:
+            maxyval = max(maxyval, cum_counts.max())
         ax.grid()
 
 for i in range(args.split_one_nbins):
