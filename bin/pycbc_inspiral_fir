@@ -863,6 +863,45 @@ def select_primary_asym_candidates(
     return cand_indices
 
 
+def compute_followup_bin_budget(
+    primary_snr,
+    num_bins=1000,
+    bin_width=0.03,
+    min_bins=5,
+    scale_factor=1.2,
+    target_network_snr=8.5,
+    secondary_snr_floor=3.0,
+    f_eff=150.0,
+    max_bins=None,
+):
+    """Compute symmetric followup bin budget K(rho_prim) based on recovery difficulty.
+
+    Includes minimum safety floor, overall scale factor, and hard-clips at the total number of bins.
+    """
+    rho_p = abs(float(primary_snr))
+    rho_sec_req = np.sqrt(max(float(secondary_snr_floor) ** 2, float(target_network_snr) ** 2 - rho_p ** 2))
+
+    window_duration = float(num_bins) * float(bin_width)
+    n_trials = window_duration * float(f_eff)
+
+    p_exceed = np.exp(-0.5 * rho_sec_req ** 2)
+    mu_noise = n_trials * p_exceed
+
+    # 2-sigma Poisson upper bound + 1 for signal itself
+    k_analytic = np.ceil(mu_noise + 2.0 * np.sqrt(mu_noise) + 1.0)
+    k_scaled = int(np.ceil(float(scale_factor) * k_analytic))
+
+    upper_cap = int(num_bins)
+    if max_bins is not None and int(max_bins) > 0:
+        upper_cap = min(upper_cap, int(max_bins))
+
+    lower_floor = max(1, int(min_bins))
+    if upper_cap < lower_floor:
+        upper_cap = lower_floor
+
+    return int(np.clip(k_scaled, lower_floor, upper_cap))
+
+
 def filter_secondary_asym_triggers(
     asym_ids, asym_t_idxs, asym_snrs, asym_tstarts, primary_snr,
     secondary_snr_threshold=None, network_snr_threshold=None, max_followup_bins=0,
@@ -1007,12 +1046,26 @@ def followup_asym_candidates(
                     asym_snrs_eval = asym_snrs
 
                 prim_snr_eval = a_snrs_eval[k]
+                if getattr(args, 'asym_dynamic_followup_bins', False):
+                    eff_max_bins = compute_followup_bin_budget(
+                        primary_snr=prim_snr_eval,
+                        num_bins=effective_asym_num_bins,
+                        bin_width=args.asym_bin_width,
+                        min_bins=getattr(args, 'asym_min_followup_bins', 5),
+                        scale_factor=getattr(args, 'asym_followup_bin_scale', 1.2),
+                        target_network_snr=getattr(args, 'asym_followup_target_net_snr', 8.5),
+                        secondary_snr_floor=getattr(args, 'asym_followup_sec_snr_floor', 3.0),
+                        max_bins=args.asym_max_followup_bins,
+                    )
+                else:
+                    eff_max_bins = args.asym_max_followup_bins
+
                 asym_ids, asym_t_idxs, _, asym_tstarts, passing_idx = filter_secondary_asym_triggers(
                     asym_ids, asym_t_idxs, asym_snrs_eval, asym_tstarts,
                     primary_snr=prim_snr_eval,
                     secondary_snr_threshold=args.asym_secondary_snr_threshold,
                     network_snr_threshold=args.asym_network_snr_threshold,
-                    max_followup_bins=args.asym_max_followup_bins,
+                    max_followup_bins=eff_max_bins,
                     return_indices=True,
                 )
 
@@ -1821,7 +1874,18 @@ def get_args():
                                  "Secondary triggers with network SNR >= threshold are kept unconditionally.")
     asym_group.add_argument("--asym-max-followup-bins", type=int, default=2,
                             help="Maximum number of loudest followup bins to keep per primary candidate trigger "
-                                 "(default: 2, set 0 to keep all passing bins).")
+                                 "(default: 2, set 0 to keep all passing bins). In dynamic mode, serves as the upper cap.")
+    asym_group.add_argument("--asym-dynamic-followup-bins", action="store_true",
+                            help="Scale followup bin budget dynamically based on the statistical difficulty "
+                                 "of recovering the secondary signal given primary SNR.")
+    asym_group.add_argument("--asym-min-followup-bins", type=int, default=5,
+                            help="Minimum number of followup bins for marginal primary triggers in dynamic mode (default: 5).")
+    asym_group.add_argument("--asym-followup-bin-scale", type=float, default=1.2,
+                            help="Overall scale factor applied to the analytic bin budget in dynamic mode (default: 1.2).")
+    asym_group.add_argument("--asym-followup-target-net-snr", type=float, default=8.5,
+                            help="Target minimum network SNR for a viable candidate in dynamic mode (default: 8.5).")
+    asym_group.add_argument("--asym-followup-sec-snr-floor", type=float, default=3.0,
+                            help="Practical secondary matched filter SNR floor in dynamic mode (default: 3.0).")
     asym_group.add_argument("--asym-max-primary-per-group-sec", type=int, default=1,
                             help="Maximum number of primary triggers per 1-second interval within each fine "
                                  "template group to instigate secondary followup windowing (default: 1, set 0 to disable).")
