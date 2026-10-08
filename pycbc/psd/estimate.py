@@ -382,7 +382,7 @@ def bandlimited_interpolate(series, delta_f):
     return interpolated_series
 
 
-def estimate_psd_trimmed_welch(timeseries, seg_len=4096, seg_stride=2048, alpha=0.20):
+def trimmed_welch(timeseries, seg_len=4096, seg_stride=2048, alpha=0.20):
     """Robust Trimmed-Mean Welch PSD estimator.
     Discards the lowest alpha and highest alpha fraction of periodograms at each bin,
     mitigating both transient loud glitches/signals and deep nulls.
@@ -437,7 +437,7 @@ def estimate_psd_trimmed_welch(timeseries, seg_len=4096, seg_stride=2048, alpha=
     return FrequencySeries(corrected_psd, delta_f=delta_f, epoch=timeseries.start_time)
 
 
-def estimate_psd_multitaper(timeseries, seg_len=4096, seg_stride=2048, NW=3.0, avg_method='median'):
+def multitaper(timeseries, seg_len=4096, seg_stride=2048, NW=3.0, avg_method='median'):
     """Multitaper Spectral Estimator using Discrete Prolate Spheroidal Sequences (DPSS).
     Applies K = 2*NW - 1 orthonormal Slepian tapers per segment to minimize spectral
     leakage across steep dynamic range gradients (e.g. seismic wall at 15-20 Hz).
@@ -494,5 +494,11 @@ def estimate_psd_multitaper(timeseries, seg_len=4096, seg_stride=2048, NW=3.0, a
         raise ValueError(f"Unknown avg_method: {avg_method}")
 
     return FrequencySeries(psd_est, delta_f=delta_f, epoch=timeseries.start_time)
+
+
+# Backwards compatibility aliases
+estimate_psd_trimmed_welch = trimmed_welch
+estimate_psd_multitaper = multitaper
+
 
 

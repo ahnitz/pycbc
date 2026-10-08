@@ -125,9 +125,38 @@ class TestPSD(unittest.TestCase):
                                 msg='seg_len=%d max_len=%d -> rms=%.3f' \
                                 % (seg_len, max_len, err_rms))
 
+    def test_trimmed_welch(self):
+        """Test robust trimmed-mean Welch PSD estimation"""
+        seg_len = 4096
+        noise_model = (numpy.linspace(1., 100., seg_len // 2 + 1)) ** (-2)
+        with self.context:
+            psd = pycbc.psd.trimmed_welch(self.noise, seg_len=seg_len, seg_stride=2048, alpha=0.15)
+            # Verify backwards-compatibility alias works identically
+            psd_alias = pycbc.psd.estimate_psd_trimmed_welch(self.noise, seg_len=seg_len, seg_stride=2048, alpha=0.15)
+            numpy.testing.assert_array_equal(psd.numpy(), psd_alias.numpy())
+
+            error = (psd.numpy() - noise_model) / noise_model
+            err_rms = numpy.sqrt(numpy.mean(error ** 2))
+            self.assertTrue(err_rms < 0.25, msg=f"trimmed_welch rms error {err_rms:.3f} >= 0.25")
+
+    def test_multitaper(self):
+        """Test DPSS multitaper PSD estimation"""
+        seg_len = 4096
+        noise_model = (numpy.linspace(1., 100., seg_len // 2 + 1)) ** (-2)
+        with self.context:
+            for avg in ('median', 'mean'):
+                psd = pycbc.psd.multitaper(self.noise, seg_len=seg_len, seg_stride=2048, NW=2.5, avg_method=avg)
+                psd_alias = pycbc.psd.estimate_psd_multitaper(self.noise, seg_len=seg_len, seg_stride=2048, NW=2.5, avg_method=avg)
+                numpy.testing.assert_array_equal(psd.numpy(), psd_alias.numpy())
+
+                error = (psd.numpy() - noise_model) / noise_model
+                err_rms = numpy.sqrt(numpy.mean(error ** 2))
+                self.assertTrue(err_rms < 0.25, msg=f"multitaper avg={avg} rms error {err_rms:.3f} >= 0.25")
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPSD))
 
 if __name__ == '__main__':
     results = unittest.TextTestRunner(verbosity=2).run(suite)
     simple_exit(results)
+
