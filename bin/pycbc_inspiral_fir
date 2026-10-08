@@ -69,12 +69,8 @@ class UpperReferenceBatch:
         # rather than multiply every output series by it on every call (a full pass over
         # ~25 series of ~10^6 samples). Rounds once on the taps instead of the output.
         sorted_taps = taps[sort_order]
-        self._taps = np.asarray(sorted_taps, dtype=np.float32)
-        self._counts = counts_arr[sort_order]
-        self.tap_scales = None
         if scales is not None:
-            self.tap_scales = np.asarray(scales, dtype=np.float32)[sort_order]
-            sorted_taps = sorted_taps * self.tap_scales[:, None]
+            sorted_taps = sorted_taps * np.asarray(scales, dtype=np.float32)[sort_order][:, None]
         self.scales = None
         self.bank = matchedfilter.TimeDomainFilterBank(
             sorted_taps, tap_counts=counts_arr[sort_order],
@@ -94,21 +90,6 @@ class UpperReferenceBatch:
                 'st': st,
                 'valid': cplan.valid,
             })
-
-    def filter_spectra(self):
-        """Each middle filter's own spectrum (no batch scale) in bank.filters_f's layout and
-        convention: the same transform the bank makes, from the unscaled taps."""
-        if self.tap_scales is None:
-            return list(self.bank.filters_f)
-        from matchedfilter import taps_to_spectra
-        out = [None] * len(self.sorted_ids)
-        for g in self.bank.groups:
-            idx = np.asarray(g['template_indices'])
-            m = int(g['orig_taps_max'])
-            spec = taps_to_spectra(self._taps[idx, :m], self._counts[idx], int(g['n']), max_taps=m)
-            for r, ti in enumerate(idx):
-                out[int(ti)] = np.conj(spec[r])
-        return out
 
     def run(self, top_series, valid_slice=None, ifo=None, pad=4096, scales=None,
             windows=None, rows=None):
@@ -254,9 +235,34 @@ class UpperReferenceBatch:
                     np.multiply(out[r0:r1, v_start:v_stop], scales[r0:r1, None],
                                 out=out[r0:r1, v_start:v_stop])
         if ifo is not None:
-            buf_entry[1].append((want.copy(), regions))
+            # A block writes up to its full valid span, past the requested region by up to a
+            # block: record that reach as written too, so a later call clears it.
+            reach = max((int(p['cplan'].n) for p in self._plan), default=0)
+            written = [(max(0, a - reach), min(L, b + reach)) for a, b in regions]
+            buf_entry[1].append((want.copy(), written))
 
         return {self.sorted_ids[r]: out[r] for r in sel}
+
+
+def chisq_middle_spectra(taps, counts, ids, block_length):
+    """Each middle filter's spectrum for the power chisq, keyed by middle id.
+
+    On the smallest power-of-two multiple of the chisq block that holds the filter, so
+    decimating by an integer gives its exact DTFT samples on the chisq grid; in the
+    convention of TimeDomainFilterBank.filters_f (conjugate, centre tap at lag 0).
+    """
+    from matchedfilter import taps_to_spectra
+    counts = np.asarray(counts, dtype=np.int64)
+    taps = np.asarray(taps, dtype=np.float32)
+    ns = np.array([max(int(block_length), 1 << int(np.ceil(np.log2(int(c) + 1)))) for c in counts])
+    out = {}
+    for n in np.unique(ns):
+        rows = np.flatnonzero(ns == n)
+        m = int(counts[rows].max())
+        spec = taps_to_spectra(taps[rows, :m], counts[rows], int(n), max_taps=m)
+        for r, row in enumerate(rows):
+            out[int(ids[row])] = np.conj(spec[r])
+    return out
 
 
 def _valid_lags(td_bank, local_id):
@@ -1079,28 +1085,10 @@ def process_top_template_task(task_args):
     )
     local_timers['upper_prep'] += time.perf_counter() - t_up_prep
 
-    upper_f_by_coarse = {}
-    if hasattr(upper_batch, 'bank') and hasattr(upper_batch.bank, 'filters_f'):
-        # the chisq weights want each filter's own spectrum; the bank's carry the batch scales
-        own_f = upper_batch.filter_spectra()
-        for row, mid in enumerate(upper_batch.sorted_ids):
-            upper_f_by_coarse[int(mid)] = own_f[row]
-        # The power chisq samples each middle filter's response on its own block's grid by
-        # decimating this spectrum, which needs it on a grid at least as fine. Middle filters
-        # the upper stage blocks more finely than that get their spectrum recomputed from the
-        # taps on a multiple of the chisq length (exact DTFT samples; same convention).
-        nc = int(args.chisq_block_length)
-        short = [row for row in range(len(upper_batch.sorted_ids))
-                 if len(own_f[row]) < nc]
-        if short:
-            from matchedfilter import TimeDomainFilterBank
-            rows = np.asarray(short)
-            src = upper_batch.sort_order[rows]
-            fine_grid = TimeDomainFilterBank(
-                taps_u[src], tap_counts=np.asarray(counts_u, dtype=np.int64)[src],
-                engine='matchedfilter', fft_lengths=[nc * (1 << k) for k in range(6)])
-            for j, row in enumerate(short):
-                upper_f_by_coarse[int(upper_batch.sorted_ids[row])] = fine_grid.filters_f[j]
+    # The power chisq's coarse weights sample each middle filter's spectrum on its block's grid.
+    # Take it from the taps on a grid set by the chisq block alone, not from the middle stage's
+    # own transforms, so how matchedfilter blocks the middle stage cannot move a chisq bin edge.
+    upper_f_by_coarse = chisq_middle_spectra(taps_u, counts_u, middle_ids, int(args.chisq_block_length))
 
     top_groups = []
     for mid in middle_ids:
