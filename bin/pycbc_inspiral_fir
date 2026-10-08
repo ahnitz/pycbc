@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+import weakref
 
 import h5py
 import numpy as np
@@ -302,12 +303,17 @@ def chisq_middle_spectra(taps, counts, ids, block_length):
     return out
 
 
+_VALID_LAGS = weakref.WeakKeyDictionary()
+
+
 def _valid_lags(td_bank, local_id):
     """[start, stop) of the valid lags of a template's block in a TimeDomainFilterBank."""
-    for g in td_bank.groups:
-        if int(local_id) in set(int(i) for i in g['template_indices']):
-            return g['c_bad'], g['c_bad'] + g['n_valid']
-    raise KeyError(local_id)
+    lags = _VALID_LAGS.get(td_bank)
+    if lags is None:
+        lags = _VALID_LAGS[td_bank] = {
+            int(i): (g['c_bad'], g['c_bad'] + g['n_valid'])
+            for g in td_bank.groups for i in g['template_indices']}
+    return lags[int(local_id)]
 
 
 class RatioPowerChisq(SingleDetPowerChisq):
@@ -544,21 +550,14 @@ class RatioAutoChisq(SingleDetAutoChisq):
                         * (1 if args.autochi_onesided else 2) * (2 if args.autochi_two_phase else 1))
         self.power_chisq = power_chisq
         self.autocors = {}
-        self.valid_ranges = {}
         self.elapsed = 0.0          # time spent here, kept out of the power chisq's
 
     def clear(self):
         self.autocors.clear()
-        self.valid_ranges.clear()
 
     def valid_range(self, td_bank, local_id):
         """[start, stop) of the valid samples in a block of the template's library group."""
-        key = id(td_bank)
-        if key not in self.valid_ranges:
-            self.valid_ranges[key] = {
-                int(i): (g['c_bad'], g['c_bad'] + g['n_valid'])
-                for g in td_bank.groups for i in g['template_indices']}
-        return self.valid_ranges[key][int(local_id)]
+        return _valid_lags(td_bank, local_id)
 
     def autocorrelation(self, stilde, coarse_idx, local_id, filters_f, band):
         N = len(filters_f[local_id])
