@@ -128,16 +128,14 @@ class UpperReferenceBatch:
             # dirty holds (row mask, regions) for what earlier calls wrote.
             # Clear it only for the rows written now; skipped rows keep their
             # record so a later call that does compute them clears it then.
-            kept_dirty = []
+            kept_dirty, stale = [], []
             for d_mask, d_regions in dirty:
                 if d_mask.size != n_req:
                     # written for another row layout: treat every row as dirty
                     d_mask = np.ones(n_req, dtype=bool)
                 hit = d_mask & want
                 if hit.any():
-                    hit_rows = np.flatnonzero(hit)
-                    for s0, s1 in d_regions:
-                        out[hit_rows, s0:s1] = 0
+                    stale.append((hit, d_regions))   # cleared below, except where this call writes
                 rest = d_mask & ~want
                 if rest.any():
                     kept_dirty.append((rest, d_regions))
@@ -173,6 +171,7 @@ class UpperReferenceBatch:
         else:
             iv = None
 
+        work = []
         for p in self._plan:
             cplan = p['cplan']
             st = p['st']
@@ -212,6 +211,25 @@ class UpperReferenceBatch:
                         if last_end < L:
                             gaps.append((last_end, L))
 
+            if st_run.size:
+                cov = np.stack([st_run + lo, np.minimum(st_run + hi, L)], axis=1).astype(np.int64)
+                brk = np.flatnonzero(cov[1:, 0] > cov[:-1, 1]) + 1     # blocks are contiguous within a window
+                covered = [(int(c[0, 0]), int(c[-1, 1])) for c in np.split(cov, brk)]
+            else:
+                covered = []
+            work.append((p, cplan, st_run, lo, hi, g0, runs, gaps, covered))
+
+        if ifo is not None:
+            # What earlier calls wrote in these rows, minus what this call overwrites, goes back to zero.
+            for hit, d_regions in stale:
+                for p, cplan, st_run, lo, hi, g0, runs, gaps, covered in work:
+                    rows = g0 + np.flatnonzero(hit[p['g_slice']])
+                    if rows.size == 0:
+                        continue
+                    for a, b in _subtract_intervals(d_regions, covered):
+                        out[rows, a:b] = 0
+
+        for p, cplan, st_run, lo, hi, g0, runs, gaps, covered in work:
             for r0, r1 in runs:
                 dest = out[g0 + r0:g0 + r1]
                 for a, b in gaps:
@@ -242,6 +260,25 @@ class UpperReferenceBatch:
             buf_entry[1].append((want.copy(), written))
 
         return {self.sorted_ids[r]: out[r] for r in sel}
+
+
+def _subtract_intervals(regions, covered):
+    """Parts of the [start, stop) regions that no covered interval contains."""
+    out = []
+    cov = sorted(covered)
+    for a, b in regions:
+        pos = a
+        for c0, c1 in cov:
+            if c1 <= pos or c0 >= b:
+                continue
+            if c0 > pos:
+                out.append((pos, c0))
+            pos = max(pos, c1)
+            if pos >= b:
+                break
+        if pos < b:
+            out.append((pos, b))
+    return out
 
 
 def chisq_middle_spectra(taps, counts, ids, block_length):
