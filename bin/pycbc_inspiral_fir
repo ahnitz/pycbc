@@ -878,7 +878,7 @@ def compute_followup_bin_budget(
 
     Includes minimum safety floor, overall scale factor, and hard-clips at the total number of bins.
     """
-    rho_p = abs(float(primary_snr))
+    rho_p = float(abs(primary_snr))
     rho_sec_req = np.sqrt(max(float(secondary_snr_floor) ** 2, float(target_network_snr) ** 2 - rho_p ** 2))
 
     window_duration = float(num_bins) * float(bin_width)
