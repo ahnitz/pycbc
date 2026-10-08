@@ -22,7 +22,7 @@ def effsnr(snr, reduced_x2, fac=250.,
         return esnr[0]
 
 
-def newsnr(snr, reduced_x2, q=6., n=2.,
+def newsnr(snr, reduced_x2, q=6., n=2., chisq_thresh=1.,
            **kwargs):  # pylint:disable=unused-argument
     """Calculate the re-weighted SNR statistic ('newSNR') from given SNR and
     reduced chi-squared values. See http://arxiv.org/abs/1208.3491 for
@@ -31,15 +31,21 @@ def newsnr(snr, reduced_x2, q=6., n=2.,
     nsnr = numpy.array(snr, ndmin=1, dtype=numpy.float64)
     reduced_x2 = numpy.abs(numpy.array(reduced_x2, ndmin=1, dtype=numpy.float64))
 
-    # newsnr is only different from snr if reduced chisq > 1
-    ind = numpy.where(reduced_x2 > 1.)[0]
-    nsnr[ind] *= (0.5 * (1. + reduced_x2[ind] ** (q/n))) ** (-1./q)
+    # newsnr is only different from snr if reduced chisq > chisq_thresh
+    ind = numpy.where(reduced_x2 > chisq_thresh)[0]
+    scaled_x2 = reduced_x2[ind] / chisq_thresh
+    nsnr[ind] *= (0.5 * (1. + scaled_x2 ** (q/n))) ** (-1./q)
 
     # If snr input is float, return a float. Otherwise return numpy array.
     if hasattr(snr, '__len__'):
         return nsnr
     else:
         return nsnr[0]
+
+
+def newsnr_offset125(snr, reduced_x2, **kwargs):
+    """Calculate NewSNR with chisq_thresh=1.25"""
+    return newsnr(snr, reduced_x2, chisq_thresh=1.25, **kwargs)
 
 
 def newsnr_sgveto(snr, brchisq, sgchisq, **kwargs):
@@ -60,6 +66,11 @@ def newsnr_sgveto(snr, brchisq, sgchisq, **kwargs):
         return nsnr
     else:
         return nsnr[0]
+
+
+def newsnr_sgveto_offset125(snr, brchisq, sgchisq, **kwargs):
+    """Combined SNR derived from NewSNR with chisq_thresh=1.25 and Sine-Gaussian Chisq"""
+    return newsnr_sgveto(snr, brchisq, sgchisq, chisq_thresh=1.25, **kwargs)
 
 
 def newsnr_sgveto_psdvar(snr, brchisq, sgchisq, psd_var_val,
@@ -207,6 +218,23 @@ def get_newsnr(trigs, **kwargs):
     return numpy.array(nsnr, ndmin=1, dtype=numpy.float32)
 
 
+def get_newsnr_offset125(trigs, **kwargs):
+    """Calculate newsnr with chisq_thresh=1.25
+
+    Parameters
+    ----------
+    trigs: dict of numpy.ndarrays, h5py group (or similar dict-like object)
+        Dictionary holding single detector trigger information.
+        'chisq_dof', 'snr', and 'chisq' are required keys
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of newsnr values
+    """
+    return get_newsnr(trigs, chisq_thresh=1.25, **kwargs)
+
+
 def get_newsnr_sgveto(trigs, **kwargs):
     """
     Calculate newsnr re-weigthed by the sine-gaussian veto
@@ -230,6 +258,23 @@ def get_newsnr_sgveto(trigs, **kwargs):
         **kwargs
     )
     return numpy.array(nsnr_sg, ndmin=1, dtype=numpy.float32)
+
+
+def get_newsnr_sgveto_offset125(trigs, **kwargs):
+    """Calculate newsnr with chisq_thresh=1.25 re-weighted by sine-gaussian veto
+
+    Parameters
+    ----------
+    trigs: dict of numpy.ndarrays, h5py group (or similar dict-like object)
+        Dictionary holding single detector trigger information.
+        'chisq_dof', 'snr', 'sg_chisq' and 'chisq' are required keys
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of newsnr values
+    """
+    return get_newsnr_sgveto(trigs, chisq_thresh=1.25, **kwargs)
 
 
 def get_newsnr_sgveto_psdvar(trigs, **kwargs):
@@ -344,7 +389,9 @@ sngls_ranking_function_dict = {
     'snr': get_snr,
     'newsnr': get_newsnr,
     'new_snr': get_newsnr,
+    'newsnr_offset125': get_newsnr_offset125,
     'newsnr_sgveto': get_newsnr_sgveto,
+    'newsnr_sgveto_offset125': get_newsnr_sgveto_offset125,
     'newsnr_sgveto_psdvar': get_newsnr_sgveto_psdvar,
     'newsnr_sgveto_psdvar_threshold': get_newsnr_sgveto_psdvar_threshold,
     'newsnr_sgveto_psdvar_scaled': get_newsnr_sgveto_psdvar_scaled,
@@ -357,7 +404,9 @@ reqd_datasets = {}
 reqd_datasets['snr'] = ['snr']
 reqd_datasets['newsnr'] = reqd_datasets['snr'] + ['chisq', 'chisq_dof']
 reqd_datasets['new_snr'] = reqd_datasets['newsnr']
+reqd_datasets['newsnr_offset125'] = reqd_datasets['newsnr']
 reqd_datasets['newsnr_sgveto'] = reqd_datasets['newsnr'] + ['sg_chisq']
+reqd_datasets['newsnr_sgveto_offset125'] = reqd_datasets['newsnr_sgveto']
 reqd_datasets['newsnr_sgveto_psdvar'] = \
     reqd_datasets['newsnr_sgveto'] + ['psd_var_val']
 reqd_datasets['newsnr_sgveto_psdvar_threshold'] = \
