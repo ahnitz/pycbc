@@ -290,60 +290,80 @@ def get_dynamic_snr_renorm_factor(series, dt=None, window_duration=8.0, hollow_d
     renorm_factor : ndarray (float32 or float64)
         1D array of renormalization scale factors in (0.0, max_boost_factor or 1/sqrt(variance_floor)].
     """
-    if os.environ.get('PYCBC_DISABLE_DYNAMIC_SNR_RENORM', '0') == '1':
-        return np.ones(len(series), dtype=np.float32)
+    factor = DynamicSNRRenormFactor(
+        series, dt=dt, window_duration=window_duration, hollow_duration=hollow_duration,
+        variance_floor=variance_floor, scale=scale, max_boost_factor=max_boost_factor)
+    return factor[np.arange(len(factor))]
 
-    n = len(series)
-    if n == 0:
-        return np.ones(0, dtype=np.float32)
 
-    if dt is None:
-        dt = float(getattr(series, 'delta_t', 1.0))
-    else:
-        dt = float(dt)
+class DynamicSNRRenormFactor(object):
+    """The envelope of get_dynamic_snr_renorm_factor, evaluated where it is read.
 
-    if dt <= 0:
-        return np.ones(n, dtype=np.float32)
+    A search reads the envelope only at its triggers, a few hundred samples of a
+    series of ~10^6; building it everywhere was most of the reference stage's
+    time. This keeps the one O(n) part (the running sum of the local power) and
+    evaluates the rest at the requested indices with the same arithmetic, so the
+    values are identical. Supports len() and indexing by integer arrays.
+    """
 
-    if window_duration <= 2.0 * hollow_duration:
-        raise ValueError(
-            f"window_duration ({window_duration}s) must be greater than 2 * hollow_duration ({2.0 * hollow_duration}s)"
-        )
+    def __init__(self, series, dt=None, window_duration=8.0, hollow_duration=0.5,
+                 variance_floor=1.0, scale=None, max_boost_factor=None):
+        self._n = n = len(series)
+        self._ones = (os.environ.get('PYCBC_DISABLE_DYNAMIC_SNR_RENORM', '0') == '1' or n == 0)
+        if dt is None:
+            dt = float(getattr(series, 'delta_t', 1.0))
+        else:
+            dt = float(dt)
+        if dt <= 0:
+            self._ones = True
+        if self._ones:
+            self._dtype = np.float32
+            return
 
-    arr = np.asarray(series)
-    # Local power P(t) = 0.5 * |z(t)|^2
-    if scale is not None and float(scale) > 0:
-        inv_scale = 1.0 / float(scale)
-        power = (arr.real * arr.real + arr.imag * arr.imag) * (0.5 * inv_scale * inv_scale)
-    else:
-        power = (arr.real * arr.real + arr.imag * arr.imag) * 0.5
+        if window_duration <= 2.0 * hollow_duration:
+            raise ValueError(
+                f"window_duration ({window_duration}s) must be greater than 2 * hollow_duration ({2.0 * hollow_duration}s)"
+            )
 
-    np.nan_to_num(power, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        arr = np.asarray(series)
+        # Local power P(t) = 0.5 * |z(t)|^2
+        if scale is not None and float(scale) > 0:
+            inv_scale = 1.0 / float(scale)
+            power = (arr.real * arr.real + arr.imag * arr.imag) * (0.5 * inv_scale * inv_scale)
+        else:
+            power = (arr.real * arr.real + arr.imag * arr.imag) * 0.5
 
-    w_outer = int(round((0.5 * window_duration) / dt))
-    w_inner = int(round(hollow_duration / dt))
+        np.nan_to_num(power, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-    cumsum = np.pad(np.cumsum(power, dtype=np.float64), (1, 0), mode='constant')
+        self._w_outer = int(round((0.5 * window_duration) / dt))
+        self._w_inner = int(round(hollow_duration / dt))
+        self._cumsum = np.pad(np.cumsum(power, dtype=np.float64), (1, 0), mode='constant')
+        self._floor = max(float(variance_floor), 1e-12)
+        self._max_boost = max_boost_factor
+        self._dtype = np.float64 if arr.dtype == np.complex128 else np.float32
 
-    idx = np.arange(n)
-    l_out = np.clip(idx - w_outer, 0, n)
-    r_out = np.clip(idx + w_outer + 1, 0, n)
-    l_in = np.clip(idx - w_inner, 0, n)
-    r_in = np.clip(idx + w_inner + 1, 0, n)
+    def __len__(self):
+        return self._n
 
-    sum_hollow = (cumsum[r_out] - cumsum[l_out]) - (cumsum[r_in] - cumsum[l_in])
-    cnt_hollow = (r_out - l_out) - (r_in - l_in)
+    def __getitem__(self, idx):
+        idx = np.asarray(idx)
+        if self._ones:
+            return np.ones(idx.shape, dtype=self._dtype)
+        n, cumsum = self._n, self._cumsum
+        l_out = np.clip(idx - self._w_outer, 0, n)
+        r_out = np.clip(idx + self._w_outer + 1, 0, n)
+        l_in = np.clip(idx - self._w_inner, 0, n)
+        r_in = np.clip(idx + self._w_inner + 1, 0, n)
 
-    floor_safe = max(float(variance_floor), 1e-12)
-    var_est = sum_hollow / np.maximum(cnt_hollow, 1)
-    var_eff = np.where(np.isfinite(var_est), np.maximum(var_est, floor_safe), floor_safe)
-    renorm_factor = np.where(np.isfinite(var_eff), 1.0 / np.sqrt(var_eff), 1.0)
-    if max_boost_factor is not None:
-        renorm_factor = np.clip(renorm_factor, 0.0, float(max_boost_factor))
+        sum_hollow = (cumsum[r_out] - cumsum[l_out]) - (cumsum[r_in] - cumsum[l_in])
+        cnt_hollow = (r_out - l_out) - (r_in - l_in)
 
-    if arr.dtype == np.complex128:
-        return renorm_factor.astype(np.float64)
-    return renorm_factor.astype(np.float32)
+        var_est = sum_hollow / np.maximum(cnt_hollow, 1)
+        var_eff = np.where(np.isfinite(var_est), np.maximum(var_est, self._floor), self._floor)
+        renorm_factor = np.where(np.isfinite(var_eff), 1.0 / np.sqrt(var_eff), 1.0)
+        if self._max_boost is not None:
+            renorm_factor = np.clip(renorm_factor, 0.0, float(self._max_boost))
+        return renorm_factor.astype(self._dtype)
 
 
 def dynamic_snr_renormalize(series, dt=None, window_duration=8.0, hollow_duration=0.5, variance_floor=1.0, scale=None, max_boost_factor=None):

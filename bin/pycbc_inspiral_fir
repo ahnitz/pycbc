@@ -26,7 +26,7 @@ import pycbc.scheme
 import pycbc.strain
 import pycbc.types.optparse
 import pycbc.vetoes
-from pycbc.filter.matched_filter_ratio import MatchedFilterRatioControl, dynamic_snr_renormalize, get_dynamic_snr_renorm_factor
+from pycbc.filter.matched_filter_ratio import MatchedFilterRatioControl, dynamic_snr_renormalize, DynamicSNRRenormFactor
 from pycbc.types import FrequencySeries, TimeSeries, complex64, float32, zeros
 from pycbc.vetoes.chisq import (
     SingleDetPowerChisq,
@@ -65,9 +65,19 @@ class UpperReferenceBatch:
         self.sort_order = sort_order
         self.sorted_ids = np.asarray(middle_ids, dtype=int)[sort_order]
         self.series_length = int(series_length)
-        self.scales = np.asarray(scales, dtype=np.float32)[sort_order] if scales is not None else None
+        # Each middle filter's scale is fixed for the batch: fold it into the filter's taps
+        # rather than multiply every output series by it on every call (a full pass over
+        # ~25 series of ~10^6 samples). Rounds once on the taps instead of the output.
+        sorted_taps = taps[sort_order]
+        self._taps = np.asarray(sorted_taps, dtype=np.float32)
+        self._counts = counts_arr[sort_order]
+        self.tap_scales = None
+        if scales is not None:
+            self.tap_scales = np.asarray(scales, dtype=np.float32)[sort_order]
+            sorted_taps = sorted_taps * self.tap_scales[:, None]
+        self.scales = None
         self.bank = matchedfilter.TimeDomainFilterBank(
-            taps[sort_order], tap_counts=counts_arr[sort_order],
+            sorted_taps, tap_counts=counts_arr[sort_order],
             engine='corr'
         )
 
@@ -85,6 +95,21 @@ class UpperReferenceBatch:
                 'valid': cplan.valid,
             })
 
+    def filter_spectra(self):
+        """Each middle filter's own spectrum (no batch scale) in bank.filters_f's layout and
+        convention: the same transform the bank makes, from the unscaled taps."""
+        if self.tap_scales is None:
+            return list(self.bank.filters_f)
+        from matchedfilter import taps_to_spectra
+        out = [None] * len(self.sorted_ids)
+        for g in self.bank.groups:
+            idx = np.asarray(g['template_indices'])
+            m = int(g['orig_taps_max'])
+            spec = taps_to_spectra(self._taps[idx, :m], self._counts[idx], int(g['n']), max_taps=m)
+            for r, ti in enumerate(idx):
+                out[int(ti)] = np.conj(spec[r])
+        return out
+
     def run(self, top_series, valid_slice=None, ifo=None, pad=4096, scales=None,
             windows=None, rows=None):
         """Return middle-id to SNR series, scaled like direct middle filtering.
@@ -100,9 +125,7 @@ class UpperReferenceBatch:
         if len(top_series) != self.series_length:
             raise ValueError('top reference length changed between segments')
 
-        if scales is None:
-            scales = self.scales
-        elif len(scales) == len(self.sorted_ids):
+        if scales is not None and len(scales) == len(self.sorted_ids):
             scales = scales[self.sort_order]
 
         L = self.series_length
@@ -224,11 +247,12 @@ class UpperReferenceBatch:
         regions = [tuple(x) for x in iv] if iv is not None else [(0, L)]
         sel = np.flatnonzero(want)
         cuts = np.flatnonzero(np.diff(sel) != 1) + 1
-        for run in (np.split(sel, cuts) if sel.size else []):
-            r0, r1 = int(run[0]), int(run[-1]) + 1
-            for v_start, v_stop in regions:
-                np.multiply(out[r0:r1, v_start:v_stop], scales[r0:r1, None],
-                            out=out[r0:r1, v_start:v_stop])
+        if scales is not None:          # extra per-call scales; the batch's own are in the taps
+            for run in (np.split(sel, cuts) if sel.size else []):
+                r0, r1 = int(run[0]), int(run[-1]) + 1
+                for v_start, v_stop in regions:
+                    np.multiply(out[r0:r1, v_start:v_stop], scales[r0:r1, None],
+                                out=out[r0:r1, v_start:v_stop])
         if ifo is not None:
             buf_entry[1].append((want.copy(), regions))
 
@@ -1057,15 +1081,17 @@ def process_top_template_task(task_args):
 
     upper_f_by_coarse = {}
     if hasattr(upper_batch, 'bank') and hasattr(upper_batch.bank, 'filters_f'):
+        # the chisq weights want each filter's own spectrum; the bank's carry the batch scales
+        own_f = upper_batch.filter_spectra()
         for row, mid in enumerate(upper_batch.sorted_ids):
-            upper_f_by_coarse[int(mid)] = upper_batch.bank.filters_f[row]
+            upper_f_by_coarse[int(mid)] = own_f[row]
         # The power chisq samples each middle filter's response on its own block's grid by
         # decimating this spectrum, which needs it on a grid at least as fine. Middle filters
         # the upper stage blocks more finely than that get their spectrum recomputed from the
         # taps on a multiple of the chisq length (exact DTFT samples; same convention).
         nc = int(args.chisq_block_length)
         short = [row for row in range(len(upper_batch.sorted_ids))
-                 if len(upper_batch.bank.filters_f[row]) < nc]
+                 if len(own_f[row]) < nc]
         if short:
             from matchedfilter import TimeDomainFilterBank
             rows = np.asarray(short)
@@ -1184,7 +1210,7 @@ def process_top_template_task(task_args):
             dt_sample = float(st.delta_t)
             amp_scale = float(st.delta_t / engine.decimation_factor)
             if not getattr(args, 'disable_dynamic_snr_renorm', False):
-                renorm_factors[ifo] = get_dynamic_snr_renorm_factor(
+                renorm_factors[ifo] = DynamicSNRRenormFactor(
                     series, dt=dt_sample, scale=amp_scale,
                     window_duration=getattr(args, 'dynamic_snr_window', 8.0),
                     hollow_duration=getattr(args, 'dynamic_snr_hollow', 0.5),
