@@ -27,7 +27,7 @@ import pycbc.scheme
 import pycbc.strain
 import pycbc.types.optparse
 import pycbc.vetoes
-from pycbc.filter.matched_filter_ratio import MatchedFilterRatioControl, dynamic_snr_renormalize, DynamicSNRRenormFactor
+from pycbc.filter.matched_filter_ratio import MatchedFilterRatioControl, DynamicSNRRenormFactor
 from pycbc.types import FrequencySeries, TimeSeries, complex64, float32, zeros
 from pycbc.vetoes.chisq import (
     SingleDetPowerChisq,
