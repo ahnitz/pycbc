@@ -122,7 +122,11 @@ class MatchedFilterRatioControl(object):
         scale = (norm * stilde.delta_t) / self.decimation_factor
         # The cached IFFT output is overwritten by the next reference; upper
         # series must survive while all of its middle children are processed.
-        return (snr.numpy() * scale).astype(np.complex64, copy=False), h_norm
+        # scale is a float64 scalar: multiplying into a complex64 output keeps the
+        # double-precision product and its rounding, without a complex128 temporary.
+        out = np.empty(len(snr), dtype=np.complex64)
+        np.multiply(snr.numpy(), scale, out=out, casting='same_kind')
+        return out, h_norm
 
     def prepare_chisq_filters(self, fir_taps, tap_counts, block_length, reach=0):
         """Template spectra on the chisq block: length block_length, the convention of filters_f.
@@ -327,17 +331,21 @@ class DynamicSNRRenormFactor(object):
 
         arr = np.asarray(series)
         # Local power P(t) = 0.5 * |z(t)|^2
+        power = arr.real * arr.real
+        power += arr.imag * arr.imag
         if scale is not None and float(scale) > 0:
             inv_scale = 1.0 / float(scale)
-            power = (arr.real * arr.real + arr.imag * arr.imag) * (0.5 * inv_scale * inv_scale)
+            power *= (0.5 * inv_scale * inv_scale)
         else:
-            power = (arr.real * arr.real + arr.imag * arr.imag) * 0.5
+            power *= 0.5
 
         np.nan_to_num(power, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
         self._w_outer = int(round((0.5 * window_duration) / dt))
         self._w_inner = int(round(hollow_duration / dt))
-        self._cumsum = np.pad(np.cumsum(power, dtype=np.float64), (1, 0), mode='constant')
+        self._cumsum = np.empty(n + 1, dtype=np.float64)
+        self._cumsum[0] = 0.0
+        np.cumsum(power, dtype=np.float64, out=self._cumsum[1:])
         self._floor = max(float(variance_floor), 1e-12)
         self._max_boost = max_boost_factor
         self._dtype = np.float64 if arr.dtype == np.complex128 else np.float32
