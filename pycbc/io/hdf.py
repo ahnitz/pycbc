@@ -968,8 +968,16 @@ class SingleDetTriggers(object):
         return ranking.newsnr(self.snr, self.rchisq)
 
     @property
+    def newsnr_offset125(self):
+        return ranking.newsnr_offset125(self.snr, self.rchisq)
+
+    @property
     def newsnr_sgveto(self):
         return ranking.newsnr_sgveto(self.snr, self.rchisq, self.sgchisq)
+
+    @property
+    def newsnr_sgveto_offset125(self):
+        return ranking.newsnr_sgveto_offset125(self.snr, self.rchisq, self.sgchisq)
 
     @property
     def newsnr_sgveto_psdvar(self):
