@@ -268,9 +268,8 @@ for tsid in tsids:
         empty_slide_count += 1
 
 allbkg_ifars = numpy.array(allbkg_ifars)
-allbkg_ifars = allbkg_ifars * (fp.attrs['foreground_time'] / allbkg_dur )
 allbkg_ifars.sort()
-allbkg_cumnum = numpy.arange(len(allbkg_ifars), 0, -1)
+allbkg_cumnum = numpy.arange(len(allbkg_ifars), 0, -1) * (fp.attrs['foreground_time'] / allbkg_dur)
 plt.loglog(allbkg_ifars, allbkg_cumnum, color='green', linewidth=1.5,
              label="All decimated background")
 
@@ -308,9 +307,10 @@ if opts.open_box and len(fore_cumnum) > 100:
     plt.ylim(0.8, 1.1 * len(fore_cumnum))
     plt.xlim(0.9 * min(fore_ifar))
 elif len(allbkg_cumnum) > 0:
-    # If we have < 100 foreground triggers (or this is closed box), scale the
-    # plot around the cumulative background (the green line).
-    plt.ylim(0.8, 1.1 * len(allbkg_cumnum))
+    # Scale the plot around the cumulative background
+    min_cumnum = max(1e-5, min(allbkg_cumnum))
+    max_cumnum = max(1.1 * len(fore_cumnum) if (opts.open_box and len(fore_cumnum) > 0) else 1.0, 10.0)
+    plt.ylim(min_cumnum * 0.8, max_cumnum)
     plt.xlim(0.9 * min(allbkg_ifars))
 plt.grid()
 plt.legend(loc='upper right', fontsize=9)
