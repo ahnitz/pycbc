@@ -282,3 +282,11 @@ class MatchedFilterRatioControl(object):
                 np.array(all_t_idxs, dtype=np.int64),
                 np.array(all_snrs, dtype=np.complex64),
                 np.array(all_tstarts, dtype=np.int32))
+
+
+# Backwards compatibility re-exports for dynamic SNR renormalization
+from .dynamic_snr_renorm import (
+    dynamic_snr_renormalize,
+    get_dynamic_snr_renorm_factor,
+    DynamicSNRRenormFactor,
+)
