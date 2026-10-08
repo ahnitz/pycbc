@@ -1121,12 +1121,13 @@ def process_top_template_task(task_args):
             t_g = tau0_fine[g_entry[2]]
             group_tau[g_entry[0]] = (float(t_g.min()) - cw, float(t_g.max()) + cw)
 
+    # Every block a fine bank reads must lie in computed middle series: pad by the
+    # longest block a bank uses or may still choose (it settles at its first reference).
     top_pad = max(
         [4096] + [
-            int(g.n)
+            int(g_entry[3]._td_bank.max_block_length)
             for g_entry in top_groups
             if getattr(g_entry[3], '_td_bank', None) is not None
-            for g in g_entry[3]._td_bank._groups
         ]
     )
 

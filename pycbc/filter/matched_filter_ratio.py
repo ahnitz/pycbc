@@ -85,8 +85,11 @@ class MatchedFilterRatioControl(object):
         self._ap_ref_key = None
 
     def prepare_filters(self, fir_taps, tap_counts):
-        """
-        Prepare frequency-domain filters for a batch of taps using TimeDomainFilterBank.
+        """Build the fine-stage TimeDomainFilterBank for a batch of taps.
+
+        Nothing is returned: with the peak granularity stated, the bank settles its
+        block sizes at its first reference, so its spectra do not exist yet (the
+        chisq has its own, from prepare_chisq_filters).
         """
         fft_lengths = None
         if os.environ.get('PYCBC_RATIO_FFT_LENGTH'):
@@ -102,9 +105,9 @@ class MatchedFilterRatioControl(object):
             coarse_band_hz=self._coarse_band_hz,
             device=self._device,
             fft_lengths=fft_lengths,
+            # the peak granularity: with it stated, the block size is matchedfilter's choice
+            binsize=self.peak_binsize,
         )
-        n_taps_max = int(np.max(tap_counts))
-        return self._td_bank.filters_f, n_taps_max
 
     def make_reference_series(self, stilde, psd, ref_template):
         """Return the scaled reference SNR series and its template sigmasq."""
