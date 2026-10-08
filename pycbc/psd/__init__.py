@@ -19,6 +19,7 @@ from pycbc.psd.read import *
 from pycbc.psd.analytical import *
 from pycbc.psd.analytical_space import *
 from pycbc.psd.estimate import *
+from pycbc.psd.estimate import estimate_psd_trimmed_welch, estimate_psd_multitaper
 from pycbc.psd.variation import *
 from pycbc.types import float32,float64
 from pycbc.types import MultiDetOptionAppendAction, MultiDetOptionAction
