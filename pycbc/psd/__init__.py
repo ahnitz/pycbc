@@ -74,6 +74,14 @@ def from_cli(opt, length, delta_f, low_frequency_cutoff,
         f_low = low_frequency_cutoff
     sample_rate = (length -1) * 2 * delta_f
 
+    if getattr(opt, 'psd_high_frequency_cutoff', None) is not None:
+        f_high = opt.psd_high_frequency_cutoff
+    elif getattr(opt, 'high_frequency_cutoff', None) is not None:
+        f_high = opt.high_frequency_cutoff
+    else:
+        # Default to 0.9 * Nyquist frequency
+        f_high = 0.9 * (sample_rate / 2.0)
+
     try:
         psd_estimation = opt.psd_estimation is not None
     except AttributeError:
@@ -144,6 +152,7 @@ def from_cli(opt, length, delta_f, low_frequency_cutoff,
             int(opt.psd_inverse_length * sample_rate),
             which_spectrum=which_spectrum,
             low_frequency_cutoff=f_low,
+            high_frequency_cutoff=f_high,
             low_frequency_fill_value=fill_value,
             trunc_method=opt.invpsd_trunc_method)
 
@@ -221,6 +230,11 @@ def insert_psd_option_group(parser, output=True, include_data_options=True):
     psd_options.add_argument("--psd-low-frequency-cutoff", type=float,
                              help="(Optional) The low frequency cutoff for the "
                                   "PSD. If not specified, the low frequency "
+                                  "cutoff of the matched filter/likelihood "
+                                  "integral will be used.")
+    psd_options.add_argument("--psd-high-frequency-cutoff", type=float,
+                             help="(Optional) The high frequency cutoff for the "
+                                  "PSD. If not specified, the high frequency "
                                   "cutoff of the matched filter/likelihood "
                                   "integral will be used.")
     # Truncation options if specifying psd-inverse-length

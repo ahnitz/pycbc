@@ -324,7 +324,11 @@ del fg_times_list
 
 def filter_dataset(h5file, name, idx):
     # Dataset needs to be deleted and remade as it is a different size
-    filtered_dset = h5file[name][:][idx]
+    dset = h5file[name][:]
+    if len(idx) > 0 and len(dset) > 0 and idx.max() >= len(dset):
+        pad = np.zeros(idx.max() + 1 - len(dset), dtype=dset.dtype)
+        dset = np.concatenate([dset, pad])
+    filtered_dset = dset[idx] if len(dset) > 0 else np.empty(0, dtype=dset.dtype)
     del h5file[name]
     h5file[name] = filtered_dset
 
@@ -497,13 +501,21 @@ if not injection_style:
     f['segments/foreground_veto/start'] = vstart
     f['segments/foreground_veto/end'] = vend
     # Only output non-exclusive ifar/fap if it is _not_ an injection case
-    f['foreground/ifar'][:] = fg_ifar
+    if 'foreground/ifar' in f:
+        del f['foreground/ifar']
+    f['foreground/ifar'] = fg_ifar
+    if 'foreground/fap' in f:
+        del f['foreground/fap']
     f['foreground/fap'] = 1 - np.exp(-conv.sec_to_year(fg_time) / fg_ifar)
 
 del test_times
 
-f['foreground/ifar_exc'][:] = fg_ifar_exc
+if 'foreground/ifar_exc' in f:
+    del f['foreground/ifar_exc']
+f['foreground/ifar_exc'] = fg_ifar_exc
 fg_time_exc = f.attrs['foreground_time_exc']
+if 'foreground/fap_exc' in f:
+    del f['foreground/fap_exc']
 f['foreground/fap_exc'] = 1 - np.exp(-conv.sec_to_year(fg_time_exc) /
                                      fg_ifar_exc)
 

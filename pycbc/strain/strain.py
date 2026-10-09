@@ -135,6 +135,7 @@ def detect_loud_glitches(strain, psd_duration=4., psd_stride=2.,
     psd = pycbc.psd.inverse_spectrum_truncation(
             psd, int(psd_duration * strain.sample_rate),
             low_frequency_cutoff=low_freq_cutoff,
+            high_frequency_cutoff=high_freq_cutoff,
             trunc_method='hann')
     kmin = int(low_freq_cutoff / psd.delta_f)
     psd[0:kmin] = numpy.inf
@@ -1692,6 +1693,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                  max_buffer,
                  sample_rate,
                  low_frequency_cutoff=20,
+                 high_frequency_cutoff=None,
                  highpass_frequency=15.0,
                  highpass_reduction=200.0,
                  highpass_bandwidth=5.0,
@@ -1810,6 +1812,9 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                                            increment_update_cache=increment_update_cache)
 
         self.low_frequency_cutoff = low_frequency_cutoff
+        if high_frequency_cutoff is None:
+            high_frequency_cutoff = 0.9 * (sample_rate / 2.0)
+        self.high_frequency_cutoff = high_frequency_cutoff
 
         # Set up status buffers
         self.analyze_flags = analyze_flags
@@ -2033,13 +2038,15 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                 psdt = pycbc.psd.interpolate(self.psd, fseries.delta_f)
                 psdt = pycbc.psd.inverse_spectrum_truncation(psdt,
                                        int(self.sample_rate * self.psd_inverse_length),
-                                       low_frequency_cutoff=self.low_frequency_cutoff)
+                                       low_frequency_cutoff=self.low_frequency_cutoff,
+                                       high_frequency_cutoff=self.high_frequency_cutoff)
                 psdt._delta_f = fseries.delta_f
 
                 psd = pycbc.psd.interpolate(self.psd, delta_f)
                 psd = pycbc.psd.inverse_spectrum_truncation(psd,
                                        int(self.sample_rate * self.psd_inverse_length),
-                                       low_frequency_cutoff=self.low_frequency_cutoff)
+                                       low_frequency_cutoff=self.low_frequency_cutoff,
+                                       high_frequency_cutoff=self.high_frequency_cutoff)
 
                 psd.psdt = psdt
                 self.psds[delta_f] = psd
@@ -2268,6 +2275,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
             idq_threshold=args.idq_threshold,
             sample_rate=args.sample_rate,
             low_frequency_cutoff=args.low_frequency_cutoff,
+            high_frequency_cutoff=getattr(args, 'high_frequency_cutoff', None),
             highpass_frequency=args.highpass_frequency,
             highpass_reduction=args.highpass_reduction,
             highpass_bandwidth=args.highpass_bandwidth,

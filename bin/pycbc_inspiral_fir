@@ -375,8 +375,12 @@ class RatioPowerChisq(SingleDetPowerChisq):
                     coarse_dec = top_dec * upper_dec
                 else:
                     coarse_dec = top_dec
+                kmax_w = min(int(self.f_final / df), n_half - 1)
+                coarse_dec[kmax_w:] = 0.0
                 psd_safe = np.maximum(psd_pad, 1e-30)
-                self.coarse_w_cache[coarse_key] = (coarse_dec / np.sqrt(psd_safe)).astype(np.complex64)
+                cw = (coarse_dec / np.sqrt(psd_safe)).astype(np.complex64)
+                cw[kmax_w:] = 0.0
+                self.coarse_w_cache[coarse_key] = cw
             else:
                 self.coarse_w_cache[coarse_key] = None
         return psd_key, self.coarse_w_cache[coarse_key]
@@ -1239,7 +1243,8 @@ def process_top_template_task(task_args):
         args.chisq_snr_threshold,
         sample_rate,
         flow=flow,
-        f_final=bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0,
+        f_final=min(float(getattr(args, 'high_frequency_cutoff', 800.0) or 800.0),
+                    float(bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0)),
         chisq_window=getattr(args, 'chisq_window', 1.0),
         chisq_iterations=getattr(args, 'chisq_iterations', None),
         top_template=top_template,
@@ -1520,6 +1525,7 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
             inpaint_ow = getattr(args, 'inpaint_edges', False)
             ifo_strain, _, _ = overwhiten_strain(
                 ifo_strain, f_low=f_low_ow, max_filter_duration=max_dur_ow,
+                f_high=getattr(args, 'high_frequency_cutoff', None),
                 inpaint_edges=inpaint_ow
             )
             ifo_strain = ifo_strain.astype(np.float32)
@@ -2050,6 +2056,15 @@ def main():
             with h5py.File(args.bank_file, 'r') as f:
                 if 'f_lower' in f:
                     flow = float(np.min(f['f_lower'][:]))
+
+        if getattr(args, 'high_frequency_cutoff', None) is None:
+            if isinstance(args.sample_rate, dict) and len(args.sample_rate) > 0:
+                sr_val = min(args.sample_rate.values())
+            else:
+                sr_val = float(args.sample_rate or 2048.0)
+            args.high_frequency_cutoff = 0.9 * (sr_val / 2.0)
+            logging.info("Defaulted high-frequency-cutoff to 0.9 * Nyquist = %.2f Hz",
+                         args.high_frequency_cutoff)
 
         # With --injection-window, keep each segment once with its full analysis
         # range and the injection windows attached (StrainSegments otherwise

@@ -203,7 +203,8 @@ def welch(timeseries, seg_len=4096, seg_stride=2048, window='hann',
 
 def inverse_spectrum_truncation(psd, max_filter_len, which_spectrum='invasd',
                                 low_frequency_cutoff=None, 
-                                low_frequency_fill_value=0., trunc_method=None):
+                                low_frequency_fill_value=0., trunc_method=None,
+                                high_frequency_cutoff=None):
     """Modify a PSD such that the impulse response associated with its inverse
     square root is no longer than `max_filter_len` time samples. In practice
     this corresponds to a coarse graining or smoothing of the PSD.
@@ -227,6 +228,9 @@ def inverse_spectrum_truncation(psd, max_filter_len, which_spectrum='invasd',
     trunc_method : {None, 'hann'}
         Function used for truncating the time-domain filter.
         None produces a hard truncation at `max_filter_len`.
+    high_frequency_cutoff : {None, float}, optional
+        Frequencies at or above `high_frequency_cutoff` are zeroed out in the
+        inverse spectrum to prevent leakage from stopbands or steep rolloffs.
     
 
     Returns
@@ -237,7 +241,8 @@ def inverse_spectrum_truncation(psd, max_filter_len, which_spectrum='invasd',
     Raises
     ------
     ValueError
-        For invalid types or values of `max_filter_len` and `low_frequency_cutoff`.
+        For invalid types or values of `max_filter_len`, `low_frequency_cutoff`,
+        or `high_frequency_cutoff`.
 
     Notes
     -----
@@ -253,6 +258,11 @@ def inverse_spectrum_truncation(psd, max_filter_len, which_spectrum='invasd',
              low_frequency_cutoff > psd.sample_frequencies[-1]):
         raise ValueError('low_frequency_cutoff must be within the bandwidth of '
                          'the PSD')
+    if high_frequency_cutoff is not None and \
+            (high_frequency_cutoff < 0. or
+             high_frequency_cutoff > psd.sample_frequencies[-1]):
+        raise ValueError('high_frequency_cutoff must be within the bandwidth of '
+                         'the PSD')
 
     N = (len(psd)-1)*2
 
@@ -262,6 +272,13 @@ def inverse_spectrum_truncation(psd, max_filter_len, which_spectrum='invasd',
     kmin = 1
     if low_frequency_cutoff:
         kmin = int(low_frequency_cutoff / psd.delta_f)
+
+    kmax = N // 2
+    if high_frequency_cutoff is not None:
+        kmax = min(kmax, int(high_frequency_cutoff / psd.delta_f))
+    else:
+        # Default to 0.9 * Nyquist frequency
+        kmax = int(0.9 * (N // 2))
     
     # set values below low frequency cutoff
     if low_frequency_fill_value != 0.:
@@ -269,11 +286,17 @@ def inverse_spectrum_truncation(psd, max_filter_len, which_spectrum='invasd',
             low_frequency_fill_value = 1./psd[kmin]
         inv_spectrum[:kmin] = float(low_frequency_fill_value)
 
-    inv_spectrum[kmin:N//2] = (1.0 / psd[kmin:N//2])
+    if kmax > kmin:
+        inv_band = (1.0 / psd[kmin:kmax])
+        bad = numpy.isnan(inv_band._data) | numpy.isinf(inv_band._data) | (inv_band._data < 0)
+        inv_band._data[bad] = 0.0
+        inv_spectrum[kmin:kmax] = inv_band
+    inv_spectrum._data[kmax:] = 0.0
 
     # if truncating asd, take sqrt
     if which_spectrum == 'invasd':
-        inv_spectrum[:N//2] = inv_spectrum[:N//2]**0.5
+        inv_spectrum[:kmax] = inv_spectrum[:kmax]**0.5
+        inv_spectrum._data[kmax:] = 0.0
     elif which_spectrum != 'invpsd':
         raise ValueError(f'Invalid which_spectrum input {which_spectrum}; '
                          f'input must be either "invpsd" or "invasd"')

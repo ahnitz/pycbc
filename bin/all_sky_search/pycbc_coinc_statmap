@@ -307,12 +307,13 @@ if max_slide is not None:
 if (back_locs.sum()) == 0:
     logging.warning("There were no background events, so we could not "
                     "assign any statistic values")
-    f['background/ifar'] = numpy.array([])
-    f['background_exc/ifar'] = numpy.array([])
-    f['foreground/ifar'] = numpy.array([])
-    f['foreground/fap'] = numpy.array([])
-    f['foreground/ifar_exc'] = numpy.array([])
-    f['foreground/fap_exc'] = numpy.array([])
+    n_fore = int(fore_locs.sum()) if 'fore_locs' in locals() else 0
+    f['background/ifar'] = numpy.array([], dtype=float)
+    f['background_exc/ifar'] = numpy.array([], dtype=float)
+    f['foreground/ifar'] = numpy.zeros(n_fore, dtype=float)
+    f['foreground/fap'] = numpy.ones(n_fore, dtype=float)
+    f['foreground/ifar_exc'] = numpy.zeros(n_fore, dtype=float)
+    f['foreground/fap_exc'] = numpy.ones(n_fore, dtype=float)
     if 'name' in all_trigs.attrs:
         f.attrs['name'] = all_trigs.attrs['name']
     sys.exit()
