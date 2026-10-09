@@ -47,7 +47,8 @@ __all__ = [
 
 
 def construct_regularized_kernels(psd_base, fs, duration, f_low=18.0, f_taper=4.0,
-                                  f_high=None, max_filter_duration=4.0):
+                                  f_high=None, max_filter_duration=4.0,
+                                  synthesize_full_spectrum=True):
     """Construct regularized overwhitening and whitening kernels.
 
     Constructs:
@@ -71,13 +72,16 @@ def construct_regularized_kernels(psd_base, fs, duration, f_low=18.0, f_taper=4.
         High frequency cutoff in Hertz. Frequencies at or above f_high are zeroed out (default: None).
     max_filter_duration : float, optional
         Maximum time-domain filter impulse response duration in seconds (default: 4.0).
+    synthesize_full_spectrum : bool, optional
+        Whether to synthesize full-grid frequency kernels when duration is large (default: True).
+        Can be set to False when using overlap-save streaming convolution which only requires FIR taps.
 
     Returns
     -------
-    invpsd_full : ndarray
-        Frequency-domain regularized overwhitening kernel values.
-    w_kernel_full : ndarray
-        Frequency-domain dimensionless whitening kernel values (unit discrete variance).
+    invpsd_full : ndarray or None
+        Frequency-domain regularized overwhitening kernel values (None if synthesize_full_spectrum=False).
+    w_kernel_full : ndarray or None
+        Frequency-domain dimensionless whitening kernel values (None if synthesize_full_spectrum=False).
     fir_dow : ndarray
         Centered zero-phase FIR filter kernel for d_ow(t).
     fir_w : ndarray
@@ -109,6 +113,35 @@ def construct_regularized_kernels(psd_base, fs, duration, f_low=18.0, f_taper=4.
     if f_high is None:
         f_high = 0.9 * (fs / 2.0)
     taper_full[freqs_full >= f_high] = 0.0
+
+    # For large duration streams, compute inverse spectrum truncation and FIR taps
+    # on a compact frequency grid (e.g. 64s). The FIR filter impulse response is bounded
+    # by max_filter_duration (typically <= 4.0s), so computing IST across millions of
+    # frequency bins is mathematically redundant.
+    dur_compact = min(float(duration), max(64.0, 4.0 * float(max_filter_duration)))
+    if dur_compact < duration:
+        invpsd_c, w_c, fir_dow, fir_w, psd_ist_ow_c, _ = construct_regularized_kernels(
+            psd_base, fs, dur_compact, f_low=f_low, f_taper=f_taper, f_high=f_high,
+            max_filter_duration=max_filter_duration, synthesize_full_spectrum=True
+        )
+        if not synthesize_full_spectrum:
+            return None, None, fir_dow, fir_w, psd_ist_ow_c, delta_f_full
+
+        half_filt = (len(fir_dow) - 1) // 2
+
+        # Synthesize full-grid frequency kernels directly from the compact zero-phase FIR taps
+        h_pad = np.zeros(N_full, dtype=np.float64)
+        h_pad[:half_filt + 1] = fir_dow[half_filt:]
+        h_pad[-half_filt:] = fir_dow[:half_filt]
+        invpsd_full = np.fft.rfft(h_pad).real
+
+        h_w_pad = np.zeros(N_full, dtype=np.float64)
+        h_w_pad[:half_filt + 1] = fir_w[half_filt:]
+        h_w_pad[-half_filt:] = fir_w[:half_filt]
+        w_kernel_full = np.fft.rfft(h_w_pad).real
+
+        psd_ist_ow = FrequencySeries(1.0 / np.maximum(invpsd_full, 1e-60), delta_f=delta_f_full)
+        return invpsd_full, w_kernel_full, fir_dow, fir_w, psd_ist_ow, delta_f_full
 
     # Safe filter truncation bounds: max_filter_duration cannot exceed half stream duration
     max_filt_dur_bound = max(1.0 / fs, min(float(max_filter_duration), (duration / 2.0) - 1.0 / fs))
@@ -451,6 +484,7 @@ def overwhiten_strain(timeseries, psd=None, f_low=18.0, f_taper=4.0, f_high=None
     """
     fs = float(timeseries.sample_rate)
     duration = float(timeseries.duration)
+    pad_dur = min(max_filter_duration, 2.0) if edge_pad_duration is None else float(edge_pad_duration)
 
     subtracted_lines = []
     if subtract_lines:
@@ -474,8 +508,10 @@ def overwhiten_strain(timeseries, psd=None, f_low=18.0, f_taper=4.0, f_high=None
         model_compact.fit_static_from_psd(psd)
         model_compact.track_nonstationarity(timeseries, t_step=1.0, t_window=4.0)
 
+    synthesize_full = not use_overlap_save or (model_compact is not None and model_compact.band_scales is not None)
     invpsd_full, w_kernel_full, fir_dow, fir_w, psd_ist_ow, delta_f_full = construct_regularized_kernels(
-        psd, fs, duration, f_low=f_low, f_taper=f_taper, f_high=f_high, max_filter_duration=max_filter_duration
+        psd, fs, duration, f_low=f_low, f_taper=f_taper, f_high=f_high, max_filter_duration=max_filter_duration,
+        synthesize_full_spectrum=synthesize_full
     )
 
     if model_compact is not None and model_compact.band_scales is not None:
@@ -569,7 +605,7 @@ def overwhiten_strain(timeseries, psd=None, f_low=18.0, f_taper=4.0, f_high=None
             ts_dw = TimeSeries(y_w, delta_t=1.0 / fs, epoch=timeseries.start_time)
             ts_dow = TimeSeries(y_dow, delta_t=1.0 / fs, epoch=timeseries.start_time)
     else:
-        if inpaint_edges:
+        if inpaint_edges and not use_overlap_save:
             from pycbc.strain.gate import gate_and_paint
             pad_dur = min(max_filter_duration, 2.0) if edge_pad_duration is None else float(edge_pad_duration)
             pad_n = int(round(pad_dur * fs))
