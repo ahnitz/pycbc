@@ -105,11 +105,11 @@ def _is_gwf(file_path):
 
 
 def _is_hdf5(file_path):
-    """Test if a file is an HDF5 file by checking magic bytes."""
+    """Test if a file is an HDF5 file using standard h5py.is_hdf5."""
     try:
-        with open(file_path, 'rb') as f:
-            return f.read(8) == b'\x89HDF\r\n\x1a\n'
-    except (IOError, OSError):
+        import h5py
+        return bool(h5py.is_hdf5(file_path))
+    except (ImportError, Exception):
         pass
     return False
 

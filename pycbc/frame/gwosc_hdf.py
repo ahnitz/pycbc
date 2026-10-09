@@ -31,7 +31,6 @@ from pycbc.types import TimeSeries
 logger = logging.getLogger('pycbc.frame.gwosc_hdf')
 
 HDF5_EXTENSIONS = ('.hdf5', '.h5', '.hdf')
-HDF5_MAGIC = b'\x89HDF\r\n\x1a\n'
 
 
 def is_gwosc_hdf_file(file_path):
@@ -45,7 +44,7 @@ def is_gwosc_hdf_file(file_path):
     Returns
     -------
     bool
-        True if the file has an HDF5 extension or HDF5 magic bytes.
+        True if the file has an HDF5 extension or is recognized as HDF5 by h5py.
     """
     if not isinstance(file_path, str):
         return False
@@ -55,14 +54,10 @@ def is_gwosc_hdf_file(file_path):
     if ext in HDF5_EXTENSIONS:
         return True
 
-    if os.path.isfile(path):
-        try:
-            with open(path, 'rb') as f:
-                return f.read(8) == HDF5_MAGIC
-        except (IOError, OSError):
-            return False
-
-    return False
+    try:
+        return bool(h5py.is_hdf5(path))
+    except Exception:
+        return False
 
 
 def parse_gwosc_hdf_filename(file_path):
