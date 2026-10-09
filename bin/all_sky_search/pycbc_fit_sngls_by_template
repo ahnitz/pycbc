@@ -293,6 +293,9 @@ if args.prune_param:
             logging.error('Uh-oh, we pruned too many things .. %i, to be '
                           'precise' % numpruned)
             raise RuntimeError
+        if len(statpruneall) == 0:
+            logging.info('Finished pruning: no remaining triggers.')
+            break
         loudest = np.argmax(statpruneall)
         lstat = statpruneall[loudest]
         ltid = tidpruneall[loudest]
