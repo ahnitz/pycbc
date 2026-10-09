@@ -152,13 +152,11 @@ def construct_regularized_kernels(psd_base, fs, duration, f_low=18.0, f_taper=4.
     # Truncate inverse spectrum
     psd_ist_ow = pycbc.psd.inverse_spectrum_truncation(
         psd_full, max_filter_len=N_filt, which_spectrum='invpsd',
-        low_frequency_cutoff=f_low, high_frequency_cutoff=f_high,
-        trunc_method='hann'
+        low_frequency_cutoff=f_low, trunc_method='hann'
     )
     psd_ist_w = pycbc.psd.inverse_spectrum_truncation(
         psd_full, max_filter_len=N_filt, which_spectrum='invasd',
-        low_frequency_cutoff=f_low, high_frequency_cutoff=f_high,
-        trunc_method='hann'
+        low_frequency_cutoff=f_low, trunc_method='hann'
     )
 
     # Overwhitening kernel with zero-division protection
