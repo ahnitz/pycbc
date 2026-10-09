@@ -33,19 +33,21 @@ from pycbc.frame import read_frame
 
 
 class TimeVaryingPSD(object):
-    def __init__(self, file_name, length=None, delta_f=None, f_low=None):
+    def __init__(self, file_name, length=None, delta_f=None, f_low=None, f_high=None):
         with HFile(file_name, 'r') as f:
             self.file_name = file_name
             detector = tuple(f.keys())[0]
             self.start_times = f[detector + '/start_time'][:]
             self.end_times = f[detector + '/end_time'][:]
-            self.file_f_low = f.attrs['low_frequency_cutoff']
+            self.file_f_low = f.attrs.get('low_frequency_cutoff', 0.0)
+            self.file_f_high = f.attrs.get('high_frequency_cutoff', None)
         self._curr_psd = {}
         self._curr_psd_index = {}
         self.detector = detector
         self.length = length
         self.delta_f = delta_f
         self.f_low = f_low
+        self.f_high = f_high
 
     def __call__(self, time=None):
         mask = np.logical_and(self.start_times <= time, self.end_times > time)
@@ -72,9 +74,15 @@ class TimeVaryingPSD(object):
                 else:
                     psd2[:] = psd[0:self.length]
                 psd = psd2
-            if self.f_low is not None and self.f_low < self.file_f_low:
-                k = int(self.file_f_low / psd.delta_f)
+            eff_f_low = self.f_low if self.f_low is not None else self.file_f_low
+            if eff_f_low is not None and eff_f_low > 0:
+                k = int(eff_f_low / psd.delta_f)
                 psd[0:k] = np.inf
+            eff_f_high = self.f_high if self.f_high is not None else self.file_f_high
+            if eff_f_high is not None and eff_f_high > 0:
+                k_high = int(eff_f_high / psd.delta_f)
+                if k_high < len(psd):
+                    psd[k_high:] = np.inf
             self._curr_psd[curr_pid] = psd
             self._curr_psd_index[curr_pid] = index
         return self._curr_psd[curr_pid]
@@ -206,8 +214,10 @@ def main():
                         help='Optional, analyze only a certain range of injections. Format PART/NUM_PARTS')
     parser.add_argument('--cores', default=1, type=int,
                         help='Parallelize the computation over cores (for pipeline compatibility)')
-    parser.add_argument('--f-low', type=float, default=20.0,
+    parser.add_argument('--f-low', '--low-frequency-cutoff', dest='f_low', type=float, default=20.0,
                         help='Low frequency cutoff for matched filtering (default 20.0 Hz)')
+    parser.add_argument('--f-high', '--high-frequency-cutoff', dest='f_high', type=float, default=None,
+                        help='High frequency cutoff for matched filtering (default 0.9 * nyquist)')
     parser.add_argument('--seg-length', type=float, default=256.0,
                         help='Segment duration in seconds (default 256.0 s)')
     parser.add_argument('--sample-rate', type=float, default=2048.0,
@@ -249,12 +259,16 @@ def main():
     tlen = int(seg_len * sample_rate)
     flen = tlen // 2 + 1
     f_low = opts.f_low
+    f_high = opts.f_high
+    if f_high is None:
+        f_high = 0.9 * (sample_rate / 2.0)
+    logging.info("Frequency cutoffs: f_low=%.1f Hz, f_high=%.1f Hz", f_low, f_high)
 
     logging.info("Loading PSDs for %s", detectors)
     psds = {}
     if opts.time_varying_psds:
         for tvpsd_file in opts.time_varying_psds:
-            tvpsd = TimeVaryingPSD(tvpsd_file, flen, delta_f, f_low)
+            tvpsd = TimeVaryingPSD(tvpsd_file, flen, delta_f, f_low, f_high)
             psds[tvpsd.detector] = tvpsd
 
     logging.info("Initializing frame readers for %s", detectors)
@@ -363,12 +377,11 @@ def main():
             wave_fd = make_frequency_series(wave_ts)
 
             # Deterministic optimal SNR
-            sig = sigma(wave_fd, psd=psd, low_frequency_cutoff=f_low)
+            sig = sigma(wave_fd, psd=psd, low_frequency_cutoff=f_low, high_frequency_cutoff=f_high)
             inj_table['optimal_snr_' + det][idx] = float(sig)
 
             # 3. Add injection to real detector data
-            data_with_inj = data.copy()
-            injections.apply(data_with_inj, det, distance_scale=1.0 / pycbc.DYN_RANGE_FAC, simulation_ids=[sim_id])
+            data_with_inj = data + wave_ts
 
             # 4. Matched filter: shift template merger to t=0 so peak occurs at physical arrival time tc
             try:
@@ -378,7 +391,9 @@ def main():
                 wave_fd_shifted = FrequencySeries(wave_fd.numpy() * phase_shift,
                                                  delta_f=wave_fd.delta_f, epoch=0)
 
-                snr_ts = matched_filter(wave_fd_shifted, data_with_inj, psd=psd, low_frequency_cutoff=f_low, sigmasq=sig**2)
+                snr_ts = matched_filter(wave_fd_shifted, data_with_inj, psd=psd,
+                                        low_frequency_cutoff=f_low, high_frequency_cutoff=f_high,
+                                        sigmasq=sig**2)
                 tc_idx = int(round((tc - float(snr_ts.start_time)) * sample_rate))
                 idx_min = max(0, tc_idx - n_win)
                 idx_max = min(len(snr_ts), tc_idx + n_win)
