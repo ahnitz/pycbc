@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 """ Plot found and missed injections.
 """
 import numpy
@@ -245,15 +245,16 @@ if args.gradient_far:
         c.set_label('False Alarm Rate $(yr^{-1})$, %s' % far_title)
 
         # Set up tick labels - there will be 5 if possible
-        min_tick = numpy.ceil(min(numpy.log10(color)))
-        max_tick = numpy.floor(max(numpy.log10(color)))
-        tick_step = max(1, numpy.floor((max_tick - min_tick) / 5))
-        ticks = numpy.arange(min_tick, max_tick, tick_step)
-        c.set_ticks(numpy.power(10, ticks))
-    except (TypeError, ZeroDivisionError):
-        # Can't make colorbar if no quiet found injections
-        if len(fvals):
-            raise
+        color_pos = color[numpy.isfinite(color) & (color > 0)]
+        if len(color_pos) > 0:
+            min_tick = numpy.ceil(min(numpy.log10(color_pos)))
+            max_tick = numpy.floor(max(numpy.log10(color_pos)))
+            if numpy.isfinite(min_tick) and numpy.isfinite(max_tick) and max_tick > min_tick:
+                tick_step = max(1, numpy.floor((max_tick - min_tick) / 5))
+                ticks = numpy.arange(min_tick, max_tick, tick_step)
+                c.set_ticks(numpy.power(10, ticks))
+    except (TypeError, ZeroDivisionError, ValueError):
+        pass
 
 if args.missed_on_top:
   caption += "Missed injections are shown on top of found injections."

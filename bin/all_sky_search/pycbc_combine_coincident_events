@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 """
 This program combines together a set of STATMAP files from disjoint times.
 The resulting file would contain triggers from the full set of input files

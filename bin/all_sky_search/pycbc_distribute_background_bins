@@ -1,4 +1,4 @@
-#!/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 import argparse, numpy, pycbc.events, logging, pycbc.events, pycbc.io
 
 parser = argparse.ArgumentParser()

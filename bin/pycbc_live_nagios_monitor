@@ -1,4 +1,4 @@
-#!/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 # Monitor the pycbc live process and log files to determine the state
 
 # Future

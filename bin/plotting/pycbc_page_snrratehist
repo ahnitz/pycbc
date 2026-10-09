@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 """ Make SNR vs rate of triggers histogram for foreground coincident events.
     Also has the ability to plot inclusive backgrounds from different stages
     of hierarchical removal.

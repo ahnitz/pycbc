@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 
 
 __prog__ = 'pycbc_randr_by_snr'

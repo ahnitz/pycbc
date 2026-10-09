@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 """ Histogram of templates where injections are found.
 """
 import logging, argparse, numpy as np

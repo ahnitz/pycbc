@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 """ Make a table of found injection information
 """
 import argparse

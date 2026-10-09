@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 """ Make cumulative histogram of foreground coincident events via rate vs
     ranking statistic, or make statistical significance vs ranking statistic
     cumulative histograms. 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 """
 The program combines coincident output files generated
 by pycbc_multiifo_coinc_findtrigs to generated a mapping between SNR and FAP, along

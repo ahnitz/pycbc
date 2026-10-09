@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 
 """Generate a grid of points in the sky to be used by `pycbc_multi_inspiral` to
 find multi-detector gravitational wave triggers and calculate the coherent SNRs

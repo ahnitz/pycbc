@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 """
 Create a workflow for adding compressed waveforms to a template bank
 """

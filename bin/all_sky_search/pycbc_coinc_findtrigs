@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 import copy, argparse, logging, numpy, numpy.random, h5py
 import shutil, uuid, os.path, atexit
 from igwn_segments import infinity

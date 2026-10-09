@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 
 """Fast and simple sky localization for a specific compact binary merger event.
 Runs a single-template matched filter on strain data from a number of detectors

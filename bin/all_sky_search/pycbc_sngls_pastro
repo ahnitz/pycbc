@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 
 """
 This executable is used to get the output of pycbc_multiifo_sngls_findtrigs

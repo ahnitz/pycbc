@@ -1,4 +1,4 @@
-#!/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 """ Calculate total FAR based on statistic ranking for coincidences in times
 with more than one ifo combination available. Cluster to keep foreground
 coincs with the highest stat value.

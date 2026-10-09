@@ -1,4 +1,4 @@
-#!/bin/env python
+#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
 """Rewrite statmap file and rerank candidates using the statistic values
 generated from the followup of candidates.
 """
