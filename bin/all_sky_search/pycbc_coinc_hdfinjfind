@@ -246,7 +246,7 @@ for trigger_file, injection_file in zip(args.trigger_files,
             data = inj_data[k][:]
 
             # set optimal snr to zero for detectors that were vetoed
-            if 'optimal_snr' in k or 'optimal_mf_snr' in k:
+            if 'optimal_snr' in k:
                 ifo = k.split('_')[-1]
                 data[veto_dict[ifo]] = 0
 

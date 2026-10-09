@@ -35,6 +35,15 @@ from pycbc import conversions as conv
 logger = logging.getLogger('pycbc.events.significance')
 
 
+def _empty_n_louder_return(fore_stat):
+    """Return empty background array and matching zero foreground louder counts."""
+    if hasattr(fore_stat, '__len__'):
+        fg_n_louder = np.zeros(len(fore_stat), dtype=float)
+    else:
+        fg_n_louder = 0.0
+    return np.array([], dtype=float), fg_n_louder, {}
+
+
 def count_n_louder(bstat, fstat, dec,
                    **kwargs):  # pylint:disable=unused-argument
     """ Calculate for each foreground event the number of background events
@@ -59,13 +68,7 @@ def count_n_louder(bstat, fstat, dec,
         Ensure we return the same tuple of objects as n_louder_from_fit()
     """
     if len(bstat) == 0:
-        if isinstance(fstat, np.ndarray):
-            fore_n_louder = np.zeros(len(fstat), dtype=float)
-        elif hasattr(fstat, '__len__'):
-            fore_n_louder = np.zeros(len(fstat), dtype=float)
-        else:
-            fore_n_louder = 0.0
-        return np.array([], dtype=float), fore_n_louder, {}
+        return _empty_n_louder_return(fstat)
 
     sort = bstat.argsort()
     bstat = copy.deepcopy(bstat)[sort]
@@ -134,13 +137,7 @@ def n_louder_from_fit(back_stat, fore_stat, dec_facs,
         Information regarding the significance fit
     """
     if len(back_stat) == 0:
-        if isinstance(fore_stat, np.ndarray):
-            fg_n_louder = np.zeros(len(fore_stat), dtype=float)
-        elif hasattr(fore_stat, '__len__'):
-            fg_n_louder = np.zeros(len(fore_stat), dtype=float)
-        else:
-            fg_n_louder = 0.0
-        return np.array([], dtype=float), fg_n_louder, {}
+        return _empty_n_louder_return(fore_stat)
 
     # Calculate the fitting factor of the ranking statistic distribution
     alpha, sig_alpha = trstats.fit_above_thresh(
