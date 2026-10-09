@@ -50,6 +50,8 @@ parser.add_argument('--reduction-method', choices=['min','max','mean','median'],
                     default='mean',
                     help='Method of reducing the ASD data into fewer'
                          ' frequency bins to plot (default %(default)s).')
+parser.add_argument('--high-frequency-cutoff', '--f-high', type=float, default=None,
+                    help='High frequency cutoff for plotting (defaults to 0.9 * Nyquist).')
 
 opts = parser.parse_args()
 pycbc.init_logging(opts.verbose)
@@ -68,30 +70,39 @@ psds = [f[ifo + '/psds/' + str(key)][:] for key in range(len(f[ifo + '/psds']))]
 flow = f.attrs['low_frequency_cutoff']
 kmin = int(flow / df)
 
+f_nyquist = (len(psds[0]) - 1) * df
+if opts.high_frequency_cutoff is not None:
+    fhigh = min(opts.high_frequency_cutoff, f_nyquist)
+else:
+    fhigh = 0.9 * f_nyquist
+kmax = int(fhigh / df)
+
 fac = 1.0 / pycbc.DYN_RANGE_FAC
-freqs = numpy.arange( 0 , len(psds[0]) )[kmin:] * df
+freqs = numpy.arange(kmin, kmax) * df
 start, end = f[ifo + '/start_time'][:], f[ifo + '/end_time'][:]
 
 logging.info('Starting the plot PSD over time')
 
 reduction_function = { 'min' : numpy.min , 'max' : numpy.max , 'mean' : numpy.mean ,
                        'median' : numpy.median  }
-asd_median = numpy.median( psds, axis = 0 )[kmin:] ** 0.5 * fac
+asd_median = numpy.median( [p[kmin:kmax] for p in psds], axis = 0 ) ** 0.5 * fac
 # Select limits for the colorbar
 if opts.normalize:
     asdmin = 0.5
     asdmax = 2
 else:
-    asdmin = min(psds[0][kmin:]) ** 0.5 * fac
+    valid_psds = [p[kmin:kmax] for p in psds]
+    min_val = min(p[numpy.isfinite(p) & (p > 0)].min() for p in valid_psds if len(p[numpy.isfinite(p) & (p > 0)]) > 0)
+    asdmin = min_val ** 0.5 * fac
     asdmax = 1e-20
 
 for psd_segment in range(len(psds)):
     logging.info('Plotting PSD segment number %d', psd_segment)
     time = numpy.array( [ start[psd_segment] , end[psd_segment] ] )
     if opts.normalize:
-        asd = psds[psd_segment][kmin:] ** 0.5 * fac / asd_median
+        asd = psds[psd_segment][kmin:kmax] ** 0.5 * fac / asd_median
     else:
-        asd = psds[psd_segment][kmin:] ** 0.5 * fac
+        asd = psds[psd_segment][kmin:kmax] ** 0.5 * fac
 
     # Get the frequency bins equally spaced in a logarithmic scale and the
     # indices needed for the ASDs

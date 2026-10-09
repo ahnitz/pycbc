@@ -141,6 +141,9 @@ if __name__ == '__main__':
     parser.add_argument('--f-low', type=float, default=30.,
                         help='Start frequency of matched-filter integration '
                              'in Hz (default %(default)s)')
+    parser.add_argument('--f-high', '--high-frequency-cutoff', type=float, default=None,
+                        help='End frequency of matched-filter integration '
+                             'in Hz (defaults to 0.9 * Nyquist)')
     parser.add_argument('--seg-length', type=float, default=256,
                         help='Segment duration in seconds (default %(default)s)')
     parser.add_argument('--sample-rate', type=float, default=16384,
@@ -255,7 +258,11 @@ if __name__ == '__main__':
                 inj.simulation_id,
                 det
             )
-            sval = sigma(wave, psd=psd, low_frequency_cutoff=f_low)
+            f_high = opts.f_high
+            if f_high is None and psd is not None:
+                f_high = 0.9 * ((len(psd) - 1) * psd.delta_f)
+            sval = sigma(wave, psd=psd, low_frequency_cutoff=f_low,
+                         high_frequency_cutoff=f_high)
             if ligolw:
                 setattr(inj, column, sval)
             else:

@@ -26,6 +26,9 @@ parser.add_argument('--low-frequency-cutoff', type=float,
                     help="The low frequency cutoff of the PSD. If not "
                          "provided, will try to retrive it from the "
                          "hdf-group's attrs.")
+parser.add_argument('--high-frequency-cutoff', '--f-high', type=float, default=None,
+                    help="The high frequency cutoff of the PSD. If not "
+                         "provided, defaults to 0.9 * Nyquist.")
 parser.add_argument("--ifos", nargs="+",
                     help="What ifo(s) to plot. If none provided, will use  "
                          "the names of the top-level keys in the psd file(s).")
@@ -56,7 +59,10 @@ ax.grid(which='both', ls='solid', alpha=0.2, lw=0.3)
 ax.set_ylabel('Amplitude Spectral Density (Strain / $\\sqrt{\\rm Hz}$)')
 ax.set_xlabel('Frequency (Hz)')
 
+x_min = None
+x_max = None
 y_min = None
+y_max = None
 
 for psd_file in args.psd_files:
     f = HFile(psd_file, 'r')
@@ -83,8 +89,13 @@ for psd_file in args.psd_files:
                 raise RuntimeError("hdf file %s does not contain an attribute giving "
                                    "low frequency cutoff, please specify a value using "
                                    "the --low-frequency-cutoff option" % psd_file)
+        nyquist = (len(f[ifo + '/psds/' + keys[0]][:]) - 1) * df
+        if args.high_frequency_cutoff is not None:
+            fhigh = min(args.high_frequency_cutoff, nyquist)
+        else:
+            fhigh = 0.9 * nyquist
         kmin = int(flow / df)
-        kmax = len(f[ifo + '/psds/' + keys[0]][:])
+        kmax = int(fhigh / df)
         klen = kmax - kmin
         # Let's try and keep this to 1GB
         num_points = len(keys) * (klen)
@@ -121,11 +132,21 @@ for psd_file in args.psd_files:
             if y_min is None or y_min > m_low:
                 y_min = m_low
 
+        valid_high = high[numpy.isfinite(high) & (high > 0)]
+        if len(valid_high) > 0:
+            m_high = valid_high.max()
+            if y_max is None or y_max < m_high:
+                y_max = m_high
+
+        if x_min is None or flow < x_min:
+            x_min = flow
+        if x_max is None or fhigh > x_max:
+            x_max = fhigh
+
         color = pycbc.results.ifo_color(ifo)
 
         ax.fill_between(samples, low, high, alpha=0.4, linewidth=0, color=color)
         ax.loglog(samples, middle, linewidth=0.3, color=color, label=ifo)
-        ax.set_xlim(flow, samples[-1])
 
 if args.psd_model or args.psd_file or args.asd_file:
     reference_psd = pycbc.psd.from_cli(args, 2048, 1., 10., None)
@@ -133,8 +154,14 @@ if args.psd_model or args.psd_file or args.asd_file:
         ax.loglog(reference_psd.sample_frequencies, reference_psd ** 0.5,
                   '-k', lw=0.3, label='Reference')
 
+if x_min is not None and x_max is not None:
+    ax.set_xlim(x_min, x_max)
+
 if y_min is not None and numpy.isfinite(y_min) and y_min > 0:
-    ax.set_ylim(y_min * 0.5, y_min * 100)
+    if y_max is not None and numpy.isfinite(y_max) and y_max > y_min:
+        ax.set_ylim(y_min * 0.5, max(y_min * 100, y_max * 1.5))
+    else:
+        ax.set_ylim(y_min * 0.5, y_min * 100)
 
 ax.legend(loc='upper right', fontsize='small')
 pycbc.results.save_fig_with_metadata(fig, args.output_file, 

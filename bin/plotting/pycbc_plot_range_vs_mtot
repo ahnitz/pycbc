@@ -29,6 +29,9 @@ parser.add_argument("--max_mtot", nargs="+", type=float,
                     help="Maximum total mass for range")
 parser.add_argument("--d_mtot", nargs="+", type=float,
                     help="Delta total mass for range ")
+parser.add_argument("--high-frequency-cutoff", "--f-high", type=float, default=None,
+                    help="The high frequency cutoff to use for calculating range. "
+                         "If not provided, defaults to 0.9 * Nyquist.")
 parser.add_argument("--approximant", nargs="+",
                     help="approximant to use for range")
 args = parser.parse_args()
@@ -58,6 +61,11 @@ for psd_file in args.psd_files:
         name = ifo + '/psds/' + str(i)
         psd = pycbc.types.load_frequencyseries(psd_file, group=name)
         delta_t = 1.0 / ((len(psd) - 1) * 2 * psd.delta_f)
+        f_nyquist = (len(psd) - 1) * psd.delta_f
+        if args.high_frequency_cutoff is not None:
+            fhigh = min(args.high_frequency_cutoff, f_nyquist)
+        else:
+            fhigh = 0.9 * f_nyquist
         out = pycbc.types.zeros(len(psd), dtype=numpy.complex64)
 
         for mi, mf, dm, apx in zip(args.min_mtot, args.max_mtot, args.d_mtot, args.approximant):
@@ -69,7 +77,8 @@ for psd_file in args.psd_files:
                                      distance = 1.0/pycbc.DYN_RANGE_FAC)
                 htilde = htilde.astype(numpy.complex64)
                 sigma = pycbc.filter.sigma(htilde, psd=psd,
-                                           low_frequency_cutoff=flow)
+                                           low_frequency_cutoff=flow,
+                                           high_frequency_cutoff=fhigh)
                 horizon_distance = sigma / canonical_snr 
                 inspiral_range = horizon_distance / 2.26
 

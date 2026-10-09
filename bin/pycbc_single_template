@@ -32,10 +32,11 @@ from pycbc.types import complex_same_precision_as
 from pycbc.detector import Detector
 import pycbc.waveform.utils
 
-def subtract_template(stilde, template, snr, trigger_time, flow):
+def subtract_template(stilde, template, snr, trigger_time, flow, f_high=None):
     idx = int((trigger_time - snr.start_time) / snr.delta_t)
     if idx >= 0 and idx < len(snr):
-        sig = filter.sigma(template, psd=stilde.psd, low_frequency_cutoff=flow)
+        sig = filter.sigma(template, psd=stilde.psd, low_frequency_cutoff=flow,
+                           high_frequency_cutoff=f_high)
         inverse = template * snr[idx] / sig
         dt = trigger_time - snr.start_time
         stilde -= pycbc.waveform.utils.apply_fseries_time_shift(inverse, dt)
@@ -220,6 +221,12 @@ strain.StrainSegments.verify_segment_options(opt, parser)
 scheme.verify_processing_options(opt, parser)
 fft.verify_fft_options(opt,parser)
 
+if getattr(opt, 'high_frequency_cutoff', None) is None:
+    if getattr(opt, 'sample_rate', None) is not None:
+        opt.high_frequency_cutoff = 0.9 * (float(opt.sample_rate) / 2.0)
+        logging.info("Defaulted high-frequency-cutoff to 0.9 * Nyquist = %.2f Hz",
+                     opt.high_frequency_cutoff)
+
 ctx = scheme.from_cli(opt)
 gwstrain = strain.from_cli(opt, pycbc.DYN_RANGE_FAC)
 strain_segments = strain.StrainSegments.from_cli(opt, gwstrain)
@@ -403,15 +410,18 @@ with ctx:
         logging.info("Filtering segment %s", s_num)
         snr, corr, norm = filter.matched_filter_core(template, stilde,
                                     psd=stilde.psd,
-                                    low_frequency_cutoff=flow)
+                                    low_frequency_cutoff=flow,
+                                    high_frequency_cutoff=opt.high_frequency_cutoff)
         snr *= norm
 
         if opt.subtract_template:
             stilde = subtract_template(stilde, template,
-                                       snr, opt.trigger_time, flow)
+                                       snr, opt.trigger_time, flow,
+                                       f_high=opt.high_frequency_cutoff)
             snr, corr, norm = filter.matched_filter_core(template, stilde,
                                 psd=stilde.psd,
-                                low_frequency_cutoff=flow)
+                                low_frequency_cutoff=flow,
+                                high_frequency_cutoff=opt.high_frequency_cutoff)
 
         if sidx_global is None:
             first_start_time = snr[stilde.analyze].start_time
@@ -438,6 +448,7 @@ with ctx:
             logging.info("calculating chisq")
             chisq, raw_bin = vetoes.power_chisq(template, stilde, chisq_bins, stilde.psd,
                                                 low_frequency_cutoff=flow,
+                                                high_frequency_cutoff=opt.high_frequency_cutoff,
                                                 return_bins=True,
                                                 return_bins_slice=seg_slice)
             chisq /= chisq_bins * 2 - 2
@@ -465,7 +476,8 @@ with ctx:
         raw_bins[i] = None
 
     f['chisq_boundaries'] = numpy.array(vetoes.power_chisq_bins(template, chisq_bins, last_psd,
-                                    low_frequency_cutoff=flow)) * template.delta_f
+                                    low_frequency_cutoff=flow,
+                                    high_frequency_cutoff=opt.high_frequency_cutoff)) * template.delta_f
 
     f['snr'] = numpy.concatenate(snrs)
     f['snr'].attrs['start_time'] = start_time
