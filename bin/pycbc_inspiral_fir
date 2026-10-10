@@ -608,7 +608,10 @@ def process_and_record_triggers(
     td_bank=None,
 ):
     """Filter triggers for analysis boundary, evaluate chisq, and append batch record."""
-    if len(ids_local) > 0 and getattr(stilde, 'analyze', None) is not None:
+    n_in = len(ids_local)
+    surviving_indices = np.arange(n_in)
+
+    if n_in > 0 and getattr(stilde, 'analyze', None) is not None:
         local_shifts_check = shifts[ids_local] if shifts is not None else 0
         phys_t = t_idxs - local_shifts_check
         in_bounds = (phys_t >= stilde.analyze.start) & (phys_t < stilde.analyze.stop)
@@ -617,6 +620,7 @@ def process_and_record_triggers(
             t_idxs = t_idxs[in_bounds]
             snrs = snrs[in_bounds]
             tstarts = tstarts[in_bounds]
+            surviving_indices = surviving_indices[in_bounds]
 
     if len(ids_local) > 0 and renorm_factor is not None:
         local_shifts = shifts[ids_local] if shifts is not None else 0
@@ -636,6 +640,7 @@ def process_and_record_triggers(
                 snrs = snrs[keep]
                 snrs_renorm = snrs_renorm[keep]
                 tstarts = tstarts[keep]
+                surviving_indices = surviving_indices[keep]
 
     n_trig = len(ids_local)
     if n_trig > 0:
@@ -678,6 +683,10 @@ def process_and_record_triggers(
         ifo_trigs = triggers[ifo]
         for col, arr in batch.items():
             ifo_trigs[col].append(arr)
+        return surviving_indices, ids_local, t_idxs, snrs_renorm, chi, chi_dof
+    else:
+        return (np.empty(0, dtype=np.int64), ids_local[:0], t_idxs[:0],
+                snrs_renorm[:0], np.empty(0, dtype=float32), np.empty(0, dtype=np.int32))
 
 
 
@@ -990,7 +999,8 @@ def followup_asym_candidates(
             continue
 
         # Record candidate primary triggers
-        process_and_record_triggers(
+        (cand_sub_idxs, p_ids, p_tidxs, p_snrs,
+         p_chi, p_chidof) = process_and_record_triggers(
             a_ids[cand_indices], a_tidxs[cand_indices],
             a_snrs[cand_indices], a_tstarts[cand_indices],
             segments[ifo_A][s_num], h_norms[ifo_A], coarse_idx, fine_indices,
@@ -1004,6 +1014,24 @@ def followup_asym_candidates(
             autochisq=autochisq,
             td_bank=group_engine.chisq_bank,
         )
+
+        if len(cand_sub_idxs) == 0:
+            continue
+
+        prim_newsnr_thresh = getattr(args, 'asym_primary_newsnr_threshold', None)
+        if prim_newsnr_thresh is None:
+            prim_newsnr_thresh = getattr(args, 'newsnr_threshold', None)
+
+        if prim_newsnr_thresh is not None and prim_newsnr_thresh > 0:
+            rchisq = np.where(p_chidof > 0, p_chi / np.maximum(1, p_chidof), 1.0)
+            p_newsnr = ranking.newsnr(np.abs(p_snrs), rchisq)
+            pass_newsnr = (p_newsnr >= prim_newsnr_thresh)
+            followup_indices = cand_indices[cand_sub_idxs[pass_newsnr]]
+        else:
+            followup_indices = cand_indices[cand_sub_idxs]
+
+        if len(followup_indices) == 0:
+            continue
 
         sr_A = ifo_sample_rates[ifo_A]
         s_start_A = seg_starts[(ifo_A, s_num)]
@@ -1019,7 +1047,7 @@ def followup_asym_candidates(
             t0_B = ifo_gps_starts[ifo_B]
             rf_B = renorm_factors.get(ifo_B) if renorm_factors else None
 
-            for k in cand_indices:
+            for k in followup_indices:
                 cand_lid = a_ids[k]
                 a_tcenter = a_tidxs[k]
                 gps_trig = t0_A + (s_start_A + a_tcenter) / sr_A
@@ -1924,6 +1952,9 @@ def get_args():
                             help="Width in seconds of each bin in the asymmetric window (default 0.1s).")
     asym_group.add_argument("--asym-num-bins", type=int, default=100,
                             help="Number of bins in the asymmetric window (default 100).")
+    asym_group.add_argument("--asym-primary-newsnr-threshold", type=float, default=None,
+                            help="Minimum NewSNR for primary candidate triggers to be followed up "
+                                 "in secondary detectors within asymmetric windows (default: None, falls back to --newsnr-threshold if set).")
 
     # Analysis Options
     parser.add_argument('--output', required=True,
