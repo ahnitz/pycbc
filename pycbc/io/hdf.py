@@ -1580,7 +1580,7 @@ class ReadByTemplate(object):
         return data
 
 
-chisq_choices = ['traditional', 'cont', 'bank', 'max_cont_trad', 'sg',
+chisq_choices = ['traditional', 'cont', 'auto', 'autochi', 'bank', 'max_cont_trad', 'sg',
                  'max_bank_cont', 'max_bank_trad', 'max_bank_cont_trad']
 
 def get_chisq_from_file_choice(hdfile, chisq_choice):
@@ -1600,6 +1600,10 @@ def get_chisq_from_file_choice(hdfile, chisq_choice):
     chisq: numpy.ndarray
         The reduced chi-squared values based on the specified choice.
     """
+    # Normalize aliases
+    if chisq_choice in ['auto', 'autochi']:
+        chisq_choice = 'cont'
+
     # Get the reduced chi-squared values
     if chisq_choice in ['traditional','max_cont_trad', 'max_bank_trad',
                              'max_bank_cont_trad']:

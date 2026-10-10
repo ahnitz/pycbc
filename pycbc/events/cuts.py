@@ -45,7 +45,7 @@ sngl_rank_keys = ranking.sngls_ranking_function_dict.keys()
 trigger_param_choices = list(sngl_rank_keys)
 trigger_param_choices += [cc + '_chisq' for cc in hdf.chisq_choices]
 trigger_param_choices += ['end_time', 'psd_var_val', 'sigmasq',
-                          'sigma_multiple']
+                          'sigma_multiple', 'sngl_ranking', 'sngl-ranking']
 
 template_fit_param_choices = ['fit_by_fit_coeff', 'smoothed_fit_coeff',
                               'fit_by_count_above_thresh',
@@ -264,7 +264,7 @@ def apply_trigger_cuts(triggers, trigger_cut_dict, statistic=None):
         # What kind of parameter is it?
         if parameter.endswith('_chisq'):
             # parameter is a chisq-type thing
-            chisq_choice = parameter.split('_')[0]
+            chisq_choice = parameter.rsplit('_chisq', 1)[0]
             # Currently calculated for all triggers - this seems inefficient
             value = get_chisq_from_file_choice(triggers, chisq_choice)
             # Apply any previous cuts to the value for comparison
@@ -285,6 +285,12 @@ def apply_trigger_cuts(triggers, trigger_cut_dict, statistic=None):
                 err_msg += "triggers in a ReadByTemplate format. This code "
                 err_msg += f"uses a {type(triggers).__name__} format."
                 raise NotImplementedError(err_msg)
+        elif parameter in ['sngl_ranking', 'sngl-ranking']:
+            if statistic is not None and hasattr(statistic, 'get_sngl_ranking'):
+                value = statistic.get_sngl_ranking(triggers)
+            else:
+                value = ranking.get_sngls_ranking_from_trigs(triggers, 'newsnr')
+            value = value[idx_out]
         elif ((not hasattr(triggers, "file") and parameter in triggers)
                 or (hasattr(triggers, "file")
                     and parameter in triggers.file[triggers.ifo])):
