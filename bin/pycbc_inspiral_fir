@@ -434,10 +434,6 @@ class RatioPowerChisq(SingleDetPowerChisq):
             # the analysed span.
             tstart = min(max(t_idx - block_len // 2, 0), len(ref_snr) - block_len)
             dt = t_idx - tstart
-            if td_bank is not None:
-                lo, hi = autochisq.valid_range(td_bank, local_id) if autochisq is not None else _valid_lags(td_bank, local_id)
-                if dt < lo or dt >= hi:
-                    continue
 
             # ref_snr is one middle group's series in one detector's segment;
             # the cache spans all of them for a top template, so the key must
@@ -1355,6 +1351,35 @@ def process_top_template_task(task_args):
                     profile_template=top_template,
                 )
                 local_timers['fine_fir'] += time.perf_counter() - t_fine0
+
+                rf = renorm_factors.get(ifo) if renorm_factors else None
+                if rf is not None and len(ids_local) > 0:
+                    local_shifts = shifts[ids_local] if shifts is not None else 0
+                    phys_t = np.clip(t_idxs - local_shifts, 0, len(rf) - 1)
+                    snrs_eval = snrs * rf[phys_t]
+                else:
+                    snrs_eval = snrs
+
+                cand_indices = select_primary_asym_candidates(
+                    a_ids=ids_local,
+                    a_tidxs=t_idxs,
+                    a_snrs=snrs_eval,
+                    sample_rate=ifo_sample_rates[ifo],
+                    asym_snr_threshold=primary_snr_threshold,
+                    max_primary_per_group_sec=args.asym_max_primary_per_group_sec,
+                    stilde=stilde,
+                    gps_start_time=ifo_gps_cli_starts[ifo],
+                )
+                if len(cand_indices) > 0:
+                    ids_local = ids_local[cand_indices]
+                    t_idxs = t_idxs[cand_indices]
+                    snrs = snrs[cand_indices]
+                    tstarts = tstarts[cand_indices]
+                else:
+                    ids_local = ids_local[:0]
+                    t_idxs = t_idxs[:0]
+                    snrs = snrs[:0]
+                    tstarts = tstarts[:0]
 
                 if not can_asym_seg:
                     process_and_record_triggers(
