@@ -427,7 +427,8 @@ def overwhiten_strain(timeseries, psd=None, f_low=18.0, f_taper=4.0, f_high=None
                       use_overlap_save=True, chunk_len_s=16.0, seg_len=None, seg_stride=None,
                       avg_method='median', model_compact=None, track_nonstationarity=False,
                       subtract_lines=False, line_threshold=3.5, max_lines=64,
-                      inpaint_edges=False, edge_pad_duration=None):
+                      inpaint_edges=False, edge_pad_duration=None,
+                      psd_model=None, psd_model_type='welch'):
     """Convenience driver to overwhiten strain data in a single call.
 
     Parameters
@@ -491,14 +492,50 @@ def overwhiten_strain(timeseries, psd=None, f_low=18.0, f_taper=4.0, f_high=None
         )
 
     if psd is None:
-        if seg_len is None:
-            max_seg = int(round(max_filter_duration * fs))
-            seg_len = max(max_seg, int(round(4.0 * fs)))
-            if seg_len > len(timeseries) // 2:
-                seg_len = max(int(round(4.0 * fs)), len(timeseries) // 4)
-        if seg_stride is None:
-            seg_stride = seg_len // 2
-        psd = pycbc.psd.welch(timeseries, seg_len=seg_len, seg_stride=seg_stride, avg_method=avg_method)
+        if psd_model is not None:
+            if hasattr(psd_model, 'fit') and not hasattr(psd_model, 'psd_static'):
+                psd_model.fit(timeseries, f_low=f_low, f_high=f_high)
+            df = 1.0 / duration
+            flen = int(fs / 2.0 / df) + 1
+            freqs = np.linspace(0, fs / 2.0, flen)
+            psd_vals = psd_model.eval_psd(freqs)
+            psd = FrequencySeries(psd_vals, delta_f=df)
+        elif psd_model_type in ('line-continuum', 'line_continuum', 'bayesline'):
+            from pycbc.psd.estimators import LineContinuumPSDModel
+            model = LineContinuumPSDModel(f_low=f_low, f_high=f_high)
+            model.fit(timeseries, f_low=f_low, f_high=f_high)
+            df = 1.0 / duration
+            flen = int(fs / 2.0 / df) + 1
+            freqs = np.linspace(0, fs / 2.0, flen)
+            psd_vals = model.eval_psd(freqs)
+            psd = FrequencySeries(psd_vals, delta_f=df)
+        elif psd_model_type == 'multitaper':
+            from pycbc.psd.estimators import MultitaperPSDModel
+            model = MultitaperPSDModel(f_low=f_low, f_high=f_high)
+            model.fit(timeseries, f_low=f_low, f_high=f_high)
+            df = 1.0 / duration
+            flen = int(fs / 2.0 / df) + 1
+            freqs = np.linspace(0, fs / 2.0, flen)
+            psd_vals = model.eval_psd(freqs)
+            psd = FrequencySeries(psd_vals, delta_f=df)
+        elif psd_model_type == 'spline':
+            from pycbc.psd.estimators import SplineLinePSDModel
+            model = SplineLinePSDModel(f_low=f_low, f_high=f_high)
+            model.fit(timeseries, f_low=f_low, f_high=f_high)
+            df = 1.0 / duration
+            flen = int(fs / 2.0 / df) + 1
+            freqs = np.linspace(0, fs / 2.0, flen)
+            psd_vals = model.eval_psd(freqs)
+            psd = FrequencySeries(psd_vals, delta_f=df)
+        else:
+            if seg_len is None:
+                max_seg = int(round(max_filter_duration * fs))
+                seg_len = max(max_seg, int(round(4.0 * fs)))
+                if seg_len > len(timeseries) // 2:
+                    seg_len = max(int(round(4.0 * fs)), len(timeseries) // 4)
+            if seg_stride is None:
+                seg_stride = seg_len // 2
+            psd = pycbc.psd.welch(timeseries, seg_len=seg_len, seg_stride=seg_stride, avg_method=avg_method)
 
     if track_nonstationarity and model_compact is None:
         from pycbc.psd.model import CompactInstantaneousPSD

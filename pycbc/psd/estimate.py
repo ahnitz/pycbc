@@ -519,3 +519,109 @@ def estimate_psd_multitaper(timeseries, seg_len=4096, seg_stride=2048, NW=3.0, a
     return FrequencySeries(psd_est, delta_f=delta_f, epoch=timeseries.start_time)
 
 
+# Aliases for consistent naming convention
+multitaper = estimate_psd_multitaper
+trimmed_welch = estimate_psd_trimmed_welch
+
+
+def line_continuum(timeseries, length=None, delta_f=None, f_low=20.0, f_high=None,
+                   n_knots=64, pilot_seg_len_s=16.0, line_snr_threshold=3.5,
+                   max_lines=400, seg_len=None):
+    """Two-component Line-Continuum spectral estimator.
+
+    Decomposes the PSD into an unbiased, shape-preserving PCHIP spline continuum
+    plus a sum of Cauchy-Lorentzian spectral lines with smoothed wings.
+    Guarantees strict continuum lower-bounds and eliminates inverted drops.
+
+    Parameters
+    ----------
+    timeseries : TimeSeries
+        Input PyCBC TimeSeries.
+    length : int, optional
+        Length in frequency samples of output FrequencySeries.
+    delta_f : float, optional
+        Frequency resolution in Hz. If None, defaults to 1.0 / pilot_seg_len_s.
+    f_low : float, optional
+        Lower frequency cutoff in Hz (default: 20.0).
+    f_high : float, optional
+        Upper frequency cutoff in Hz (default: 0.9 * Nyquist).
+    n_knots : int, optional
+        Number of logarithmically-spaced spline knots (default: 64).
+    pilot_seg_len_s : float, optional
+        Duration in seconds of the pilot Welch segments (default: 16.0s).
+    line_snr_threshold : float, optional
+        Threshold ratio over smoothed baseline to detect lines (default: 3.5).
+    max_lines : int, optional
+        Maximum number of lines to model (default: 400).
+    seg_len : int, optional
+        Alternative way to specify pilot segment length in samples.
+
+    Returns
+    -------
+    psd : FrequencySeries
+        Estimated PSD as a PyCBC FrequencySeries.
+    """
+    from pycbc.psd.estimators.line_continuum import LineContinuumPSDModel
+
+    fs = float(timeseries.sample_rate)
+    if seg_len is not None:
+        pilot_seg_len_s = seg_len / fs
+
+    if delta_f is None:
+        delta_f = 1.0 / pilot_seg_len_s
+
+    if length is None:
+        length = int(round((fs / 2.0) / delta_f)) + 1
+
+    model = LineContinuumPSDModel(
+        f_low=f_low,
+        f_high=f_high,
+        n_knots=n_knots,
+        pilot_seg_len_s=pilot_seg_len_s,
+        line_snr_threshold=line_snr_threshold,
+        max_lines=max_lines,
+    )
+    model.fit(timeseries, f_low=f_low, f_high=f_high)
+
+    freq_grid = numpy.arange(length, dtype=numpy.float64) * delta_f
+    psd_vals = model.eval_psd(freq_grid)
+
+    return FrequencySeries(
+        psd_vals,
+        delta_f=delta_f,
+        epoch=timeseries.start_time,
+        dtype=timeseries.dtype,
+    )
+
+
+def estimate_psd(timeseries, method='welch', **kwargs):
+    """Unified entry-point for data-driven PSD estimation.
+
+    Parameters
+    ----------
+    timeseries : TimeSeries
+        PyCBC TimeSeries containing strain data.
+    method : {'welch', 'line_continuum', 'line-continuum', 'multitaper', 'trimmed_welch', 'trimmed-welch'}
+        PSD estimation algorithm to employ (default: 'welch').
+    **kwargs :
+        Additional arguments passed to the specific estimator.
+
+    Returns
+    -------
+    psd : FrequencySeries
+        Estimated PSD.
+    """
+    clean_method = str(method).lower().replace('-', '_')
+    if clean_method == 'welch':
+        return welch(timeseries, **kwargs)
+    elif clean_method in ('line_continuum', 'linecontinuum'):
+        return line_continuum(timeseries, **kwargs)
+    elif clean_method == 'multitaper':
+        return estimate_psd_multitaper(timeseries, **kwargs)
+    elif clean_method in ('trimmed_welch', 'trimmedwelch'):
+        return estimate_psd_trimmed_welch(timeseries, **kwargs)
+    else:
+        raise ValueError(f"Unknown PSD estimation method: {method}")
+
+
+

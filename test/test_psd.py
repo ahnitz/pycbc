@@ -125,9 +125,66 @@ class TestPSD(unittest.TestCase):
                                 msg='seg_len=%d max_len=%d -> rms=%.3f' \
                                 % (seg_len, max_len, err_rms))
 
+    def test_estimate_line_continuum(self):
+        """Test estimating PSD using line_continuum drop-in estimator"""
+        with self.context:
+            psd = pycbc.psd.line_continuum(self.noise, length=self.psd_len,
+                                           delta_f=self.psd_delta_f,
+                                           f_low=self.psd_low_freq_cutoff,
+                                           n_knots=32, pilot_seg_len_s=2.0)
+            self.assertIsInstance(psd, FrequencySeries)
+            self.assertEqual(len(psd), self.psd_len)
+            self.assertAlmostEqual(psd.delta_f, self.psd_delta_f)
+            self.assertFalse(numpy.any(numpy.isnan(psd.numpy())))
+            self.assertFalse(numpy.any(numpy.isinf(psd.numpy())))
+            self.assertTrue(numpy.all(psd.numpy() > 0))
+
+    def test_estimate_multitaper(self):
+        """Test estimating PSD using multitaper estimator"""
+        with self.context:
+            psd = pycbc.psd.multitaper(self.noise, seg_len=2048, seg_stride=1024, NW=2.5)
+            self.assertIsInstance(psd, FrequencySeries)
+            self.assertEqual(len(psd), 2048 // 2 + 1)
+            self.assertFalse(numpy.any(numpy.isnan(psd.numpy())))
+            self.assertFalse(numpy.any(numpy.isinf(psd.numpy())))
+            self.assertTrue(numpy.all(psd.numpy() > 0))
+
+    def test_estimate_psd_dispatcher(self):
+        """Test unified estimate_psd dispatcher"""
+        with self.context:
+            p_welch = pycbc.psd.estimate_psd(self.noise, method='welch', seg_len=2048, seg_stride=1024)
+            self.assertIsInstance(p_welch, FrequencySeries)
+            p_lc = pycbc.psd.estimate_psd(self.noise, method='line_continuum',
+                                          length=self.psd_len, delta_f=self.psd_delta_f,
+                                          f_low=self.psd_low_freq_cutoff, pilot_seg_len_s=2.0)
+            self.assertIsInstance(p_lc, FrequencySeries)
+            p_mt = pycbc.psd.estimate_psd(self.noise, method='multitaper', seg_len=2048, seg_stride=1024)
+            self.assertIsInstance(p_mt, FrequencySeries)
+
+    def test_from_cli_line_continuum(self):
+        """Test CLI integration with --psd-estimation-method line-continuum"""
+        import argparse
+        parser = argparse.ArgumentParser()
+        pycbc.psd.insert_psd_option_group(parser)
+        opts = parser.parse_args([
+            '--psd-estimation', 'median',
+            '--psd-estimation-method', 'line-continuum',
+            '--psd-segment-length', '2.0',
+            '--psd-segment-stride', '1.0'
+        ])
+        with self.context:
+            psd = pycbc.psd.from_cli(opts, length=self.psd_len, delta_f=self.psd_delta_f,
+                                     low_frequency_cutoff=self.psd_low_freq_cutoff,
+                                     strain=self.noise)
+            self.assertIsInstance(psd, FrequencySeries)
+            self.assertEqual(len(psd), self.psd_len)
+            self.assertAlmostEqual(psd.delta_f, self.psd_delta_f)
+            self.assertTrue(numpy.all(psd.numpy() > 0))
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPSD))
 
 if __name__ == '__main__':
     results = unittest.TextTestRunner(verbosity=2).run(suite)
     simple_exit(results)
+
