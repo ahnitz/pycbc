@@ -667,6 +667,13 @@ class SingleDetTriggers(object):
         self.veto_files = [veto_file] if veto_file else []
         self.segment_name = [segment_name] if segment_name else []
 
+    def __contains__(self, key):
+        if hasattr(self, 'trigs') and self.trigs is not None and key in self.trigs:
+            return True
+        if hasattr(self, 'bank') and self.bank is not None and key in self.bank:
+            return True
+        return hasattr(self, key)
+
     def __getitem__(self, key):
         # Is key in the TRIGGER_MERGE file?
         try:
@@ -960,6 +967,18 @@ class SingleDetTriggers(object):
             / (self.get_column('chisq_dof') * 2 - 2)
 
     @property
+    def auto_rchisq(self):
+        if 'cont_chisq' in self.trigs and 'cont_chisq_dof' in self.trigs:
+            return self.get_column('cont_chisq') / np.maximum(1.0, self.get_column('cont_chisq_dof'))
+        elif 'auto_chisq' in self.trigs and 'auto_chisq_dof' in self.trigs:
+            return self.get_column('auto_chisq') / np.maximum(1.0, self.get_column('auto_chisq_dof'))
+        elif 'cont_chisq' in self.trigs:
+            return self.get_column('cont_chisq')
+        elif 'auto_chisq' in self.trigs:
+            return self.get_column('auto_chisq')
+        return None
+
+    @property
     def psd_var_val(self):
         return self.get_column('psd_var_val')
 
@@ -978,6 +997,11 @@ class SingleDetTriggers(object):
     @property
     def newsnr_sgveto_offset125(self):
         return ranking.newsnr_sgveto_offset125(self.snr, self.rchisq, self.sgchisq)
+
+    @property
+    def newsnr_sgveto_autochisq(self):
+        return ranking.newsnr_sgveto_autochisq(self.snr, self.rchisq, self.sgchisq, self.auto_rchisq)
+
 
     @property
     def newsnr_sgveto_psdvar(self):
@@ -1557,6 +1581,11 @@ class ReadByTemplate(object):
         trigger_id = self.keep + \
                          self.file['%s/template_boundaries' % self.ifo][num]
         return trigger_id
+
+    def __contains__(self, col):
+        if not isinstance(col, str):
+            return False
+        return ('%s/%s' % (self.ifo, col)) in self.file
 
     def __getitem__(self, col):
         """ Return the column of data for current active template after

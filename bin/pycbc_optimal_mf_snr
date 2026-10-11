@@ -108,7 +108,8 @@ class FrameBufferReader(object):
         for f in frame_files:
             clean_f = f.replace('file://localhost', '').replace('file://', '')
             base = os.path.basename(clean_f)
-            parts = base.replace('.gwf', '').split('-')
+            base_no_ext = os.path.splitext(base)[0]
+            parts = base_no_ext.split('-')
             try:
                 st = int(parts[-2])
                 dur = int(parts[-1])
@@ -295,7 +296,11 @@ def main():
                     if parts:
                         files.append(parts[-1].replace('file://localhost', '').replace('file://', ''))
         else:
-            cand_files = sorted(glob.glob(f"tests/search_test/frames/*{det}*.gwf"))
+            cand_files = sorted(glob.glob(f"frames/*{det}*.gwf")) + sorted(glob.glob(f"../frames/*{det}*.gwf"))
+            if not cand_files:
+                cand_files = sorted(glob.glob(f"/home/ahnitz/projects/claude/searchdev/bbh_test/frames/*{det}*.gwf"))
+            if not cand_files:
+                cand_files = sorted(glob.glob(f"tests/search_test/frames/*{det}*.gwf"))
             if not cand_files:
                 cand_files = sorted(glob.glob(f"/home/ahnitz/projects/claude/searchdev/tests/search_test/frames/*{det}*.gwf"))
             if cand_files:

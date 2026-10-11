@@ -180,6 +180,12 @@ data[0].append('%i' % sngl_file.get_column('chisq_dof')[0])
 headers.append("&chi;<sup>2</sup><sub>r</sub>")
 headers.append("&chi;<sup>2</sup>&nbsp;bins")
 try:
+    if sngl_file.auto_rchisq is not None:
+        data[0].append('%5.2f' % sngl_file.auto_rchisq[0])
+        headers.append("auto&nbsp;&chi;<sup>2</sup><sub>r</sub>")
+except:
+    pass
+try:
     data[0].append('%5.2f' % sngl_file.sgchisq[0])
     headers.append("sg&chi;<sup>2</sup>")
 except:

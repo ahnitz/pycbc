@@ -152,6 +152,18 @@ if args.output_file.endswith('.html'):
         single_snr = fortrigs.get_snglfile_array_dict('snr')
         single_chisq = fortrigs.get_snglfile_array_dict('chisq')
         single_chisq_dof = fortrigs.get_snglfile_array_dict('chisq_dof')
+        has_auto = False
+        try:
+            single_autochisq = fortrigs.get_snglfile_array_dict('cont_chisq')
+            single_autochisq_dof = fortrigs.get_snglfile_array_dict('cont_chisq_dof')
+            has_auto = True
+        except:
+            try:
+                single_autochisq = fortrigs.get_snglfile_array_dict('auto_chisq')
+                single_autochisq_dof = fortrigs.get_snglfile_array_dict('auto_chisq_dof')
+                has_auto = True
+            except:
+                has_auto = False
 
         for ifo in sorted(single_snr.keys()):
             snrs = []
@@ -171,6 +183,18 @@ if args.output_file.endswith('.html'):
             columns.append(numpy.array(chisqs))
             names.append("%s Red. Chisq" %(ifo))
             format_strings.append("##.##")
+            if has_auto:
+                autochisqs = []
+                for idx in range(len(single_snr[ifo][0])):
+                    if single_snr[ifo][1][idx] and single_autochisq[ifo][1][idx]:
+                        dof = max(1.0, float(single_autochisq_dof[ifo][0][idx]))
+                        r_auto = single_autochisq[ifo][0][idx] / dof
+                        autochisqs.append('%.2f' % r_auto)
+                    else:
+                        autochisqs.append(' ')
+                columns.append(numpy.array(autochisqs))
+                names.append("%s Auto Chisq" % ifo)
+                format_strings.append("##.##")
 
     logging.info('Making table of foreground triggers')
     html_table = pycbc.results.html_table(columns, names,

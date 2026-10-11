@@ -75,6 +75,10 @@ else:
             ids_ifo = np.array(ids[ifo], dtype=int)
             snr_vals = np.full(len(ids_ifo), np.nan)
             chisq_vals = np.full(len(ids_ifo), np.nan)
+            auto_vals = np.full(len(ids_ifo), np.nan)
+            auto_key = 'cont_chisq' if 'cont_chisq' in f else ('auto_chisq' if 'auto_chisq' in f else None)
+            dof_key = 'cont_chisq_dof' if 'cont_chisq_dof' in f else ('auto_chisq_dof' if 'auto_chisq_dof' in f else None)
+
             if len(ids_ifo) > 0 and len(f['snr']) > 0:
                 valid = (ids_ifo >= 0) & (ids_ifo < len(f['snr']))
                 if valid.any():
@@ -83,6 +87,10 @@ else:
                     chisq_raw = f['chisq'][:][valid_ids]
                     chisq_dof = f['chisq_dof'][:][valid_ids]
                     chisq_vals[valid] = chisq_raw / (2 * chisq_dof - 2)
+                    if auto_key is not None:
+                        raw_auto = f[auto_key][:][valid_ids]
+                        dof_auto = f[dof_key][:][valid_ids] if dof_key in f else 1.0
+                        auto_vals[valid] = raw_auto / np.maximum(1.0, dof_auto)
             newsnr_vals = pycbc.events.ranking.newsnr(snr_vals, chisq_vals)
             snr = ['%.2f' % s if not np.isnan(s) else ' ' for s in snr_vals]
             chisq = ['%.2f' % c if not np.isnan(c) else ' ' for c in chisq_vals]
@@ -91,6 +99,11 @@ else:
             found_names += [ifo + " SNR", ifo + " CHISQ", ifo + " NewSNR"]
             found_cols += [snr, chisq, newsnr]
             found_formats += ['##.##', '##.##', '##.##']
+            if auto_key is not None:
+                autochisq = ['%.2f' % a if not np.isnan(a) else ' ' for a in auto_vals]
+                found_names += [ifo + " Auto CHISQ"]
+                found_cols += [autochisq]
+                found_formats += ['##.##']
 
 eff_dist = {'eff_dist_%s' % i[0].lower() : 'Eff Dist (%s)' % i for i in ifos}
 
