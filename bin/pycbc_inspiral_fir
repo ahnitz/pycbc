@@ -347,6 +347,15 @@ class RatioPowerChisq(SingleDetPowerChisq):
         self.coarse_w_cache.clear()
         self.ref_f_cache.clear()
 
+    def begin_group(self):
+        """Release the block spectra of the previous (segment, middle group) pass.
+
+        They are keyed by segment and group, so none is read again once the pass
+        ends; kept to the end of the top template they grew with every trigger
+        (8 GB in a busy one).
+        """
+        self.ref_f_cache.clear()
+
     def coarse_weight(self, stilde, coarse_idx, block_len):
         """(psd key, whitened top x upper spectrum of a middle group) on a block's
         frequency grid: (top_dec * upper_f) / sqrt(psd), None without a top template."""
@@ -567,7 +576,11 @@ class RatioAutoChisq(SingleDetAutoChisq):
             power = np.zeros(N)
             power[band] = np.abs(coarse_w[band] * np.conj(filters_f[local_id][band])) ** 2
             autocor = np.fft.ifft(power)
-            self.autocors[key] = autocor / autocor[0]
+            # Only lags within +-reach are read (autochisq_from_precomputed indexes
+            # [-reach, reach]); keep those, in the same wrapped positions, not all N.
+            reach = self.stride * self.num_points
+            lags = np.r_[0:reach + 1, N - reach:N]
+            self.autocors[key] = autocor[lags] / autocor[0]
         return self.autocors[key]
 
     def value(self, stilde, coarse_idx, ref_snr, filters_f, local_id, t, rescale, td_bank):
@@ -1361,6 +1374,7 @@ def process_top_template_task(task_args):
             coarse_idx, counts, fine_indices, group_engine, filters_f, shifts, local_arange = g_entry
             if kept is not None and coarse_idx not in kept:
                 continue
+            power_chisq.begin_group()
             std_trigs = {}
             h_norms = {ifo: norms[ifo] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
 
