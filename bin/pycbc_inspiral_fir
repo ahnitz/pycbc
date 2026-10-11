@@ -12,7 +12,6 @@ import os
 import re
 import sys
 import time
-import weakref
 
 import h5py
 import numpy as np
@@ -289,7 +288,7 @@ def chisq_middle_spectra(taps, counts, ids, block_length):
     decimating by an integer gives its exact DTFT samples on the chisq grid; in the
     convention of TimeDomainFilterBank.filters_f (conjugate, centre tap at lag 0).
     """
-    from matchedfilter import taps_to_spectra
+    from matchedfilter import template_spectra
     counts = np.asarray(counts, dtype=np.int64)
     taps = np.asarray(taps, dtype=np.float32)
     ns = np.array([max(int(block_length), 1 << int(np.ceil(np.log2(int(c) + 1)))) for c in counts])
@@ -297,23 +296,10 @@ def chisq_middle_spectra(taps, counts, ids, block_length):
     for n in np.unique(ns):
         rows = np.flatnonzero(ns == n)
         m = int(counts[rows].max())
-        spec = taps_to_spectra(taps[rows, :m], counts[rows], int(n), max_taps=m)
+        spec, _ = template_spectra(taps[rows, :m], counts[rows], int(n))
         for r, row in enumerate(rows):
-            out[int(ids[row])] = np.conj(spec[r])
+            out[int(ids[row])] = spec[r]
     return out
-
-
-_VALID_LAGS = weakref.WeakKeyDictionary()
-
-
-def _valid_lags(td_bank, local_id):
-    """[start, stop) of the valid lags of a template's block in a TimeDomainFilterBank."""
-    lags = _VALID_LAGS.get(td_bank)
-    if lags is None:
-        lags = _VALID_LAGS[td_bank] = {
-            int(i): (g['c_bad'], g['c_bad'] + g['n_valid'])
-            for g in td_bank.groups for i in g['template_indices']}
-    return lags[int(local_id)]
 
 
 class RatioPowerChisq(SingleDetPowerChisq):
@@ -395,7 +381,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
         return psd_key, self.coarse_w_cache[coarse_key]
 
     def compute(self, ids_local, t_idxs, snrs, fine_indices, tstarts, stilde, bank, ref_snr, filters_f, coarse_idx, args, snr_amp=None,
-                autochisq=None, td_bank=None):
+                autochisq=None, chisq_valid=None):
         global_ids = fine_indices[ids_local]
         if snr_amp is None:
             snr_amp = abs(snrs)
@@ -515,7 +501,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
             chisq_dof_vals[update_mask] = 2 * p - 2
             if autochisq is not None:
                 auto = autochisq.value(stilde, coarse_idx, ref_snr, filters_f, local_id,
-                                       t_idx, rescale, td_bank)
+                                       t_idx, rescale, chisq_valid)
                 if auto is not None:
                     auto_vals[update_mask] = auto
             assigned_mask[update_mask] = True
@@ -564,9 +550,9 @@ class RatioAutoChisq(SingleDetAutoChisq):
     def clear(self):
         self.autocors.clear()
 
-    def valid_range(self, td_bank, local_id):
-        """[start, stop) of the valid samples in a block of the template's library group."""
-        return _valid_lags(td_bank, local_id)
+    def valid_range(self, chisq_valid, local_id):
+        """[start, stop) of the template's valid lags in its chisq block."""
+        return chisq_valid[local_id]
 
     def autocorrelation(self, stilde, coarse_idx, local_id, filters_f, band):
         N = len(filters_f[local_id])
@@ -583,13 +569,13 @@ class RatioAutoChisq(SingleDetAutoChisq):
             self.autocors[key] = autocor[lags] / autocor[0]
         return self.autocors[key]
 
-    def value(self, stilde, coarse_idx, ref_snr, filters_f, local_id, t, rescale, td_bank):
+    def value(self, stilde, coarse_idx, ref_snr, filters_f, local_id, t, rescale, chisq_valid):
         """Auto-chisq of one trigger, or None if its lags would leave the series."""
         t0 = time.perf_counter()
         reach = self.stride * self.num_points
         N = len(filters_f[local_id])
         start = min(max(int(t) - N // 2, 0), len(ref_snr) - N)
-        valid_start, valid_stop = self.valid_range(td_bank, local_id)
+        valid_start, valid_stop = self.valid_range(chisq_valid, local_id)
         if t - reach - start < valid_start or t + reach - start >= valid_stop:
             return None
         df = self.power_chisq.sample_rate / N
@@ -618,7 +604,7 @@ def process_and_record_triggers(
     renorm_factor=None,
     primary_snr_threshold=6.0,
     autochisq=None,
-    td_bank=None,
+    chisq_valid=None,
 ):
     """Filter triggers for analysis boundary, evaluate chisq, and append batch record."""
     n_in = len(ids_local)
@@ -666,7 +652,7 @@ def process_and_record_triggers(
                 fine_indices, tstarts, stilde, bank,
                 ref_snr, filters_f, coarse_idx, args,
                 snr_amp=abs(snrs_renorm),
-                autochisq=autochisq if auto_on else None, td_bank=td_bank)
+                autochisq=autochisq if auto_on else None, chisq_valid=chisq_valid)
             auto_dur = autochisq.elapsed - auto0 if auto_on else 0.0
             chi_dur = time.perf_counter() - t_chi0
             t_clock = timers if timers is not None else TIMERS
@@ -1025,7 +1011,7 @@ def followup_asym_candidates(
             renorm_factor=rf_A,
             primary_snr_threshold=primary_snr_threshold,
             autochisq=autochisq,
-            td_bank=group_engine.chisq_bank,
+            chisq_valid=group_engine.chisq_valid,
         )
 
         if len(cand_sub_idxs) == 0:
@@ -1121,7 +1107,7 @@ def followup_asym_candidates(
                     renorm_factor=rf_B,
                     primary_snr_threshold=args.asym_secondary_snr_threshold,
                     autochisq=autochisq,
-                    td_bank=group_engine.chisq_bank,
+                    chisq_valid=group_engine.chisq_valid,
                 )
 
 
@@ -1435,7 +1421,7 @@ def process_top_template_task(task_args):
                         renorm_factor=renorm_factors.get(ifo),
                         primary_snr_threshold=primary_snr_threshold,
                         autochisq=autochisq,
-                        td_bank=group_engine.chisq_bank,
+                        chisq_valid=group_engine.chisq_valid,
                     )
                 else:
                     std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)

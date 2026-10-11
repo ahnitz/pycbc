@@ -139,25 +139,24 @@ class MatchedFilterRatioControl(object):
         of the statistic.
         """
         n = int(block_length)
-        bank = _mf.TimeDomainFilterBank(
-            fir_taps, tap_counts=np.asarray(tap_counts, dtype=np.int64),
-            tap_sample_rate=self.tap_sr, data_sample_rate=self.engine_sr,
-            engine='matchedfilter', fft_lengths=[n])
-        for g in bank.groups:
-            centre = n // 2
-            lo, hi = g['c_bad'], g['c_bad'] + g['n_valid']
-            if g['n'] != n or centre - reach < lo or centre + reach >= hi:
-                raise ValueError(
-                    "--chisq-block-length %d is too short for this template group: its "
-                    "longest ratio filter needs valid lags [%d, %d) around the block centre "
-                    "+-%d" % (n, lo, hi, reach))
-        self._chisq_bank = bank
-        return bank.filters_f
+        filters, valid = _mf.template_spectra(
+            fir_taps, tap_counts, n,
+            tap_sample_rate=self.tap_sr, data_sample_rate=self.engine_sr)
+        centre = n // 2
+        short = np.flatnonzero((centre - reach < valid[:, 0]) | (centre + reach >= valid[:, 1]))
+        if len(short):
+            lo, hi = valid[short[0]]
+            raise ValueError(
+                "--chisq-block-length %d is too short for this template group: a "
+                "ratio filter has valid lags [%d, %d), not the block centre "
+                "+-%d" % (n, lo, hi, reach))
+        self._chisq_valid = valid
+        return filters
 
     @property
-    def chisq_bank(self):
-        """The flat bank holding the chisq spectra (block layout and valid margins)."""
-        return self._chisq_bank
+    def chisq_valid(self):
+        """(T, 2) [start, stop) of each chisq filter's valid lags in its block."""
+        return self._chisq_valid
 
     def process_segment(self, stilde, psd, ref_template, filters_f, n_taps, indices,
                         valid_slice=None, reference_series=None,
