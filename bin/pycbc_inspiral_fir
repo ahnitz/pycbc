@@ -1020,14 +1020,24 @@ def followup_asym_candidates(
         prim_newsnr_thresh = getattr(args, 'asym_primary_newsnr_threshold', None)
         if prim_newsnr_thresh is None:
             prim_newsnr_thresh = getattr(args, 'newsnr_threshold', None)
+        if prim_newsnr_thresh is None:
+            prim_newsnr_thresh = primary_snr_threshold
+
+        max_rchisq = getattr(args, 'asym_primary_max_rchisq', 5.0)
+        if max_rchisq is not None and max_rchisq <= 0:
+            max_rchisq = None
+
+        rchisq = np.where(p_chidof > 0, p_chi / np.maximum(1, p_chidof), 1.0)
+        pass_gate = np.ones(len(p_snrs), dtype=bool)
 
         if prim_newsnr_thresh is not None and prim_newsnr_thresh > 0:
-            rchisq = np.where(p_chidof > 0, p_chi / np.maximum(1, p_chidof), 1.0)
             p_newsnr = ranking.newsnr(np.abs(p_snrs), rchisq)
-            pass_newsnr = (p_newsnr >= prim_newsnr_thresh)
-            followup_indices = cand_indices[cand_sub_idxs[pass_newsnr]]
-        else:
-            followup_indices = cand_indices[cand_sub_idxs]
+            pass_gate &= (p_newsnr >= prim_newsnr_thresh)
+
+        if max_rchisq is not None:
+            pass_gate &= (rchisq <= max_rchisq)
+
+        followup_indices = cand_indices[cand_sub_idxs[pass_gate]]
 
         if len(followup_indices) == 0:
             continue
@@ -1958,7 +1968,11 @@ def get_args():
                             help="Number of bins in the asymmetric window (default 100).")
     asym_group.add_argument("--asym-primary-newsnr-threshold", type=float, default=None,
                             help="Minimum NewSNR for primary candidate triggers to be followed up "
-                                 "in secondary detectors within asymmetric windows (default: None, falls back to --newsnr-threshold if set).")
+                                 "in secondary detectors within asymmetric windows "
+                                 "(default: None, falls back to --newsnr-threshold or primary SNR threshold).")
+    asym_group.add_argument("--asym-primary-max-rchisq", type=float, default=5.0,
+                            help="Maximum reduced chi-squared for primary candidate triggers to be followed up "
+                                 "in secondary detectors within asymmetric windows (default: 5.0, set 0 to disable).")
 
     # Analysis Options
     parser.add_argument('--output', required=True,
