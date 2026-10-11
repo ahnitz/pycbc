@@ -34,10 +34,11 @@ class LineContinuumPSDModel(BasePSDModel):
     """
 
     def __init__(self, f_low=20.0, f_high=None, n_knots=64, pilot_seg_len_s=16.0,
-                 line_snr_threshold=3.5, max_lines=400):
+                 pilot_seg_stride_s=None, line_snr_threshold=3.5, max_lines=400):
         super().__init__(f_low=f_low, f_high=f_high)
         self.n_knots = int(n_knots)
         self.pilot_seg_len_s = float(pilot_seg_len_s)
+        self.pilot_seg_stride_s = float(pilot_seg_stride_s) if pilot_seg_stride_s is not None else None
         self.line_snr_threshold = float(line_snr_threshold)
         self.max_lines = int(max_lines)
 
@@ -59,14 +60,19 @@ class LineContinuumPSDModel(BasePSDModel):
         self.t_start = float(timeseries.start_time)
         self.t_end = float(timeseries.end_time)
 
-        # 1. Pilot high-resolution Welch spectrum (16s segments, 50% overlap)
+        # 1. Pilot high-resolution Welch spectrum (e.g. 16s segments, 50% overlap)
         seg_len_samples = int(round(self.pilot_seg_len_s * self.fs))
         seg_len_samples = min(seg_len_samples, len(timeseries) // 2)
         if seg_len_samples <= 0:
             seg_len_samples = len(timeseries)
 
+        if self.pilot_seg_stride_s is not None:
+            seg_stride_samples = int(round(self.pilot_seg_stride_s * self.fs))
+        else:
+            seg_stride_samples = max(1, seg_len_samples // 2)
+
         pilot_fs = pycbc.psd.welch(
-            timeseries, seg_len=seg_len_samples, seg_stride=max(1, seg_len_samples // 2),
+            timeseries, seg_len=seg_len_samples, seg_stride=seg_stride_samples,
             avg_method='median'
         )
         self.pilot_psd = pilot_fs

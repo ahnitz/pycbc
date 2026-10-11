@@ -133,12 +133,14 @@ def from_cli(opt, length, delta_f, low_frequency_cutoff,
         clean_method = str(method).lower().replace('_', '-')
         if clean_method == 'line-continuum':
             pilot_seg_len_s = opt.psd_segment_length if opt.psd_segment_length else 16.0
+            pilot_seg_stride_s = opt.psd_segment_stride if opt.psd_segment_stride else (pilot_seg_len_s / 2.0)
             n_knots = getattr(opt, 'psd_line_continuum_knots', 64) or 64
             line_thresh = getattr(opt, 'psd_line_continuum_threshold', 3.5) or 3.5
             psd = line_continuum(strain, length=length, delta_f=delta_f,
                                  f_low=f_low, f_high=f_high,
                                  n_knots=n_knots,
                                  pilot_seg_len_s=pilot_seg_len_s,
+                                 pilot_seg_stride_s=pilot_seg_stride_s,
                                  line_snr_threshold=line_thresh)
         elif clean_method == 'multitaper':
             nw = getattr(opt, 'psd_multitaper_nw', 3.0) or 3.0

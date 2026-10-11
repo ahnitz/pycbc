@@ -525,8 +525,8 @@ trimmed_welch = estimate_psd_trimmed_welch
 
 
 def line_continuum(timeseries, length=None, delta_f=None, f_low=20.0, f_high=None,
-                   n_knots=64, pilot_seg_len_s=16.0, line_snr_threshold=3.5,
-                   max_lines=400, seg_len=None):
+                   n_knots=64, pilot_seg_len_s=16.0, pilot_seg_stride_s=None,
+                   line_snr_threshold=3.5, max_lines=400, seg_len=None, seg_stride=None):
     """Two-component Line-Continuum spectral estimator.
 
     Decomposes the PSD into an unbiased, shape-preserving PCHIP spline continuum
@@ -549,12 +549,16 @@ def line_continuum(timeseries, length=None, delta_f=None, f_low=20.0, f_high=Non
         Number of logarithmically-spaced spline knots (default: 64).
     pilot_seg_len_s : float, optional
         Duration in seconds of the pilot Welch segments (default: 16.0s).
+    pilot_seg_stride_s : float, optional
+        Stride in seconds between consecutive pilot segments.
     line_snr_threshold : float, optional
         Threshold ratio over smoothed baseline to detect lines (default: 3.5).
     max_lines : int, optional
         Maximum number of lines to model (default: 400).
     seg_len : int, optional
         Alternative way to specify pilot segment length in samples.
+    seg_stride : int, optional
+        Alternative way to specify pilot segment stride in samples.
 
     Returns
     -------
@@ -566,6 +570,8 @@ def line_continuum(timeseries, length=None, delta_f=None, f_low=20.0, f_high=Non
     fs = float(timeseries.sample_rate)
     if seg_len is not None:
         pilot_seg_len_s = seg_len / fs
+    if seg_stride is not None:
+        pilot_seg_stride_s = seg_stride / fs
 
     if delta_f is None:
         delta_f = 1.0 / pilot_seg_len_s
@@ -578,6 +584,7 @@ def line_continuum(timeseries, length=None, delta_f=None, f_low=20.0, f_high=Non
         f_high=f_high,
         n_knots=n_knots,
         pilot_seg_len_s=pilot_seg_len_s,
+        pilot_seg_stride_s=pilot_seg_stride_s,
         line_snr_threshold=line_snr_threshold,
         max_lines=max_lines,
     )
