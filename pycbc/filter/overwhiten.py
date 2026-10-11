@@ -502,7 +502,9 @@ def overwhiten_strain(timeseries, psd=None, f_low=18.0, f_taper=4.0, f_high=None
             psd = FrequencySeries(psd_vals, delta_f=df)
         elif psd_model_type in ('line-continuum', 'line_continuum', 'bayesline'):
             from pycbc.psd.estimators import LineContinuumPSDModel
-            model = LineContinuumPSDModel(f_low=f_low, f_high=f_high)
+            p_len = seg_len / fs if seg_len is not None else 16.0
+            p_stride = seg_stride / fs if seg_stride is not None else None
+            model = LineContinuumPSDModel(f_low=f_low, f_high=f_high, pilot_seg_len_s=p_len, pilot_seg_stride_s=p_stride)
             model.fit(timeseries, f_low=f_low, f_high=f_high)
             df = 1.0 / duration
             flen = int(fs / 2.0 / df) + 1

@@ -1568,6 +1568,7 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
                 ifo_strain.gating_info = orig_gating
             logging.info("Subtracted %d coherent lines in %s", len(sub_lines), ifo)
 
+        single_det_opt = pycbc.types.optparse.copy_opts_for_single_ifo(args, ifo)
         if getattr(args, 'overwhiten_strain', False):
             logging.info("Applying continuous overwhitening for %s...", ifo)
             from pycbc.filter.overwhiten import overwhiten_strain
@@ -1576,11 +1577,14 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
             f_low_ow = getattr(args, 'overwhiten_f_low', 18.0)
             max_dur_ow = getattr(args, 'overwhiten_max_filter_duration', 4.0)
             inpaint_ow = getattr(args, 'inpaint_edges', False)
+            ow_psd_model = getattr(single_det_opt, 'overwhiten_psd_model', None)
+            if ow_psd_model is None:
+                ow_psd_model = getattr(single_det_opt, 'psd_estimation_method', None) or getattr(single_det_opt, 'psd_estimation', 'welch')
             ifo_strain, _, _ = overwhiten_strain(
                 ifo_strain, f_low=f_low_ow, max_filter_duration=max_dur_ow,
                 f_high=getattr(args, 'high_frequency_cutoff', None),
                 inpaint_edges=inpaint_ow,
-                psd_model_type=getattr(args, 'overwhiten_psd_model', 'welch')
+                psd_model_type=ow_psd_model
             )
             ifo_strain = ifo_strain.astype(np.float32)
             ifo_strain._is_overwhitened = True
@@ -1591,7 +1595,6 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
             logging.info("Overwhitening completed for %s", ifo)
 
         logging.info("Making frequency-domain data segments and associating PSDs for %s...", ifo)
-        single_det_opt = pycbc.types.optparse.copy_opts_for_single_ifo(args, ifo)
         ifo_segments = pycbc.strain.StrainSegments.from_cli_single_ifo(args, ifo_strain, ifo)
 
         if count == 0:
@@ -2010,9 +2013,9 @@ def get_args():
                           help="Low-frequency cutoff in Hz for continuous overwhitening filter (default: 18.0).")
     ow_group.add_argument("--overwhiten-max-filter-duration", type=float, default=4.0,
                           help="Maximum filter duration in seconds for overwhitening filter (default: 4.0).")
-    ow_group.add_argument("--overwhiten-psd-model", type=str, default="welch",
+    ow_group.add_argument("--overwhiten-psd-model", type=str, default=None,
                           choices=["welch", "line-continuum", "line_continuum", "bayesline", "multitaper", "spline"],
-                          help="PSD estimation method for overwhitening: 'welch' (baseline), 'line-continuum' (Line-Continuum PCHIP spline + Lorentzian lines), 'multitaper' (Thomson multitaper), or 'spline' (default: welch).")
+                          help="PSD estimation method for overwhitening: 'welch' (baseline), 'line-continuum' (Line-Continuum PCHIP spline + Lorentzian lines), 'multitaper' (Thomson multitaper), or 'spline' (default: None, inherits --psd-estimation-method).")
     ow_group.add_argument("--subtract-lines", action="store_true", default=False,
                           help="Enable coherent line subtraction before filtering.")
 

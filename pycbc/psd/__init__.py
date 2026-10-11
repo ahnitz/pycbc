@@ -126,7 +126,7 @@ def from_cli(opt, length, delta_f, low_frequency_cutoff,
 
     elif psd_estimation:
         # estimate PSD from data
-        method = getattr(opt, 'psd_estimation_method', 'welch')
+        method = getattr(opt, 'psd_estimation_method', None) or 'welch'
         if opt.psd_estimation in ('line-continuum', 'line_continuum', 'multitaper', 'trimmed-welch', 'trimmed_welch'):
             method = opt.psd_estimation
 
