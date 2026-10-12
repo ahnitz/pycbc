@@ -499,7 +499,9 @@ class RatioPowerChisq(SingleDetPowerChisq):
             update_mask = same_tmpl_window & (~assigned_mask) & (snr_amp >= cthresh)
             chisq_vals[update_mask] = float(chi_val)
             chisq_dof_vals[update_mask] = 2 * p - 2
-            if autochisq is not None:
+            max_rchi = getattr(args, 'autochi_max_rchisq', getattr(args, 'autochisq_max_rchisq', 5.0))
+            rchi_val = chi_val / (2 * p - 2) if p > 1 else chi_val
+            if autochisq is not None and (max_rchi is None or rchi_val <= max_rchi):
                 auto = autochisq.value(stilde, coarse_idx, ref_snr, filters_f, local_id,
                                        t_idx, rescale, chisq_valid)
                 if auto is not None:
@@ -1222,11 +1224,16 @@ def process_top_template_task(task_args):
         taps, counts, fine_indices, shifts = bank.get_firs(coarse_idx, return_shifts=True)
         if len(fine_indices) == 0:
             continue
+        fine_rescales = np.asarray(
+            bank.snr_rescale(fine_indices, method=args.template_normalization_method),
+            dtype=taps.dtype
+        )
+        scaled_taps = np.ascontiguousarray(taps * (1.0 / fine_rescales[:, None]), dtype=taps.dtype)
         group_engine = MatchedFilterRatioControl(
             snr_threshold=primary_snr_threshold,
             delta_f=delta_f,
             high_frequency_cutoff=args.high_frequency_cutoff,
-                tap_sample_rate=bank.sample_rate,
+            tap_sample_rate=bank.sample_rate,
             engine_sample_rate=sample_rate,
             engine=args.ratio_filter_engine,
             false_dismissal=args.ratio_filter_false_dismissal,
@@ -1235,7 +1242,7 @@ def process_top_template_task(task_args):
             peak_window=args.cluster_window,
         )
         t_fp0 = time.perf_counter()
-        group_engine.prepare_filters(taps, counts)
+        group_engine.prepare_filters(scaled_taps, counts)
         # The chisq has its own block (--chisq-block-length), centred on each trigger:
         # independent of how matchedfilter blocks the series for filtering.
         reach = args.autochi_stride * args.autochi_number_points if args.autochi_stride > 0 else 0
@@ -1768,13 +1775,11 @@ def ingest_ifo_triggers(
     if args.template_normalization_method == 'precalculated_sigma':
         if not hasattr(bank, 'sigma_snr_rescale'):
             bank.setup_sigma_norm()
-        snr_rescale = bank.sigma_snr_rescale[data['template_id']]
         sigmasq_rescale = bank.sigma_sigma_rescale[data['template_id']] ** 2.0
     else:
-        snr_rescale = bank.snr_rescale(data['template_id'], method=args.template_normalization_method)
         sigmasq_rescale = bank.sigma_rescale(data['template_id'], method=args.template_normalization_method) ** 2.0
 
-    data['snr'] = (data['snr'] / snr_rescale).astype(complex64)
+    # data['snr'] is already true SNR via scaled_taps in prepare_filters
     data['sigmasq'] = (data['sigmasq'] * sigmasq_rescale).astype(float32)
 
     if sg_chisq.do:
@@ -2073,6 +2078,10 @@ def get_args():
                         help="If using --autochi-max-valued this value denotes the "
                              "pre-calculated mean value that will be stored as the "
                              "auto-chisq degrees-of-freedom value.")
+    parser.add_argument("--autochi-max-rchisq", type=float, default=5.0,
+                        help="Maximum reduced power chisq for which auto-chisq is evaluated "
+                             "(default: 5.0). Triggers with reduced power chisq exceeding this "
+                             "threshold bypass auto-chisq.")
     parser.add_argument("--chisq-iterations", type=int, default=100)
     parser.add_argument("--chisq-delta", type=float, default=0,
                         help="SNR-dependent term added to the chisq dof before applying --chisq-threshold.")
