@@ -391,12 +391,13 @@ class RatioPowerChisq(SingleDetPowerChisq):
         chisq_dof_vals = np.full(num_trigs, 2 * num_b - 2, dtype=np.int32)
         # auto-chisq, when on, follows the same rules; others keep its dof (reduced value 1)
         auto_vals = np.full(num_trigs, autochisq.dof, dtype=float32) if autochisq is not None else None
+        fpeak_vals = np.zeros(num_trigs, dtype=float32)
         assigned_mask = np.zeros(num_trigs, dtype=bool)
 
         cthresh = self.snr_threshold
         above_thresh = np.flatnonzero(snr_amp >= cthresh)
         if len(above_thresh) == 0:
-            return chisq_vals, chisq_dof_vals, auto_vals
+            return chisq_vals, chisq_dof_vals, auto_vals, fpeak_vals
 
         sort_order = np.argsort(snr_amp)[::-1]
 
@@ -479,12 +480,14 @@ class RatioPowerChisq(SingleDetPowerChisq):
                 inv_wb = (tot_wb / raw_wb).astype(np.float32)
                 k_freqs = np.arange(bins[0], bins[-1], dtype=np.float32)
                 bin_starts = bins[:-1] - bins[0]
-                self.bins_cache[bins_key] = (bins, p, inv_wb, k_freqs, bin_starts)
+                fstep = float(bins[-2] - bins[-3]) * df
+                fpeak = float(bins[-2]) * df + fstep
+                self.bins_cache[bins_key] = (bins, p, inv_wb, k_freqs, bin_starts, fpeak)
 
             cached = self.bins_cache.get(bins_key)
             if cached is None:
                 continue
-            bins, p, inv_wb, k_freqs, bin_starts = cached
+            bins, p, inv_wb, k_freqs, bin_starts, fpeak = cached
 
             ratio = filters_f[local_id]
             corr = (ratio * ref_f) / (rescale * block_len)
@@ -499,6 +502,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
             update_mask = same_tmpl_window & (~assigned_mask) & (snr_amp >= cthresh)
             chisq_vals[update_mask] = float(chi_val)
             chisq_dof_vals[update_mask] = 2 * p - 2
+            fpeak_vals[update_mask] = float(fpeak)
             max_rchi = getattr(args, 'autochi_max_rchisq', getattr(args, 'autochisq_max_rchisq', 5.0))
             rchi_val = chi_val / (2 * p - 2) if p > 1 else chi_val
             if autochisq is not None and (max_rchi is None or rchi_val <= max_rchi):
@@ -509,7 +513,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
             assigned_mask[update_mask] = True
             iterations += 1
 
-        return chisq_vals, chisq_dof_vals, auto_vals
+        return chisq_vals, chisq_dof_vals, auto_vals, fpeak_vals
 
 
 # -----------------------------------------------------------------------------
@@ -649,7 +653,7 @@ def process_and_record_triggers(
         if power_chisq.do and np.any(abs(snrs_renorm) >= power_chisq.snr_threshold):
             t_chi0 = time.perf_counter()
             auto0 = autochisq.elapsed if auto_on else 0.0
-            chi, chi_dof, auto = power_chisq.compute(
+            chi, chi_dof, auto, fpeak = power_chisq.compute(
                 ids_local, t_idxs, snrs,
                 fine_indices, tstarts, stilde, bank,
                 ref_snr, filters_f, coarse_idx, args,
@@ -665,6 +669,7 @@ def process_and_record_triggers(
             chi = np.full(n_trig, 2 * num_b - 2, dtype=float32)
             chi_dof = np.full(n_trig, 2 * num_b - 2, dtype=np.int32)
             auto = np.full(n_trig, autochisq.dof, dtype=float32) if auto_on else None
+            fpeak = np.zeros(n_trig, dtype=float32)
 
         local_shifts = shifts[ids_local] if shifts is not None else 0
         time_offset = (-stilde.analyze.start + stilde.cumulative_index) if getattr(stilde, 'analyze', None) is not None else 0
@@ -678,6 +683,7 @@ def process_and_record_triggers(
             'chisq_dof': chi_dof.astype(np.int32),
             's_num': np.full(n_trig, s_num, dtype=np.int32),
             'is_asym': np.full(n_trig, is_asym, dtype=bool),
+            'fpeak': fpeak.astype(float32),
         }
         if auto_on:
             batch['cont_chisq'] = auto
@@ -1797,7 +1803,15 @@ def ingest_ifo_triggers(
             if not np.any(tmpl_nsnr >= sg_chisq.snr_threshold):
                 continue
 
-            tmpl = bank[gid_int]
+            tmpl_fpeak = data['fpeak'][s_idx:e_idx] if 'fpeak' in data else []
+            valid_fpeak = tmpl_fpeak[tmpl_fpeak > 0] if len(tmpl_fpeak) > 0 else []
+            if len(valid_fpeak) > 0:
+                fpeak = float(valid_fpeak[0])
+            else:
+                row = bank.table[gid_int]
+                fpeak = float(pycbc.pnutils.named_frequency_cutoffs.get('IMRPhenomDPeak', lambda r: 100.0)(row))
+
+            flow_tmpl = float(bank.table['f_lower'][gid_int])
             snums_tmpl = data['s_num'][s_idx:e_idx]
             snrs_tmpl = data['snr'][s_idx:e_idx]
             chi_tmpl = data['chisq'][s_idx:e_idx]
@@ -1806,12 +1820,15 @@ def ingest_ifo_triggers(
 
             for s in np.unique(snums_tmpl):
                 s_mask = (snums_tmpl == s)
+                if not np.any(tmpl_nsnr[s_mask] >= sg_chisq.snr_threshold):
+                    continue
                 stilde = ifo_segments[s]
-                res = sg_chisq.values(
-                    stilde, tmpl, stilde.psd,
+                res = sg_chisq.values_from_fpeak(
+                    stilde, thash, fpeak, stilde.psd,
                     snrs_tmpl[s_mask], 1.0,
                     chi_tmpl[s_mask], dof_tmpl[s_mask],
-                    tidxs_tmpl[s_mask]
+                    tidxs_tmpl[s_mask],
+                    flow=flow_tmpl
                 )
                 if res is not None:
                     data['sg_chisq'][s_idx:e_idx][s_mask] = res
