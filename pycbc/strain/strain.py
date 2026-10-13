@@ -62,7 +62,9 @@ def next_power_of_2(n):
 def detect_loud_glitches(strain, psd_duration=4., psd_stride=2.,
                          psd_avg_method='median', low_freq_cutoff=30.,
                          threshold=50., cluster_window=5., corrupt_time=4.,
-                         high_freq_cutoff=None, output_intermediates=False):
+                         high_freq_cutoff=None, output_intermediates=False,
+                         return_widths=False, envelope_threshold=5.0,
+                         min_width=0.10, max_width=5.0, pad_width=0.05):
     """Automatic identification of loud transients for gating purposes.
 
     This function first estimates the PSD of the input time series using the
@@ -99,11 +101,14 @@ def detect_loud_glitches(strain, psd_duration=4., psd_stride=2.,
         Save intermediate time series for debugging.
     """
 
+    if strain.dtype != numpy.float64:
+        strain = strain.astype(numpy.float64)
+    elif not high_freq_cutoff:
+        strain = strain.copy()
+
     if high_freq_cutoff:
         strain = resample_to_delta_t(strain, 0.5 / high_freq_cutoff,
                                      method='ldas')
-    else:
-        strain = strain.copy()
 
     # taper strain
     corrupt_length = int(corrupt_time * strain.sample_rate)
@@ -176,7 +181,82 @@ def detect_loud_glitches(strain, psd_duration=4., psd_stride=2.,
     times = [idx * strain.delta_t + strain.start_time \
              for idx in indices[cluster_idx]]
 
-    return times
+    if not return_widths:
+        return times
+
+    # Compute dynamic envelope widths around each cluster peak
+    pad_samples = int(pad_width * strain.sample_rate) if pad_width else 0
+    gates = []
+    for p in indices[cluster_idx]:
+        l = p
+        while l > corrupt_length and mag[l] > envelope_threshold:
+            l -= 1
+        r = p
+        while r < len(mag) - corrupt_length and mag[r] > envelope_threshold:
+            r += 1
+
+        l_padded = max(corrupt_length, l - pad_samples)
+        r_padded = min(len(mag) - corrupt_length, r + pad_samples)
+
+        t_start = l_padded * strain.delta_t + strain.start_time
+        t_end = r_padded * strain.delta_t + strain.start_time
+        half_width = (t_end - t_start) / 2.0
+        if min_width is not None:
+            half_width = max(half_width, min_width)
+        if max_width is not None:
+            half_width = min(half_width, max_width)
+        center = (t_start + t_end) / 2.0
+        gates.append((center, half_width))
+
+    return gates
+
+
+def merge_gate_intervals(gate_params, merge_gap=0.0):
+    """Merges overlapping or closely spaced gating intervals.
+
+    Parameters
+    ----------
+    gate_params : list of lists/tuples
+        List of [time, half_width, taper_width] (or [time, half_width]).
+    merge_gap : float, optional
+        Maximum gap in seconds between gate intervals to merge into a single gate.
+        Default is 0.0 (only merge strictly overlapping/touching intervals).
+
+    Returns
+    -------
+    list
+        Merged list of [time, half_width, taper_width].
+    """
+    if not gate_params or len(gate_params) <= 1:
+        return list(gate_params)
+
+    # Convert to [start, end, taper]
+    intervals = []
+    for gp in gate_params:
+        gt = gp[0]
+        gw = gp[1]
+        gtaper = gp[2] if len(gp) > 2 else 0.0
+        intervals.append((gt - gw, gt + gw, gtaper))
+
+    intervals.sort(key=lambda x: x[0])
+    merged = [intervals[0]]
+    gap = merge_gap if merge_gap is not None else 0.0
+    for cur in intervals[1:]:
+        prev_st, prev_en, prev_taper = merged[-1]
+        cur_st, cur_en, cur_taper = cur
+        if cur_st <= prev_en + gap:
+            new_en = max(prev_en, cur_en)
+            new_taper = max(prev_taper, cur_taper)
+            merged[-1] = (prev_st, new_en, new_taper)
+        else:
+            merged.append(cur)
+
+    out = []
+    for st, en, taper in merged:
+        center = (st + en) / 2.0
+        half_width = (en - st) / 2.0
+        out.append([center, half_width, taper])
+    return out
 
 def from_cli(opt, dyn_range_fac=1, precision='single',
              inj_filter_rejector=None):
@@ -383,8 +463,8 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
         gate_params = numpy.loadtxt(opt.gating_file)
         if len(gate_params.shape) == 1:
             gate_params = [gate_params]
-        paint_m = getattr(opt, 'paint_method', 'toeplitz')
-        paint_r = getattr(opt, 'paint_ridge', 1e-3)
+        paint_m = getattr(opt, 'paint_method', 'cholesky')
+        paint_r = getattr(opt, 'paint_ridge', 1e-8)
         invpsd = _get_gating_invpsd() if opt.gating_method == 'paint' else None
         for gate_time, gate_window, gate_taper in gate_params:
             strain = strain.gate(gate_time, window=gate_window,
@@ -400,17 +480,36 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
                  and (gp[0] - gp[1] - gp[2] <= strain.end_time)]
 
     if opt.autogating_threshold is not None:
-        paint_m = getattr(opt, 'paint_method', 'toeplitz')
-        paint_r = getattr(opt, 'paint_ridge', 1e-3)
+        paint_m = getattr(opt, 'paint_method', 'cholesky')
+        paint_r = getattr(opt, 'paint_ridge', 1e-8)
+        merge_gap = getattr(opt, 'autogating_merge_gap', None)
+        dynamic_width = getattr(opt, 'autogating_dynamic_width', False)
+        env_threshold = getattr(opt, 'autogating_envelope_threshold', 5.0)
+        max_width = getattr(opt, 'autogating_max_width', 5.0)
         gating_info['auto'] = []
         for _ in range(opt.autogating_max_iterations):
-            glitch_times = detect_loud_glitches(
-                    strain, threshold=opt.autogating_threshold,
-                    cluster_window=opt.autogating_cluster,
-                    low_freq_cutoff=opt.strain_high_pass,
-                    corrupt_time=opt.pad_data + opt.autogating_pad)
-            gate_params = [[gt, opt.autogating_width, opt.autogating_taper]
-                           for gt in glitch_times]
+            if dynamic_width:
+                glitch_gates = detect_loud_glitches(
+                        strain, threshold=opt.autogating_threshold,
+                        cluster_window=opt.autogating_cluster,
+                        low_freq_cutoff=opt.strain_high_pass,
+                        corrupt_time=opt.pad_data + opt.autogating_pad,
+                        return_widths=True,
+                        envelope_threshold=env_threshold,
+                        min_width=opt.autogating_width,
+                        max_width=max_width)
+                gate_params = [[gt, gw, opt.autogating_taper]
+                               for gt, gw in glitch_gates]
+            else:
+                glitch_times = detect_loud_glitches(
+                        strain, threshold=opt.autogating_threshold,
+                        cluster_window=opt.autogating_cluster,
+                        low_freq_cutoff=opt.strain_high_pass,
+                        corrupt_time=opt.pad_data + opt.autogating_pad)
+                gate_params = [[gt, opt.autogating_width, opt.autogating_taper]
+                               for gt in glitch_times]
+            if merge_gap is not None and merge_gap > 0 and len(gate_params) > 1:
+                gate_params = merge_gate_intervals(gate_params, merge_gap=merge_gap)
             gating_info['auto'] += gate_params
             if len(gate_params) > 0 and opt.gating_method == 'paint':
                 invpsd = _get_gating_invpsd()
@@ -424,10 +523,10 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
                                      invpsd=invpsd,
                                      paint_method=paint_m,
                                      paint_ridge=paint_r)
-            if len(glitch_times) > 0:
+            if len(gate_params) > 0:
                 logger.info('Autogating at %s',
-                            ', '.join(['%.3f' % gt
-                                       for gt in glitch_times]))
+                            ', '.join(['%.3f (w=%.3f)' % (gp[0], gp[1])
+                                       for gp in gate_params]))
             else:
                 break
 
@@ -689,19 +788,27 @@ def insert_strain_option_group(parser, gps_times=True):
                                     help='Ignore the given length of whitened '
                                          'strain at the ends of a segment, to '
                                          'avoid filters ringing.')
+    data_reading_group.add_argument('--autogating-dynamic-width', action='store_true',
+                                    help='Dynamically determine autogating window width based on glitch excursion envelope.')
+    data_reading_group.add_argument('--autogating-envelope-threshold', type=float, default=5.0,
+                                    help='Whitened amplitude threshold used to determine glitch envelope boundaries when --autogating-dynamic-width is set. Default: 5.0')
+    data_reading_group.add_argument('--autogating-max-width', type=float, default=5.0,
+                                    help='Maximum half-width (seconds) for dynamic autogating. Default: 5.0')
+    data_reading_group.add_argument('--autogating-merge-gap', type=float, default=None,
+                                    help='If specified, merge gates whose intervals are closer than this gap (in seconds).')
     data_reading_group.add_argument('--gating-method', type=str,
                                     default='taper',
                                     help='Choose the method for gating. '
                                          'Default: `taper`',
                                     choices=['hard', 'taper', 'paint'])
     data_reading_group.add_argument('--paint-method', type=str,
-                                    default='toeplitz',
+                                    default='cholesky',
                                     choices=['cholesky', 'toeplitz', 'matmul'],
-                                    help='Solver method for inpainting. Default: `toeplitz`')
+                                    help='Solver method for inpainting. Default: `cholesky`')
     data_reading_group.add_argument('--paint-ridge', type=float,
-                                    default=1e-3,
+                                    default=1e-8,
                                     help='Diagonal regularization ridge parameter for inpainting. '
-                                         'Default: 1e-3')
+                                         'Default: 1e-8')
     # Optional
     data_reading_group.add_argument("--normalize-strain", type=float,
                     help="(optional) Divide frame data by constant.")
@@ -951,6 +1058,20 @@ def insert_strain_option_group_multi_ifo(parser, gps_times=True):
                                     help='Ignore the given length of whitened '
                                          'strain at the ends of a segment, to '
                                          'avoid filters ringing.')
+    data_reading_group_multi.add_argument('--autogating-dynamic-width', action='store_true',
+                                    help='Dynamically determine autogating window width based on glitch excursion envelope.')
+    data_reading_group_multi.add_argument('--autogating-envelope-threshold', type=float,
+                                    nargs='+', action=MultiDetOptionAction,
+                                    default=5.0,
+                                    help='Whitened amplitude threshold used to determine glitch envelope boundaries when --autogating-dynamic-width is set. Default: 5.0')
+    data_reading_group_multi.add_argument('--autogating-max-width', type=float,
+                                    nargs='+', action=MultiDetOptionAction,
+                                    default=5.0,
+                                    help='Maximum half-width (seconds) for dynamic autogating. Default: 5.0')
+    data_reading_group_multi.add_argument('--autogating-merge-gap', type=float,
+                                    nargs='+', action=MultiDetOptionAction,
+                                    default=None,
+                                    help='If specified, merge gates whose intervals are closer than this gap (in seconds).')
     data_reading_group_multi.add_argument('--gating-method', type=str,
                                     nargs='+', action=MultiDetOptionAction,
                                     default='taper',
@@ -959,14 +1080,14 @@ def insert_strain_option_group_multi_ifo(parser, gps_times=True):
                                     choices=['hard', 'taper', 'paint'])
     data_reading_group_multi.add_argument('--paint-method', type=str,
                                     nargs='+', action=MultiDetOptionAction,
-                                    default='toeplitz',
+                                    default='cholesky',
                                     choices=['cholesky', 'toeplitz', 'matmul'],
-                                    help='Solver method for inpainting. Default: `toeplitz`')
+                                    help='Solver method for inpainting. Default: `cholesky`')
     data_reading_group_multi.add_argument('--paint-ridge', type=float,
                                     nargs='+', action=MultiDetOptionAction,
-                                    default=1e-3,
+                                    default=1e-8,
                                     help='Diagonal regularization ridge parameter for inpainting. '
-                                         'Default: 1e-3')
+                                         'Default: 1e-8')
 
     # Optional
     data_reading_group_multi.add_argument("--normalize-strain", type=float,

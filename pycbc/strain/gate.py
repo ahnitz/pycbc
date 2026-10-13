@@ -206,7 +206,7 @@ def gate_and_paint(data, lindex, rindex, invpsd, copy=True, method='toeplitz',
         invpsd = invpsd.astype(np.float32 if data.precision == 'single' else np.float64)
 
     tdfilter = _get_tdfilter(invpsd)
-    diag = tdfilter[0]
+    diag = float(tdfilter[0])
     delta_t = float(data.delta_t)
     M = min(len(tdfilter) // 2, int(round(pad_duration / delta_t))) if pad_duration is not None else 0
 
@@ -235,24 +235,24 @@ def gate_and_paint(data, lindex, rindex, invpsd, copy=True, method='toeplitz',
         owhgated_data = (data.to_frequencyseries() * invpsd).to_timeseries()
         rhs = owhgated_data[lindex:rindex].numpy()
 
+    raw_col = tdfilter[:K].numpy() if hasattr(tdfilter[:K], 'numpy') else tdfilter[:K]
     if method == 'cholesky':
-        col = tdfilter[:K].numpy() if hasattr(tdfilter[:K], 'numpy') else tdfilter[:K]
-        col = col / diag
+        col = raw_col.astype(np.float64) / diag
         T = linalg.toeplitz(col)
         if ridge > 0:
-            T += ridge * np.eye(K)
+            T += ridge * np.eye(K, dtype=np.float64)
         c, lower = linalg.cho_factor(T)
-        proj = linalg.cho_solve((c, lower), rhs / diag)
+        proj = linalg.cho_solve((c, lower), (rhs / diag).astype(np.float64))
     elif method == 'toeplitz':
-        col = tdfilter[:K].numpy().copy() if hasattr(tdfilter[:K], 'numpy') else tdfilter[:K].copy()
+        col = raw_col.astype(np.float64).copy()
         if ridge > 0:
             col[0] += ridge * diag
-        proj = linalg.solve_toeplitz(col, rhs)
+        proj = linalg.solve_toeplitz(col, rhs.astype(np.float64))
     else:
         raise ValueError(f"Unknown inpainting method: {method}")
 
     # remove the projection into the null space
-    data[lindex:rindex] -= proj
+    data[lindex:rindex] -= proj.astype(data.dtype)
     return data
 
 

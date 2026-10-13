@@ -697,8 +697,8 @@ class TimeSeries(Array):
             a PSD is generated using default settings.
         paint_method: str
             Which method to use for inpainting the gated region if
-            method='paint'. If 'toeplitz' (default), use regularized Levinson
-            recursion. If 'cholesky', use regularized Cholesky decomposition.
+            method='paint'. If 'cholesky', use regularized Cholesky decomposition.
+            If 'toeplitz' (default), use regularized Levinson recursion.
             If 'matmul', use explicit matrix inversion and multiplication.
         paint_invmat: array
             The uninverted covariance matrix to use to calculate inpainting if
