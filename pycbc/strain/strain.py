@@ -185,18 +185,24 @@ def detect_loud_glitches(strain, psd_duration=4., psd_stride=2.,
         return times
 
     # Compute dynamic envelope widths around each cluster peak
+    # Use the analytic signal (Hilbert) envelope to avoid halting at oscillation zero-crossings
+    from scipy.signal import hilbert
+    env = numpy.abs(hilbert(strain_pad[pad_start:pad_end].numpy()))
+    env[0:corrupt_length] = 0
+    env[-1:-corrupt_length-1:-1] = 0
+
     pad_samples = int(pad_width * strain.sample_rate) if pad_width else 0
     gates = []
     for p in indices[cluster_idx]:
         l = p
-        while l > corrupt_length and mag[l] > envelope_threshold:
+        while l > corrupt_length and env[l] > envelope_threshold:
             l -= 1
         r = p
-        while r < len(mag) - corrupt_length and mag[r] > envelope_threshold:
+        while r < len(env) - corrupt_length and env[r] > envelope_threshold:
             r += 1
 
         l_padded = max(corrupt_length, l - pad_samples)
-        r_padded = min(len(mag) - corrupt_length, r + pad_samples)
+        r_padded = min(len(env) - corrupt_length, r + pad_samples)
 
         t_start = l_padded * strain.delta_t + strain.start_time
         t_end = r_padded * strain.delta_t + strain.start_time
@@ -481,7 +487,7 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
 
     if opt.autogating_threshold is not None:
         paint_m = getattr(opt, 'paint_method', 'cholesky')
-        paint_r = getattr(opt, 'paint_ridge', 1e-8)
+        paint_r = getattr(opt, 'paint_ridge', 1e-3)
         merge_gap = getattr(opt, 'autogating_merge_gap', None)
         dynamic_width = getattr(opt, 'autogating_dynamic_width', False)
         env_threshold = getattr(opt, 'autogating_envelope_threshold', 5.0)
@@ -806,9 +812,9 @@ def insert_strain_option_group(parser, gps_times=True):
                                     choices=['cholesky', 'toeplitz', 'matmul'],
                                     help='Solver method for inpainting. Default: `cholesky`')
     data_reading_group.add_argument('--paint-ridge', type=float,
-                                    default=1e-8,
+                                    default=1e-3,
                                     help='Diagonal regularization ridge parameter for inpainting. '
-                                         'Default: 1e-8')
+                                         'Default: 1e-3')
     # Optional
     data_reading_group.add_argument("--normalize-strain", type=float,
                     help="(optional) Divide frame data by constant.")
@@ -1085,9 +1091,9 @@ def insert_strain_option_group_multi_ifo(parser, gps_times=True):
                                     help='Solver method for inpainting. Default: `cholesky`')
     data_reading_group_multi.add_argument('--paint-ridge', type=float,
                                     nargs='+', action=MultiDetOptionAction,
-                                    default=1e-8,
+                                    default=1e-3,
                                     help='Diagonal regularization ridge parameter for inpainting. '
-                                         'Default: 1e-8')
+                                         'Default: 1e-3')
 
     # Optional
     data_reading_group_multi.add_argument("--normalize-strain", type=float,
