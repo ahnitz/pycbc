@@ -470,7 +470,7 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
         if len(gate_params.shape) == 1:
             gate_params = [gate_params]
         paint_m = getattr(opt, 'paint_method', 'cholesky')
-        paint_r = getattr(opt, 'paint_ridge', 1e-8)
+        paint_r = getattr(opt, 'paint_ridge', 1e-3)
         invpsd = _get_gating_invpsd() if opt.gating_method == 'paint' else None
         for gate_time, gate_window, gate_taper in gate_params:
             strain = strain.gate(gate_time, window=gate_window,
@@ -493,7 +493,11 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
         env_threshold = getattr(opt, 'autogating_envelope_threshold', 5.0)
         max_width = getattr(opt, 'autogating_max_width', 5.0)
         gating_info['auto'] = []
-        for _ in range(opt.autogating_max_iterations):
+        raw_strain = strain.copy()
+        accumulated_gates = []
+        invpsd = _get_gating_invpsd() if opt.gating_method == 'paint' else None
+
+        for iteration in range(opt.autogating_max_iterations):
             if dynamic_width:
                 glitch_gates = detect_loud_glitches(
                         strain, threshold=opt.autogating_threshold,
@@ -504,24 +508,28 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
                         envelope_threshold=env_threshold,
                         min_width=opt.autogating_width,
                         max_width=max_width)
-                gate_params = [[gt, gw, opt.autogating_taper]
-                               for gt, gw in glitch_gates]
+                new_gates = [[gt, gw, opt.autogating_taper]
+                             for gt, gw in glitch_gates]
             else:
                 glitch_times = detect_loud_glitches(
                         strain, threshold=opt.autogating_threshold,
                         cluster_window=opt.autogating_cluster,
                         low_freq_cutoff=opt.strain_high_pass,
                         corrupt_time=opt.pad_data + opt.autogating_pad)
-                gate_params = [[gt, opt.autogating_width, opt.autogating_taper]
-                               for gt in glitch_times]
-            if merge_gap is not None and merge_gap > 0 and len(gate_params) > 1:
-                gate_params = merge_gate_intervals(gate_params, merge_gap=merge_gap)
-            gating_info['auto'] += gate_params
-            if len(gate_params) > 0 and opt.gating_method == 'paint':
-                invpsd = _get_gating_invpsd()
-            else:
-                invpsd = None
-            for gate_time, gate_window, gate_taper in gate_params:
+                new_gates = [[gt, opt.autogating_width, opt.autogating_taper]
+                             for gt in glitch_times]
+
+            if not new_gates:
+                break
+
+            accumulated_gates.extend(new_gates)
+            if merge_gap is not None and merge_gap > 0 and len(accumulated_gates) > 1:
+                accumulated_gates = merge_gate_intervals(accumulated_gates, merge_gap=merge_gap)
+
+            # Re-apply merged accumulated gates onto raw_strain
+            # (never inpaint on top of already-inpainted data)
+            strain = raw_strain.copy()
+            for gate_time, gate_window, gate_taper in accumulated_gates:
                 strain = strain.gate(gate_time, window=gate_window,
                                      method=opt.gating_method,
                                      copy=False,
@@ -529,12 +537,12 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
                                      invpsd=invpsd,
                                      paint_method=paint_m,
                                      paint_ridge=paint_r)
-            if len(gate_params) > 0:
-                logger.info('Autogating at %s',
-                            ', '.join(['%.3f (w=%.3f)' % (gp[0], gp[1])
-                                       for gp in gate_params]))
-            else:
-                break
+
+        if accumulated_gates:
+            logger.info('Autogating at %s',
+                        ', '.join(['%.3f (w=%.3f)' % (gp[0], gp[1])
+                                   for gp in accumulated_gates]))
+        gating_info['auto'] = accumulated_gates
 
     if opt.strain_high_pass:
         logger.info("Highpass Filtering")
