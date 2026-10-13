@@ -674,7 +674,8 @@ class TimeSeries(Array):
 
     def gate(self, time, window=0.25, method='taper', copy=True,
              taper_width=0.25, invpsd=None, paint_method='toeplitz',
-             paint_invmat=None, paint_ridge=1e-3):
+             paint_invmat=None, paint_ridge=1e-3, paint_pad_duration=16.0,
+             paint_subsample_shift=False):
         """ Gate out portion of time series
 
         Parameters
@@ -706,6 +707,13 @@ class TimeSeries(Array):
         paint_ridge: float, optional
             Diagonal ridge parameter for regularizing covariance inversion.
             Default is 1e-3.
+        paint_pad_duration: float, optional
+            Padding duration in seconds on each side of the gate for local
+            convolution inpainting. Default is 16.0 seconds.
+        paint_subsample_shift: bool, optional
+            Whether to apply a full-series fractional-sample time shift if the
+            gate window does not align with sample boundaries. Default is False
+            to avoid expensive whole-array FFT passes.
 
         Returns
         -------
@@ -735,15 +743,17 @@ class TimeSeries(Array):
                 if paint_method in ('cholesky', 'toeplitz'):
                     return gate_and_paint(target_data, lindex, rindex, invpsd,
                                           copy=False, method=paint_method,
-                                          ridge=paint_ridge)
+                                          ridge=paint_ridge,
+                                          pad_duration=paint_pad_duration)
                 elif paint_method == 'matmul':
                     return gate_and_paint_matmul(target_data, lindex, rindex,
                                                  invpsd, invmat=paint_invmat,
-                                                 ridge=paint_ridge, copy=False)
+                                                 ridge=paint_ridge, copy=False,
+                                                 pad_duration=paint_pad_duration)
                 else:
                     raise ValueError(f'Unrecognized paint_method input {paint_method}')
 
-            if offset == 0:
+            if not paint_subsample_shift or offset == 0:
                 return _apply_paint(data)
             else:
                 # time shift such that gate end time lands on a specific data sample
