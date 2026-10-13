@@ -69,9 +69,10 @@ class SingleDetSGChisq(SingleDetPowerChisq):
                    args.sgchisq_locations)
 
     def values_from_fpeak(self, stilde, thash, fpeak, psd, snrv, snr_norm,
-                          bchisq, bchisq_dof, indices, flow=20.0, epoch=0.0):
+                          bchisq, bchisq_dof, indices, flow=20.0, epoch=0.0,
+                          template=None):
         """ Calculate sine-Gaussian chisq directly from template peak frequency
-        and template hash, without requiring a full template waveform.
+        and template hash, with optional template projection subtraction.
 
         Parameters
         ----------
@@ -97,6 +98,9 @@ class SingleDetSGChisq(SingleDetPowerChisq):
             Low frequency cutoff (default 20.0 Hz)
         epoch: float, optional
             Epoch offset for time shifting (default 0.0)
+        template: pycbc.types.FrequencySeries, optional
+            The waveform template being analyzed, used to subtract expected
+            signal power projection from sine-Gaussian tiles.
 
         Returns
         -------
@@ -122,8 +126,20 @@ class SingleDetSGChisq(SingleDetPowerChisq):
             if (fpeak + float(offset) + 50.0) > fstop:
                 return numpy.ones(len(snrv))
 
+        # Template norm sigma_h for proper unit-normalized projection
+        if template is not None:
+            if hasattr(template, 'sigmasq'):
+                hsigma = float(numpy.sqrt(template.sigmasq(psd)))
+            else:
+                flow_tmpl = getattr(template, 'f_lower', float(template.delta_f))
+                hsigma = float(sigma(template, psd=psd, low_frequency_cutoff=flow_tmpl))
+        else:
+            hsigma = 0.0
+
         chisq = numpy.ones(len(snrv))
         gtem = [None for _ in values]
+        gsigma_list = [None for _ in values]
+        gh_proj = [None for _ in values]
         for i, snrvi in enumerate(snrv):
             # Skip if newsnr too low
             snr = abs(snrvi * snr_norm)
@@ -153,19 +169,36 @@ class SingleDetSGChisq(SingleDetPowerChisq):
                 kmin = int(t_flow / delta_f)
                 kmax = int(fhigh / delta_f)
 
-                # Calculate sine-gaussian tile
+                # Calculate sine-gaussian tile and template projection
                 if gtem[idxx] is None:
                     gtem[idxx] = sinegauss.fd_sine_gaussian(
                         1.0, q, fcen, t_flow,
                         len(stilde) * delta_f,
                         delta_f
                     ).astype(numpy.complex64)
-                gsigma = sigma(gtem[idxx], psd=psd,
-                               low_frequency_cutoff=t_flow,
-                               high_frequency_cutoff=fhigh)
+                    gsigma_list[idxx] = sigma(gtem[idxx], psd=psd,
+                                              low_frequency_cutoff=t_flow,
+                                              high_frequency_cutoff=fhigh)
+                    if template is not None and hsigma > 0:
+                        g_tile = gtem[idxx][kmin:kmax]
+                        tmpl_overwhite = template[kmin:kmax] / psd[kmin:kmax]
+                        gh_proj[idxx] = (g_tile * tmpl_overwhite).sum() * (
+                            4.0 * delta_f / (gsigma_list[idxx] * hsigma)
+                        )
+                    else:
+                        gh_proj[idxx] = 0.0
+
+                gsigma = gsigma_list[idxx]
                 # Calculate the SNR of the tile
                 gsnr = (gtem[idxx][kmin:kmax] * stilde_shift[kmin:kmax]).sum()
                 gsnr *= 4.0 * delta_f / gsigma
+
+                # Subtract expected template projection to prevent loud genuine
+                # signals from self-vetoing due to high-frequency leakage
+                if gh_proj[idxx] is not None and gh_proj[idxx] != 0.0:
+                    z = snrvi * snr_norm
+                    gsnr -= z * gh_proj[idxx]
+
                 chisq[i] += abs(gsnr)**2.0
                 dof += 2
             if dof == 0:
@@ -224,6 +257,7 @@ class SingleDetSGChisq(SingleDetPowerChisq):
             stilde, thash, fpeak, psd, snrv, snr_norm,
             bchisq, bchisq_dof, indices,
             flow=float(getattr(template, 'f_lower', 20.0)),
-            epoch=float(getattr(template, 'epoch', 0.0))
+            epoch=float(getattr(template, 'epoch', 0.0)),
+            template=template
         )
 

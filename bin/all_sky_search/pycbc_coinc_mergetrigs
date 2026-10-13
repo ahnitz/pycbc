@@ -212,6 +212,26 @@ for ifo in ifos_to_process:
                              shuffle=True)
             del data
             region(f, key, full_boundaries, unsort)
+
+        if len(trigger_sort) > 0 and '%s/end_time' % ifo in f:
+            logging.info('[%s] computing hollow trigger density', ifo)
+            td = f['%s/end_time' % ifo][:]
+            sd = f['%s/snr' % ifo][:]
+            cd = f['%s/chisq' % ifo][:]
+            dd = f['%s/chisq_dof' % ifo][:]
+            rcd = cd / numpy.maximum(1.0, 2.0 * dd - 2.0)
+            mask_blown = (rcd > 3.0) | (sd > 8.0)
+            t_blown = numpy.sort(td[mask_blown])
+            W, H = 2.0, 0.25
+            l_out = numpy.searchsorted(t_blown, td - W, side='left')
+            r_out = numpy.searchsorted(t_blown, td + W, side='right')
+            l_in  = numpy.searchsorted(t_blown, td - H, side='left')
+            r_in  = numpy.searchsorted(t_blown, td + H, side='right')
+            density = ((r_out - l_out) - (r_in - l_in)).astype(numpy.float32)
+            dkey = '%s/hollow_density' % ifo
+            f.create_dataset(dkey, data=density, compression='gzip',
+                             compression_opts=args.compression_level, shuffle=True)
+            region(f, dkey, full_boundaries, unsort)
     else:
         full_boundaries = numpy.zeros(len(hashes) + 1, dtype=int)
         f.create_dataset('%s/template_id' % ifo,
@@ -225,6 +245,10 @@ for ifo in ifos_to_process:
                              compression_opts=args.compression_level,
                              shuffle=True)
             region(f, key, full_boundaries, unsort)
+        dkey = '%s/hollow_density' % ifo
+        f.create_dataset(dkey, data=numpy.array([], dtype=numpy.float32), compression='gzip',
+                         compression_opts=args.compression_level, shuffle=True)
+        region(f, dkey, full_boundaries, unsort)
 
 f.close()
 logging.info('done')

@@ -73,11 +73,12 @@ def newsnr_sgveto_offset125(snr, brchisq, sgchisq, **kwargs):
     return newsnr_sgveto(snr, brchisq, sgchisq, chisq_thresh=1.25, **kwargs)
 
 
-def newsnr_sgveto_autochisq(snr, brchisq, sgchisq, autochisq,
-                            chisq_thresh=1.50, sg_thresh=4.0, auto_thresh=4.0,
-                            n_trad=2.0, n_sg=2.0, n_auto=2.0, q=6.0, **kwargs):
+def newsnr_sgveto_autochisq(snr, brchisq, sgchisq, autochisq, density=None,
+                            chisq_thresh=1.50, sg_thresh=4.0, auto_thresh=2.50,
+                            auto_thresh_snr_coeff=0.005, density_thresh=50.0,
+                            n_trad=2.0, n_sg=2.0, n_auto=2.0, n_density=2.0, q=6.0, **kwargs):
     """Combined NewSNR with traditional chi2 offset, sine-Gaussian chi2 offset,
-    and auto-correlation chi2 offset with smooth power-law downweighting."""
+    auto-correlation chi2 offset, and hollow trigger density downweighting."""
     nsnr = numpy.array(newsnr(snr, brchisq, chisq_thresh=chisq_thresh, q=q, n=n_trad, **kwargs), ndmin=1)
     
     if sg_thresh is not None and sgchisq is not None:
@@ -89,10 +90,24 @@ def newsnr_sgveto_autochisq(snr, brchisq, sgchisq, autochisq,
             
     if auto_thresh is not None and autochisq is not None:
         autochisq = numpy.array(autochisq, ndmin=1)
-        t_auto = numpy.where(autochisq > auto_thresh)[0]
+        if auto_thresh_snr_coeff:
+            eff_auto_thresh = auto_thresh + float(auto_thresh_snr_coeff) * (numpy.array(snr, ndmin=1) ** 2)
+        else:
+            eff_auto_thresh = auto_thresh
+        t_auto = numpy.where(autochisq > eff_auto_thresh)[0]
         if len(t_auto):
-            scaled_auto = autochisq[t_auto] / auto_thresh
-            nsnr[t_auto] *= (0.5 * (1.0 + scaled_auto ** (q / n_auto))) ** (-1.0 / q)
+            if hasattr(eff_auto_thresh, '__len__'):
+                sc_auto = autochisq[t_auto] / eff_auto_thresh[t_auto]
+            else:
+                sc_auto = autochisq[t_auto] / eff_auto_thresh
+            nsnr[t_auto] *= (0.5 * (1.0 + sc_auto ** (q / n_auto))) ** (-1.0 / q)
+
+    if density_thresh is not None and density is not None:
+        density = numpy.array(density, ndmin=1)
+        t_density = numpy.where(density > density_thresh)[0]
+        if len(t_density):
+            scaled_density = density[t_density] / density_thresh
+            nsnr[t_density] *= (0.5 * (1.0 + scaled_density ** (q / n_density))) ** (-1.0 / q)
 
     if hasattr(snr, '__len__'):
         return nsnr
@@ -305,9 +320,10 @@ def get_newsnr_sgveto_offset125(trigs, **kwargs):
     return get_newsnr_sgveto(trigs, chisq_thresh=1.25, **kwargs)
 
 
-def get_newsnr_sgveto_autochisq(trigs, chisq_thresh=1.50, sg_thresh=4.0, auto_thresh=4.0,
-                                n_trad=2.0, n_sg=2.0, n_auto=2.0, q=6.0, **kwargs):
-    """Calculate newsnr re-weighted by traditional chisq, sine-gaussian chisq, and auto-correlation chisq"""
+def get_newsnr_sgveto_autochisq(trigs, chisq_thresh=1.50, sg_thresh=4.0, auto_thresh=2.50,
+                                auto_thresh_snr_coeff=0.005, density_thresh=50.0,
+                                n_trad=2.0, n_sg=2.0, n_auto=2.0, n_density=2.0, q=6.0, **kwargs):
+    """Calculate newsnr re-weighted by traditional chisq, sine-gaussian chisq, auto-correlation chisq, and hollow trigger density"""
     dof = 2.0 * trigs['chisq_dof'][:] - 2.0
     rchisq = trigs['chisq'][:] / dof
     try:
@@ -336,17 +352,26 @@ def get_newsnr_sgveto_autochisq(trigs, chisq_thresh=1.50, sg_thresh=4.0, auto_th
             except (KeyError, ValueError):
                 autochisq = None
 
+    try:
+        density = trigs['hollow_density'][:]
+    except (KeyError, ValueError):
+        density = None
+
     nsnr = newsnr_sgveto_autochisq(
         trigs['snr'][:],
         rchisq,
         sgchisq,
         autochisq,
+        density=density,
         chisq_thresh=chisq_thresh,
         sg_thresh=sg_thresh,
         auto_thresh=auto_thresh,
+        auto_thresh_snr_coeff=auto_thresh_snr_coeff,
+        density_thresh=density_thresh,
         n_trad=n_trad,
         n_sg=n_sg,
         n_auto=n_auto,
+        n_density=n_density,
         q=q,
         **kwargs
     )

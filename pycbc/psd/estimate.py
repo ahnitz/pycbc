@@ -457,7 +457,8 @@ def estimate_psd_trimmed_welch(timeseries, seg_len=4096, seg_stride=2048, alpha=
         bias_factor = median_bias(num_segs)
 
     corrected_psd = raw_psd / bias_factor
-    return FrequencySeries(corrected_psd, delta_f=delta_f, epoch=timeseries.start_time)
+    return FrequencySeries(corrected_psd, delta_f=delta_f, epoch=timeseries.start_time,
+                           dtype=timeseries.dtype)
 
 
 def estimate_psd_multitaper(timeseries, seg_len=4096, seg_stride=2048, NW=3.0, avg_method='median'):
@@ -516,7 +517,8 @@ def estimate_psd_multitaper(timeseries, seg_len=4096, seg_stride=2048, NW=3.0, a
     else:
         raise ValueError(f"Unknown avg_method: {avg_method}")
 
-    return FrequencySeries(psd_est, delta_f=delta_f, epoch=timeseries.start_time)
+    return FrequencySeries(psd_est, delta_f=delta_f, epoch=timeseries.start_time,
+                           dtype=timeseries.dtype)
 
 
 # Aliases for consistent naming convention

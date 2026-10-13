@@ -1538,8 +1538,17 @@ class ReadByTemplate(object):
         data: numpy.ndarray
             The requested column of data
         """
-        ref = self.file['%s/%s_template' % (self.ifo, col)][num]
-        return self.file['%s/%s' % (self.ifo, col)][ref]
+        t_key = '%s/%s_template' % (self.ifo, col)
+        if t_key in self.file:
+            ref = self.file[t_key][num]
+            return self.file['%s/%s' % (self.ifo, col)][ref]
+        elif '%s/template_boundaries' % self.ifo in self.file and '%s/%s' % (self.ifo, col) in self.file:
+            ref = self.file['%s/end_time_template' % self.ifo][num]
+            n_trigs = len(self.file['%s/end_time' % self.ifo][ref])
+            start = self.file['%s/template_boundaries' % self.ifo][num]
+            return self.file['%s/%s' % (self.ifo, col)][start:start + n_trigs]
+        else:
+            raise KeyError("Column %s not found in trigger file" % col)
 
     def set_template(self, num):
         """Set the active template to read from.
