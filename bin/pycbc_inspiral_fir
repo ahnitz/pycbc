@@ -1378,7 +1378,8 @@ def process_top_template_task(task_args):
         for ifo in active_ifos:
             st = segments[ifo][s_num]
             t_ref0 = time.perf_counter()
-            series, norm = engine.make_reference_series(st, st.psd, top_template)
+            # Quadrature bank: the real top filter's output (real-real-complex hierarchy).
+            series, norm = engine.make_reference_series(st, st.psd, top_template, real=quadrature)
             dt_sample = float(st.delta_t)
             amp_scale = float(st.delta_t / engine.decimation_factor)
             if not getattr(args, 'disable_dynamic_snr_renorm', False):

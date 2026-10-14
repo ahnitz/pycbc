@@ -5,7 +5,7 @@ from pycbc.fft import IFFT
 from pycbc.filter.matchedfilter import (
     correlate, get_cutoff_indices, matched_filter_core,
 )
-from pycbc.types import Array, complex64, zeros
+from pycbc.types import Array, complex64, float32, zeros
 
 # matchedfilter back end is required for ratio/FIR filtering.
 try:
@@ -109,9 +109,19 @@ class MatchedFilterRatioControl(object):
             binsize=self.peak_binsize,
         )
 
-    def make_reference_series(self, stilde, psd, ref_template):
-        """Return the scaled reference SNR series and its template sigmasq."""
+    def make_reference_series(self, stilde, psd, ref_template, real=False):
+        """Return the scaled reference SNR series and its template sigmasq.
+
+        real: the real part only -- the real top filter's output, which a real-real-complex
+        hierarchy (complex final taps) filters -- from a half-size complex-to-real inverse
+        transform of the same one-sided spectrum (Re z = C2R(q) / 2): exact, half the work."""
         h_norm = ref_template.sigmasq(psd)
+        if real and self._ref_direct:
+            snr, norm = self._reference_snr(stilde, psd, ref_template, h_norm, real=True)
+            scale = 0.5 * (norm * stilde.delta_t) / self.decimation_factor
+            out = np.empty(len(snr), dtype=np.float32)
+            np.multiply(snr.numpy(), scale, out=out, casting='same_kind')
+            return out, h_norm
         if self._ref_direct:
             snr, norm = self._reference_snr(stilde, psd, ref_template, h_norm)
         else:
@@ -126,6 +136,8 @@ class MatchedFilterRatioControl(object):
         # double-precision product and its rounding, without a complex128 temporary.
         out = np.empty(len(snr), dtype=np.complex64)
         np.multiply(snr.numpy(), scale, out=out, casting='same_kind')
+        if real:
+            return np.ascontiguousarray(out.real), h_norm
         return out, h_norm
 
     def prepare_chisq_filters(self, fir_taps, tap_counts, block_length, reach=0):
@@ -216,7 +228,7 @@ class MatchedFilterRatioControl(object):
         else:
             return [], [], [], tstarts, h_norm
 
-    def _reference_snr(self, stilde, psd, ref_template, h_norm):
+    def _reference_snr(self, stilde, psd, ref_template, h_norm, real=False):
         """The reference SNR series, driving the class-based IFFT directly.
 
         matched_filter_core goes through pycbc.fft's *function* API, which on
@@ -231,7 +243,9 @@ class MatchedFilterRatioControl(object):
         N = (len(stilde) - 1) * 2
         kmin, kmax = get_cutoff_indices(
             ref_template.f_lower, self.f_high, stilde.delta_f, N)
-        plan, qt, q = self._get_ref_plan(N, kmax)
+        if real and kmax > N // 2:
+            raise ValueError('a real reference series needs the upper cutoff below Nyquist')
+        plan, qt, q = self._get_ref_plan(N, kmax, real=real)
         # Only the low strip is cleared per call.  correlate writes solely
         # [kmin:kmax] and execute() reads qt and writes q, so nothing ever
         # dirties the region above kmax -- and kmax derives from self.f_high,
@@ -246,7 +260,7 @@ class MatchedFilterRatioControl(object):
         norm = (4.0 * stilde.delta_f) / np.sqrt(h_norm)
         return q, norm
 
-    def _get_ref_plan(self, size, kmax):
+    def _get_ref_plan(self, size, kmax, real=False):
         """Cached IFFT plan and its buffers for the reference filter.
 
         Keyed on kmax as well as size: zeros() hands back a cleared buffer,
@@ -254,12 +268,16 @@ class MatchedFilterRatioControl(object):
         call.  If the upper cutoff ever did change, this reallocates rather
         than leaving a stale band in the transform.
         """
-        cached = self._ref_plan
-        if cached is None or cached[0] != (size, kmax):
-            qt = zeros(size, dtype=complex64)
-            q = zeros(size, dtype=complex64)
+        # real: the one-sided spectrum (size//2 + 1 bins) to a real series of size samples,
+        # its own plan beside the complex one.
+        plans = self.__dict__.setdefault('_ref_plans', {})
+        key = (size, kmax, bool(real))
+        cached = plans.get(key)
+        if cached is None:
+            qt = zeros(size // 2 + 1 if real else size, dtype=complex64)
+            q = zeros(size, dtype=float32 if real else complex64)
             plan = IFFT(qt, q)
-            cached = self._ref_plan = ((size, kmax), plan, qt, q)
+            cached = plans[key] = (key, plan, qt, q)
         _, plan, qt, q = cached
         return plan, Array(qt, copy=False), q
 
@@ -336,14 +354,20 @@ class DynamicSNRRenormFactor(object):
             )
 
         arr = np.asarray(series)
-        # Local power P(t) = 0.5 * |z(t)|^2
-        power = arr.real * arr.real
-        power += arr.imag * arr.imag
+        # Local power P(t) = 0.5 * |z(t)|^2. For a REAL series x = Re z (the real top filter's
+        # output, real-real-complex hierarchy) the same expectation is x^2: E x^2 = E|z|^2 / 2.
+        if np.iscomplexobj(arr):
+            power = arr.real * arr.real
+            power += arr.imag * arr.imag
+            half = 0.5
+        else:
+            power = arr * arr
+            half = 1.0
         if scale is not None and float(scale) > 0:
             inv_scale = 1.0 / float(scale)
-            power *= (0.5 * inv_scale * inv_scale)
-        else:
-            power *= 0.5
+            power *= (half * inv_scale * inv_scale)
+        elif half != 1.0:
+            power *= half
 
         np.nan_to_num(power, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
