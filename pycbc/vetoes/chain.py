@@ -221,6 +221,7 @@ class _SGStage(_Stage):
             _unit_psd(template),
             np.array([seconds]),
             whitened=getattr(stilde, "_is_whitened", False),
+            snrs=np.array([batch.snr[j]]),
         )
         return {"sg_chisq": val[0]}
 
