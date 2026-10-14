@@ -79,18 +79,22 @@ def estimate_fir_taps(h1_np, h2_np):
     return int(np.round(4.0 * std_tg + 15))
 
 # --- TOEPLITZ FILTER DESIGN ---
-def spectrum_to_correlation(frequency_bins, spectral_values, fft_len, is_complex=False):
-    """Compute time-domain correlation from frequency spectrum (real symmetric or complex Hermitian)."""
+def hermitian_spectrum_to_correlation(frequency_bins, spectral_values, fft_len):
+    """Compute real time-domain correlation from sparse Hermitian positive-frequency spectrum."""
     val = np.asarray(spectral_values)
+    half = np.zeros(val.shape[:-1] + (fft_len // 2 + 1,), dtype=np.complex128)
+    half[..., frequency_bins] = val
+    half[..., 0] *= 2.0; half[..., -1] *= 2.0
+    return (0.5 * fft_len) * np.fft.irfft(half, n=fft_len, axis=-1)
+
+def spectrum_to_correlation(frequency_bins, spectral_values, fft_len, is_complex=False):
+    """Compute time-domain correlation RHS from frequency spectrum (real or complex quadrature pair)."""
     if is_complex:
+        val = np.asarray(spectral_values)
         full = np.zeros(val.shape[:-1] + (fft_len,), dtype=np.complex128)
         full[..., frequency_bins] = val
         return np.fft.ifft(full, n=fft_len, axis=-1) * fft_len
-    else:
-        half = np.zeros(val.shape[:-1] + (fft_len // 2 + 1,), dtype=np.complex128)
-        half[..., frequency_bins] = val
-        half[..., 0] *= 2.0; half[..., -1] *= 2.0
-        return (0.5 * fft_len) * np.fft.irfft(half, n=fft_len, axis=-1)
+    return hermitian_spectrum_to_correlation(frequency_bins, spectral_values, fft_len)
 
 def tap_positions(n_taps, fft_len):
     return (np.arange(n_taps) - n_taps // 2) % fft_len
@@ -102,16 +106,14 @@ def snap_tap_count(tap_count, round_up=True):
     return 15 + max(rounded, 0) * 8
 
 def cached_toeplitz_solve(toeplitz_col, rhs_vector):
-    """Solve Toeplitz system with Cholesky factor caching (real symmetric or complex Hermitian)."""
-    is_complex = np.iscomplexobj(toeplitz_col)
+    """Solve real symmetric Toeplitz system with Cholesky factor caching."""
     if len(toeplitz_col) > 1024:
-        return solve_toeplitz((toeplitz_col, toeplitz_col.conj()) if is_complex else toeplitz_col, rhs_vector)
+        return solve_toeplitz(toeplitz_col, rhs_vector)
     key = toeplitz_col.tobytes()
     factor = _g_factor_cache.get(key)
     if factor is None:
         if len(_g_factor_cache) >= 64: _g_factor_cache.clear()
-        mat = scipy.linalg.toeplitz(toeplitz_col, toeplitz_col.conj()) if is_complex else scipy.linalg.toeplitz(toeplitz_col)
-        factor = _g_factor_cache[key] = cho_factor(mat, lower=True, check_finite=False)
+        factor = _g_factor_cache[key] = cho_factor(scipy.linalg.toeplitz(toeplitz_col), lower=True, check_finite=False)
     return cho_solve(factor, rhs_vector, check_finite=False)
 
 def design_fft_toeplitz_filter(target_response, valid_mask, n_taps, weights, regularization, toeplitz_solver=None, r_base=None, b_base=None, is_complex=None):
@@ -136,20 +138,16 @@ def design_fft_toeplitz_filter(target_response, valid_mask, n_taps, weights, reg
             bins = np.concatenate((base_bins, extra_bins))
             w = np.concatenate((base_w, np.full(len(extra_bins), typ_w)))
             tgt = np.concatenate((base_tgt, np.zeros(len(extra_bins), dtype=complex)))
-            r_col = spectrum_to_correlation(bins, w ** 2, fft_len, is_complex=is_complex)[:n_taps].copy()
+            r_col = hermitian_spectrum_to_correlation(bins, w ** 2, fft_len)[:n_taps].copy()
             r_col[0] += regularization
             b = spectrum_to_correlation(bins, tgt * (w ** 2), fft_len, is_complex=is_complex)[pos]
 
-        if toeplitz_solver is not None:
-            taps = toeplitz_solver(r_col, b)
-        elif is_complex:
-            taps = solve_toeplitz((r_col, r_col.conj()), b)
-        else:
-            taps = solve_toeplitz(r_col, b)
+        taps = (toeplitz_solver or solve_toeplitz)(r_col, b)
 
         if is_complex:
-            wave = np.zeros(fft_len, dtype=complex); wave[pos] = taps
-            mags = np.abs(np.fft.fft(wave)[:len(target_response)])
+            wave_re = np.zeros(fft_len, dtype=float); wave_re[pos] = taps.real
+            wave_im = np.zeros(fft_len, dtype=float); wave_im[pos] = taps.imag
+            mags = np.maximum(np.abs(np.fft.rfft(wave_re)), np.abs(np.fft.rfft(wave_im)))
         else:
             wave = np.zeros(fft_len, dtype=float); wave[pos] = taps
             mags = np.abs(np.fft.rfft(wave))
@@ -188,42 +186,67 @@ def build_fit_problem(cand_idx, fine_waveform_np, ref_waveform=None, ref_norm_sq
     is_complex = getattr(g_args, 'complex_taps', False)
     b_bins = np.flatnonzero(band)
     w_bins = fit_w[b_bins]
-    r_base = spectrum_to_correlation(b_bins, w_bins ** 2, g_fft_len, is_complex=is_complex)
+    r_base = hermitian_spectrum_to_correlation(b_bins, w_bins ** 2, g_fft_len)
     b_base = spectrum_to_correlation(b_bins, target[b_bins] * (w_bins ** 2), g_fft_len, is_complex=is_complex)
     return dict(c_idx=c, h_ref=ref_waveform, target=target, band=band, w_fit=fit_w,
                 w_match=match_w, shift=shift, ref_ss=ref_norm_sq, ref_fs=ref_fs, shared=shared,
                 r_base=r_base, b_base=b_base)
 
 def compute_filter_frequency_response(taps, is_complex=None):
+    """Compute positive-frequency response of real filter or (Re, Im) quadrature filter pair."""
     if is_complex is None:
         is_complex = getattr(g_args, 'complex_taps', False) or np.iscomplexobj(taps)
+    pos = tap_positions(len(taps), g_fft_len)
     if is_complex:
-        wave = np.zeros(g_fft_len, dtype=complex)
-        wave[tap_positions(len(taps), g_fft_len)] = taps
-        return np.fft.fft(wave)[:g_fft_len // 2 + 1]
+        wave_re = np.zeros(g_fft_len, dtype=float); wave_re[pos] = taps.real
+        wave_im = np.zeros(g_fft_len, dtype=float); wave_im[pos] = taps.imag
+        return np.fft.rfft(wave_re), np.fft.rfft(wave_im)
     else:
-        wave = np.zeros(g_fft_len, dtype=float)
-        wave[tap_positions(len(taps), g_fft_len)] = taps
+        wave = np.zeros(g_fft_len, dtype=float); wave[pos] = taps
         return np.fft.rfft(wave)
 
 def compute_filter_metrics(freq_response, taps, problem):
-    mags, fb = np.abs(freq_response), problem['band']
+    if isinstance(freq_response, tuple):
+        mags = np.maximum(np.abs(freq_response[0]), np.abs(freq_response[1]))
+        max_tap = float(max(np.max(np.abs(taps.real)), np.max(np.abs(taps.imag))))
+    else:
+        mags = np.abs(freq_response)
+        max_tap = float(np.max(np.abs(taps)))
+    fb = problem['band']
     wm = problem['w_match'][fb]
     inband = np.sqrt(np.sum(wm * mags[fb] ** 2) / np.sum(wm))
-    if inband <= 0: return float(np.max(np.abs(taps))), np.inf, np.inf
+    if inband <= 0: return max_tap, np.inf, np.inf
     oob = (mags[~fb].max() / inband) if (~fb).any() else 0.0
-    return float(np.max(np.abs(taps))), float(oob), float(np.sqrt(np.mean(mags ** 2)) / inband)
+    return max_tap, float(oob), float(np.sqrt(np.mean(mags ** 2)) / inband)
 
-def verify_filter_reconstruction(freq_response, problem, fine_waveform_np, fine_norm_sq):
-    resp = freq_response / g_args.sample_rate
-    if problem['shift']: resp = resp * np.exp(-1j * 2.0 * np.pi * g_freqs * problem['shift'] / g_args.sample_rate)
+def verify_filter_reconstruction(freq_response, problem, fine_waveform_np, fine_norm_sq, taps_arr=None):
+    """Verify reconstruction match against target waveform (checking both Re and Im quadratures if complex)."""
     sl = g_freq_slice
-    rec = problem['h_ref'][sl] * resp[sl]
-    ip = np.sum(np.conj(fine_waveform_np[sl]) * rec * g_inv_psd[sl])
-    rec_ss = np.sum((rec.real ** 2 + rec.imag ** 2) * g_inv_psd[sl])
-    m = (abs(ip) / np.sqrt(rec_ss * fine_norm_sq)) if rec_ss > 0 else 0.0
     sc = 4.0 * g_delta_f
-    return float(m), (np.sqrt(sc * problem['ref_ss']), np.sqrt(sc * rec_ss), np.sqrt(sc * fine_norm_sq))
+    phase = np.exp(-1j * 2.0 * np.pi * g_freqs[sl] * problem['shift'] / g_args.sample_rate) if problem['shift'] else 1.0
+    if isinstance(freq_response, tuple):
+        resp_re = (freq_response[0][sl] / g_args.sample_rate) * phase
+        resp_im = (1j * freq_response[1][sl] / g_args.sample_rate) * phase
+        rec_re = problem['h_ref'][sl] * resp_re
+        rec_im = problem['h_ref'][sl] * resp_im
+        rec_re_ss = float(np.sum((rec_re.real ** 2 + rec_re.imag ** 2) * g_inv_psd[sl]))
+        rec_im_ss = float(np.sum((rec_im.real ** 2 + rec_im.imag ** 2) * g_inv_psd[sl]))
+        if rec_re_ss <= 0 or rec_im_ss <= 0:
+            return 0.0, (np.sqrt(sc * problem['ref_ss']), 0.0, np.sqrt(sc * fine_norm_sq))
+        ip_re = float(np.real(np.sum(np.conj(fine_waveform_np[sl]) * rec_re * g_inv_psd[sl])))
+        ip_im = float(np.real(np.sum(np.conj(fine_waveform_np[sl]) * rec_im * g_inv_psd[sl])))
+        m_re = ip_re / np.sqrt(rec_re_ss * fine_norm_sq)
+        m_im = ip_im / np.sqrt(rec_im_ss * fine_norm_sq)
+        if taps_arr is not None:
+            taps_arr.imag *= np.float32(np.sqrt(rec_re_ss / rec_im_ss))
+        return float(min(m_re, m_im)), (np.sqrt(sc * problem['ref_ss']), np.sqrt(sc * rec_re_ss), np.sqrt(sc * fine_norm_sq))
+    else:
+        resp = (freq_response[sl] / g_args.sample_rate) * phase
+        rec = problem['h_ref'][sl] * resp
+        ip = np.sum(np.conj(fine_waveform_np[sl]) * rec * g_inv_psd[sl])
+        rec_ss = np.sum((rec.real ** 2 + rec.imag ** 2) * g_inv_psd[sl])
+        m = (abs(ip) / np.sqrt(rec_ss * fine_norm_sq)) if rec_ss > 0 else 0.0
+        return float(m), (np.sqrt(sc * problem['ref_ss']), np.sqrt(sc * rec_ss), np.sqrt(sc * fine_norm_sq))
 
 def evaluate_filter_fit(problem, n_taps, fine_waveform_np, fine_norm_sq):
     """Design FIR filter and evaluate match against target waveform."""
@@ -235,7 +258,7 @@ def evaluate_filter_fit(problem, n_taps, fine_waveform_np, fine_norm_sq):
     taps_arr = np.asarray(taps, dtype=np.complex64 if is_complex else np.float32)
     resp = compute_filter_frequency_response(taps_arr, is_complex=is_complex)
     metrics = compute_filter_metrics(resp, taps_arr, problem)
-    overlap_match, sigmas = verify_filter_reconstruction(resp, problem, fine_waveform_np, fine_norm_sq)
+    overlap_match, sigmas = verify_filter_reconstruction(resp, problem, fine_waveform_np, fine_norm_sq, taps_arr=taps_arr)
     is_accepted = (overlap_match >= g_args.min_match and np.isfinite(metrics[0]) and metrics[0] <= 1e5)
     return is_accepted, dict(c_idx=problem['c_idx'], n_taps=int(n_taps), match=overlap_match, taps=taps_arr,
                              sigmas=sigmas, shift=problem['shift'], metrics=metrics, n_passes=n_passes, n_bad=n_bad)
@@ -330,22 +353,16 @@ def get_cached_waveform(waveform_idx):
     return hit
 
 def solve_toeplitz_batch(problem, n_taps, target_matrix, regularization, fft_len):
-    is_complex = getattr(g_args, 'complex_taps', False)
     bins = np.flatnonzero(problem['band'])
     w2 = problem['w_fit'][bins] ** 2
-    r_col = spectrum_to_correlation(bins, w2, fft_len, is_complex=is_complex)[:n_taps].copy()
+    r_col = hermitian_spectrum_to_correlation(bins, w2, fft_len)[:n_taps].copy()
     r_col[0] += regularization
     pos = tap_positions(n_taps, fft_len)
-    b = spectrum_to_correlation(bins, target_matrix[:, bins] * w2[None, :], fft_len, is_complex=is_complex)[:, pos]
+    b = hermitian_spectrum_to_correlation(bins, target_matrix[:, bins] * w2[None, :], fft_len)[:, pos]
     taps = cached_toeplitz_solve(r_col, b.T)
-    if is_complex:
-        wave = np.zeros((fft_len, taps.shape[1]), dtype=complex)
-        wave[pos] = taps
-        return np.fft.fft(wave, axis=0)[:fft_len // 2 + 1].T, taps
-    else:
-        wave = np.zeros((fft_len, taps.shape[1]), dtype=float)
-        wave[pos] = taps
-        return np.fft.rfft(wave, axis=0).T, taps
+    wave = np.zeros((fft_len, taps.shape[1]), dtype=float)
+    wave[pos] = taps
+    return np.fft.rfft(wave, axis=0).T, taps
 
 def compute_basis_corrected_parent(base_idx, correction_coeffs):
     base_fs, base_np, base_norm_sq = get_cached_waveform(base_idx)
@@ -359,7 +376,6 @@ def evaluate_gn_linearization(task):
     base_idx, coeffs, child_indices, n_taps = task
     parent_np, parent_norm_sq, parent_fs = compute_basis_corrected_parent(base_idx, coeffs)
     n_basis, out = len(g_correction_basis), []
-    is_complex = getattr(g_args, 'complex_taps', False)
     for child_idx in child_indices:
         _, child_np, child_norm_sq = get_cached_waveform(child_idx)
         prob = build_fit_problem(base_idx, child_np, parent_np, parent_norm_sq, parent_fs, shared=True)
@@ -367,10 +383,9 @@ def evaluate_gn_linearization(task):
             out.append((child_idx, 1.0, 1e-10, np.zeros((n_basis, n_basis)), np.zeros(n_basis))); continue
         T0 = prob['target']
         targets = np.vstack([T0[None, :], T0[None, :] * g_correction_basis])
-        resp, taps = solve_toeplitz_batch(prob, n_taps, targets, g_args.regularization_magnitude, g_fft_len)
-        taps_0 = taps[:, 0].astype(np.complex64 if is_complex else np.float32)
-        rec_resp = compute_filter_frequency_response(taps_0, is_complex=is_complex)
-        mis = 1.0 - verify_filter_reconstruction(rec_resp, prob, child_np, child_norm_sq)[0]
+        resp, _ = solve_toeplitz_batch(prob, n_taps, targets, g_args.regularization_magnitude, g_fft_len)
+        _, rec = evaluate_filter_fit(prob, n_taps, child_np, child_norm_sq)
+        mis = 1.0 - rec['match']
         bins = np.flatnonzero(prob['band'])
         w = prob['w_fit'][bins]
         rho = (resp[0] - T0)[bins] * w
@@ -918,7 +933,7 @@ def run_hierarchy_level(child_path, parent_seed_path, freq_len, delta_f, psd, ar
         if failed_count:
             failed_indices = [idx for idx in indices if results[idx] is None or not (results[idx][2] >= args.min_match)]
             logging.info("Self-healing: promoting %d unabsorbed %s template(s) to parent seeds", len(failed_indices), label)
-            identity_taps = np.zeros(15, dtype=np.complex64 if args.complex_taps else np.float32)
+            identity_taps = np.zeros(15, dtype=np.float32)
             identity_taps[7] = float(args.sample_rate)
             identity_metrics = (float(args.sample_rate), 1.0, 1.0)
             psd_arr = psd.numpy() if hasattr(psd, 'numpy') else np.asarray(psd)
@@ -931,10 +946,17 @@ def run_hierarchy_level(child_path, parent_seed_path, freq_len, delta_f, psd, ar
                 new_parent_pos = len(seed_source_indices)
                 src_seed = candidates[f_idx] if child_indices is not None else f_idx
                 seed_source_indices = np.append(seed_source_indices, src_seed)
-                f_np = child_bank[f_idx].numpy().astype(complex)
+                f_wave = child_bank[f_idx].copy()
+                f_np = f_wave.numpy().astype(complex)
                 norm_sq = float(np.sum(np.abs(f_np[sl]) ** 2 * inv_psd[sl]))
                 sigma_val = float(np.sqrt(4.0 * delta_f * norm_sq))
-                results[f_idx] = (1.0, new_parent_pos, 1.0, identity_taps, (sigma_val, sigma_val, sigma_val), 0, identity_metrics)
+                if args.complex_taps:
+                    prob = build_fit_problem(new_parent_pos, f_np, f_np, norm_sq, f_wave)
+                    rec, fail = find_minimum_taps(prob, args.max_taps, f_np, norm_sq)
+                    chosen = rec if rec is not None else fail
+                    results[f_idx] = (1.0, new_parent_pos, chosen['match'], chosen['taps'], chosen['sigmas'], chosen['shift'], chosen['metrics'])
+                else:
+                    results[f_idx] = (1.0, new_parent_pos, 1.0, identity_taps, (sigma_val, sigma_val, sigma_val), 0, identity_metrics)
             failed_count = 0
 
         n_used = len({r[1] for r in results if r is not None and r[1] >= 0})
@@ -1016,8 +1038,9 @@ def main():
         upper_args.max_taps = args.upper_max_taps
         upper_args.min_match = 1.0 - (1.0 - args.min_match) / 10.0
         upper_args.regularization_magnitude = 1e-6
+        upper_args.complex_taps = False
 
-        # Level 2: Middle -> Top
+        # Level 2: Middle -> Top (always real filters for top/middle stages)
         seed_params_top = (snap_tap_count(int(0.85 * upper_args.max_taps)), upper_args.max_taps, 1, 12345)
         upper_results, top_bank, _, _ = run_hierarchy_level(
             mid_seed_path, top_seed_path, fit_flen, fit_df, upper_psd, upper_args,
@@ -1051,9 +1074,9 @@ def main():
         upper_group.attrs['delta_f'] = upper_df
         upper_group.attrs['fit_solver'] = 'toeplitz'
         upper_group.attrs['sample_shift_folded_into_lower'] = 1
-        upper_group.attrs['complex_taps'] = bool(args.complex_taps)
+        upper_group.attrs['complex_taps'] = False
 
-        write_fir_groups(upper_group, upper_results, match_dtype='float64', is_complex=args.complex_taps)
+        write_fir_groups(upper_group, upper_results, match_dtype='float64', is_complex=False)
         fir_group.attrs['hierarchy_version'] = 2
         fir_group.attrs['complex_taps'] = bool(args.complex_taps)
         fir_group.attrs['fine_bank_sha256'] = compute_file_sha256(args.fine_bank)
