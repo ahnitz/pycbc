@@ -56,7 +56,11 @@ class UpperReferenceBatch:
     def clear_buffers(cls):
         cls._BUFFERS.clear()
 
-    def __init__(self, taps, counts, middle_ids, series_length, scales=None):
+    def __init__(self, taps, counts, middle_ids, series_length, scales=None, real_input=False):
+        """real_input: the bank's final filters are complex (quadrature) taps, so the
+        hierarchy is real-real-complex -- the middle filters see the real top output (the
+        real part of the top template's complex SNR, which is the real top filter's output)
+        and give real middle series, from which the final filters make the complex SNR."""
         import matchedfilter
         from matchedfilter import _automatic_series_layout
 
@@ -65,6 +69,7 @@ class UpperReferenceBatch:
         self.sort_order = sort_order
         self.sorted_ids = np.asarray(middle_ids, dtype=int)[sort_order]
         self.series_length = int(series_length)
+        self.real_input = bool(real_input)
         # Each middle filter's scale is fixed for the batch: fold it into the filter's taps
         # rather than multiply every output series by it on every call (a full pass over
         # ~25 series of ~10^6 samples). Rounds once on the taps instead of the output.
@@ -143,7 +148,8 @@ class UpperReferenceBatch:
         else:
             out = np.zeros((n_req, L), dtype=np.complex64)
 
-        ser = np.ascontiguousarray(top_series, dtype=np.complex64)
+        ser = np.ascontiguousarray(top_series.real if self.real_input else top_series,
+                                   dtype=np.complex64)
 
         pad_val = int(pad) if pad is not None else 4096
         if windows is not None:
@@ -1214,8 +1220,11 @@ def process_top_template_task(task_args):
 
     t_up_prep = time.perf_counter()
     any_seg = next(segments[i][0] for i in instruments if len(segments[i]) > 0)
+    # Complex final taps: a real-real-complex hierarchy (pycbc_fir_bank --complex-taps).
+    quadrature = bool(len(middle_ids)) and np.iscomplexobj(bank.get_firs(int(middle_ids[0]))[0])
     upper_batch = UpperReferenceBatch(
-        taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2, scales=all_scales
+        taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2, scales=all_scales,
+        real_input=quadrature,
     )
     local_timers['upper_prep'] += time.perf_counter() - t_up_prep
 
