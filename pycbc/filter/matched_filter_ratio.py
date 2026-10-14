@@ -192,7 +192,14 @@ class MatchedFilterRatioControl(object):
             self.ref_snr = snr.numpy()
             self.ref_snr *= (norm * stilde.delta_t) / self.decimation_factor
         else:
-            self.ref_snr = reference_series if isinstance(reference_series, np.ndarray) and reference_series.dtype == np.complex64 else np.asarray(reference_series, dtype=np.complex64)
+            # A real middle series (real-real-complex hierarchy: complex final taps) stays real,
+            # possibly one lane of a packed pair's row, which matchedfilter reads in place.
+            if isinstance(reference_series, np.ndarray) and reference_series.dtype in (np.complex64, np.float32):
+                self.ref_snr = reference_series
+            elif np.iscomplexobj(reference_series):
+                self.ref_snr = np.asarray(reference_series, dtype=np.complex64)
+            else:
+                self.ref_snr = np.asarray(reference_series, dtype=np.float32)
             if len(self.ref_snr) != (len(stilde) - 1) * 2:
                 raise ValueError('reference series length does not match data segment')
 
