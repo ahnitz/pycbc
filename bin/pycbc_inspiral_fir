@@ -179,8 +179,20 @@ class UpperReferenceBatch:
         else:
             out = np.zeros((n_req, L), dtype=np.complex64)
 
-        ser = np.ascontiguousarray(top_series.real if self.real_input else top_series,
-                                   dtype=np.complex64)
+        # Real input: the real top output stays real (4 bytes a sample) where the library
+        # correlates a real series itself (half-size block transforms); widened otherwise.
+        ser_real = None
+        if self.real_input:
+            ser_real = np.ascontiguousarray(np.real(top_series), dtype=np.float32)
+            ser = None
+        else:
+            ser = np.ascontiguousarray(top_series, dtype=np.complex64)
+
+        def complex_series():
+            nonlocal ser
+            if ser is None:
+                ser = ser_real.astype(np.complex64)
+            return ser
 
         pad_val = int(pad) if pad is not None else 4096
         if windows is not None:
@@ -274,11 +286,16 @@ class UpperReferenceBatch:
                 if st_run.size == 0:
                     continue      # nothing to compute; the C layer rejects an empty block list
                 if cplan._gpu is not None:
-                    cplan._continuous_gpu(ser, st_run, r0, r1 - r0, dest)
+                    cplan._continuous_gpu(complex_series(), st_run, r0, r1 - r0, dest)
                 else:
-                    cplan._execution_plan().correlate_series_continuous(
-                        ser, st_run, lo, hi, r0, r1 - r0, dest
-                    )
+                    ep = cplan._execution_plan()
+                    if ser_real is not None and hasattr(ep, 'correlate_series_continuous_real'):
+                        ep.correlate_series_continuous_real(
+                            ser_real, st_run, lo, hi, r0, r1 - r0, dest)
+                    else:
+                        ep.correlate_series_continuous(
+                            complex_series(), st_run, lo, hi, r0, r1 - r0, dest
+                        )
 
         regions = [tuple(x) for x in iv] if iv is not None else [(0, L)]
         sel = np.flatnonzero(want)
