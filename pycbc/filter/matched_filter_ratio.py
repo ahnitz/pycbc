@@ -167,10 +167,15 @@ class MatchedFilterRatioControl:
                 w = ref_template[::dec] / psd[::dec] ** 0.5
                 newf = np.arange(0, n) * delta_f
                 self._ref_weight = np.interp(newf, w.sample_frequencies, w)
+            # The correlation of a template h with the data s is
+            # conj(h) * s / psd, and the engine computes the fine template's
+            # as ratio * conj(reference) * s / psd, so the fine template is
+            # given by conj(ratio) * reference
             tmplt = FrequencySeries(
-                filters_f[i] * self._ref_weight, delta_f=delta_f, dtype=stilde.dtype
+                np.conj(filters_f[i]) * self._ref_weight / self.engine_sr,
+                delta_f=delta_f,
+                dtype=stilde.dtype,
             )
-            tmplt[:] = abs(tmplt) / self.engine_sr
             tmplt.params = params
             tmplt.f_lower = ref_template.f_lower
             self._fine_templates[i] = tmplt
