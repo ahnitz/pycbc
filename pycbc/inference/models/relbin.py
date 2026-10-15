@@ -478,7 +478,7 @@ class Relative(DistMarg, BaseGaussianNoise):
 
         self.wf_ret = wf_ret
         if self.check_heterodyne_bins:
-            logging.info("heterodyne bin error: %s", self.heterodyne_bin_error())
+            logger.info("heterodyne bin error: %s", self.heterodyne_bin_error())
         return wf_ret
 
     @property
