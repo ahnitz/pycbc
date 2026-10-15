@@ -301,16 +301,21 @@ def main():
                         template_ids, method=args.template_normalization_method
                     )
 
-                    def template(j):
-                        return engine.fine_template(
-                            ids_local[j], bank.table[template_ids[j]]
-                        )
+                    def template(j, _ids=ids_local, _tids=template_ids):
+                        return engine.fine_template(_ids[j], bank.table[_tids[j]])
 
-                    def correlation(j, reach):
+                    def correlation(
+                        j,
+                        reach,
+                        _ids=ids_local,
+                        _t=t_idxs,
+                        _ts=tstarts,
+                        _r=rescale,
+                    ):
                         corr, index = engine.fine_correlation(
-                            ids_local[j], t_idxs[j], tstarts[j], reach
+                            _ids[j], _t[j], _ts[j], reach
                         )
-                        return corr / rescale[j], index
+                        return corr / _r[j], index
 
                     keep, vetoes = veto_chain.values(
                         snrs / rescale,

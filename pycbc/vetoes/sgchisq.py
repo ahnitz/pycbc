@@ -126,8 +126,8 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         if not above.any():
             return chisq
 
-        N = (len(template) - 1) * 2
-        dt = 1.0 / (N * template.delta_f)
+        num_samples = (len(template) - 1) * 2
+        dt = 1.0 / (num_samples * template.delta_f)
         times = float(template.epoch) + dt * numpy.array(indices)[above]
         chisq[above] = self.values_at(stilde, psd, template, psd, times)
         return chisq
