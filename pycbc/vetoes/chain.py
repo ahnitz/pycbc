@@ -50,10 +50,12 @@ the other its template's correlation with the data around it.
 
 import logging
 import time
+from typing import ClassVar
 
-import numpy
+import numpy as np
 
 from pycbc.events import cuts, ranking
+from pycbc.io.hdf import get_chisq_from_file_choice
 from pycbc.types import FrequencySeries
 from pycbc.vetoes.autochisq import SingleDetAutoChisq, autochisq_from_precomputed
 from pycbc.vetoes.chisq import SingleDetPowerChisq
@@ -71,9 +73,9 @@ class _Batch:
     def __init__(
         self, snr, time_index, template_id, template, correlation, stilde, columns
     ):
-        self.snr = numpy.asarray(snr)
-        self.time_index = numpy.asarray(time_index)
-        self.template_id = numpy.asarray(template_id)
+        self.snr = np.asarray(snr)
+        self.time_index = np.asarray(time_index)
+        self.template_id = np.asarray(template_id)
         self.template = template
         self.correlation = correlation
         self.stilde = stilde
@@ -89,7 +91,7 @@ def _unit_psd(template):
     key = (len(template), template.delta_f)
     if key not in _unit_psds:
         _unit_psds[key] = FrequencySeries(
-            numpy.ones(len(template), dtype=numpy.float32), delta_f=template.delta_f
+            np.ones(len(template), dtype=np.float32), delta_f=template.delta_f
         )
     return _unit_psds[key]
 
@@ -127,12 +129,12 @@ class _Stage:
 
 class _PowerStage(_Stage):
     name = "power"
-    columns = {"chisq": numpy.float32, "chisq_dof": int}
+    columns: ClassVar[dict] = {"chisq": np.float32, "chisq_dof": int}
 
     def default(self, n):
         return {
-            "chisq": numpy.zeros(n, dtype=numpy.float32),
-            "chisq_dof": numpy.zeros(n, dtype=int) - 100,
+            "chisq": np.zeros(n, dtype=np.float32),
+            "chisq_dof": np.zeros(n, dtype=int) - 100,
         }
 
     def evaluate(self, batch, j):
@@ -140,10 +142,10 @@ class _PowerStage(_Stage):
         template = batch.template(j)
         chi, dof = self.estimator.values(
             corr,
-            numpy.array([batch.snr[j]]),
+            np.array([batch.snr[j]]),
             1,
             _unit_psd(template),
-            numpy.array([index]),
+            np.array([index]),
             template,
         )
         if chi is None:
@@ -153,21 +155,21 @@ class _PowerStage(_Stage):
 
 class _AutoStage(_Stage):
     name = "auto"
-    columns = {"cont_chisq": numpy.float32}
+    columns: ClassVar[dict] = {"cont_chisq": np.float32}
 
     def default(self, n):
-        return {"cont_chisq": numpy.zeros(n, dtype=numpy.float32)}
+        return {"cont_chisq": np.zeros(n, dtype=np.float32)}
 
     def evaluate(self, batch, j):
         est = self.estimator
         corr, index = batch.correlation(j, est.stride * est.num_points)
-        corr = numpy.asarray(corr)
-        sn = numpy.fft.ifft(corr) * len(corr)
+        corr = np.asarray(corr)
+        sn = np.fft.ifft(corr) * len(corr)
         _, achisq = autochisq_from_precomputed(
             sn,
             sn,
             self.autocorrelation(batch, j),
-            numpy.array([index]),
+            np.array([index]),
             stride=est.stride,
             num_points=est.num_points,
             oneside=est.one_sided,
@@ -185,19 +187,19 @@ class _AutoStage(_Stage):
         """
         tid = batch.template_id[j]
         if tid not in batch.autocorrelations:
-            power = numpy.abs(numpy.asarray(batch.template(j))) ** 2
+            power = np.abs(np.asarray(batch.template(j))) ** 2
             power[len(power) // 2 + 1 :] = 0
-            autocor = numpy.fft.ifft(power)
+            autocor = np.fft.ifft(power)
             batch.autocorrelations[tid] = autocor / autocor[0]
         return batch.autocorrelations[tid]
 
 
 class _SGStage(_Stage):
     name = "sg"
-    columns = {"sg_chisq": numpy.float32}
+    columns: ClassVar[dict] = {"sg_chisq": np.float32}
 
     def default(self, n):
-        return {"sg_chisq": numpy.ones(n, dtype=numpy.float32)}
+        return {"sg_chisq": np.ones(n, dtype=np.float32)}
 
     def evaluate(self, batch, j):
         stilde = batch.stilde
@@ -209,7 +211,7 @@ class _SGStage(_Stage):
             stilde.psd,
             template,
             _unit_psd(template),
-            numpy.array([seconds]),
+            np.array([seconds]),
             whitened=False,
         )
         return {"sg_chisq": val[0]}
@@ -281,8 +283,8 @@ class SignalConsistencyChain:
         for step in steps:
             if step in ("power", "auto", "sg"):
                 if step not in stages:
-                    raise ValueError(
-                        "Stage '%s' is in the chain but its options are not set" % step
+                    raise ValueError(  # noqa: TRY003
+                        f"Stage '{step}' is in the chain but its options are not set"
                     )
                 stage = stages[step]
                 self.steps.append(stage)
@@ -294,9 +296,9 @@ class SignalConsistencyChain:
                 param, func, value, action = self._parse_threshold(step)
                 missing = set(self._required(param)) - available
                 if missing:
-                    raise ValueError(
-                        "'%s' needs %s, which no earlier step "
-                        "provides" % (step, sorted(missing))
+                    raise ValueError(  # noqa: TRY003
+                        f"'{step}' needs {sorted(missing)}, "
+                        "which no earlier step provides"
                     )
                 self.steps.append((param, func, value, action, step))
         logger.info("Signal consistency chain: %s", self.description)
@@ -305,12 +307,12 @@ class SignalConsistencyChain:
     def _parse_threshold(step):
         fields = step.split(":")
         if len(fields) != 4 or fields[3].lower() not in ("remove", "skip"):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY003
                 "A threshold step is "
                 "PARAMETER:VALUE:LIMIT:ACTION, with ACTION "
                 "'remove' (drop the triggers that fail from the "
                 "output) or 'skip' (keep them, but compute no "
-                "later test for them); got '%s'" % step
+                f"later test for them); got '{step}'"
             )
         action = fields.pop().lower()
         choices = (
@@ -318,9 +320,9 @@ class SignalConsistencyChain:
             + list(_chisq_choice_columns)
             + ["snr", "psd_var_val"]
         )
-        (param, func), value = list(
-            cuts.convert_inputstr(":".join(fields), choices).items()
-        )[0]
+        (param, func), value = next(
+            iter(cuts.convert_inputstr(":".join(fields), choices).items())
+        )
         return param, func, value, action
 
     @staticmethod
@@ -344,11 +346,11 @@ class SignalConsistencyChain:
 
         Parameters
         ----------
-        snr : complex numpy.ndarray
+        snr : complex np.ndarray
             The normalized SNR of each trigger.
-        time_index : numpy.ndarray
+        time_index : np.ndarray
             The time of each trigger, in samples from the start of stilde.
-        template_id : numpy.ndarray
+        template_id : np.ndarray
             The template of each trigger. Values are only shared between
             triggers of the same template.
         template : function
@@ -372,10 +374,10 @@ class SignalConsistencyChain:
 
         Returns
         -------
-        keep : numpy.ndarray of bool
+        keep : np.ndarray of bool
             Which triggers are kept in the output: those no 'remove'
             threshold dropped.
-        values : dict of numpy.ndarray
+        values : dict of np.ndarray
             Each column the tests compute, with one entry per trigger of the
             batch.
 
@@ -384,13 +386,13 @@ class SignalConsistencyChain:
             snr, time_index, template_id, template, correlation, stilde, columns
         )
         n = len(batch.snr)
-        keep = numpy.ones(n, dtype=bool)
+        keep = np.ones(n, dtype=bool)
         # The triggers still being tested: thresholds and tests narrow it
-        alive = numpy.ones(n, dtype=bool)
+        alive = np.ones(n, dtype=bool)
         vals = {}
         for step in self.steps:
             if isinstance(step, tuple):
-                idx = numpy.flatnonzero(alive)
+                idx = np.flatnonzero(alive)
                 failed = idx[~self._threshold(step, batch, vals, idx)]
                 alive[failed] = False
                 if step[3] == "remove":
@@ -412,22 +414,20 @@ class SignalConsistencyChain:
 
     def _threshold(self, step, batch, vals, idx):
         param, func, value = step[:3]
-        trigs = {"snr": numpy.abs(batch.snr[idx])}
+        trigs = {"snr": np.abs(batch.snr[idx])}
         for col, arr in vals.items():
             trigs[col] = arr[idx]
         for col, arr in batch.columns.items():
-            trigs[col] = numpy.asarray(arr)[idx]
+            trigs[col] = np.asarray(arr)[idx]
         if "chisq_dof" in trigs:
             # EventManager's convention (2p - 2); ranking expects p bins
             trigs["chisq_dof"] = trigs["chisq_dof"] / 2 + 1
         if "cont_chisq" in vals:
-            trigs["cont_chisq_dof"] = numpy.repeat(float(self._auto_dof), len(idx))
+            trigs["cont_chisq_dof"] = np.repeat(float(self._auto_dof), len(idx))
 
         if param in ranking.sngls_ranking_function_dict:
             stat = ranking.get_sngls_ranking_from_trigs(trigs, param)
         elif param in _chisq_choice_columns:
-            from pycbc.io.hdf import get_chisq_from_file_choice
-
             stat = get_chisq_from_file_choice(trigs, param)
         else:
             stat = trigs[param]
@@ -435,12 +435,12 @@ class SignalConsistencyChain:
 
     def _run_stage(self, stage, batch, vals, alive):
         start = time.perf_counter()
-        priority = numpy.abs(batch.snr)
+        priority = np.abs(batch.snr)
         times = batch.time_index
         tids = batch.template_id
         assigned = ~alive
         computed = 0
-        for j in numpy.argsort(priority)[::-1]:
+        for j in np.argsort(priority)[::-1]:
             if not alive[j]:
                 continue
             if self.max_iterations is not None and computed >= self.max_iterations:
@@ -453,7 +453,7 @@ class SignalConsistencyChain:
                 # in its window may stand in for it
                 continue
             share = (
-                (numpy.abs(times - times[j]) <= self.window)
+                (np.abs(times - times[j]) <= self.window)
                 & (tids == tids[j])
                 & ~assigned
             )
@@ -536,7 +536,7 @@ class SignalConsistencyChain:
 
         """
         if args.autochi_reverse_template:
-            raise ValueError("The chain does not support --autochi-reverse-template")
+            raise ValueError("The chain does not support --autochi-reverse-template")  # noqa: TRY003
         # The tests' SNR thresholds are steps of the chain, not of the
         # estimators
         power = SingleDetPowerChisq(args.chisq_bins)
@@ -548,12 +548,12 @@ class SignalConsistencyChain:
             steps = []
             if power.do:
                 if args.chisq_snr_threshold:
-                    steps.append("snr:%r:lower:skip" % args.chisq_snr_threshold)
+                    steps.append(f"snr:{args.chisq_snr_threshold!r}:lower:skip")
                 steps.append("power")
             if auto.do:
                 steps.append("auto")
             if sg.do:
-                steps += ["newsnr:%r:lower_inc:skip" % sg.snr_threshold, "sg"]
+                steps += [f"newsnr:{sg.snr_threshold!r}:lower_inc:skip", "sg"]
         return cls(
             power,
             auto,
