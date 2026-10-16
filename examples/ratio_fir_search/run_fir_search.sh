@@ -41,6 +41,8 @@ pycbc_inspiral_fir \
     --psdvar-high-freq 480 \
     --low-frequency-cutoff 20 \
     --snr-threshold ${SNR:-5.0} \
+    --asym-snr-threshold ${SNR:-5.0} \
+    --asym-max-primary-per-group-sec 0 \
     --cluster-window 1 \
     --chisq-snr-threshold 6 \
     --chisq-bins 64 \
