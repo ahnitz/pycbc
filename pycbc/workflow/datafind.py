@@ -154,7 +154,8 @@ def setup_datafind_workflow(workflow, scienceSegs, outputDir, seg_file=None,
         ifos = scienceSegs.keys()
         datafindcaches, datafindouts = \
             setup_datafind_from_pregenerated_lcf_files(cp, ifos,
-                                                       outputDir, tags=tags)
+                                                       outputDir, tags=tags,
+                                                       scienceSegs=scienceSegs)
     else:
         msg = """Entry datafind-method in [workflow-datafind] does not have "
               expected value. Valid values are 
@@ -665,7 +666,8 @@ def setup_datafind_runtime_frames_multi_calls_perifo(cp, scienceSegs,
 
     return datafindcaches, datafindouts
 
-def setup_datafind_from_pregenerated_lcf_files(cp, ifos, outputDir, tags=None):
+def setup_datafind_from_pregenerated_lcf_files(cp, ifos, outputDir, tags=None,
+                                               scienceSegs=None):
     """
     This function is used if you want to run with pregenerated lcf frame
     cache files.
@@ -707,6 +709,11 @@ def setup_datafind_from_pregenerated_lcf_files(cp, ifos, outputDir, tags=None):
                                                 search_string, tags=tags)
         curr_cache = lal.Cache.fromfilenames([frame_cache_file_name],
                                              coltype=lal.LIGOTimeGPS)
+        if scienceSegs and ifo in scienceSegs:
+            curr_cache = lal.Cache([
+                entry for entry in curr_cache
+                if scienceSegs[ifo].intersects_segment(entry.segment)
+            ])
         curr_cache.ifo = ifo
         datafindcaches.append(curr_cache)
     datafindouts = convert_cachelist_to_filelist(datafindcaches)
