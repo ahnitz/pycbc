@@ -22,6 +22,5 @@ pycbc_fir_bank \
     --sample-rate 2048 \
     --max-taps ${MAX_TAPS:-301 1501} \
     --min-match ${MIN_MATCH:-0.99999} \
-    --delta-f ${DELTA_F:-0.5 0.03125} \
     --n-processes 1 \
     --verbose "$@"
