@@ -744,7 +744,8 @@ for inj_file, tag in zip(inj_files, inj_tags):
     if workflow.cp.has_option_tags('workflow-injections',
                                    'compute-optimal-snr', tags=ctags):
         optimal_snr_file = wf.compute_inj_optimal_snr(
-                workflow, inj_file, psd_files, 'inj_files', tags=ctags)
+                workflow, inj_file, psd_files, 'inj_files',
+                datafind_files=datafind_files, tags=ctags)
         file_for_injfind = optimal_snr_file
     else:
         file_for_injfind = inj_file

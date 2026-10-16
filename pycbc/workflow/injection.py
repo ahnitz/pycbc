@@ -58,13 +58,25 @@ class PyCBCOptimalSNRExecutable(Executable):
     """Compute optimal SNR for injections"""
     current_retention_level = Executable.ALL_TRIGGERS
 
-    def create_node(self, workflow, inj_file, precalc_psd_files, group_str):
+    def create_node(self, workflow, inj_file, precalc_psd_files, group_str,
+                    datafind_files=None):
         node = Node(self)
         _, ext = os.path.splitext(inj_file.name)
         node.add_input_opt('--input-file', inj_file)
         node.add_opt('--injection-fraction-range', group_str)
         node.add_opt('--ifos', ' '.join(workflow.ifos))
         node.add_input_list_opt('--time-varying-psds', precalc_psd_files)
+        if not self.has_opt('channel-name') and '--channel-name' not in node._options:
+            channel_names = []
+            for ifo in workflow.ifos:
+                if self.cp.has_option_tags('workflow', f'{ifo.lower()}-channel-name', []):
+                    cname = self.cp.get_opt_tags('workflow', f'{ifo.lower()}-channel-name', [])
+                    if cname:
+                        channel_names.append(f'{ifo}:{cname}' if ':' not in cname else cname)
+            if channel_names:
+                node.add_opt('--channel-name', ' '.join(channel_names))
+        if datafind_files is not None and len(datafind_files) > 0:
+            node.add_multiifo_input_list_opt('--frame-files', datafind_files)
         node.new_output_file_opt(workflow.analysis_time, ext,
                                  '--output-file')
         return node
@@ -83,7 +95,7 @@ class PyCBCMergeHDFExecutable(Executable):
 
 
 def compute_inj_optimal_snr(workflow, inj_file, precalc_psd_files, out_dir,
-                            tags=None):
+                            datafind_files=None, tags=None):
     "Set up a job for computing optimal SNRs of a sim_inspiral file."
     if tags is None:
         tags = []
@@ -102,7 +114,8 @@ def compute_inj_optimal_snr(workflow, inj_file, precalc_psd_files, out_dir,
                                                 ifos=workflow.ifos,
                                                 out_dir=out_dir, tags=tags)
         node = opt_snr_exe.create_node(workflow, inj_file,
-                                       precalc_psd_files, '0/1')
+                                       precalc_psd_files, '0/1',
+                                       datafind_files=datafind_files)
         workflow += node
 
         return node.output_files[0]
@@ -117,7 +130,8 @@ def compute_inj_optimal_snr(workflow, inj_file, precalc_psd_files, out_dir,
         opt_snr_exe.update_current_retention_level(
             Executable.INTERMEDIATE_PRODUCT)
         node = opt_snr_exe.create_node(workflow, inj_file, precalc_psd_files,
-                                       group_str)
+                                       group_str,
+                                       datafind_files=datafind_files)
         opt_snr_split_files += [node.output_files[0]]
         workflow += node
 

@@ -127,6 +127,9 @@ def setup_foreground_minifollowups(workflow, coinc_file, single_triggers,
     job = SubWorkflow(fil.name, is_planned=False)
     input_files = [tmpltbank_file, coinc_file, insp_segs] + \
         single_triggers
+    for f in workflow._inputs:
+        if f not in input_files:
+            input_files.append(f)
     job.add_inputs(*input_files)
     job.set_subworkflow_properties(map_file,
                                    staging_site=workflow.staging_site,
@@ -248,6 +251,9 @@ def setup_single_det_minifollowups(workflow, single_trig_file, tmpltbank_file,
         input_files.append(veto_file)
     if statfiles:
         input_files += statfiles
+    for f in workflow._inputs:
+        if f not in input_files:
+            input_files.append(f)
     job.add_inputs(*input_files)
     job.set_subworkflow_properties(map_file,
                                    staging_site=workflow.staging_site,
@@ -338,6 +344,9 @@ def setup_injection_minifollowups(workflow, injection_file, inj_xml_file,
     job = SubWorkflow(fil.name, is_planned=False)
     input_files = [tmpltbank_file, injection_file, inj_xml_file, insp_segs]
     input_files += single_triggers
+    for f in workflow._inputs:
+        if f not in input_files:
+            input_files.append(f)
     job.add_inputs(*input_files)
     job.set_subworkflow_properties(map_file,
                                    staging_site=workflow.staging_site,
@@ -345,6 +354,38 @@ def setup_injection_minifollowups(workflow, injection_file, inj_xml_file,
     job.add_into_workflow(workflow)
 
     logger.info('Leaving injection minifollowups module')
+
+
+def _get_workflow_datafind_files(workflow):
+    """Return cached FileList of frame files from pregenerated LCF files if configured."""
+    if hasattr(workflow, '_cached_datafind_files'):
+        return workflow._cached_datafind_files
+    df_files = None
+    if workflow.cp.has_option('workflow-datafind', 'datafind-method'):
+        method = workflow.cp.get('workflow-datafind', 'datafind-method')
+        if method == 'FROM_PREGENERATED_LCF_FILES':
+            from pycbc.workflow.datafind import setup_datafind_from_pregenerated_lcf_files
+            sci_segs = {ifo: segments.segmentlist([workflow.analysis_time]) for ifo in workflow.ifos}
+            _, df_files = setup_datafind_from_pregenerated_lcf_files(
+                workflow.cp, workflow.ifos, '.', scienceSegs=sci_segs
+            )
+    workflow._cached_datafind_files = df_files
+    return df_files
+
+
+def _stage_frame_files_for_node(workflow, curr_exe, node, ifo, data_seg):
+    """If no frame-cache/frame-type/frame-files is configured on curr_exe,
+    stage the overlapping frame files from pregenerated LCF files via --frame-files.
+    """
+    if (not curr_exe.has_opt('frame-cache') and
+            not curr_exe.has_opt('frame-type') and
+            not curr_exe.has_opt('frame-files') and
+            '--frame-files' not in node._options):
+        df_files = _get_workflow_datafind_files(workflow)
+        if df_files:
+            needed = df_files.find_all_output_in_range(ifo, data_seg)
+            if needed:
+                node.add_input_list_opt('--frame-files', needed)
 
 
 class SingleTemplateExecutable(PlotExecutable):
@@ -552,6 +593,10 @@ def make_single_template_files(workflow, segs, ifo, data_read_name,
         node.add_input_opt('--injection-file', inj_file)
     node.add_opt('--data-read-name', data_read_name)
     node.add_opt('--data-analyzed-name', analyzed_name)
+    _stage_frame_files_for_node(
+        workflow, curr_exe, node, ifo,
+        segments.segment([int(trig_time) - 2048, int(trig_time) + 2048])
+    )
     node.new_output_file_opt(workflow.analysis_time, '.hdf',
                              '--output-file', store_file=store_file)
     workflow += node
@@ -871,6 +916,7 @@ def make_qscan_plot(workflow, ifo, trig_time, out_dir, injection_file=None,
 
     # Then if data_segments is available, check against that, and move if
     # needed
+    pad_data = int(curr_exe.get_opt('pad-data')) if curr_exe.has_opt('pad-data') else 0
     if data_segments is not None:
         # Assumes coalesced, so trig_time can only be within one segment
         for seg in data_segments:
@@ -891,11 +937,6 @@ def make_qscan_plot(workflow, ifo, trig_time, out_dir, injection_file=None,
             err_msg += "does not seem to lie within any data segments. "
             err_msg += "This shouldn't be possible, please ask for help!"
             raise ValueError(err_msg)
-        # Check for pad-data
-        if curr_exe.has_opt('pad-data'):
-            pad_data = int(curr_exe.get_opt('pad-data'))
-        else:
-            pad_data = 0
         # We only read data that's available. The code must handle the case
         # of not much data being available.
         if end > (data_seg[1] - pad_data):
@@ -906,6 +947,10 @@ def make_qscan_plot(workflow, ifo, trig_time, out_dir, injection_file=None,
     node.add_opt('--gps-start-time', int(start))
     node.add_opt('--gps-end-time', int(end))
     node.add_opt('--center-time', trig_time)
+    _stage_frame_files_for_node(
+        workflow, curr_exe, node, ifo,
+        segments.segment([int(start) - pad_data, int(end) + pad_data])
+    )
 
     if injection_file is not None:
         node.add_input_opt('--injection-file', injection_file)
@@ -973,6 +1018,7 @@ def make_singles_timefreq(workflow, single, bank_file, trig_time, out_dir,
 
     # Then if data_segments is available, check against that, and move if
     # needed
+    pad_data = int(curr_exe.get_opt('pad-data')) if curr_exe.has_opt('pad-data') else 0
     if data_segments is not None:
         # Assumes coalesced, so trig_time can only be within one segment
         for seg in data_segments:
@@ -996,11 +1042,6 @@ def make_singles_timefreq(workflow, single, bank_file, trig_time, out_dir,
             err_msg += "does not seem to lie within any data segments. "
             err_msg += "This shouldn't be possible, please ask for help!"
             raise ValueError(err_msg)
-        # Check for pad-data
-        if curr_exe.has_opt('pad-data'):
-            pad_data = int(curr_exe.get_opt('pad-data'))
-        else:
-            pad_data = 0
         if abs(data_seg) < (2 * time_window + 2 * pad_data):
             tl = 2 * time_window + 2 * pad_data
             err_msg = "I was asked to use {} seconds of data ".format(tl)
@@ -1021,6 +1062,10 @@ def make_singles_timefreq(workflow, single, bank_file, trig_time, out_dir,
     node.add_opt('--gps-start-time', int(start))
     node.add_opt('--gps-end-time', int(end))
     node.add_opt('--center-time', trig_time)
+    _stage_frame_files_for_node(
+        workflow, curr_exe, node, target_ifo,
+        segments.segment([int(start) - pad_data, int(end) + pad_data])
+    )
 
     if veto_file:
         node.add_input_opt('--veto-file', veto_file)

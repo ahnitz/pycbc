@@ -232,10 +232,10 @@ def main():
     parser.add_argument('--channel-name', nargs='*', action=MultiDetOptionAction,
                         metavar='DETECTOR:CHANNEL',
                         help='Channel name for each detector (e.g. H1:GWOSC-4KHZ_R1_STRAIN)')
-    parser.add_argument('--frame-files', nargs='*', action=MultiDetOptionAction,
+    parser.add_argument('--frame-files', nargs='*', action=pycbc.types.MultiDetOptionAppendAction,
                         metavar='DETECTOR:FILES',
                         help='Frame files for each detector')
-    parser.add_argument('--frame-cache', nargs='*', action=MultiDetOptionAction,
+    parser.add_argument('--frame-cache', nargs='*', action=pycbc.types.MultiDetOptionAppendAction,
                         metavar='DETECTOR:CACHE',
                         help='Frame cache files for each detector')
     parser.add_argument('--autogating-threshold', type=float, default=45.0,
@@ -289,14 +289,18 @@ def main():
             if isinstance(spec, str):
                 files = spec.split(',')
             else:
-                files = list(spec)
+                for item in spec:
+                    files.extend(item.split(','))
         elif getattr(opts, 'frame_cache', None) and det in opts.frame_cache:
-            cache_file = opts.frame_cache[det]
-            with open(cache_file, 'r') as cf:
-                for line in cf:
-                    parts = line.strip().split()
-                    if parts:
-                        files.append(parts[-1].replace('file://localhost', '').replace('file://', ''))
+            cache_files = opts.frame_cache[det]
+            if isinstance(cache_files, str):
+                cache_files = [cache_files]
+            for cache_file in cache_files:
+                with open(cache_file, 'r') as cf:
+                    for line in cf:
+                        parts = line.strip().split()
+                        if parts:
+                            files.append(parts[-1].replace('file://localhost', '').replace('file://', ''))
         else:
             cand_files = sorted(glob.glob(f"frames/*{det}*.gwf")) + sorted(glob.glob(f"../frames/*{det}*.gwf"))
             if not cand_files:
