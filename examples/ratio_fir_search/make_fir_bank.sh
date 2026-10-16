@@ -19,6 +19,7 @@ pycbc_fir_bank \
     --fine-bank bank_full.hdf \
     --output-file fir_full_bank.hdf \
     --psd-model aLIGOZeroDetHighPower \
+    --segment-length ${SEGMENT_LENGTH:-512} \
     --sample-rate 2048 \
     --max-taps ${MAX_TAPS:-301 1501} \
     --min-match ${MIN_MATCH:-0.99999} \
