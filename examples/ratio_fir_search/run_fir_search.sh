@@ -15,13 +15,10 @@ export OMP_NUM_THREADS=1
 # MKL takes 2.4 ms for the same transform.  Triggers are unchanged: 893/893
 # with the same SNRs to 2.9e-06, which is float32 rounding.
 pycbc_inspiral_fir \
-    --ratio-filter-engine ${ENGINE:-pycbc} \
+    --ratio-filter-engine ${ENGINE:-matchedfilter-hierarchical} \
     --output ${OUT:-fir.hdf} \
     --fft-backends ${FFTB:-mkl} \
-    --fir-length 4096 \
-    --batch-size ${BATCH:-64} \
-    --template-normalization-method precalculated_sigma \
-    --fast-chisq \
+    --disable-dynamic-snr-renorm \
     --pad-data 8 \
     --strain-high-pass 15 \
     --sample-rate 2048 \

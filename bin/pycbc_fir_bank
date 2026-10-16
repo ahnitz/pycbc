@@ -23,8 +23,74 @@ from tqdm import tqdm
 import pycbc, pycbc.psd, pycbc.conversions as conversions
 from pycbc.filter import match, get_cutoff_indices
 from pycbc.types import FrequencySeries
-from pycbc.waveform.bank import FilterBank, correction_basis
+from pycbc.waveform.bank import FilterBank
 import pycbc.waveform.compress as compress
+
+
+def correction_basis(flen, delta_f, f_low=20.0, f_final=800.0):
+    """Analytic correction basis C(f) for parent waveform optimization."""
+    freqs = np.arange(flen) * delta_f
+    band = (freqs >= f_low) & (freqs <= f_final)
+    f = np.where(band, freqs, f_low)
+    lf = np.log(f)
+    cent = np.linspace(np.log(f_low), np.log(f_final), 8)
+    wid = cent[1] - cent[0]
+    bumps = [np.exp(-0.5 * ((lf - c) / wid) ** 2) for c in cent]
+    pn = [f ** p for p in (-5. / 3, -1., -2. / 3, -1. / 3, 1. / 3, 2. / 3)] + [lf]
+    ph = [b / np.max(np.abs(b[band] - np.mean(b[band]))) for b in pn + bumps]
+    am = bumps[::2] + [bumps[-1]]
+    C = np.array([1j * p for p in ph] + [a.astype(np.complex128) for a in am])
+    return C, band
+
+
+def open_base_filter_bank(bank_path, flen, delta_f):
+    """Open fine FilterBank at requested resolution, mapping SPAtmplt to TaylorF2."""
+    bank = FilterBank(bank_path, flen, delta_f, dtype=complex, enable_compressed_waveforms=False)
+    if getattr(bank, 'file', None) is not None:
+        bank.file.close()
+    if hasattr(bank, 'table') and 'approximant' in bank.table.dtype.names:
+        apx = np.array([a.decode() if hasattr(a, 'decode') else str(a) for a in bank.table['approximant']])
+        if np.any(apx == 'SPAtmplt'):
+            apx = np.where(apx == 'SPAtmplt', 'TaylorF2', apx)
+            bank.table['approximant'][:] = apx
+    return bank
+
+
+class LevelBank:
+    """In-memory view of a subset of the fine FilterBank with optional Gauss-Newton basis corrections."""
+
+    def __init__(self, base_bank, fine_indices=None, correction_coeffs=None, f_low=20.0):
+        self.base_bank = base_bank
+        self.fine_indices = (
+            np.arange(len(base_bank), dtype=int)
+            if fine_indices is None
+            else np.asarray(fine_indices, dtype=int)
+        )
+        self.table = base_bank.table[self.fine_indices]
+        self.correction_coeffs = (
+            None if correction_coeffs is None else np.asarray(correction_coeffs, dtype=float)
+        )
+        self.f_low = f_low
+        self._basis = None
+        self._band = None
+
+    def __len__(self):
+        return len(self.fine_indices)
+
+    def __getitem__(self, index):
+        h = self.base_bank[int(self.fine_indices[index])].copy()
+        if self.correction_coeffs is not None and index < len(self.correction_coeffs):
+            z = self.correction_coeffs[index]
+            if np.any(z != 0):
+                if self._basis is None or self._basis.shape[1] != len(h):
+                    self._basis, self._band = correction_basis(
+                        len(h), float(h.delta_f), self.f_low, 800.0
+                    )
+                h_np = h.numpy().copy()
+                h_np[self._band] *= np.exp(z @ self._basis[:, self._band])
+                h = FrequencySeries(h_np, delta_f=h.delta_f, epoch=h.epoch)
+        return h
+
 
 # --- GLOBAL WORKER STATE (Inherited via fork in worker processes) ---
 g_coarse_waveforms, g_coarse_waveforms_np, g_coarse_norm_sq = None, None, None
@@ -633,9 +699,9 @@ def float_tail_worker(task):
         return (fine_idx, float(direct_m), c, best_rec['match'], best_rec['taps'], best_rec['sigmas'], best_rec['shift'], best_rec['metrics'])
     return None
 
-def run_tail_float_pass(pool, results, label, threshold=200):
+def run_tail_float_pass(pool, results, label, threshold=200, is_lowest=True):
     """Run parallel tail-floating pass to allow boundary templates to migrate to lower-tap parents."""
-    if label != 'middle': return results
+    if not is_lowest: return results
     tail_tasks = [(i, r[1], len(r[3])) for i, r in enumerate(results) if r is not None and r[1] >= 0 and len(r[3]) > threshold]
     if not tail_tasks: return results
     logging.info("Tail-Floating pass: evaluating %d tail templates (taps > %d) across surviving parents...", len(tail_tasks), threshold)
@@ -653,7 +719,7 @@ def run_tail_float_pass(pool, results, label, threshold=200):
                      n_floated, total_savings / n_floated)
     return results
 
-def dissolve_small_groups(pool, results, child_bank, args, min_size=35, label='middle', parent_corrections=None):
+def dissolve_small_groups(pool, results, child_bank, args, min_size=35, label='level_1', parent_corrections=None):
     """Dissolve small groups by reabsorbing their templates into neighboring parents."""
     groups = defaultdict(set)
     for i, r in enumerate(results):
@@ -700,7 +766,7 @@ def dissolve_small_groups(pool, results, child_bank, args, min_size=35, label='m
                  n_dissolved, len(groups), label)
     return results
 
-def consolidate_hierarchy_level(pool, results, parent_source_indices, child_bank, args, label):
+def consolidate_hierarchy_level(pool, results, parent_source_indices, child_bank, args, label, is_lowest=True):
     """Consolidate parent templates, merge groups, and remap indices."""
     rows = [None if r is None else (r[0], int(parent_source_indices[r[1]])) + tuple(r[2:]) for r in results]
     base_corrections = getattr(child_bank, 'correction_coeffs', None)
@@ -710,9 +776,9 @@ def consolidate_hierarchy_level(pool, results, parent_source_indices, child_bank
     }
     feats = extract_bank_features(child_bank, args.f_low)
     n_before = len({r[1] for r in rows if r is not None})
-    n_merged = 0 if label == 'top' else merge_parent_groups(pool, rows, feats, child_bank, args, label, parent_corrections=parent_corrections, base_corrections=base_corrections)
+    n_merged = merge_parent_groups(pool, rows, feats, child_bank, args, label, parent_corrections=parent_corrections, base_corrections=base_corrections) if is_lowest else 0
     logging.info('Group merging: %d merges, %d -> %d %s templates in use', n_merged, n_before, len({r[1] for r in rows if r is not None}), label)
-    if label != 'top':
+    if is_lowest:
         rows = dissolve_small_groups(pool, rows, child_bank, args, min_size=35, label=label, parent_corrections=parent_corrections)
 
     used_parents = np.array(sorted({r[1] for r in rows if r is not None}), dtype=int)
@@ -721,8 +787,8 @@ def consolidate_hierarchy_level(pool, results, parent_source_indices, child_bank
     return remapped_rows, used_parents, np.array([parent_corrections.get(int(s), np.zeros(20)) for s in used_parents], float)
 
 # --- I/O AND SEED SELECTION ---
-def write_fir_groups(parent_hdf_group, all_results, match_dtype='float32', is_complex=False):
-    """Write FIR tap tables and metadata datasets into HDF5 group."""
+def write_fir_groups(parent_hdf_group, all_results, match_dtype='float32', is_complex=False, sample_rate=None):
+    """Write pre-scaled FIR tap tables and metadata datasets into HDF5 group."""
     groups = defaultdict(list)
     for i, r in enumerate(all_results):
         if r is not None and r[1] >= 0: groups[r[1]].append(r + (i,))
@@ -737,40 +803,26 @@ def write_fir_groups(parent_hdf_group, all_results, match_dtype='float32', is_co
         counts = np.array([len(r[3]) for r in rows], dtype=np.int32)
         max_k = int(counts.max())
         taps_array = np.zeros((len(rows), max_k), dtype=taps_dtype)
-        for j, r in enumerate(rows): taps_array[j, :counts[j]] = r[3]
+        sigmas_list = []
+        for j, r in enumerate(rows):
+            ref_s, rec_s, target_s = float(r[4][0]), float(r[4][1]), float(r[4][2])
+            scale = (ref_s / rec_s) if rec_s > 0 else 1.0
+            if sample_rate is not None:
+                scale /= float(sample_rate)
+            taps_array[j, :counts[j]] = np.asarray(r[3] * scale, dtype=taps_dtype)
+            sigmas_list.append((ref_s, ref_s, target_s))
         grp.create_dataset('taps', data=taps_array, chunks=(len(rows), max_k), **taps_comp)
         metrics = np.array([r[6] for r in rows], dtype=np.float32)
 
         for name, data, dtype in (
             ('actual_tap_count', counts, 'int32'), ('fine_bank_index', [r[-1] for r in rows], 'int32'),
             ('filter_match', [r[2] for r in rows], match_dtype), ('coarse_match', [r[0] for r in rows], 'float32'),
-            ('sigmas', [r[4] for r in rows], 'float32'), ('sample_shift', [r[5] for r in rows], 'int32'),
+            ('sigmas', sigmas_list, 'float32'), ('sample_shift', [r[5] for r in rows], 'int32'),
             ('max_tap', metrics[:, 0], 'float32'), ('oob_gain', metrics[:, 1], 'float32'), ('noise_gain', metrics[:, 2], 'float32'),
         ):
             grp.create_dataset(name, data=np.asarray(data, dtype=dtype), chunks=True, **meta_comp)
         tap_counts.append(counts)
     return np.concatenate(tap_counts) if tap_counts else np.array([], dtype=int)
-
-def write_seed_bank(src_path, seed_indices, dst_path, force=False, correction_coeffs=None):
-    """Write seed bank subset to HDF5 file with source provenance tracking."""
-    seed_indices = np.asarray(seed_indices, dtype=int)
-    if os.path.exists(dst_path) and not force:
-        raise ValueError(f'{dst_path} exists; refusing to overwrite (use --force)')
-    with h5py.File(src_path, 'r') as src, h5py.File(dst_path, 'w') as dst:
-        n_templates = len(src['tau0']) if 'tau0' in src else None
-        skip = {'template_hash', 'seed_source_index', 'correction_coeffs'}
-        for key, obj in src.items():
-            if isinstance(obj, h5py.Dataset) and key not in skip and obj.shape and obj.shape[0] == n_templates:
-                dst.create_dataset(key, data=obj[:][seed_indices])
-        dst.attrs.update(src.attrs)
-        dst.attrs['seed_source_bank'] = os.path.abspath(src_path)
-        dst.attrs['seed_source_sha256'] = compute_file_sha256(src_path)
-        dst.create_dataset('seed_source_index', data=seed_indices.astype(np.int64))
-        if correction_coeffs is not None:
-            dst.create_dataset('correction_coeffs', data=np.asarray(correction_coeffs, float))
-        elif 'correction_coeffs' in src:
-            dst.create_dataset('correction_coeffs', data=src['correction_coeffs'][:][seed_indices])
-    logging.info('Wrote %d seeds to %s', len(seed_indices), dst_path)
 
 def compute_file_sha256(file_path):
     with open(file_path, 'rb') as f: return hashlib.file_digest(f, 'sha256').hexdigest()
@@ -881,49 +933,52 @@ def parse_cli():
     # File I/O
     parser.add_argument('--fine-bank', required=True, help="Input fine template bank HDF5 file.")
     parser.add_argument('--output-file', required=True, help="Output FIR filter bank HDF5 file.")
-    parser.add_argument('--delta-f', type=float, required=True, help="Frequency resolution in Hz.")
-    parser.add_argument('--upper-delta-f', type=parse_freq, default=None,
-                        help="Frequency resolution in Hz for upper level and top waveform compression (e.g. 1/512 or 0.001953125).")
+    parser.add_argument('--delta-f', nargs='+', type=parse_freq, required=True,
+                        help="Frequency resolution(s) in Hz per FIR level (single value or one per level).")
     parser.add_argument('--f-low', type=float, default=20.0, help="Low-frequency cutoff in Hz (default: 20).")
     parser.add_argument('--sample-rate', type=float, default=2048.0, help="Sampling rate in Hz (default: 2048).")
     parser.add_argument('--n-processes', '-n', type=int, default=1, help="Number of worker processes (default: 1).")
     parser.add_argument('--force', action='store_true', help="Overwrite existing output files.")
 
     # Primary filter parameters
-    parser.add_argument('--min-match', type=float, default=0.9999, help="Minimum filter match threshold (default: 0.9999).")
-    parser.add_argument('--max-taps', type=int, default=301, help="Maximum allowed tap count for middle level (default: 301).")
-    parser.add_argument('--upper-max-taps', type=int, default=5001, help="Maximum allowed tap count for top level (default: 5001).")
+    parser.add_argument('--min-match', nargs='+', type=float, default=[0.9999],
+                        help="Minimum filter match threshold(s) per FIR level (default: 0.9999).")
+    parser.add_argument('--max-taps', nargs='+', type=int, default=[301],
+                        help="Maximum allowed tap count(s) per FIR level, from level 1 upward (e.g. --max-taps 301 or --max-taps 301 5001).")
     parser.add_argument('--complex-taps', action='store_true', default=False,
-                        help="Enable complex-valued FIR filter taps (default: False, real float32 taps).")
+                        help="Enable complex-valued quadrature FIR filter taps at level 1 (default: False, real float32 taps).")
     return parser.parse_args()
 
 # --- PIPELINE LEVEL RUNNER ---
-def run_hierarchy_level(child_path, parent_seed_path, freq_len, delta_f, psd, args,
-                        child_indices=None, label='middle', seed_params=None):
-    """Run seeding, template fitting, pruning, consolidation, and tail-floating."""
+def run_hierarchy_level(fine_bank_path, child_fine_indices, child_corrections, freq_len, delta_f, psd, args,
+                        label='level_1', seed_params=None, is_lowest=True):
+    """Run seeding, template fitting, pruning, consolidation, and tail-floating in memory."""
     logging.info("Bottom-up seeding: selecting %s templates...", label)
-    child_bank = FilterBank(child_path, freq_len, delta_f, dtype=complex, enable_compressed_waveforms=False)
-    candidates = np.arange(len(child_bank)) if child_indices is None else child_indices
-    seed_source_indices = select_bank_seeds(child_bank, psd, args, seed_params, candidates,
-                                           min(args.n_processes, 14) if label == 'top' else args.n_processes,
-                                           f"Seeding {label} level")
-    write_seed_bank(child_path, seed_source_indices, parent_seed_path, force=True)
+    base_bank = open_base_filter_bank(fine_bank_path, freq_len, delta_f)
+    child_bank = LevelBank(base_bank, child_fine_indices, child_corrections, f_low=args.f_low)
+    candidates = np.arange(len(child_bank), dtype=int)
+    n_procs = args.n_processes if is_lowest else min(args.n_processes, 14)
+    seed_local_indices = select_bank_seeds(child_bank, psd, args, seed_params, candidates,
+                                           n_procs, f"Seeding {label}")
 
-    child_bank = FilterBank(child_path, freq_len, delta_f, dtype=complex, enable_compressed_waveforms=False)
-    parent_bank = FilterBank(parent_seed_path, freq_len, delta_f, dtype=complex, enable_compressed_waveforms=False)
-    parent_waveforms = [h.copy() for h in parent_bank]
-    indices = list(range(len(child_bank))) if child_indices is None else list(child_indices)
+    parent_bank = LevelBank(
+        base_bank,
+        child_bank.fine_indices[seed_local_indices],
+        child_bank.correction_coeffs[seed_local_indices],
+        f_low=args.f_low,
+    )
+    parent_waveforms = [parent_bank[i] for i in range(len(parent_bank))]
+    indices = list(range(len(child_bank)))
     args._coarse_tau0 = np.array(parent_bank.table['tau0'], float) if hasattr(parent_bank, 'table') and 'tau0' in parent_bank.table.dtype.names else None
     args._fine_tau0 = np.array(child_bank.table['tau0'], float) if hasattr(child_bank, 'table') and 'tau0' in child_bank.table.dtype.names else None
 
     results, failed_count = [None] * len(child_bank), 0
-    n_procs = min(args.n_processes, 14) if label == 'top' else args.n_processes
     cs = max(1, min(len(indices) // (2 * n_procs), 8))
     init_worker(parent_waveforms, child_bank, psd, args)
     with mp.Pool(processes=n_procs, initializer=init_worker, initargs=(parent_waveforms, child_bank, psd, args)) as pool:
         it = pool.imap_unordered(process_template, indices, chunksize=cs)
         if not args.verbose:
-            it = tqdm(it, total=len(indices), desc=f"Fitting {label} level", postfix={"failed": 0}, file=sys.stderr)
+            it = tqdm(it, total=len(indices), desc=f"Fitting {label}", postfix={"failed": 0}, file=sys.stderr)
         for res in it:
             fine_idx, parent_match, parent_idx, match_val, taps, sigmas, shift, metrics, accepted = res
             results[fine_idx] = (parent_match, parent_idx, match_val, taps, sigmas, shift, metrics)
@@ -943,9 +998,8 @@ def run_hierarchy_level(child_path, parent_seed_path, freq_len, delta_f, psd, ar
             sl = slice(k_min, k_max)
 
             for f_idx in failed_indices:
-                new_parent_pos = len(seed_source_indices)
-                src_seed = candidates[f_idx] if child_indices is not None else f_idx
-                seed_source_indices = np.append(seed_source_indices, src_seed)
+                new_parent_pos = len(seed_local_indices)
+                seed_local_indices = np.append(seed_local_indices, int(f_idx))
                 f_wave = child_bank[f_idx].copy()
                 f_np = f_wave.numpy().astype(complex)
                 norm_sq = float(np.sum(np.abs(f_np[sl]) ** 2 * inv_psd[sl]))
@@ -962,27 +1016,29 @@ def run_hierarchy_level(child_path, parent_seed_path, freq_len, delta_f, psd, ar
         n_used = len({r[1] for r in results if r is not None and r[1] >= 0})
         removed = prune_redundant_parents(pool, results, args.n_processes, label=label)
         logging.info('Seed pruning: %d -> %d %s templates in use', n_used, n_used - len(removed), label)
-        results, used_indices, corrections = consolidate_hierarchy_level(pool, results, seed_source_indices, child_bank, args, label)
+        results, used_local_indices, corrections = consolidate_hierarchy_level(
+            pool, results, seed_local_indices, child_bank, args, label, is_lowest=is_lowest
+        )
 
-    if getattr(parent_bank, 'file', None): parent_bank.file.close()
-    write_seed_bank(child_path, used_indices, parent_seed_path, force=True, correction_coeffs=corrections)
-    parent_bank = FilterBank(parent_seed_path, freq_len, delta_f, dtype=complex, enable_compressed_waveforms=False)
-    parent_waveforms = [h.copy() for h in parent_bank]
+    surviving_fine_indices = child_bank.fine_indices[used_local_indices]
+    parent_bank = LevelBank(base_bank, surviving_fine_indices, corrections, f_low=args.f_low)
+    parent_waveforms = [parent_bank[i] for i in range(len(parent_bank))]
 
-    # Tail-floating pass on surviving parents
-    if label == 'middle':
+    if is_lowest:
         args._coarse_tau0 = np.array(parent_bank.table['tau0'], float) if hasattr(parent_bank, 'table') and 'tau0' in parent_bank.table.dtype.names else None
         with mp.Pool(processes=n_procs, initializer=init_worker, initargs=(parent_waveforms, child_bank, psd, args)) as float_pool:
-            results = run_tail_float_pass(float_pool, results, label, threshold=int(0.65 * args.max_taps))
+            results = run_tail_float_pass(float_pool, results, label, threshold=int(0.65 * args.max_taps), is_lowest=True)
 
-    return results, parent_bank, parent_waveforms, failed_count
+    return results, surviving_fine_indices, corrections, failed_count
 
 # --- MAIN PIPELINE ---
 def main():
     args = parse_cli()
-    args.n_taps = snap_tap_count(args.max_taps // 2)
-    args.regularization_magnitude = 1e-2
-    global g_args; g_args = args
+    num_levels = len(args.max_taps)
+    if len(args.delta_f) not in (1, num_levels):
+        sys.exit(f"Error: --delta-f must have 1 or {num_levels} values (got {len(args.delta_f)})")
+    if len(args.min_match) not in (1, num_levels):
+        sys.exit(f"Error: --min-match must have 1 or {num_levels} values (got {len(args.min_match)})")
 
     if os.path.exists(args.output_file) and not args.force:
         sys.exit(f'Error: {args.output_file} exists; refusing to overwrite (use --force)')
@@ -992,106 +1048,102 @@ def main():
     if args.verbose > 0 and log.handlers and isinstance(log.handlers[0], logging.StreamHandler):
         log.handlers[0].stream = sys.stdout
 
-    flen = int((args.sample_rate / 2.0) / args.delta_f) + 1
-    logging.info(f"Setup: Rate={args.sample_rate}, df={args.delta_f}, flen={flen}, complex_taps={args.complex_taps}")
-    psd = pycbc.psd.from_cli(args, length=flen, delta_f=args.delta_f, low_frequency_cutoff=args.f_low)
-    global g_correction_basis, g_correction_band
-    g_correction_basis, g_correction_band = correction_basis(flen, args.delta_f, args.f_low, 800.0)
+    df_1 = float(args.delta_f[0])
+    flen_1 = int(round((args.sample_rate / 2.0) / df_1)) + 1
+    logging.info(f"Setup: Rate={args.sample_rate}, num_levels={num_levels}, max_taps={args.max_taps}, delta_f={args.delta_f}, complex_taps={args.complex_taps}")
 
-    fine_bank = FilterBank(args.fine_bank, flen, args.delta_f, dtype=complex, enable_compressed_waveforms=False)
-    n_fine = len(fine_bank)
+    fine_bank = FilterBank(args.fine_bank, flen_1, df_1, dtype=complex, enable_compressed_waveforms=False)
     out_file = fine_bank.write_to_hdf(args.output_file, force=True, write_compressed_waveforms=True)
+    if getattr(fine_bank, 'file', None) is not None:
+        fine_bank.file.close()
+
     fir_group = out_file.require_group("fir_data")
-    for arg_name, arg_val in vars(args).items():
-        if arg_val is not None and isinstance(arg_val, (int, float, str, bool)): fir_group.attrs[arg_name] = arg_val
+    fir_group.attrs['num_levels'] = int(num_levels)
+    fir_group.attrs['sample_rate'] = float(args.sample_rate)
+    fir_group.attrs['delta_f'] = float(df_1)
+    fir_group.attrs['f_low'] = float(args.f_low)
+    fir_group.attrs['min_match'] = float(args.min_match[0])
+    fir_group.attrs['max_taps'] = int(args.max_taps[0])
+    fir_group.attrs['n_taps'] = int(snap_tap_count(int(args.max_taps[0]) // 2))
+    fir_group.attrs['complex_taps'] = bool(args.complex_taps)
+    fir_group.attrs['fine_bank_sha256'] = compute_file_sha256(args.fine_bank)
 
-    mid_seed_path = args.output_file + '.mid.tmp.hdf'
-    top_seed_path = args.output_file + '.top.tmp.hdf'
+    current_fine_indices = np.arange(len(fine_bank), dtype=int)
+    current_corrections = np.zeros((len(fine_bank), 20), dtype=float)
+    top_df = df_1
+    top_min_match = float(args.min_match[0])
 
-    try:
-        # Level 1: Fine -> Middle
-        seed_params_mid = (snap_tap_count(int(0.85 * args.max_taps)), args.max_taps, 30, 12345)
-        all_results, coarse_bank, _, failed_count = run_hierarchy_level(
-            args.fine_bank, mid_seed_path, flen, args.delta_f, psd, args,
-            label='middle', seed_params=seed_params_mid)
+    for level in range(1, num_levels + 1):
+        is_lowest = (level == 1)
+        label = f"level_{level}"
+        lvl_max_taps = int(args.max_taps[level - 1])
+        lvl_df = float(args.delta_f[level - 1]) if len(args.delta_f) > 1 else float(args.delta_f[0]) / (16.0 ** (level - 1))
+        lvl_min_match = float(args.min_match[level - 1]) if len(args.min_match) > 1 else (1.0 - (1.0 - float(args.min_match[0])) / (10.0 ** (level - 1)))
+        top_df = lvl_df
+        top_min_match = lvl_min_match
 
-        coarse_bank.write_to_hdf(args.output_file, file_handler=out_file, group_key="fir_data/coarse_bank_params", write_compressed_waveforms=True)
-        coarse_grp = out_file['fir_data/coarse_bank_params']
-        if 'approximant' in coarse_grp: del coarse_grp['approximant']
-        coarse_grp.create_dataset('approximant', data=np.array(['FIR_INTERMEDIATE'] * len(coarse_bank), dtype='S'))
-        tap_counts = write_fir_groups(fir_group, all_results, is_complex=args.complex_taps)
+        fit_df = lvl_df if is_lowest else max(lvl_df, 0.015625)
+        fit_flen = int(round((args.sample_rate / 2.0) / fit_df)) + 1
+        lvl_complex = bool(args.complex_taps) if is_lowest else False
+        lvl_reg = 1e-2 if is_lowest else 1e-6
+        min_cluster_size = 30 if is_lowest else 1
 
-        if failed_count: raise ValueError(f'{failed_count} lower-level FIR fits failed; refusing hierarchy generation')
-        used_middles = sorted({row[1] for row in all_results if row is not None and row[1] >= 0})
-        upper_df = args.upper_delta_f if args.upper_delta_f is not None else (args.delta_f / 16.0)
-        upper_flen = int((args.sample_rate / 2.0) / upper_df) + 1
+        lvl_args = argparse.Namespace(**vars(args))
+        lvl_args.delta_f = fit_df
+        lvl_args.max_taps = lvl_max_taps
+        lvl_args.n_taps = snap_tap_count(lvl_max_taps // 2)
+        lvl_args.min_match = lvl_min_match
+        lvl_args.regularization_magnitude = lvl_reg
+        lvl_args.complex_taps = lvl_complex
+        global g_args; g_args = lvl_args
 
-        # 64-second window (fit_df = 1/64 = 0.015625 Hz) for upper FIR design
-        fit_df = max(upper_df, 0.015625)
-        fit_flen = int((args.sample_rate / 2.0) / fit_df) + 1
-        upper_psd_args = argparse.Namespace(**vars(args)); upper_psd_args.delta_f = fit_df
-        upper_psd = pycbc.psd.from_cli(upper_psd_args, length=fit_flen, delta_f=fit_df, low_frequency_cutoff=args.f_low)
+        lvl_psd = pycbc.psd.from_cli(lvl_args, length=fit_flen, delta_f=fit_df, low_frequency_cutoff=args.f_low)
+        seed_params = (snap_tap_count(int(0.85 * lvl_max_taps)), lvl_max_taps, min_cluster_size, 12345)
 
-        upper_args = argparse.Namespace(**vars(args))
-        upper_args.delta_f = fit_df
-        upper_args.n_taps = snap_tap_count(args.upper_max_taps // 2)
-        upper_args.max_taps = args.upper_max_taps
-        upper_args.min_match = 1.0 - (1.0 - args.min_match) / 10.0
-        upper_args.regularization_magnitude = 1e-6
-        upper_args.complex_taps = False
+        lvl_results, current_fine_indices, current_corrections, failed_count = run_hierarchy_level(
+            args.fine_bank, current_fine_indices, current_corrections, fit_flen, fit_df, lvl_psd, lvl_args,
+            label=label, seed_params=seed_params, is_lowest=is_lowest
+        )
+        if is_lowest and failed_count:
+            raise ValueError(f'{failed_count} lower-level FIR fits failed; refusing hierarchy generation')
 
-        # Level 2: Middle -> Top (always real filters for top/middle stages)
-        seed_params_top = (snap_tap_count(int(0.85 * upper_args.max_taps)), upper_args.max_taps, 1, 12345)
-        upper_results, top_bank, _, _ = run_hierarchy_level(
-            mid_seed_path, top_seed_path, fit_flen, fit_df, upper_psd, upper_args,
-            child_indices=used_middles, label='top', seed_params=seed_params_top)
+        lvl_group = fir_group.require_group(label)
+        lvl_group.attrs['sample_rate'] = float(args.sample_rate)
+        lvl_group.attrs['n_taps'] = int(lvl_args.n_taps)
+        lvl_group.attrs['max_taps'] = int(lvl_max_taps)
+        lvl_group.attrs['min_match'] = float(lvl_min_match)
+        lvl_group.attrs['delta_f'] = float(lvl_df)
+        lvl_group.attrs['complex_taps'] = bool(lvl_complex)
 
-        top_bank.ensure_hash()
-        top_bank.write_to_hdf(args.output_file, file_handler=out_file, group_key='fir_data/upper/top_bank_params', write_compressed_waveforms=True)
+        write_fir_groups(
+            lvl_group, lvl_results,
+            match_dtype='float32' if is_lowest else 'float64',
+            is_complex=lvl_complex,
+            sample_rate=None if is_lowest else args.sample_rate,
+        )
 
-        logging.info(f"Compressing {len(top_bank)} top waveforms at full resolution...")
-        top_grp = out_file.require_group('fir_data/upper/top_bank_params')
-        if 'approximant' in top_grp: del top_grp['approximant']
-        top_grp.create_dataset('approximant', data=np.array(['FIR_COMPRESSED'] * len(top_bank), dtype='S'))
-        if 'template_hash' not in top_grp:
-            top_grp.create_dataset('template_hash', data=top_bank.table.template_hash)
-        else:
-            top_grp['template_hash'][:] = top_bank.table.template_hash
-        if 'compressed_waveforms' in top_grp: del top_grp['compressed_waveforms']
+    # Compress topmost reference waveforms into fir_data/level_{num_levels}/compressed_waveforms/<id>
+    top_lvl_group = fir_group[f"level_{num_levels}"]
+    comp_df = min(top_df, 1.0 / 512.0)
+    comp_flen = int(round((args.sample_rate / 2.0) / comp_df)) + 1
+    comp_tol = min(1e-5, (1.0 - top_min_match) * 0.1)
+    logging.info(f"Compressing {len(current_fine_indices)} top-level reference waveforms (df={comp_df}, tol={comp_tol:.1e})...")
 
-        top_comp_bank = FilterBank(top_seed_path, upper_flen, upper_df, dtype=complex, enable_compressed_waveforms=False)
-        for i in range(len(top_comp_bank)):
-            wave, tmplt = top_comp_bank[i], top_comp_bank.table[i]
-            thash, fmin, kmax = str(tmplt.template_hash), float(getattr(tmplt, 'f_lower', args.f_low)), int(np.nonzero(abs(wave.numpy()))[0][-1])
-            hc = compress.compress_waveform(wave, np.array([fmin, kmax * upper_df], float), 1e-5, 'inline_quadratic', 'single', psd=None)
-            hc.write_to_hdf(top_grp, thash)
-            logging.info(f"Compressed top {i + 1}/{len(top_comp_bank)} (hash={thash}, points={len(hc.sample_points)}, mismatch={hc.mismatch:.2e})")
-        del top_comp_bank
+    comp_base_bank = open_base_filter_bank(args.fine_bank, comp_flen, comp_df)
+    top_comp_bank = LevelBank(comp_base_bank, current_fine_indices, current_corrections, f_low=args.f_low)
+    for i in range(len(top_comp_bank)):
+        wave, tmplt = top_comp_bank[i], top_comp_bank.table[i]
+        fmin = float(getattr(tmplt, 'f_lower', args.f_low))
+        if fmin <= 0:
+            fmin = float(args.f_low)
+        kmax = int(np.nonzero(abs(wave.numpy()))[0][-1])
+        hc = compress.compress_waveform(wave, np.array([fmin, kmax * comp_df], float), comp_tol, 'inline_quadratic', 'single', psd=None)
+        hc.write_to_hdf(top_lvl_group, str(i))
+        logging.info(f"Compressed reference {i + 1}/{len(top_comp_bank)} (points={len(hc.sample_points)}, mismatch={hc.mismatch:.2e})")
+    del top_comp_bank, comp_base_bank
 
-        upper_group = out_file.require_group('fir_data/upper')
-        for name in ('sample_rate', 'n_taps', 'max_taps', 'min_match'):
-            upper_group.attrs[name] = getattr(upper_args, name)
-        upper_group.attrs['delta_f'] = upper_df
-        upper_group.attrs['fit_solver'] = 'toeplitz'
-        upper_group.attrs['sample_shift_folded_into_lower'] = 1
-        upper_group.attrs['complex_taps'] = False
-
-        write_fir_groups(upper_group, upper_results, match_dtype='float64', is_complex=False)
-        fir_group.attrs['hierarchy_version'] = 2
-        fir_group.attrs['complex_taps'] = bool(args.complex_taps)
-        fir_group.attrs['fine_bank_sha256'] = compute_file_sha256(args.fine_bank)
-        fir_group.attrs['middle_bank_sha256'] = compute_file_sha256(mid_seed_path)
-        fir_group.attrs['top_bank_sha256'] = compute_file_sha256(top_seed_path)
-
-        for c_idx, u_row in enumerate(upper_results):
-            if u_row is not None and len(u_row) > 5 and u_row[5] != 0 and str(c_idx) in fir_group and 'sample_shift' in fir_group[str(c_idx)]:
-                fir_group[str(c_idx)]['sample_shift'][:] += u_row[5]
-
-        out_file.close()
-        logging.info(f"Done. Saved to {args.output_file}")
-    finally:
-        for p in (mid_seed_path, top_seed_path):
-            if os.path.exists(p): os.remove(p)
+    out_file.close()
+    logging.info(f"Done. Saved to {args.output_file}")
 
 if __name__ == '__main__':
     main()

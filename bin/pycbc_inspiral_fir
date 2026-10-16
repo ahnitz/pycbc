@@ -482,7 +482,6 @@ class RatioPowerChisq(SingleDetPowerChisq):
             local_id = int(ids_local[idx])
             tstart = int(tstarts[idx])
 
-            rescale = float(bank.snr_rescale(target_global_id, method=args.template_normalization_method))
             # The chisq block is centred on the trigger (clipped to the series); its lag
             # must lie in the block's valid samples, which holds for any trigger inside
             # the analysed span.
@@ -548,7 +547,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
             bins, p, inv_wb, k_freqs, bin_starts, fpeak = cached
 
             ratio = filters_f[local_id]
-            corr = (ratio * ref_f) / (rescale * block_len)
+            corr = (ratio * ref_f) / block_len
 
             phases = np.exp((2j * np.pi * dt / block_len) * k_freqs).astype(np.complex64)
             phased_corr = corr[bins[0]:bins[-1]] * phases
@@ -565,7 +564,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
             rchi_val = chi_val / (2 * p - 2) if p > 1 else chi_val
             if autochisq is not None and (max_rchi is None or rchi_val <= max_rchi):
                 auto = autochisq.value(stilde, coarse_idx, ref_snr, filters_f, local_id,
-                                       t_idx, rescale, chisq_valid)
+                                       t_idx, chisq_valid)
                 if auto is not None:
                     auto_vals[update_mask] = auto
             assigned_mask[update_mask] = True
@@ -584,7 +583,7 @@ class RatioAutoChisq(SingleDetAutoChisq):
     Options, statistic and degrees of freedom are SingleDetAutoChisq's; only its
     two inputs are built differently, from the block spectra the power chisq
     uses. Over an N-sample block of the middle series with FFT D, the template's
-    SNR is IFFT(filters_f * D) / rescale, and its autocorrelation is the IFFT of
+    SNR is IFFT(filters_f * D), and its autocorrelation is the IFFT of
     its whitened power |coarse_w * conj(filters_f)|^2. Each trigger gets a block
     centred on it, so its lags stay inside the block's valid samples.
 
@@ -633,7 +632,7 @@ class RatioAutoChisq(SingleDetAutoChisq):
             self.autocors[key] = autocor[lags] / autocor[0]
         return self.autocors[key]
 
-    def value(self, stilde, coarse_idx, ref_snr, filters_f, local_id, t, rescale, chisq_valid):
+    def value(self, stilde, coarse_idx, ref_snr, filters_f, local_id, t, chisq_valid):
         """Auto-chisq of one trigger, or None if its lags would leave the series."""
         t0 = time.perf_counter()
         reach = self.stride * self.num_points
@@ -647,7 +646,7 @@ class RatioAutoChisq(SingleDetAutoChisq):
                      min(int(self.power_chisq.f_final / df), N // 2))
         corr = np.zeros(N, dtype=np.complex128)
         corr[band] = filters_f[local_id][band] * np.fft.fft(ref_snr[start:start + N])[band]
-        snr = np.fft.ifft(corr)[t - start - reach:t - start + reach + 1] / rescale
+        snr = np.fft.ifft(corr)[t - start - reach:t - start + reach + 1]
         _, achisq = autochisq_from_precomputed(
             snr, snr, self.autocorrelation(stilde, coarse_idx, local_id, filters_f, band),
             [reach], stride=self.stride, num_points=self.num_points,
@@ -1262,7 +1261,6 @@ def process_top_template_task(task_args):
     local_timers['top_decomp'] += time.perf_counter() - t_dec0
     ref_s = sigmas_u[:, 0]
     target_s = sigmas_u[:, 2]
-    all_scales = np.asarray((ref_s / target_s) / bank.sample_rate, dtype=np.float32)
     sigmasq_ratio_by_middle = {
         int(mid): float((target_s[row] / ref_s[row]) ** 2)
         for row, mid in enumerate(middle_ids)
@@ -1275,7 +1273,7 @@ def process_top_template_task(task_args):
     # Complex final taps: a real-real-complex hierarchy (pycbc_fir_bank --complex-taps).
     quadrature = bool(len(middle_ids)) and np.iscomplexobj(bank.get_firs(int(middle_ids[0]))[0])
     upper_batch = UpperReferenceBatch(
-        taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2, scales=all_scales,
+        taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2, scales=None,
         real_input=quadrature,
     )
     local_timers['upper_prep'] += time.perf_counter() - t_up_prep
@@ -1291,11 +1289,6 @@ def process_top_template_task(task_args):
         taps, counts, fine_indices, shifts = bank.get_firs(coarse_idx, return_shifts=True)
         if len(fine_indices) == 0:
             continue
-        fine_rescales = np.asarray(
-            bank.snr_rescale(fine_indices, method=args.template_normalization_method),
-            dtype=taps.dtype
-        )
-        scaled_taps = np.ascontiguousarray(taps * (1.0 / fine_rescales[:, None]), dtype=taps.dtype)
         group_engine = MatchedFilterRatioControl(
             snr_threshold=primary_snr_threshold,
             delta_f=delta_f,
@@ -1309,7 +1302,7 @@ def process_top_template_task(task_args):
             peak_window=args.cluster_window,
         )
         t_fp0 = time.perf_counter()
-        group_engine.prepare_filters(scaled_taps, counts)
+        group_engine.prepare_filters(taps, counts)
         # The chisq has its own block (--chisq-block-length), centred on each trigger:
         # independent of how matchedfilter blocks the series for filtering.
         reach = args.autochi_stride * args.autochi_number_points if args.autochi_stride > 0 else 0
@@ -1840,14 +1833,9 @@ def ingest_ifo_triggers(
     unique_gids, start_indices = np.unique(data['template_id'], return_index=True)
     end_indices = np.append(start_indices[1:], n_candidates)
 
-    if args.template_normalization_method == 'precalculated_sigma':
-        if not hasattr(bank, 'sigma_snr_rescale'):
-            bank.setup_sigma_norm()
-        sigmasq_rescale = bank.sigma_sigma_rescale[data['template_id']] ** 2.0
-    else:
-        sigmasq_rescale = bank.sigma_rescale(data['template_id'], method=args.template_normalization_method) ** 2.0
+    sigmasq_rescale = bank.sigma_rescale(data['template_id']) ** 2.0
 
-    # data['snr'] is already true SNR via scaled_taps in prepare_filters
+    # data['snr'] is already true SNR via pre-scaled taps in prepare_filters
     data['sigmasq'] = (data['sigmasq'] * sigmasq_rescale).astype(float32)
 
     if sg_chisq.do:
@@ -2186,9 +2174,6 @@ def get_args():
     parser.add_argument("--keep-loudest-stat", default="newsnr",
                         choices=pycbc.events.ranking.sngls_ranking_function_dict.keys(),
                         help="Statistic used to determine loudest to keep")
-    parser.add_argument("--template-normalization-method",
-                        choices=('precalculated_sigma', 'mchirp'), default='mchirp',
-                        help="Method to normalize fine templates relative to their reference coarse template")
 
     argv = fix_frame_files_args()
     return parser, parser.parse_args(argv)
@@ -2316,24 +2301,19 @@ def main():
         effective_asym_num_bins = args.asym_num_bins
 
         # Pre-compute normalization tables so child processes inherit them via COW
-        if args.template_normalization_method == 'precalculated_sigma':
-            if not hasattr(bank, 'sigma_snr_rescale'):
-                bank.setup_sigma_norm()
-        elif args.template_normalization_method == 'mchirp':
-            if not hasattr(bank, 'mchirp_norm_rescale'):
-                bank.setup_mchirp_norm()
+        bank.setup_sigma_norm()
 
         tsetup = time.time() - tstart
         TIMERS['data_setup'] = tsetup
 
-        if bank.top_bank is None:
-            raise ValueError("pycbc_inspiral_fir requires a hierarchical bank with top_bank.")
+        if bank.upper_group is None:
+            raise ValueError("pycbc_inspiral_fir requires a hierarchical bank with at least 2 FIR levels.")
 
         max_upper_taps = int(bank.upper_group.attrs.get('max_taps', 0)) if getattr(bank, 'upper_group', None) is not None else 0
         if max_upper_taps == 0:
             max_upper_taps = max(int(c) for top_idx in bank.top_indices
                                  for c in bank.get_upper_firs(int(top_idx))[1])
-        max_lower_taps = int(bank.fir_group.attrs.get('max_taps', 0)) if getattr(bank, 'fir_group', None) is not None else 0
+        max_lower_taps = int(bank.level1_group.attrs.get('max_taps', 0)) if getattr(bank, 'level1_group', None) is not None else 0
         if max_lower_taps == 0:
             max_lower_taps = max(int(c) for middle_idx in bank.coarse_indices
                                  for c in bank.get_firs(int(middle_idx))[1])
@@ -2381,12 +2361,6 @@ def main():
             bank_top_indices = []
         else:
             bank_top_indices = bank.top_indices
-
-        # Pre-warm bank data structures in the parent process so they are cleanly shared via Linux COW
-        if args.template_normalization_method == 'precalculated_sigma':
-            bank.setup_sigma_norm()
-        elif args.template_normalization_method == 'mchirp':
-            bank.setup_mchirp_norm()
 
         top_templates = {int(i): bank.get_top_template(int(i)) for i in bank_top_indices}
         upper_group_data = {}
@@ -2470,7 +2444,7 @@ def main():
 
         _SHARED_WORKER_CONTEXT.clear()
 
-        if bank.top_bank is not None:
+        if bank.upper_group is not None:
             logging.info('Upper synthesis time: direct-reference %.3f s, FIR %.3f s',
                          TIMERS['upper_ref'], TIMERS['upper_fir'])
 
