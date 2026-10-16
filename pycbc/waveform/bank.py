@@ -43,7 +43,6 @@ import pycbc.pnutils
 import pycbc.waveform
 import pycbc.waveform.compress
 from pycbc import DYN_RANGE_FAC
-from pycbc.conversions import mchirp_from_mass1_mass2
 from pycbc.io.ligolw import LIGOLWContentHandler
 from pycbc.types import FrequencySeries, zeros
 
@@ -1260,12 +1259,12 @@ class RatioFilterBank(FilterBank):
         self.top_group = self.fir_group[f"level_{self.num_levels}"]
         self.upper_group = self.top_group if self.num_levels >= 2 else None
 
-        self.coarse_keys = [k for k in self.level1_group.keys() if k.isdigit()]
+        self.coarse_keys = [k for k in self.level1_group if k.isdigit()]
         self.coarse_indices = np.array([int(k) for k in self.coarse_keys], dtype=int)
         self.coarse_indices.sort()
 
         if self.upper_group is not None:
-            self.top_keys = [k for k in self.upper_group.keys() if k.isdigit()]
+            self.top_keys = [k for k in self.upper_group if k.isdigit()]
             self.top_indices = np.array([int(k) for k in self.top_keys], dtype=int)
             self.top_indices.sort()
 
@@ -1275,7 +1274,7 @@ class RatioFilterBank(FilterBank):
                 mid_indices = t_group["fine_bank_index"][:]
                 if "sample_shift" in t_group:
                     shifts = t_group["sample_shift"][:]
-                    for mid_idx, sh in zip(mid_indices, shifts):
+                    for mid_idx, sh in zip(mid_indices, shifts, strict=False):
                         self.middle_shift_map[int(mid_idx)] = int(sh)
                 else:
                     for mid_idx in mid_indices:
@@ -1335,7 +1334,7 @@ class RatioFilterBank(FilterBank):
             self.coarse_indices = np.array([], dtype=int)
 
         if self.upper_group is not None:
-            active_mid = set(int(x) for x in self.coarse_indices)
+            active_mid = {int(x) for x in self.coarse_indices}
             kept_top = []
             for top_idx in self.top_indices:
                 mid_indices = self.upper_group[str(int(top_idx))]["fine_bank_index"][:]
@@ -1357,7 +1356,6 @@ class RatioFilterBank(FilterBank):
             tempout = zeros(self.filter_length, dtype=self.dtype)
         else:
             tempout = self.out
-            poke = tempout.data  # pylint:disable=unused-variable
             tempout.clear()
 
         decomp_scratch = FrequencySeries(
@@ -1382,7 +1380,6 @@ class RatioFilterBank(FilterBank):
         htilde.approximant = None
         htilde.end_frequency = f_end
         htilde.sigmasq = types.MethodType(sigma_cached, htilde)
-        htilde._sigmasq = {}
         return htilde
 
     def get_coarse_template(self, coarse_index):
@@ -1423,10 +1420,12 @@ class RatioFilterBank(FilterBank):
         from a top reference.
         """
         if self.upper_group is None:
-            raise RuntimeError("This bank does not contain a second FIR level.")
+            msg = "This bank does not contain a second FIR level."
+            raise RuntimeError(msg)
         group_key = str(int(top_index))
         if group_key not in self.upper_group:
-            raise ValueError(f"Top index {top_index} not found in level_2 FIR data.")
+            msg = f"Top index {top_index} not found in level_2 FIR data."
+            raise ValueError(msg)
         t_group = self.upper_group[group_key]
         taps = t_group["taps"][:]
         actual_tap_counts = t_group["actual_tap_count"][:]
