@@ -2301,9 +2301,6 @@ def main():
         # to eliminate trials-factor and recovery bias
         effective_asym_num_bins = args.asym_num_bins
 
-        # Pre-compute normalization tables so child processes inherit them via COW
-        bank.setup_sigma_norm()
-
         tsetup = time.time() - tstart
         TIMERS['data_setup'] = tsetup
 
