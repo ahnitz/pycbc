@@ -2234,7 +2234,6 @@ def main():
             filter_length=flen,
             delta_f=delta_f,
             dtype=np.complex64,
-            low_frequency_cutoff=args.low_frequency_cutoff,
             enable_compressed_waveforms=args.enable_compressed_waveforms,
         )
         active_rejectors = [inj_filter_rejector[ifo] for ifo in instruments
