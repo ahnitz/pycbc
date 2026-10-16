@@ -39,7 +39,7 @@ else:
 urllib.parse.uses_relative.append('gsiftp')
 urllib.parse.uses_netloc.append('gsiftp')
 
-KNOWN_SITES = ['local', 'condorpool_symlink',
+KNOWN_SITES = ['local', 'clusterlink', 'condorpool_symlink',
                'condorpool_copy', 'condorpool_shared', 'osg']
 
 
@@ -251,6 +251,16 @@ def add_osg_site(sitecat, cp):
     sitecat.add_sites(site)
 
 
+def add_clusterlink_site(sitecat, cp):
+    """User-owned SSH federation; Clusterlink supplies the environment."""
+    site = Site("clusterlink", arch=Arch.X86_64, os_type=OS.LINUX)
+    add_site_pegasus_profile(site, cp)
+    site.add_profiles(Namespace.PEGASUS, key="style", value="condor")
+    site.add_profiles(Namespace.PEGASUS, key="data.configuration", value="condorio")
+    site.add_profiles(Namespace.CONDOR, key="universe", value="vanilla")
+    sitecat.add_sites(site)
+
+
 def add_site(sitecat, sitename, cp, out_dir=None):
     """Add site sitename to site catalog"""
     # Allow local site scratch to be overriden for any site which uses it
@@ -277,6 +287,8 @@ def add_site(sitecat, sitename, cp, out_dir=None):
         add_condorpool_copy_site(sitecat, cp)
     elif sitename == 'condorpool_shared':
         add_condorpool_shared_site(sitecat, cp, out_dir, local_url)
+    elif sitename == 'clusterlink':
+        add_clusterlink_site(sitecat, cp)
     elif sitename == 'osg':
         add_osg_site(sitecat, cp)
     else:
