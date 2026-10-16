@@ -914,7 +914,7 @@ def extract_bank_features(bank, f_low):
     return np.stack([tau0, tau3, conversions.chi_eff(m1, m2, s1, s2)], axis=1)
 
 
-def prune_redundant_parents(pool, results, n_processes, label="middle"):
+def prune_redundant_parents(pool, results, n_processes, label="level_1"):
     """Prune parent templates whose children can be reabsorbed into other parents."""
     parent_groups = defaultdict(list)
     for i, row in enumerate(results):
@@ -971,7 +971,7 @@ def merge_parent_groups(
     features,
     child_bank,
     args,
-    label="middle",
+    label="level_1",
     parent_corrections=None,
     base_corrections=None,
 ):

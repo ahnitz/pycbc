@@ -2306,14 +2306,14 @@ def main():
         tsetup = time.time() - tstart
         TIMERS['data_setup'] = tsetup
 
-        if bank.upper_group is None:
+        if bank.num_levels < 2:
             raise ValueError("pycbc_inspiral_fir requires a hierarchical bank with at least 2 FIR levels.")
 
-        max_upper_taps = int(bank.upper_group.attrs.get('max_taps', 0)) if getattr(bank, 'upper_group', None) is not None else 0
+        max_upper_taps = int(bank.level_groups[2].attrs.get('max_taps', 0))
         if max_upper_taps == 0:
-            max_upper_taps = max(int(c) for top_idx in bank.top_indices
-                                 for c in bank.get_upper_firs(int(top_idx))[1])
-        max_lower_taps = int(bank.level1_group.attrs.get('max_taps', 0)) if getattr(bank, 'level1_group', None) is not None else 0
+            max_upper_taps = max(int(c) for top_idx in bank.level_indices[2]
+                                 for c in bank.get_firs(int(top_idx), level=2)[1])
+        max_lower_taps = int(bank.level_groups[1].attrs.get('max_taps', 0))
         if max_lower_taps == 0:
             max_lower_taps = max(int(c) for middle_idx in bank.coarse_indices
                                  for c in bank.get_firs(int(middle_idx))[1])
@@ -2360,13 +2360,13 @@ def main():
             logging.info("Zero valid segments to analyze across all instruments. Skipping filtering.")
             bank_top_indices = []
         else:
-            bank_top_indices = bank.top_indices
+            bank_top_indices = bank.level_indices[2]
 
-        top_templates = {int(i): bank.get_top_template(int(i)) for i in bank_top_indices}
+        top_templates = {int(i): bank.get_coarse_template(int(i)) for i in bank_top_indices}
         upper_group_data = {}
         for i in bank_top_indices:
             i_int = int(i)
-            grp = bank.upper_group[str(i_int)]
+            grp = bank.level_groups[2][str(i_int)]
             upper_group_data[i_int] = {
                 'counts': grp['actual_tap_count'][:],
                 'm_all': grp['fine_bank_index'][:],
@@ -2444,7 +2444,7 @@ def main():
 
         _SHARED_WORKER_CONTEXT.clear()
 
-        if bank.upper_group is not None:
+        if bank.num_levels >= 2:
             logging.info('Upper synthesis time: direct-reference %.3f s, FIR %.3f s',
                          TIMERS['upper_ref'], TIMERS['upper_fir'])
 

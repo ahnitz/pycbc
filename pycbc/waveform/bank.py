@@ -1218,8 +1218,8 @@ class RatioFilterBank(FilterBank):
     This bank relies on an HDF5 file structure where a 'fine' template bank
     is stored at the root, and one or more hierarchical FIR levels are stored
     under 'fir_data/level_1', ..., 'fir_data/level_{num_levels}'.
-    The topmost level stores compressed reference waveforms under
-    'fir_data/level_{num_levels}/compressed_waveforms/<id>'.
+    The highest level ('level_{num_levels}') stores compressed reference
+    waveforms under 'compressed_waveforms/<id>'.
 
     Parameters
     ----------
@@ -1255,39 +1255,39 @@ class RatioFilterBank(FilterBank):
         self.n_taps = self.fir_group.attrs.get("n_taps", None)
         self.sample_rate = self.fir_group.attrs.get("sample_rate", None)
 
-        self.level1_group = self.fir_group["level_1"]
-        self.top_group = self.fir_group[f"level_{self.num_levels}"]
-        self.upper_group = self.top_group if self.num_levels >= 2 else None
+        self.level_groups = {
+            lvl: self.fir_group[f"level_{lvl}"] for lvl in range(1, self.num_levels + 1)
+        }
+        self.level_keys = {
+            lvl: [k for k in grp if k.isdigit()]
+            for lvl, grp in self.level_groups.items()
+        }
+        self.level_indices = {
+            lvl: np.sort(np.array([int(k) for k in keys], dtype=int))
+            for lvl, keys in self.level_keys.items()
+        }
 
-        self.coarse_keys = [k for k in self.level1_group if k.isdigit()]
-        self.coarse_indices = np.array([int(k) for k in self.coarse_keys], dtype=int)
-        self.coarse_indices.sort()
-
-        if self.upper_group is not None:
-            self.top_keys = [k for k in self.upper_group if k.isdigit()]
-            self.top_indices = np.array([int(k) for k in self.top_keys], dtype=int)
-            self.top_indices.sort()
-
-            self.middle_shift_map = {}
-            for top_id in self.top_keys:
-                t_group = self.upper_group[top_id]
-                mid_indices = t_group["fine_bank_index"][:]
-                if "sample_shift" in t_group:
-                    shifts = t_group["sample_shift"][:]
-                    for mid_idx, sh in zip(mid_indices, shifts, strict=False):
-                        self.middle_shift_map[int(mid_idx)] = int(sh)
+        # Cumulative sample shifts from higher FIR levels (level_num_levels .. level_2)
+        self.parent_shift_map = {}
+        for lvl in range(self.num_levels, 1, -1):
+            next_shifts = {}
+            for parent_key in self.level_keys[lvl]:
+                p_group = self.level_groups[lvl][parent_key]
+                child_indices = p_group["fine_bank_index"][:]
+                base_shift = self.parent_shift_map.get(int(parent_key), 0)
+                if "sample_shift" in p_group:
+                    shifts = p_group["sample_shift"][:]
+                    for child_idx, sh in zip(child_indices, shifts, strict=False):
+                        next_shifts[int(child_idx)] = base_shift + int(sh)
                 else:
-                    for mid_idx in mid_indices:
-                        self.middle_shift_map[int(mid_idx)] = 0
-        else:
-            self.top_keys = []
-            self.top_indices = np.array([], dtype=int)
-            self.middle_shift_map = {}
+                    for child_idx in child_indices:
+                        next_shifts[int(child_idx)] = base_shift
+            self.parent_shift_map = next_shifts
 
-        # Setup a mapping from the fine template index to the level_1 parent index
+        # Mapping from fine template index to (level_1 parent index, local index)
         self.fine_coarse_map = np.zeros((len(self.table), 2), dtype=int) - 1
-        for coarse_id in self.coarse_keys:
-            fine_indices = self.level1_group[coarse_id]["fine_bank_index"][:]
+        for coarse_id in self.level_keys[1]:
+            fine_indices = self.level_groups[1][coarse_id]["fine_bank_index"][:]
             if len(fine_indices) > 0:
                 mapback = np.column_stack(
                     [
@@ -1296,6 +1296,20 @@ class RatioFilterBank(FilterBank):
                     ]
                 )
                 self.fine_coarse_map[fine_indices] = mapback
+
+    @property
+    def coarse_keys(self):
+        """Keys in the level-1 FIR group."""
+        return self.level_keys[1]
+
+    @property
+    def coarse_indices(self):
+        """Active template indices in the level-1 FIR group."""
+        return self.level_indices[1]
+
+    @coarse_indices.setter
+    def coarse_indices(self, value):
+        self.level_indices[1] = np.asarray(value, dtype=int)
 
     def template_thinning(self, inj_filter_rejector):
         """Remove templates from bank that are far from all injections."""
@@ -1329,23 +1343,38 @@ class RatioFilterBank(FilterBank):
             fine_keep = np.unique(np.concatenate(matched_fine))
             coarse_keep = np.unique(self.fine_coarse_map[fine_keep, 0])
             coarse_keep = coarse_keep[coarse_keep >= 0]
-            self.coarse_indices = np.intersect1d(self.coarse_indices, coarse_keep)
+            self.level_indices[1] = np.intersect1d(self.level_indices[1], coarse_keep)
         else:
-            self.coarse_indices = np.array([], dtype=int)
+            self.level_indices[1] = np.array([], dtype=int)
 
-        if self.upper_group is not None:
-            active_mid = {int(x) for x in self.coarse_indices}
-            kept_top = []
-            for top_idx in self.top_indices:
-                mid_indices = self.upper_group[str(int(top_idx))]["fine_bank_index"][:]
-                if any(int(m) in active_mid for m in mid_indices):
-                    kept_top.append(int(top_idx))
-            self.top_indices = np.array(kept_top, dtype=int)
+        for lvl in range(2, self.num_levels + 1):
+            active_children = {int(x) for x in self.level_indices[lvl - 1]}
+            kept_parents = []
+            for parent_idx in self.level_indices[lvl]:
+                child_indices = self.level_groups[lvl][str(int(parent_idx))][
+                    "fine_bank_index"
+                ][:]
+                if any(int(c) in active_children for c in child_indices):
+                    kept_parents.append(int(parent_idx))
+            self.level_indices[lvl] = np.array(kept_parents, dtype=int)
 
-    def _decompress_reference(self, group, index):
-        """Decompress a frequency-domain reference waveform from an HDF5 level group."""
+    def get_coarse_template(self, coarse_index):
+        """
+        Get the frequency-domain reference waveform from the highest FIR level.
+
+        Parameters
+        ----------
+        coarse_index : int
+            The index of the reference waveform in `level_{num_levels}`.
+
+        Returns
+        -------
+        htilde : FrequencySeries
+            The decompressed reference waveform.
+        """
+        top_group = self.level_groups[self.num_levels]
         compressed_waveform = pycbc.waveform.compress.CompressedWaveform.from_hdf(
-            group, str(int(index)), load_now=True
+            top_group, str(int(coarse_index)), load_now=True
         )
         if self.waveform_decompression_method is not None:
             decompression_method = self.waveform_decompression_method
@@ -1382,65 +1411,14 @@ class RatioFilterBank(FilterBank):
         htilde.sigmasq = types.MethodType(sigma_cached, htilde)
         return htilde
 
-    def get_coarse_template(self, coarse_index):
-        """
-        Get the frequency-domain reference waveform for a level-1 group.
-
-        Parameters
-        ----------
-        coarse_index : int
-            The index of the reference in level_1.
-
-        Returns
-        -------
-        htilde : FrequencySeries
-            The reference waveform.
-        """
-        return self._decompress_reference(self.level1_group, coarse_index)
-
-    def get_top_template(self, top_index):
-        """
-        Get the frequency-domain reference waveform for a top-level group.
-
-        Parameters
-        ----------
-        top_index : int
-            The index of the reference in the top level.
-
-        Returns
-        -------
-        htilde : FrequencySeries
-            The reference waveform.
-        """
-        return self._decompress_reference(self.top_group, top_index)
-
-    def get_upper_firs(self, top_index):
-        """
-        Retrieve the upper-level FIR taps that reconstruct middle references
-        from a top reference.
-        """
-        if self.upper_group is None:
-            msg = "This bank does not contain a second FIR level."
-            raise RuntimeError(msg)
-        group_key = str(int(top_index))
-        if group_key not in self.upper_group:
-            msg = f"Top index {top_index} not found in level_2 FIR data."
-            raise ValueError(msg)
-        t_group = self.upper_group[group_key]
-        taps = t_group["taps"][:]
-        actual_tap_counts = t_group["actual_tap_count"][:]
-        mid_indices = t_group["fine_bank_index"][:]
-        sort_idx = np.argsort(actual_tap_counts)
-        return taps[sort_idx], actual_tap_counts[sort_idx], mid_indices[sort_idx]
-
     def setup_sigma_norm(self):
         """
         Build the precalculated-sigma rescaling used by sigma_rescale
         from the sigma values recorded per fine template at bank-build time.
         """
         self.sigma_sigma_rescale = np.ones(len(self.table))
-        for coarse_id in self.coarse_keys:
-            c_group = self.level1_group[str(coarse_id)]
+        for coarse_id in self.level_keys[1]:
+            c_group = self.level_groups[1][str(coarse_id)]
             fine_indices = c_group["fine_bank_index"][:]
             sigmas = c_group["sigmas"][:]
             if len(fine_indices) > 0:
@@ -1457,54 +1435,60 @@ class RatioFilterBank(FilterBank):
             self.setup_sigma_norm()
         return self.sigma_sigma_rescale[indices]
 
-    def get_firs(self, coarse_index, return_shifts=False):
+    def get_firs(self, coarse_index, level=1, return_shifts=False):
         """
-        Retrieve the FIR tap information for the batch of fine templates
-        associated with a specific coarse reference.
+        Retrieve the FIR tap information for the batch of child templates
+        associated with a specific parent reference at the given FIR level.
 
         Parameters
         ----------
         coarse_index : int
-            The index of the coarse template.
+            The index of the parent template at `level`.
+        level : int, optional
+            The 1-indexed FIR hierarchy level (default: 1).
         return_shifts : bool, optional
             If True, also return the 1D array of sample shifts for each filter.
 
         Returns
         -------
         taps : np.ndarray
-            2D array of FIR taps (shape: [N_fine_in_group, N_taps]).
+            2D array of FIR taps (shape: [N_children_in_group, N_taps]).
         actual_tap_counts : np.ndarray
             1D array containing the valid number of taps for each filter
             (since 'taps' might be zero-padded).
         fine_indices : np.ndarray
-            1D array of indices pointing to `self.table` (the fine bank)
-            that these filters correspond to.
+            1D array of child indices pointing to the fine bank (when level=1)
+            or to `level - 1` parent indices (when level > 1).
         shifts : np.ndarray, optional
             1D array of integer sample shifts (returned if return_shifts=True).
         """
+        if level not in self.level_groups:
+            msg = f"FIR level {level} not found in bank (num_levels={self.num_levels})."
+            raise ValueError(msg)
+        lvl_group = self.level_groups[level]
         group_key = str(int(coarse_index))
-        if group_key not in self.level1_group:
-            raise ValueError(f"Coarse index {coarse_index} not found in FIR data.")
+        if group_key not in lvl_group:
+            msg = f"Index {coarse_index} not found in level_{level} FIR data."
+            raise ValueError(msg)
 
-        c_group = self.level1_group[group_key]
+        c_group = lvl_group[group_key]
 
         taps = c_group["taps"][:]
         actual_tap_counts = c_group["actual_tap_count"][:]
         fine_indices = c_group["fine_bank_index"][:]
-        if "sample_shift" in c_group:
-            shifts = c_group["sample_shift"][:].astype(np.int64)
-        else:
-            shifts = np.zeros(len(fine_indices), dtype=np.int64)
-
-        if self.upper_group is not None:
-            mid_shift = self.middle_shift_map.get(int(coarse_index), 0)
-            if mid_shift:
-                shifts = shifts + mid_shift
 
         # Sorted by tap count so the engine's batches group similarly-sized
         # filters together (see _execute_blocked_kernel's tap_groups).
         sort_idx = np.argsort(actual_tap_counts)
         if return_shifts:
+            if "sample_shift" in c_group:
+                shifts = c_group["sample_shift"][:].astype(np.int64)
+            else:
+                shifts = np.zeros(len(fine_indices), dtype=np.int64)
+            if level == 1:
+                parent_shift = self.parent_shift_map.get(int(coarse_index), 0)
+                if parent_shift:
+                    shifts = shifts + parent_shift
             return (
                 taps[sort_idx],
                 actual_tap_counts[sort_idx],
@@ -1516,7 +1500,7 @@ class RatioFilterBank(FilterBank):
     @property
     def coarse_size(self):
         """The number of templates in the level-1 reference bank."""
-        return len(self.coarse_keys)
+        return len(self.level_keys[1])
 
 
 __all__ = (
