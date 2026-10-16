@@ -593,9 +593,23 @@ def make_single_template_files(workflow, segs, ifo, data_read_name,
         node.add_input_opt('--injection-file', inj_file)
     node.add_opt('--data-read-name', data_read_name)
     node.add_opt('--data-analyzed-name', analyzed_name)
+    pad_data = int(curr_exe.get_opt('pad-data')) if curr_exe.has_opt('pad-data') else 0
+    seg_path = segs.storage_path if getattr(segs, 'storage_path', None) else getattr(segs, 'name', None)
+    if seg_path and os.path.exists(seg_path):
+        from pycbc.events import select_segments_by_definer
+        data_segs = select_segments_by_definer(seg_path, data_read_name, ifo)
+        matching = [s for s in data_segs if s[0] <= trig_time <= s[1]]
+        if matching:
+            frame_seg = segments.segment([
+                min(int(s[0]) for s in matching) - pad_data,
+                max(int(s[1]) for s in matching) + pad_data
+            ])
+        else:
+            frame_seg = workflow.analysis_time
+    else:
+        frame_seg = workflow.analysis_time
     _stage_frame_files_for_node(
-        workflow, curr_exe, node, ifo,
-        segments.segment([int(trig_time) - 2048, int(trig_time) + 2048])
+        workflow, curr_exe, node, ifo, frame_seg
     )
     node.new_output_file_opt(workflow.analysis_time, '.hdf',
                              '--output-file', store_file=store_file)
