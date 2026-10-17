@@ -246,13 +246,22 @@ class MatchedFilterRatioControl(object):
         if real and kmax > N // 2:
             raise ValueError('a real reference series needs the upper cutoff below Nyquist')
         plan, qt, q = self._get_ref_plan(N, kmax, real=real)
-        # Only the low strip is cleared per call.  correlate writes solely
-        # [kmin:kmax] and execute() reads qt and writes q, so nothing ever
-        # dirties the region above kmax -- and kmax derives from self.f_high,
-        # an engine attribute, so it is fixed for the whole run.  Clearing it
-        # once with the buffer removes 4 MB of stores per segment.  kmin comes
-        # from the template's f_lower and does vary, so that strip stays.
+        # Only the low strip is cleared per call for the complex transform.
+        # correlate writes solely [kmin:kmax] and a complex-to-complex execute()
+        # reads qt without writing it, so nothing dirties the region above kmax
+        # -- and kmax derives from self.f_high, an engine attribute, so it is
+        # fixed for the whole run.  Clearing it once with the buffer removes
+        # 4 MB of stores per segment.  kmin comes from the template's f_lower
+        # and does vary, so that strip stays.
+        #
+        # A complex-to-real transform may overwrite its input (FFTW does by
+        # default; MKL does not), so for the real series the band above kmax
+        # is cleared on every call too.  Left in place, the previous call's
+        # scrambled spectrum entered the next reference series and the
+        # middle and final SNRs grew segment by segment.
         qt[:kmin] = 0
+        if real:
+            qt[kmax:] = 0
         # stilde arrives overwhitened (see pycbc_inspiral_fir), so there is
         # no PSD division on this path at all.
         correlate(ref_template[kmin:kmax], stilde[kmin:kmax], qt[kmin:kmax])
