@@ -1,4 +1,3 @@
-import os
 import unittest
 import numpy as np
 
@@ -193,17 +192,6 @@ class TestDynamicSNRRenormalize(unittest.TestCase):
 
         # Signal in noise must match noise background RF to within 0.5%
         self.assertAlmostEqual(rf_data[peak_idx], rf_noise[peak_idx], places=2)
-
-    def test_disable_env_var(self):
-        """Test that setting PYCBC_DISABLE_DYNAMIC_SNR_RENORM=1 bypasses renormalization."""
-        N = 4096
-        arr = (np.random.randn(N) + 1j * np.random.randn(N)).astype(np.complex64) * 10.0
-        os.environ['PYCBC_DISABLE_DYNAMIC_SNR_RENORM'] = '1'
-        try:
-            res = dynamic_snr_renormalize(arr, self.dt)
-            np.testing.assert_array_equal(res, arr)
-        finally:
-            del os.environ['PYCBC_DISABLE_DYNAMIC_SNR_RENORM']
 
     def test_two_sided_quiet_amplification(self):
         """Test Stage 5 two-sided renorm: quiet detector noise (< 1.0) is boosted up to max_boost_factor."""

@@ -26,18 +26,17 @@ import pycbc.scheme
 import pycbc.strain
 import pycbc.types.optparse
 import pycbc.vetoes
-from pycbc.filter.matched_filter_ratio import MatchedFilterRatioControl, DynamicSNRRenormFactor
-from pycbc.types import FrequencySeries, TimeSeries, complex64, float32, zeros
+from pycbc.filter.matched_filter_ratio import (
+    ChisqFilters, DynamicSNRRenormFactor, decimation_factor, leaf_bank_options)
+from pycbc.types import complex64, float32
 from pycbc.vetoes.chisq import (
     SingleDetPowerChisq,
-    power_chisq_at_points_from_precomputed,
     power_chisq_bins_from_sigmasq_series,
 )
 from pycbc.vetoes.sgchisq import SingleDetSGChisq
 from pycbc.vetoes.autochisq import SingleDetAutoChisq, autochisq_from_precomputed
 from pycbc.waveform.bank import RatioFilterBank
-from pycbc.waveform.spa_tmplt import spa_tmplt_norm
-from pycbc.filter.matchedfilter import sigmasq_series, get_cutoff_indices
+from pycbc.filter.matchedfilter import get_cutoff_indices
 
 tstart = time.time()
 TIMERS = collections.defaultdict(float)
@@ -168,7 +167,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
         sort_order = np.argsort(snr_amp)[::-1]
 
         # The chisq block: its own length (--chisq-block-length), not the filter's
-        block_len = len(filters_f[0])
+        block_len = filters_f.block_length
         df = self.sample_rate / block_len
         n_half = block_len // 2 + 1
         psd_key = self.coarse_weight(stilde, coarse_idx, block_len)[0]
@@ -186,7 +185,6 @@ class RatioPowerChisq(SingleDetPowerChisq):
 
             target_global_id = int(global_ids[idx])
             t_idx = int(t_idxs[idx])
-            snrv = snrs[idx]
             local_id = int(ids_local[idx])
             tstart = int(tstarts[idx])
 
@@ -372,12 +370,15 @@ def process_and_record_triggers(
     args, power_chisq, is_asym=False,
     shifts=None,
     timers=None,
-    renorm_factor=None,
+    renorm=None,
     primary_snr_threshold=6.0,
     autochisq=None,
     chisq_valid=None,
 ):
-    """Filter triggers for analysis boundary, evaluate chisq, and append batch record."""
+    """Filter triggers for analysis boundary, evaluate chisq, and append batch record.
+
+    renorm: the dynamic SNR renormalisation factor at each trigger (aligned with the
+    inputs), or None."""
     n_in = len(ids_local)
     surviving_indices = np.arange(n_in)
 
@@ -391,14 +392,10 @@ def process_and_record_triggers(
             snrs = snrs[in_bounds]
             tstarts = tstarts[in_bounds]
             surviving_indices = surviving_indices[in_bounds]
+            if renorm is not None:
+                renorm = renorm[in_bounds]
 
-    if len(ids_local) > 0 and renorm_factor is not None:
-        local_shifts = shifts[ids_local] if shifts is not None else 0
-        phys_t = np.clip(t_idxs - local_shifts, 0, len(renorm_factor) - 1)
-        r = renorm_factor[phys_t]
-        snrs_renorm = snrs * r
-    else:
-        snrs_renorm = snrs
+    snrs_renorm = snrs * renorm if renorm is not None and len(ids_local) > 0 else snrs
 
     if len(ids_local) > 0 and not is_asym:
         thresh = primary_snr_threshold
@@ -570,15 +567,17 @@ def analyzed_samples(stilde):
     return stilde.analyze.stop - stilde.analyze.start
 
 
-def sample_asym_bins(group_engine, ref_snr, local_id, t_center,
+def sample_asym_bins(refilter, series_length, local_id, t_center,
                      sample_rate=2048.0, bin_width=0.1, num_bins=100, valid_slice=None):
-    """Sample peak SNR in each bin across an asymmetric window around t_center."""
+    """Sample peak SNR in each bin across an asymmetric window around t_center: refilter
+    (windows, binsize, threshold, template_index) runs the group's bank over the other
+    detector's middle series."""
     bs = max(1, int(round(bin_width * float(sample_rate or 2048.0))))
     win_start_samp = (t_center - bs // 2) - (num_bins // 2) * bs
     win_end_samp = win_start_samp + num_bins * bs
 
     v_start = 0 if valid_slice is None else valid_slice.start
-    v_stop = len(ref_snr) if valid_slice is None else valid_slice.stop
+    v_stop = series_length if valid_slice is None else valid_slice.stop
 
     asym_start = max(win_start_samp, v_start)
     asym_stop = min(win_end_samp, v_stop)
@@ -591,13 +590,8 @@ def sample_asym_bins(group_engine, ref_snr, local_id, t_center,
             np.empty(0, dtype=np.int32),
         )
 
-    res = group_engine._td_bank.filter_series(
-        ref_snr,
-        windows=slice(asym_start, asym_stop),
-        binsize=bs,
-        threshold=0.0,
-        template_index=local_id
-    )
+    res = refilter(windows=slice(asym_start, asym_stop), binsize=bs, threshold=0.0,
+                   template_index=local_id)
     return (
         res.template_indices.astype(np.int32, copy=False),
         res.sample_indices.astype(np.int64, copy=False),
@@ -732,7 +726,7 @@ def filter_secondary_asym_triggers(
 
 def followup_asym_candidates(
     std_trigs, active_ifos, s_num, coarse_idx, fine_indices,
-    group_engine, filters_f, shifts, h_norms, middle_series,
+    refilter, filters_f, shifts, h_norms, middle_series,
     segments, bank, triggers, has_asym_followup, power_chisq,
     args, primary_snr_threshold, effective_asym_num_bins,
     ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
@@ -740,22 +734,21 @@ def followup_asym_candidates(
     renorm_factors=None,
     autochisq=None,
 ):
-    """Follow up primary candidate triggers in secondary detectors within asymmetric windows."""
+    """Follow up primary candidate triggers in secondary detectors within asymmetric windows.
+
+    std_trigs[ifo]: the primaries (ids, samples, SNRs, block starts, renormalisation factors
+    or None); refilter(ifo, **kw): the group's bank over ifo's middle series; filters_f: the
+    group's ChisqFilters; renorm_factors[ifo]: the renormalisation envelope, for the
+    secondaries."""
     t_asym0 = time.perf_counter()
     t_clock = timers if timers is not None else TIMERS
     chi_asym_before = t_clock['power_chisq'] + t_clock['auto_chisq']
 
     for ifo_A in active_ifos:
-        a_ids, a_tidxs, a_snrs, a_tstarts = std_trigs[ifo_A]
+        a_ids, a_tidxs, a_snrs, a_tstarts, a_renorm = std_trigs[ifo_A]
         if len(a_ids) == 0:
             continue
-        rf_A = renorm_factors.get(ifo_A) if renorm_factors else None
-        if rf_A is not None:
-            shifts_A = shifts[a_ids] if shifts is not None else 0
-            phys_t_A = np.clip(a_tidxs - shifts_A, 0, len(rf_A) - 1)
-            a_snrs_eval = a_snrs * rf_A[phys_t_A]
-        else:
-            a_snrs_eval = a_snrs
+        a_snrs_eval = a_snrs * a_renorm if a_renorm is not None else a_snrs
 
         cand_indices = select_primary_asym_candidates(
             a_ids=a_ids,
@@ -781,10 +774,10 @@ def followup_asym_candidates(
             args, power_chisq, is_asym=False,
             shifts=shifts,
             timers=timers,
-            renorm_factor=rf_A,
+            renorm=a_renorm[cand_indices] if a_renorm is not None else None,
             primary_snr_threshold=primary_snr_threshold,
             autochisq=autochisq,
-            chisq_valid=group_engine.chisq_valid,
+            chisq_valid=filters_f.valid,
         )
 
         if len(cand_sub_idxs) == 0:
@@ -836,8 +829,8 @@ def followup_asym_candidates(
                 cand_tcenter = int(round((gps_trig - t0_B) * sr_B)) - s_start_B
 
                 asym_ids, asym_t_idxs, asym_snrs, asym_tstarts = sample_asym_bins(
-                    group_engine=group_engine,
-                    ref_snr=ref_snr_B,
+                    refilter=lambda ifo=ifo_B, **kw: refilter(ifo, **kw),
+                    series_length=len(ref_snr_B),
                     local_id=cand_lid,
                     t_center=cand_tcenter,
                     sample_rate=sr_B,
@@ -848,10 +841,11 @@ def followup_asym_candidates(
 
                 has_asym_followup[ifo_B] += 1
 
+                r_B = None
                 if rf_B is not None and len(asym_ids) > 0:
                     shifts_B = shifts[asym_ids] if shifts is not None else 0
-                    phys_t_B = np.clip(asym_t_idxs - shifts_B, 0, len(rf_B) - 1)
-                    asym_snrs_eval = asym_snrs * rf_B[phys_t_B]
+                    r_B = rf_B[np.clip(asym_t_idxs - shifts_B, 0, len(rf_B) - 1)]
+                    asym_snrs_eval = asym_snrs * r_B
                 else:
                     asym_snrs_eval = asym_snrs
 
@@ -887,10 +881,10 @@ def followup_asym_candidates(
                     args, power_chisq, is_asym=True,
                     shifts=shifts,
                     timers=timers,
-                    renorm_factor=rf_B,
+                    renorm=r_B[passing_idx] if r_B is not None else None,
                     primary_snr_threshold=args.asym_secondary_snr_threshold,
                     autochisq=autochisq,
-                    chisq_valid=group_engine.chisq_valid,
+                    chisq_valid=filters_f.valid,
                 )
 
 
@@ -902,377 +896,339 @@ def followup_asym_candidates(
 _SHARED_WORKER_CONTEXT = {}
 
 
-def process_top_template_task(task_args):
-    """Filter a single top template across all data segments and detectors."""
-    top_idx, rank, n_top, fine_cnt = task_args
-    ctx = _SHARED_WORKER_CONTEXT
+class TopTemplateSearch(object):
+    """One top template's search over every segment and detector: the hierarchy below it
+    (the top as root, one inner filter per middle group, each group's fine bank as its leaf)
+    run by matchedfilter's HierarchicalSearch, with this object's methods as the hooks."""
 
-    bank = ctx['bank']
-    top_templates = ctx['top_templates']
-    upper_group_data = ctx['upper_group_data']
-    instruments = ctx['instruments']
-    segments = ctx['segments']
-    num_segs = ctx['num_segs']
-    can_asym_by_seg = ctx['can_asym_by_seg']
-    ifo_sample_rates = ctx['ifo_sample_rates']
-    ifo_gps_starts = ctx['ifo_gps_starts']
-    ifo_gps_cli_starts = ctx['ifo_gps_cli_starts']
-    seg_starts = ctx['seg_starts']
-    args = ctx['args']
-    primary_snr_threshold = ctx['primary_snr_threshold']
-    delta_f = ctx['delta_f']
-    sample_rate = ctx['sample_rate']
-    flow = ctx['flow']
-    effective_asym_num_bins = ctx['effective_asym_num_bins']
-    coarse_keep = ctx['coarse_keep']
-    inj_reject = ctx.get('inj_reject')
+    def __init__(self, task_args):
+        top_idx, rank, n_top, fine_cnt = task_args
+        ctx = _SHARED_WORKER_CONTEXT
+        self.ctx = ctx
+        self.bank = bank = ctx['bank']
+        self.instruments = instruments = ctx['instruments']
+        self.segments = segments = ctx['segments']
+        self.args = args = ctx['args']
+        self.threshold = ctx['primary_snr_threshold']
+        self.sample_rate = sample_rate = ctx['sample_rate']
+        self.inj_reject = ctx.get('inj_reject')
+        self.top_idx = top_idx = int(top_idx)
+        self.timers = collections.defaultdict(float)
+        self.triggers = {ifo: collections.defaultdict(list) for ifo in instruments}
+        self.asym = {ifo: 0 for ifo in instruments}
+        self.search = None
 
-    # Independent engine per worker task ensuring isolated FFT buffers
-    engine = MatchedFilterRatioControl(
-        snr_threshold=primary_snr_threshold,
-        delta_f=delta_f,
-        high_frequency_cutoff=args.high_frequency_cutoff,
-        tap_sample_rate=bank.sample_rate,
-        engine_sample_rate=sample_rate,
-        engine=args.ratio_filter_engine,
-        false_dismissal=args.ratio_filter_false_dismissal,
-        coarse_band_hz=args.ratio_filter_band,
-        first_stage_snr=args.ratio_filter_first_stage_snr,
-        peak_window=args.cluster_window,
-    )
-
-    local_timers = collections.defaultdict(float)
-    worker_triggers = {ifo: collections.defaultdict(list) for ifo in instruments}
-    worker_asym = {ifo: 0 for ifo in instruments}
-
-    top_idx = int(top_idx)
-    u_data = upper_group_data[top_idx]
-    counts_raw = u_data['counts']
-    order_raw = np.argsort(counts_raw)
-    m_all = u_data['m_all'][order_raw]
-
-    if coarse_keep is not None:
-        row_mask = np.isin(m_all, list(coarse_keep))
-        if not row_mask.any():
-            return top_idx, {ifo: {} for ifo in instruments}, worker_asym, dict(local_timers)
-        keep_idx = np.flatnonzero(row_mask)
-    else:
+        u_data = ctx['upper_group_data'][top_idx]
+        counts_raw = u_data['counts']
+        order_raw = np.argsort(counts_raw)
+        m_all = u_data['m_all'][order_raw]
         keep_idx = slice(None)
+        if ctx['coarse_keep'] is not None:
+            row_mask = np.isin(m_all, list(ctx['coarse_keep']))
+            if not row_mask.any():
+                return
+            keep_idx = np.flatnonzero(row_mask)
+        middle_ids = m_all[keep_idx]
+        counts_u = counts_raw[order_raw][keep_idx]
+        taps_u = u_data['taps'][order_raw][keep_idx]
+        sigmas_u = u_data['sigmas'][order_raw][keep_idx]
 
-    middle_ids = m_all[keep_idx]
-    counts_u = counts_raw[order_raw][keep_idx]
-    taps_u = u_data['taps'][order_raw][keep_idx]
-    sigmas_u = u_data['sigmas'][order_raw][keep_idx]
+        t0 = time.perf_counter()
+        self.top_template = top_template = ctx['top_templates'][top_idx]
+        self.timers['top_decomp'] += time.perf_counter() - t0
+        self.sigmasq_ratio = {int(mid): float((sigmas_u[row, 2] / sigmas_u[row, 0]) ** 2)
+                              for row, mid in enumerate(middle_ids)}
+        logging.info(f"Top template {rank+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups ({fine_cnt} fine templates)")
 
-    t_dec0 = time.perf_counter()
-    top_template = top_templates[top_idx]
-    local_timers['top_decomp'] += time.perf_counter() - t_dec0
-    ref_s = sigmas_u[:, 0]
-    target_s = sigmas_u[:, 2]
-    sigmasq_ratio_by_middle = {
-        int(mid): float((target_s[row] / ref_s[row]) ** 2)
-        for row, mid in enumerate(middle_ids)
-    }
+        try:
+            from matchedfilter import search as mf_search
+            from matchedfilter.time_domain import reference_profile
+        except ImportError as exc:
+            raise ImportError(
+                "pycbc_inspiral_fir needs a matchedfilter with matchedfilter.search (the "
+                "hierarchical search; matchedfilter main from 2026-10-17 on)") from exc
 
-    logging.info(f"Top template {rank+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups ({fine_cnt} fine templates)")
+        # The power chisq's coarse weights sample each middle filter's spectrum on its block's grid.
+        # Take it from the taps on a grid set by the chisq block alone, not from the middle stage's
+        # own transforms, so how matchedfilter blocks the middle stage cannot move a chisq bin edge.
+        upper_f_by_coarse = chisq_middle_spectra(taps_u, counts_u, middle_ids, int(args.chisq_block_length))
 
-    try:
-        from matchedfilter import search as mf_search
-        from matchedfilter.time_domain import reference_profile
-    except ImportError as exc:
-        raise ImportError(
-            "pycbc_inspiral_fir needs a matchedfilter with matchedfilter.search (the "
-            "hierarchical search; matchedfilter main from 2026-10-17 on)") from exc
+        reach = args.autochi_stride * args.autochi_number_points if args.autochi_stride > 0 else 0
+        self.groups = {}           # middle id -> (fine indices, chisq filters, shifts)
+        inner_nodes = []
+        t0 = time.perf_counter()
+        for row, mid in enumerate(middle_ids):
+            coarse_idx = int(mid)
+            taps, counts, fine_indices, shifts = bank.get_firs(coarse_idx, return_shifts=True)
+            children = []
+            if len(fine_indices):
+                # The chisq has its own block (--chisq-block-length), centred on each trigger:
+                # independent of how matchedfilter blocks the series for filtering.
+                chisq = ChisqFilters(taps, counts, args.chisq_block_length, reach=reach,
+                                     tap_sample_rate=bank.sample_rate, data_sample_rate=sample_rate)
+                self.groups[coarse_idx] = (fine_indices, chisq, shifts)
+                children.append(mf_search.Leaf(taps, counts, lags=shifts, node_id=coarse_idx))
+            inner_nodes.append(mf_search.Inner(taps_u[row], count=int(counts_u[row]),
+                                               children=children, node_id=coarse_idx))
+        self.timers['filter_prep'] += time.perf_counter() - t0
+        if not self.groups:
+            return
 
-    # The power chisq's coarse weights sample each middle filter's spectrum on its block's grid.
-    # Take it from the taps on a grid set by the chisq block alone, not from the middle stage's
-    # own transforms, so how matchedfilter blocks the middle stage cannot move a chisq bin edge.
-    upper_f_by_coarse = chisq_middle_spectra(taps_u, counts_u, middle_ids, int(args.chisq_block_length))
+        t0 = time.perf_counter()
+        self.seg_ifos = seg_ifos = [ifo for ifo in instruments if len(segments[ifo]) > 0]
+        first_seg = segments[seg_ifos[0]][0]
+        n_series = (len(first_seg) - 1) * 2
+        kmin, kmax = get_cutoff_indices(top_template.f_lower, args.high_frequency_cutoff,
+                                        ctx['delta_f'], n_series)
+        # The fine banks' gates are calibrated with the top's expected signal spectrum over the
+        # first segment's noise.
+        profile = reference_profile(top_template, first_seg.psd, float(top_template.f_lower or 0.0),
+                                    float(args.high_frequency_cutoff or 0.0), ctx['delta_f'])
+        self.root = mf_search.Root(top_template.numpy(), (kmin, kmax), children=inner_nodes,
+                                   profile=(profile, ctx['delta_f']), node_id=top_idx)
 
-    # The hierarchy below this top: one inner (middle) filter per middle group, each with the
-    # group's fine bank as its leaf. matchedfilter runs it over every segment and calls back
-    # here with each group's peaks while its middle series are held.
-    reach = args.autochi_stride * args.autochi_number_points if args.autochi_stride > 0 else 0
-    groups = {}
-    inner_nodes = []
-    for row, mid in enumerate(middle_ids):
-        coarse_idx = int(mid)
-        taps, counts, fine_indices, shifts = bank.get_firs(coarse_idx, return_shifts=True)
-        children = []
-        if len(fine_indices):
-            t_fp0 = time.perf_counter()
-            group_engine = MatchedFilterRatioControl(
-                snr_threshold=primary_snr_threshold,
-                delta_f=delta_f,
-                high_frequency_cutoff=args.high_frequency_cutoff,
-                tap_sample_rate=bank.sample_rate,
-                engine_sample_rate=sample_rate,
-                engine=args.ratio_filter_engine,
-                false_dismissal=args.ratio_filter_false_dismissal,
-                coarse_band_hz=args.ratio_filter_band,
-                first_stage_snr=args.ratio_filter_first_stage_snr,
-                peak_window=args.cluster_window,
-            )
-            # The chisq has its own block (--chisq-block-length), centred on each trigger:
-            # independent of how matchedfilter blocks the series for filtering.
-            filters_f = group_engine.prepare_chisq_filters(taps, counts, args.chisq_block_length, reach=reach)
-            local_timers['filter_prep'] += time.perf_counter() - t_fp0
-            groups[coarse_idx] = (counts, fine_indices, group_engine, filters_f, shifts)
-            children.append(mf_search.Leaf(taps, counts, lags=shifts, node_id=coarse_idx))
-        inner_nodes.append(mf_search.Inner(taps_u[row], count=int(counts_u[row]),
-                                           children=children, node_id=coarse_idx))
-    if not groups:
-        return top_idx, {ifo: {} for ifo in instruments}, worker_asym, dict(local_timers)
+        # Renormalisation: the fine SNR is multiplied by rf <= rf_max, so a peak needs
+        # |z| >= T / rf: the threshold envelope 1 / rf, at least 1 / rf_max.
+        self.renorm_on = not getattr(args, 'disable_dynamic_snr_renorm', False)
+        self.vfloor = getattr(args, 'dynamic_snr_variance_floor', 1.0)
+        self.max_boost = getattr(args, 'dynamic_snr_max_boost', None)
+        rf_max = 1.0 / np.sqrt(max(float(self.vfloor), 1e-12))
+        if self.max_boost is not None:
+            rf_max = min(rf_max, float(self.max_boost))
+        self.decimation = decimation_factor(bank.sample_rate, sample_rate)
+        self.search = mf_search.HierarchicalSearch(
+            [self.root], threshold=self.threshold,
+            envelope_floor=(1.0 / rf_max) if self.renorm_on else 1.0,
+            leaf_options=leaf_bank_options(
+                args.ratio_filter_engine, args.ratio_filter_false_dismissal,
+                args.ratio_filter_band, args.ratio_filter_first_stage_snr,
+                args.ratio_filter_device, args.cluster_window, bank.sample_rate, sample_rate),
+            context=asym_half_span(args, sample_rate, ctx['effective_asym_num_bins']))
+        self.timers['upper_prep'] += time.perf_counter() - t0
+        self.top_pad = self.search.pad(self.root)   # builds and calibrates the fine banks
 
-    t_up_prep = time.perf_counter()
-    seg_ifos = [ifo for ifo in instruments if len(segments[ifo]) > 0]
-    first_seg = segments[seg_ifos[0]][0]
-    n_series = (len(first_seg) - 1) * 2
-    kmin, kmax = get_cutoff_indices(top_template.f_lower, args.high_frequency_cutoff, delta_f, n_series)
-    # The fine banks' gates are calibrated with the top's expected signal spectrum over the
-    # first segment's noise.
-    profile = reference_profile(top_template, first_seg.psd, float(top_template.f_lower or 0.0),
-                                float(args.high_frequency_cutoff or 0.0), delta_f)
-    root = mf_search.Root(top_template.numpy(), (kmin, kmax), children=inner_nodes,
-                          profile=(profile, delta_f), node_id=top_idx)
+        self.power_chisq = RatioPowerChisq(
+            args.chisq_bins,
+            args.chisq_snr_threshold,
+            sample_rate,
+            flow=ctx['flow'],
+            f_final=min(float(getattr(args, 'high_frequency_cutoff', 800.0) or 800.0),
+                        float(bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0)),
+            chisq_window=getattr(args, 'chisq_window', 1.0),
+            chisq_iterations=getattr(args, 'chisq_iterations', None),
+            top_template=top_template,
+            upper_f_by_coarse=upper_f_by_coarse,
+        )
+        self.autochisq = RatioAutoChisq(self.power_chisq, args)
 
-    # Renormalisation: the fine SNR is multiplied by rf <= rf_max, so a peak needs |z| >= T / rf.
-    renorm_on = not getattr(args, 'disable_dynamic_snr_renorm', False)
-    vfloor = getattr(args, 'dynamic_snr_variance_floor', 1.0)
-    max_boost = getattr(args, 'dynamic_snr_max_boost', None)
-    rf_max = 1.0 / np.sqrt(max(float(vfloor), 1e-12))
-    if max_boost is not None:
-        rf_max = min(rf_max, float(max_boost))
-    search = mf_search.HierarchicalSearch(
-        [root], threshold=primary_snr_threshold,
-        envelope_floor=(1.0 / rf_max) if renorm_on else 1.0,
-        leaf_options=engine.leaf_options(),
-        context=asym_half_span(args, sample_rate, effective_asym_num_bins))
-    local_timers['upper_prep'] += time.perf_counter() - t_up_prep
-    top_pad = search.pad(root)          # builds and calibrates the fine banks (search setup)
+        # Chirp-time rejection per injection window: a middle group is filtered
+        # only near injections whose chirp time lies within the rejector window of
+        # one of its fine templates.
+        self.group_tau = {}
+        self.rej_pairs = [0, 0]                    # (group, segment) pairs kept, total
+        if self.inj_reject is not None:
+            tau0_fine = self.inj_reject['tau0_fine']
+            cw = self.inj_reject['window']
+            for cid, (fine_indices, _, _) in self.groups.items():
+                t_g = tau0_fine[fine_indices]
+                self.group_tau[cid] = (float(t_g.min()) - cw, float(t_g.max()) + cw)
+        self.kept_by_seg = {}
+        self.norms = {}                # (ifo, segment) -> the top's sigmasq over its noise
+        self.renorm_factors = {}       # ifo -> this segment's renormalisation envelope
+        self.seg_clock = {'t': time.perf_counter(), 'leaf': 0.0, 'chi': 0.0, 'asym': 0.0,
+                          'top': 0.0, 'mid': 0.0}
 
-    power_chisq = RatioPowerChisq(
-        args.chisq_bins,
-        args.chisq_snr_threshold,
-        sample_rate,
-        flow=flow,
-        f_final=min(float(getattr(args, 'high_frequency_cutoff', 800.0) or 800.0),
-                    float(bank.table['f_final'].max() if hasattr(bank, 'table') and 'f_final' in bank.table else 800.0)),
-        chisq_window=getattr(args, 'chisq_window', 1.0),
-        chisq_iterations=getattr(args, 'chisq_iterations', None),
-        top_template=top_template,
-        upper_f_by_coarse=upper_f_by_coarse,
-    )
-    autochisq = RatioAutoChisq(power_chisq, args)
-
-    # The top's normalisation per segment: its sigmasq over the segment's noise, kept for the
-    # trigger records.
-    norms = {}
-
-    def root_scale_for(ifo):
-        def root_scale(_root, s):
-            st = segments[ifo][s]
-            h_norm = top_template.sigmasq(st.psd)
-            norms[(ifo, s)] = h_norm
+    def root_scale(self, ifo):
+        """The top's output scale for each of ifo's segments; keeps its sigmasq for the records."""
+        def scale(_root, s):
+            st = self.segments[ifo][s]
+            h_norm = self.top_template.sigmasq(st.psd)
+            self.norms[(ifo, s)] = h_norm
             norm = (4.0 * st.delta_f) / np.sqrt(h_norm)
-            return 0.5 * (norm * st.delta_t) / engine.decimation_factor
-        return root_scale
+            return 0.5 * (norm * st.delta_t) / self.decimation
+        return scale
 
-    inputs = {ifo: mf_search.BlockInput(
-                  [st.numpy() for st in segments[ifo]],
-                  [(st.analyze.start, st.analyze.stop) for st in segments[ifo]],
-                  root_scale_for(ifo), tags=list(segments[ifo]))
-              for ifo in seg_ifos}
-
-    # Chirp-time rejection per injection window: a middle group is filtered
-    # only near injections whose chirp time lies within the rejector window of
-    # one of its fine templates.
-    group_tau = {}
-    rej_pairs = [0, 0]                    # (group, segment) pairs kept, total
-    if inj_reject is not None:
-        tau0_fine = inj_reject['tau0_fine']
-        cw = inj_reject['window']
-        for cid, g in groups.items():
-            t_g = tau0_fine[g[1]]
-            group_tau[cid] = (float(t_g.min()) - cw, float(t_g.max()) + cw)
-    kept_by_seg = {}
-
-    def kept_groups(s_num):
+    def kept_groups(self, s_num):
         """The groups searched in a segment (None: all) and its injections per detector."""
-        if s_num not in kept_by_seg:
+        if s_num not in self.kept_by_seg:
             kept, seg_inj = None, {}
-            if inj_reject is not None:
-                for ifo in seg_ifos:
-                    if s_num < len(segments[ifo]):
-                        injs = getattr(segments[ifo][s_num], 'analyze_injections', None)
+            if self.inj_reject is not None:
+                for ifo in self.seg_ifos:
+                    if s_num < len(self.segments[ifo]):
+                        injs = getattr(self.segments[ifo][s_num], 'analyze_injections', None)
                         seg_inj[ifo] = None if injs is None else [
-                            (a, b, inj_reject['tau0_inj'][ifo][row]) for a, b, row in injs]
+                            (a, b, self.inj_reject['tau0_inj'][ifo][row]) for a, b, row in injs]
                 if all(v is not None for v in seg_inj.values()):
                     seg_tau = [t for v in seg_inj.values() for _, _, t in v]
-                    kept = {cid for cid, (lo, hi) in group_tau.items()
+                    kept = {cid for cid, (lo, hi) in self.group_tau.items()
                             if any(lo <= t <= hi for t in seg_tau)}
-                rej_pairs[0] += len(groups) if kept is None else len(kept)
-                rej_pairs[1] += len(groups)
-            kept_by_seg[s_num] = (kept, seg_inj)
-        return kept_by_seg[s_num]
+                self.rej_pairs[0] += len(self.groups) if kept is None else len(kept)
+                self.rej_pairs[1] += len(self.groups)
+            self.kept_by_seg[s_num] = (kept, seg_inj)
+        return self.kept_by_seg[s_num]
 
-    def windows(leaf, s_num, ifo, extra):
+    def windows(self, leaf, s_num, ifo, extra):
         """A group's search windows in a segment, widened by the injection guard band and
         extra samples: None for the whole analysed range, empty to skip the group."""
-        kept, seg_inj = kept_groups(s_num)
+        kept, seg_inj = self.kept_groups(s_num)
         cid = leaf.node_id
         if kept is not None and cid not in kept:
             return []
-        st_g = segments[ifo][s_num]
-        margin = injection_guard_samples(args, ifo_sample_rates[ifo], top_pad) + extra
+        st_g = self.segments[ifo][s_num]
+        margin = injection_guard_samples(self.args, self.ctx['ifo_sample_rates'][ifo],
+                                         self.top_pad) + extra
         if kept is None:
             return segment_windows(st_g, margin)
-        lo, hi = group_tau[cid]
+        lo, hi = self.group_tau[cid]
         return injection_group_windows(st_g, seg_inj[ifo], lo, hi, margin)
 
-    renorm_factors = {}
-
-    def on_series(ctx):
-        """The top's output per detector: build each renormalisation envelope from it."""
+    def on_series(self, ctx):
+        """The top's output per detector: each renormalisation envelope, built from it, and
+        given to the search as the threshold envelope 1 / rf."""
         t0 = time.perf_counter()
         envelopes = {}
         for ifo in ctx.channels:
-            st = ctx.tags[ifo]
-            if not renorm_on:
-                renorm_factors[ifo] = None
+            if not self.renorm_on:
+                self.renorm_factors[ifo] = None
                 continue
+            st = ctx.tags[ifo]
             rf = DynamicSNRRenormFactor(
                 ctx.series[ifo], dt=float(st.delta_t),
-                scale=float(st.delta_t / engine.decimation_factor),
-                window_duration=getattr(args, 'dynamic_snr_window', 8.0),
-                hollow_duration=getattr(args, 'dynamic_snr_hollow', 0.5),
-                variance_floor=vfloor, max_boost_factor=max_boost)
-            renorm_factors[ifo] = rf
+                scale=float(st.delta_t / self.decimation),
+                window_duration=getattr(self.args, 'dynamic_snr_window', 8.0),
+                hollow_duration=getattr(self.args, 'dynamic_snr_hollow', 0.5),
+                variance_floor=self.vfloor, max_boost_factor=self.max_boost)
+            self.renorm_factors[ifo] = rf
             envelopes[ifo] = lambda t, rf=rf: 1.0 / rf[t]
-        local_timers['upper_ref'] += time.perf_counter() - t0
+        self.timers['upper_ref'] += time.perf_counter() - t0
         return envelopes
 
-    def on_peaks(ctx):
+    def on_peaks(self, ctx):
         """One middle group's fine peaks in a segment: renormalise, select, veto, record."""
+        args = self.args
         coarse_idx = ctx.leaf.node_id
-        counts, fine_indices, group_engine, filters_f, shifts = groups[coarse_idx]
+        fine_indices, chisq, shifts = self.groups[coarse_idx]
         s_num = ctx.chunk
-        active_ifos = ctx.channels
-        can_asym_seg = can_asym_by_seg.get(s_num, False)
-        power_chisq.begin_group()
+        can_asym_seg = self.ctx['can_asym_by_seg'].get(s_num, False)
+        self.power_chisq.begin_group()
         std_trigs = {}
-        h_norms = {ifo: norms[(ifo, s_num)] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
-        middle_series = {ifo: {coarse_idx: ctx.series(ifo)} for ifo in active_ifos}
-        group_engine._td_bank = search.leaf_bank(root, ctx.leaf)   # follow-ups re-filter with it
+        h_norms = {ifo: self.norms[(ifo, s_num)] * self.sigmasq_ratio[coarse_idx]
+                   for ifo in ctx.channels}
+        middle_series = {ifo: {coarse_idx: ctx.series(ifo)} for ifo in ctx.channels}
 
-        for ifo in active_ifos:
+        for ifo in ctx.channels:
             stilde = ctx.tags[ifo]
-            h_norm = h_norms[ifo]
-            ref_snr = middle_series[ifo][coarse_idx]
             res = ctx.peaks[ifo]
             ids_local, t_idxs, snrs, tstarts = (
                 res.template_indices, res.sample_indices, res.snr, res.block_starts)
+            # the renormalisation at each peak: 1 / the envelope the search thresholded with
+            e = ctx.envelope(ifo)
+            renorm = (1.0 / e).astype(np.float32) if e is not None else None
+            snrs_eval = snrs * renorm if renorm is not None else snrs
 
-            rf = renorm_factors.get(ifo)
-            if rf is not None and len(ids_local) > 0:
-                local_shifts = shifts[ids_local] if shifts is not None else 0
-                phys_t = np.clip(t_idxs - local_shifts, 0, len(rf) - 1)
-                snrs_eval = snrs * rf[phys_t]
-            else:
-                snrs_eval = snrs
-
-            cand_indices = select_primary_asym_candidates(
+            cand = select_primary_asym_candidates(
                 a_ids=ids_local,
                 a_tidxs=t_idxs,
                 a_snrs=snrs_eval,
-                sample_rate=ifo_sample_rates[ifo],
-                asym_snr_threshold=primary_snr_threshold,
+                sample_rate=self.ctx['ifo_sample_rates'][ifo],
+                asym_snr_threshold=self.threshold,
                 max_primary_per_group_sec=args.asym_max_primary_per_group_sec,
                 stilde=stilde,
-                gps_start_time=ifo_gps_cli_starts[ifo],
+                gps_start_time=self.ctx['ifo_gps_cli_starts'][ifo],
             )
-            ids_local = ids_local[cand_indices]
-            t_idxs = t_idxs[cand_indices]
-            snrs = snrs[cand_indices]
-            tstarts = tstarts[cand_indices]
+            ids_local, t_idxs, snrs, tstarts = ids_local[cand], t_idxs[cand], snrs[cand], tstarts[cand]
+            renorm = renorm[cand] if renorm is not None else None
 
             if not can_asym_seg:
                 process_and_record_triggers(
                     ids_local, t_idxs, snrs, tstarts,
-                    stilde, h_norm, coarse_idx, fine_indices,
-                    filters_f, ref_snr, bank,
-                    s_num, ifo, worker_triggers,
-                    args, power_chisq, is_asym=False,
+                    stilde, h_norms[ifo], coarse_idx, fine_indices,
+                    chisq, middle_series[ifo][coarse_idx], self.bank,
+                    s_num, ifo, self.triggers,
+                    args, self.power_chisq, is_asym=False,
                     shifts=shifts,
-                    timers=local_timers,
-                    renorm_factor=renorm_factors.get(ifo),
-                    primary_snr_threshold=primary_snr_threshold,
-                    autochisq=autochisq,
-                    chisq_valid=group_engine.chisq_valid,
+                    timers=self.timers,
+                    renorm=renorm,
+                    primary_snr_threshold=self.threshold,
+                    autochisq=self.autochisq,
+                    chisq_valid=chisq.valid,
                 )
             else:
-                std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
+                std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts, renorm)
 
         if can_asym_seg:
             followup_asym_candidates(
-                std_trigs, active_ifos, s_num, coarse_idx, fine_indices,
-                group_engine, filters_f, shifts, h_norms, middle_series,
-                segments, bank, worker_triggers, worker_asym, power_chisq,
-                args, primary_snr_threshold, effective_asym_num_bins,
-                ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
-                timers=local_timers,
-                renorm_factors=renorm_factors,
-                autochisq=autochisq,
+                std_trigs, ctx.channels, s_num, coarse_idx, fine_indices,
+                lambda ifo, **kw: ctx.refilter(ifo, **kw), chisq, shifts, h_norms,
+                middle_series, self.segments, self.bank, self.triggers, self.asym,
+                self.power_chisq, args, self.threshold, self.ctx['effective_asym_num_bins'],
+                self.ctx['ifo_sample_rates'], self.ctx['ifo_gps_starts'], self.ctx['seg_starts'],
+                self.ctx['ifo_gps_cli_starts'],
+                timers=self.timers,
+                renorm_factors=self.renorm_factors,
+                autochisq=self.autochisq,
             )
 
-    seg_clock = {'t': time.perf_counter(), 'leaf': 0.0, 'chi': 0.0, 'asym': 0.0,
-                 'top': 0.0, 'mid': 0.0}
-
-    def on_chunk(ctx):
+    def on_chunk(self, ctx):
         """A segment is done: log its time and throughput."""
         now = time.perf_counter()
-        t_seg_dur = max(now - seg_clock['t'], 1e-6)
-        kept, _ = kept_groups(ctx.chunk)
-        n_groups = len(groups) if kept is None else len(kept)
-        n_tmpl_seg = sum(len(g[1]) for cid, g in groups.items() if kept is None or cid in kept)
+        clock, timings = self.seg_clock, self.search.timings
+        t_seg_dur = max(now - clock['t'], 1e-6)
+        kept, _ = self.kept_groups(ctx.chunk)
+        n_groups = len(self.groups) if kept is None else len(kept)
+        n_tmpl_seg = sum(len(g[0]) for cid, g in self.groups.items() if kept is None or cid in kept)
         stilde_ref = ctx.tags[ctx.channels[0]]
         total_analyzed_dur = len(ctx.channels) * analyzed_samples(stilde_ref) * stilde_ref.delta_t
         tperf_seg = total_analyzed_dur / t_seg_dur * n_tmpl_seg
-        s_fine = search.timings['leaf'] - seg_clock['leaf']
-        s_chi = local_timers['power_chisq'] - seg_clock['chi']
-        s_asym = local_timers['asym_followup'] - seg_clock['asym']
-        top_now = search.timings['root'] + local_timers['upper_ref']   # the top and its envelope
-        s_top = top_now - seg_clock['top']
-        s_mid = search.timings['inner'] - seg_clock['mid']
-        logging.info(f"[Top {top_idx}] Seg {ctx.chunk+1}/{num_segs}: {n_groups} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s top={s_top:.3f}s mid={s_mid:.3f}s]")
-        seg_clock.update(t=now, leaf=search.timings['leaf'], chi=local_timers['power_chisq'],
-                         asym=local_timers['asym_followup'], top=top_now,
-                         mid=search.timings['inner'])
-        renorm_factors.clear()
+        s_fine = timings['leaf'] - clock['leaf']
+        s_chi = self.timers['power_chisq'] - clock['chi']
+        s_asym = self.timers['asym_followup'] - clock['asym']
+        top_now = timings['root'] + self.timers['upper_ref']   # the top and its envelope
+        s_top = top_now - clock['top']
+        s_mid = timings['inner'] - clock['mid']
+        logging.info(f"[Top {self.top_idx}] Seg {ctx.chunk+1}/{self.ctx['num_segs']}: {n_groups} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s top={s_top:.3f}s mid={s_mid:.3f}s]")
+        clock.update(t=now, leaf=timings['leaf'], chi=self.timers['power_chisq'],
+                     asym=self.timers['asym_followup'], top=top_now, mid=timings['inner'])
+        self.renorm_factors.clear()
 
-    search.run(inputs, windows=windows, on_series=on_series, on_peaks=on_peaks, on_chunk=on_chunk)
-    local_timers['upper_ref'] += search.timings['root']
-    local_timers['upper_fir'] += search.timings['inner']
-    local_timers['fine_fir'] += search.timings['leaf']
-    local_timers['filter_prep'] += search.timings['setup']
+    def run(self):
+        """Search every segment; returns (top id, triggers per detector, follow-up counts,
+        timers) for the worker pool."""
+        if self.search is None:
+            return self.top_idx, {ifo: {} for ifo in self.instruments}, self.asym, dict(self.timers)
+        inputs = {ifo: mf_search_block_input(self.segments[ifo], self.root_scale(ifo))
+                  for ifo in self.seg_ifos}
+        self.search.run(inputs, windows=self.windows, on_series=self.on_series,
+                        on_peaks=self.on_peaks, on_chunk=self.on_chunk)
+        timings = self.search.timings
+        self.timers['upper_ref'] += timings['root']
+        self.timers['upper_fir'] += timings['inner']
+        self.timers['fine_fir'] += timings['leaf']
+        self.timers['filter_prep'] += timings['setup']
+        if self.inj_reject is not None:
+            logging.info("[Top %d] injection rejection: %d of %d (group, segment) pairs filtered",
+                         self.top_idx, self.rej_pairs[0], self.rej_pairs[1])
+        self.power_chisq.clear()
+        self.autochisq.clear()
+        collapsed = {}
+        for ifo in self.instruments:
+            collapsed[ifo] = {col: np.concatenate(arrs) if arrs else np.empty(0)
+                              for col, arrs in self.triggers[ifo].items()}
+        return self.top_idx, collapsed, self.asym, dict(self.timers)
 
-    if inj_reject is not None:
-        logging.info("[Top %d] injection rejection: %d of %d (group, segment) pairs filtered",
-                     top_idx, rej_pairs[0], rej_pairs[1])
 
-    power_chisq.clear()
-    autochisq.clear()
+def mf_search_block_input(segs, root_scale):
+    """A detector's segments as matchedfilter search input blocks: each overwhitened segment
+    spectrum, its analysed range, the segment itself as the tag."""
+    from matchedfilter.search import BlockInput
+    return BlockInput([st.numpy() for st in segs],
+                      [(st.analyze.start, st.analyze.stop) for st in segs],
+                      root_scale, tags=list(segs))
 
-    collapsed_trigs = {}
-    for ifo in instruments:
-        collapsed_trigs[ifo] = {}
-        for col, arrs in worker_triggers[ifo].items():
-            if arrs:
-                collapsed_trigs[ifo][col] = np.concatenate(arrs)
-            else:
-                collapsed_trigs[ifo][col] = np.empty(0)
 
-    return top_idx, collapsed_trigs, worker_asym, dict(local_timers)
+def process_top_template_task(task_args):
+    """Filter a single top template across all data segments and detectors."""
+    return TopTemplateSearch(task_args).run()
 
 
 # -----------------------------------------------------------------------------
@@ -1557,7 +1513,7 @@ def ingest_ifo_triggers(
 
     sigmasq_rescale = bank.sigma_rescale(data['template_id']) ** 2.0
 
-    # data['snr'] is already true SNR via pre-scaled taps in prepare_filters
+    # data['snr'] is already the true SNR: the bank's taps are pre-scaled
     data['sigmasq'] = (data['sigmasq'] * sigmasq_rescale).astype(float32)
 
     if sg_chisq.do:
@@ -1798,6 +1754,9 @@ def get_args():
     group.add_argument('--ratio-filter-false-dismissal', type=float,
                        default=1e-3, metavar='PROB',
                        help="Tolerated probability of missing a signal at the SNR threshold.")
+    group.add_argument('--ratio-filter-device', default=None,
+                       help='matchedfilter device for the fine banks (e.g. gpu:0). Default: the '
+                            'library\'s default device.')
     group.add_argument('--ratio-filter-band', type=float, default=0, metavar='HZ',
                        help="Width of the band the first stage filters, in Hz. 0 uses the design table's choice.")
     group.add_argument('--ratio-filter-first-stage-snr', type=float, default=0, metavar='SNR',

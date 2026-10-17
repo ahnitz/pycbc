@@ -53,11 +53,10 @@ def test_lazy_envelope_matches_definition_and_full_evaluation(kw):
     np.testing.assert_allclose(full, ref, rtol=2e-5)
 
 
-def test_disabled_and_degenerate_inputs_give_unit_factors(monkeypatch):
+def test_degenerate_inputs_give_unit_factors():
     z = np.ones(10, np.complex64)
     assert np.array_equal(DynamicSNRRenormFactor(z, dt=0.0)[np.arange(10)], np.ones(10, np.float32))
-    monkeypatch.setenv("PYCBC_DISABLE_DYNAMIC_SNR_RENORM", "1")
-    assert np.array_equal(DynamicSNRRenormFactor(z, dt=1.0)[[0, 5]], np.ones(2, np.float32))
+    assert np.array_equal(DynamicSNRRenormFactor(z[:0], dt=1.0)[[]], np.ones(0, np.float32))
 
 
 @pytest.mark.parametrize("n", [4000, 4003])

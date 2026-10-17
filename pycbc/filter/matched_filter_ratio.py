@@ -1,4 +1,3 @@
-import os
 import numpy as np
 
 
@@ -14,115 +13,85 @@ def matchedfilter_available():
     return _mf is not None
 
 
-class MatchedFilterRatioControl(object):
-    """
-    High-performance engine for hierarchical "Ratio/FIR" matched filtering.
-    Acts as the PyCBC adapter to the C++/AVX-optimized matchedfilter.TimeDomainFilterBank.
-    """
-
-    def __init__(self, snr_threshold, delta_f,
-                 high_frequency_cutoff=None,
-                 tap_sample_rate=2048, engine_sample_rate=2048,
-                 engine='matchedfilter-hierarchical', false_dismissal=1e-3,
-                 coarse_band_hz=0, first_stage_snr=0, peak_window=None, **kwargs):
-        if _mf is None:
-            raise ImportError(
-                "matchedfilter is required for ratio/FIR filtering but is not installed"
-            )
-
-        self.delta_f = delta_f
-        self.snr_threshold = snr_threshold
-        self.f_high = high_frequency_cutoff
-
-        self.tap_sr = int(tap_sample_rate)
-        self.engine_sr = int(engine_sample_rate)
-
-        self.threshold_sq = float(snr_threshold**2)
-        # Granularity of the primary peak search, in seconds: one peak is reported per span this
-        # long (pycbc passes its per-template cluster window), so how matchedfilter blocks the
-        # series is its own choice and does not change which peaks survive clustering.
-        self.peak_binsize = int(round(float(peak_window) * self.engine_sr)) if peak_window else None
-
-        # Taps are generated at tap_sample_rate but filtered against data at
-        # engine_sample_rate; the ratio must be an exact integer.
-        exact_ratio = self.tap_sr / self.engine_sr
-        self.decimation_factor = int(np.round(exact_ratio))
-        if abs(exact_ratio - self.decimation_factor) > 1e-5 or self.decimation_factor < 1:
-            raise ValueError(
-                f"Multi-rate Error: The bank sample rate ({self.tap_sr} Hz) must be "
-                f"an exact integer multiple of the engine sample "
-                f"rate ({self.engine_sr} Hz).\n"
-                f"Calculated ratio was {exact_ratio:.4f}. Please use an engine "
-                f"sample rate that evenly divides the bank sample rate."
-            )
+def _require_matchedfilter():
+    if _mf is None:
+        raise ImportError("matchedfilter is required for ratio/FIR filtering but is not installed")
 
 
-        # matchedfilter backend mode: 'hier' or 'flat'
-        mode = {'matchedfilter': 'flat',
-                'matchedfilter-hierarchical': 'hier'}.get(engine, engine)
-        self._engine_mode = os.environ.get('PYCBC_RATIO_ENGINE', mode).lower()
-        self._engine_fd = float(os.environ.get(
-            'PYCBC_RATIO_ENGINE_FD', false_dismissal))
-        env_band = os.environ.get('PYCBC_RATIO_BAND_HZ')
-        if env_band:
-            parts = [float(x.strip()) for x in env_band.split(',') if x.strip()]
-            self._coarse_band_hz = tuple(int(x) for x in parts) if len(parts) > 1 else parts[0]
-        elif isinstance(coarse_band_hz, (tuple, list)):
-            self._coarse_band_hz = tuple(int(x) for x in coarse_band_hz)
-        else:
-            self._coarse_band_hz = float(coarse_band_hz)
-        self._device = os.environ.get('PYCBC_RATIO_DEVICE') or None
-        self._first_stage_snr = float(os.environ.get(
-            'PYCBC_RATIO_FIRST_STAGE_SNR', first_stage_snr))
+def decimation_factor(tap_sample_rate, data_sample_rate):
+    """The integer ratio of the bank's tap sample rate to the data's; raises if it is not one."""
+    exact = float(tap_sample_rate) / float(data_sample_rate)
+    factor = int(np.round(exact))
+    if abs(exact - factor) > 1e-5 or factor < 1:
+        raise ValueError(
+            f"The bank sample rate ({tap_sample_rate} Hz) must be an exact integer multiple "
+            f"of the data sample rate ({data_sample_rate} Hz); the ratio is {exact:.4f}.")
+    return factor
 
-    def leaf_options(self):
-        """Keyword arguments for a fine bank's matchedfilter TimeDomainFilterBank, as this
-        engine configures it (the search sets the threshold). With the peak granularity
-        stated, the block size is matchedfilter's choice."""
-        fft_lengths = None
-        if os.environ.get('PYCBC_RATIO_FFT_LENGTH'):
-            fft_lengths = [int(x.strip()) for x in os.environ['PYCBC_RATIO_FFT_LENGTH'].split(',') if x.strip()]
-        return dict(
-            tap_sample_rate=self.tap_sr,
-            data_sample_rate=self.engine_sr,
-            engine=self._engine_mode,
-            false_dismissal=self._engine_fd,
-            first_stage_snr=self._first_stage_snr,
-            coarse_band_hz=self._coarse_band_hz,
-            device=self._device,
-            fft_lengths=fft_lengths,
-            binsize=self.peak_binsize,
-        )
 
-    def prepare_chisq_filters(self, fir_taps, tap_counts, block_length, reach=0):
-        """Template spectra on the chisq block: length block_length, the convention of filters_f.
+def leaf_bank_options(engine, false_dismissal, coarse_band_hz, first_stage_snr, device,
+                      peak_window, tap_sample_rate, data_sample_rate):
+    """Keyword arguments for a fine bank's matchedfilter TimeDomainFilterBank (the search sets
+    the threshold). engine is pycbc's --ratio-filter-engine name; peak_window (s) is the
+    granularity of the peak search, one peak a template per span this long (pycbc's cluster
+    window), so how matchedfilter blocks the series is its own choice."""
+    _require_matchedfilter()
+    decimation_factor(tap_sample_rate, data_sample_rate)
+    mode = {'matchedfilter': 'flat', 'matchedfilter-hierarchical': 'hier'}.get(engine, engine)
+    return dict(
+        tap_sample_rate=int(tap_sample_rate),
+        data_sample_rate=int(data_sample_rate),
+        engine=mode.lower(),
+        false_dismissal=float(false_dismissal),
+        first_stage_snr=float(first_stage_snr),
+        coarse_band_hz=float(coarse_band_hz),
+        device=device or None,
+        binsize=int(round(float(peak_window) * int(data_sample_rate))) if peak_window else None,
+    )
 
-        The chisq is computed on a block of its own, centred on each trigger, so its
-        resolution is pycbc's choice and independent of how matchedfilter blocks the
-        series for filtering. The block must hold every filter with room for the lags
-        evaluated around the trigger (`reach` either side, for the auto-chisq);
-        otherwise this raises rather than lengthen the block, since its length is part
-        of the statistic.
-        """
-        n = int(block_length)
-        filters, valid = _mf.template_spectra(
-            fir_taps, tap_counts, n,
-            tap_sample_rate=self.tap_sr, data_sample_rate=self.engine_sr)
+
+class ChisqFilters(object):
+    """A fine group's chisq filters: each template's spectrum on the chisq block (length
+    block_length, conjugated, centre tap at lag 0), made from its taps when first read --
+    most templates never have a trigger loud enough for a chisq.
+
+    The chisq is computed on a block of its own, centred on each trigger, so its resolution
+    is pycbc's choice and independent of how matchedfilter blocks the series for filtering.
+    The block must hold every filter with room for the lags evaluated around the trigger
+    (reach either side, for the auto-chisq); otherwise this raises rather than lengthen the
+    block, since its length is part of the statistic. valid: (T, 2) [start, stop) of each
+    filter's valid lags in its block."""
+
+    def __init__(self, taps, counts, block_length, reach=0, tap_sample_rate=2048,
+                 data_sample_rate=2048):
+        _require_matchedfilter()
+        n = self.block_length = int(block_length)
+        self._taps = taps
+        self._counts = np.asarray(counts, dtype=np.int64)
+        self._rates = dict(tap_sample_rate=tap_sample_rate, data_sample_rate=data_sample_rate)
+        self.valid = _mf.template_valid(self._counts, n, **self._rates)
         centre = n // 2
-        short = np.flatnonzero((centre - reach < valid[:, 0]) | (centre + reach >= valid[:, 1]))
+        short = np.flatnonzero((centre - reach < self.valid[:, 0])
+                               | (centre + reach >= self.valid[:, 1]))
         if len(short):
-            lo, hi = valid[short[0]]
+            lo, hi = self.valid[short[0]]
             raise ValueError(
                 "--chisq-block-length %d is too short for this template group: a "
                 "ratio filter has valid lags [%d, %d), not the block centre "
                 "+-%d" % (n, lo, hi, reach))
-        self._chisq_valid = valid
-        return filters
+        self._rows = {}
 
-    @property
-    def chisq_valid(self):
-        """(T, 2) [start, stop) of each chisq filter's valid lags in its block."""
-        return self._chisq_valid
+    def __len__(self):
+        return len(self._counts)
+
+    def __getitem__(self, i):
+        i = int(i)
+        row = self._rows.get(i)
+        if row is None:
+            spectra, _ = _mf.template_spectra(self._taps[i:i + 1], self._counts[i:i + 1],
+                                              self.block_length, **self._rates)
+            row = self._rows[i] = spectra[0]
+        return row
 
 
 def get_dynamic_snr_renorm_factor(series, dt=None, window_duration=8.0, hollow_duration=0.5, variance_floor=1.0, scale=None, max_boost_factor=None):
@@ -185,7 +154,7 @@ class DynamicSNRRenormFactor(object):
     def __init__(self, series, dt=None, window_duration=8.0, hollow_duration=0.5,
                  variance_floor=1.0, scale=None, max_boost_factor=None):
         self._n = n = len(series)
-        self._ones = (os.environ.get('PYCBC_DISABLE_DYNAMIC_SNR_RENORM', '0') == '1' or n == 0)
+        self._ones = n == 0
         if dt is None:
             dt = float(getattr(series, 'delta_t', 1.0))
         else:
@@ -307,9 +276,6 @@ def dynamic_snr_renormalize(series, dt=None, window_duration=8.0, hollow_duratio
     renormalized_series : same type as series
         Series scaled by renorm factor.
     """
-    if os.environ.get('PYCBC_DISABLE_DYNAMIC_SNR_RENORM', '0') == '1':
-        return series
-
     n = len(series)
     if n == 0:
         return series
