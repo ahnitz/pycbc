@@ -287,11 +287,16 @@ class DynamicSNRRenormFactor(object):
     """The envelope of get_dynamic_snr_renorm_factor, evaluated where it is read.
 
     A search reads the envelope only at its triggers, a few hundred samples of a
-    series of ~10^6; building it everywhere was most of the reference stage's
-    time. This keeps the one O(n) part (the running sum of the local power) and
-    evaluates the rest at the requested indices with the same arithmetic, so the
-    values are identical. Supports len() and indexing by integer arrays.
+    series of ~10^6, so the envelope is never built everywhere. The O(n) part is
+    the local power (float32, as the series) and its float64 sum over every block
+    of _BLOCK samples; a window sum at a requested index is then the block sums
+    it spans plus the partial blocks at its edges, so every sample still enters
+    at full resolution. Supports len() and indexing by integer arrays.
+
+    A series with non-finite samples takes the power of those samples as zero.
     """
+
+    _BLOCK = 16
 
     def __init__(self, series, dt=None, window_duration=8.0, hollow_duration=0.5,
                  variance_floor=1.0, scale=None, max_boost_factor=None):
@@ -315,6 +320,8 @@ class DynamicSNRRenormFactor(object):
         arr = np.asarray(series)
         # Local power P(t) = 0.5 * |z(t)|^2. For a REAL series x = Re z (the real top filter's
         # output, real-real-complex hierarchy) the same expectation is x^2: E x^2 = E|z|^2 / 2.
+        # The constant factor (and the 1/scale^2 of a scaled series) multiplies the window
+        # sums, not every sample.
         if np.iscomplexobj(arr):
             power = arr.real * arr.real
             power += arr.imag * arr.imag
@@ -323,21 +330,42 @@ class DynamicSNRRenormFactor(object):
             power = arr * arr
             half = 1.0
         if scale is not None and float(scale) > 0:
-            inv_scale = 1.0 / float(scale)
-            power *= (half * inv_scale * inv_scale)
-        elif half != 1.0:
-            power *= half
+            self._factor = half / (float(scale) * float(scale))
+        else:
+            self._factor = half
 
-        np.nan_to_num(power, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        blocks = self._block_prefix(power)
+        if not np.isfinite(blocks[-1]):
+            np.nan_to_num(power, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            blocks = self._block_prefix(power)
+        self._power, self._blocks = power, blocks
 
         self._w_outer = int(round((0.5 * window_duration) / dt))
         self._w_inner = int(round(hollow_duration / dt))
-        self._cumsum = np.empty(n + 1, dtype=np.float64)
-        self._cumsum[0] = 0.0
-        np.cumsum(power, dtype=np.float64, out=self._cumsum[1:])
         self._floor = max(float(variance_floor), 1e-12)
         self._max_boost = max_boost_factor
         self._dtype = np.float64 if arr.dtype == np.complex128 else np.float32
+
+    _PARTIAL = np.arange(_BLOCK - 1)
+
+    @classmethod
+    def _block_prefix(cls, power):
+        """blocks[j]: the float64 sum of power over samples [0, j * _BLOCK)."""
+        B, n = cls._BLOCK, len(power)
+        whole = n // B
+        blocks = np.zeros(-(-n // B) + 1, dtype=np.float64)
+        blocks[1:whole + 1] = power[:whole * B].reshape(whole, B).sum(axis=1, dtype=np.float64)
+        if len(blocks) > whole + 1:
+            blocks[-1] = power[whole * B:].sum(dtype=np.float64)
+        return np.cumsum(blocks, out=blocks)
+
+    def _prefix(self, m):
+        """Sum of the power over samples [0, m), for a 1D integer array m in [0, n]."""
+        B = self._BLOCK
+        base = m - m % B
+        v = self._power[np.minimum(base[:, None] + self._PARTIAL, self._n - 1)]
+        v[self._PARTIAL >= (m - base)[:, None]] = 0     # the partial block [base, m) only
+        return self._blocks[m // B] + v.sum(axis=1, dtype=np.float64)
 
     def __len__(self):
         return self._n
@@ -346,13 +374,15 @@ class DynamicSNRRenormFactor(object):
         idx = np.asarray(idx)
         if self._ones:
             return np.ones(idx.shape, dtype=self._dtype)
-        n, cumsum = self._n, self._cumsum
+        n = self._n
         l_out = np.clip(idx - self._w_outer, 0, n)
         r_out = np.clip(idx + self._w_outer + 1, 0, n)
         l_in = np.clip(idx - self._w_inner, 0, n)
         r_in = np.clip(idx + self._w_inner + 1, 0, n)
 
-        sum_hollow = (cumsum[r_out] - cumsum[l_out]) - (cumsum[r_in] - cumsum[l_in])
+        edges = self._prefix(np.concatenate([r_out.ravel(), l_out.ravel(), r_in.ravel(), l_in.ravel()]))
+        e_ro, e_lo, e_ri, e_li = edges.reshape(4, *idx.shape)
+        sum_hollow = self._factor * ((e_ro - e_lo) - (e_ri - e_li))
         cnt_hollow = (r_out - l_out) - (r_in - l_in)
 
         var_est = sum_hollow / np.maximum(cnt_hollow, 1)

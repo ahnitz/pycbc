@@ -11,8 +11,14 @@ from pycbc.filter.matched_filter_ratio import DynamicSNRRenormFactor, get_dynami
 
 
 def _direct(z, dt, window, hollow, floor=1.0, boost=None, scale=None):
-    """The envelope's definition, one sample at a time (float64)."""
-    p = 0.5 * np.abs(z.astype(np.complex128)) ** 2
+    """The envelope's definition, one sample at a time (float64): the hollow-window
+    mean of 0.5|z|^2, or of x^2 for a real series x, with non-finite samples' power
+    taken as zero."""
+    if np.iscomplexobj(z):
+        p = 0.5 * np.abs(z.astype(np.complex128)) ** 2
+    else:
+        p = z.astype(np.float64) ** 2
+    p = np.where(np.isfinite(p), p, 0.0)
     if scale is not None:
         p = p / scale ** 2
     n = len(z)
@@ -52,3 +58,26 @@ def test_disabled_and_degenerate_inputs_give_unit_factors(monkeypatch):
     assert np.array_equal(DynamicSNRRenormFactor(z, dt=0.0)[np.arange(10)], np.ones(10, np.float32))
     monkeypatch.setenv("PYCBC_DISABLE_DYNAMIC_SNR_RENORM", "1")
     assert np.array_equal(DynamicSNRRenormFactor(z, dt=1.0)[[0, 5]], np.ones(2, np.float32))
+
+
+@pytest.mark.parametrize("n", [4000, 4003])
+def test_real_series_matches_definition(n):
+    """A real series (the top filter's output in a real-real-complex search), with a
+    length that is and is not a whole number of the envelope's blocks."""
+    rng = np.random.default_rng(2)
+    dt = 1.0 / 256
+    x = (rng.standard_normal(n) * 3.0).astype(np.float32)
+    x[1500:1520] *= 8.0
+    full = get_dynamic_snr_renorm_factor(x, dt=dt, window_duration=2.0, hollow_duration=0.25, scale=3.0)
+    assert full.dtype == np.float32
+    ref = _direct(x, dt, 2.0, 0.25, scale=3.0)
+    np.testing.assert_allclose(full, ref, rtol=2e-5)
+
+
+def test_non_finite_samples_count_as_zero_power():
+    rng = np.random.default_rng(3)
+    n, dt = 4000, 1.0 / 256
+    x = rng.standard_normal(n).astype(np.float32)
+    x[[100, 2000, 3999]] = [np.nan, np.inf, -np.inf]
+    full = get_dynamic_snr_renorm_factor(x, dt=dt, window_duration=2.0, hollow_duration=0.25)
+    np.testing.assert_allclose(full, _direct(x, dt, 2.0, 0.25), rtol=2e-5)
