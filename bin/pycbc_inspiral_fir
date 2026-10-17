@@ -48,7 +48,12 @@ TIMERS = collections.defaultdict(float)
 # -----------------------------------------------------------------------------
 
 class UpperReferenceBatch:
-    """Expand one top SNR series into all middle series in one library call."""
+    """Expand one top series into all middle series in one library call.
+
+    The hierarchy is real-real-complex: the bank's final taps are complex and its
+    top and middle taps real, so the middle filters see the real top output and
+    give real middle series, from which the final filters make the complex SNR.
+    """
 
     _BUFFERS = {}
 
@@ -56,11 +61,7 @@ class UpperReferenceBatch:
     def clear_buffers(cls):
         cls._BUFFERS.clear()
 
-    def __init__(self, taps, counts, middle_ids, series_length, scales=None, real_input=False):
-        """real_input: the bank's final filters are complex (quadrature) taps, so the
-        hierarchy is real-real-complex -- the middle filters see the real top output (the
-        real part of the top template's complex SNR, which is the real top filter's output)
-        and give real middle series, from which the final filters make the complex SNR."""
+    def __init__(self, taps, counts, middle_ids, series_length):
         import matchedfilter
         from matchedfilter import _automatic_series_layout
 
@@ -69,38 +70,27 @@ class UpperReferenceBatch:
         self.sort_order = sort_order
         self.sorted_ids = np.asarray(middle_ids, dtype=int)[sort_order]
         self.series_length = int(series_length)
-        self.real_input = bool(real_input)
-        # Each middle filter's scale is fixed for the batch: fold it into the filter's taps
-        # rather than multiply every output series by it on every call (a full pass over
-        # ~25 series of ~10^6 samples). Rounds once on the taps instead of the output.
+        if np.iscomplexobj(taps):
+            raise ValueError('middle taps must be real: final taps are the only complex stage')
         sorted_taps = taps[sort_order]
-        if scales is not None:
-            sorted_taps = sorted_taps * np.asarray(scales, dtype=np.float32)[sort_order][:, None]
-        self.scales = None
         sorted_counts = counts_arr[sort_order]
-        # Real input (real-real-complex): the middle outputs are real, so two middle filters
-        # run as ONE complex filter, h_a - i h_b, whose output is out_a + i out_b (the series
-        # is correlated against the conjugate taps). Each is placed so that its own centre tap
-        # stays the packed filter's centre (offset c//2 - c_i//2), so each output is exactly
-        # its filter's. Half the middle transforms; the fine banks read each real series in
-        # place as one lane of its pair's row. Neighbours in length order are paired.
-        self.packed = bool(real_input) and os.environ.get('PYCBC_FIR_PACK_MIDDLE', '1') != '0'
-        self.n_rows = len(self.sorted_ids)
-        if self.packed:
-            npair = (self.n_rows + 1) // 2
-            pc = np.array([int(max(sorted_counts[2 * q:2 * q + 2])) for q in range(npair)], dtype=np.int64)
-            ptaps = np.zeros((npair, int(pc.max())), dtype=np.complex64)
-            for r in range(self.n_rows):
-                q, lane = divmod(r, 2)
-                c_i = int(sorted_counts[r])
-                o = int(pc[q]) // 2 - c_i // 2
-                ptaps[q, o:o + c_i] += (1.0 if lane == 0 else -1j) * sorted_taps[r, :c_i]
-            self.n_rows = npair
-            bank_taps, bank_counts = ptaps, pc
-        else:
-            bank_taps, bank_counts = sorted_taps, sorted_counts
+        # The middle outputs are real, so two middle filters run as ONE complex filter,
+        # h_a - i h_b, whose output is out_a + i out_b (the series is correlated against the
+        # conjugate taps). Each is placed so that its own centre tap stays the packed filter's
+        # centre (offset c//2 - c_i//2), so each output is exactly its filter's. Half the
+        # middle transforms; the fine banks read each real series in place as one lane of
+        # its pair's row. Neighbours in length order are paired.
+        npair = (len(self.sorted_ids) + 1) // 2
+        pc = np.array([int(max(sorted_counts[2 * q:2 * q + 2])) for q in range(npair)], dtype=np.int64)
+        ptaps = np.zeros((npair, int(pc.max())), dtype=np.complex64)
+        for r in range(len(self.sorted_ids)):
+            q, lane = divmod(r, 2)
+            c_i = int(sorted_counts[r])
+            o = int(pc[q]) // 2 - c_i // 2
+            ptaps[q, o:o + c_i] += (1.0 if lane == 0 else -1j) * sorted_taps[r, :c_i]
+        self.n_rows = npair
         self.bank = matchedfilter.TimeDomainFilterBank(
-            bank_taps, tap_counts=bank_counts,
+            ptaps, tap_counts=pc,
             engine='corr'
         )
 
@@ -118,9 +108,11 @@ class UpperReferenceBatch:
                 'valid': cplan.valid,
             })
 
-    def run(self, top_series, valid_slice=None, ifo=None, pad=4096, scales=None,
+    def run(self, top_series, valid_slice=None, ifo=None, pad=4096,
             windows=None, rows=None):
-        """Return middle-id to SNR series, scaled like direct middle filtering.
+        """Return middle-id to real middle series, scaled like direct middle filtering.
+
+        top_series is the top filter's real output (float32).
 
         valid_slice, or windows (a list of (start, stop) pairs) when given,
         selects where the middle series is needed; each is widened by pad and
@@ -133,24 +125,19 @@ class UpperReferenceBatch:
         if len(top_series) != self.series_length:
             raise ValueError('top reference length changed between segments')
 
-        if scales is not None and len(scales) == len(self.sorted_ids):
-            scales = scales[self.sort_order]
-        if scales is not None and self.packed:
-            raise ValueError('per-call scales are not supported with packed middle pairs')
+        if np.iscomplexobj(top_series):
+            raise TypeError('the top series must be real: final taps are the only complex stage')
 
         L = self.series_length
         if rows is None:
             want_mid = np.ones(len(self.sorted_ids), dtype=bool)
         else:
             want_mid = np.isin(self.sorted_ids, np.asarray(list(rows), dtype=int))
-        # Internal rows: middle filters, or packed pairs of them.
+        # Internal rows: packed pairs of middle filters.
         n_req = self.n_rows
-        if self.packed:
-            pad_mid = np.zeros(2 * n_req, dtype=bool)
-            pad_mid[:want_mid.size] = want_mid
-            want = pad_mid[0::2] | pad_mid[1::2]
-        else:
-            want = want_mid
+        pad_mid = np.zeros(2 * n_req, dtype=bool)
+        pad_mid[:want_mid.size] = want_mid
+        want = pad_mid[0::2] | pad_mid[1::2]
         if ifo is not None:
             buf_key = (ifo, L)
             buf_entry = UpperReferenceBatch._BUFFERS.get(buf_key)
@@ -179,14 +166,11 @@ class UpperReferenceBatch:
         else:
             out = np.zeros((n_req, L), dtype=np.complex64)
 
-        # Real input: the real top output stays real (4 bytes a sample) where the library
-        # correlates a real series itself (half-size block transforms); widened otherwise.
-        ser_real = None
-        if self.real_input:
-            ser_real = np.ascontiguousarray(np.real(top_series), dtype=np.float32)
-            ser = None
-        else:
-            ser = np.ascontiguousarray(top_series, dtype=np.complex64)
+        # The real top output stays real (4 bytes a sample) on the CPU, where the library
+        # correlates a real series itself (half-size block transforms). GPU plans read a
+        # complex series, widened once on first use.
+        ser_real = np.ascontiguousarray(top_series, dtype=np.float32)
+        ser = None
 
         def complex_series():
             nonlocal ser
@@ -288,24 +272,10 @@ class UpperReferenceBatch:
                 if cplan._gpu is not None:
                     cplan._continuous_gpu(complex_series(), st_run, r0, r1 - r0, dest)
                 else:
-                    ep = cplan._execution_plan()
-                    if ser_real is not None and hasattr(ep, 'correlate_series_continuous_real'):
-                        ep.correlate_series_continuous_real(
-                            ser_real, st_run, lo, hi, r0, r1 - r0, dest)
-                    else:
-                        ep.correlate_series_continuous(
-                            complex_series(), st_run, lo, hi, r0, r1 - r0, dest
-                        )
+                    cplan._execution_plan().correlate_series_continuous_real(
+                        ser_real, st_run, lo, hi, r0, r1 - r0, dest)
 
         regions = [tuple(x) for x in iv] if iv is not None else [(0, L)]
-        sel = np.flatnonzero(want)
-        cuts = np.flatnonzero(np.diff(sel) != 1) + 1
-        if scales is not None:          # extra per-call scales; the batch's own are in the taps
-            for run in (np.split(sel, cuts) if sel.size else []):
-                r0, r1 = int(run[0]), int(run[-1]) + 1
-                for v_start, v_stop in regions:
-                    np.multiply(out[r0:r1, v_start:v_stop], scales[r0:r1, None],
-                                out=out[r0:r1, v_start:v_stop])
         if ifo is not None:
             # A block writes up to its full valid span, past the requested region by up to a
             # block: record that reach as written too, so a later call clears it.
@@ -313,11 +283,9 @@ class UpperReferenceBatch:
             written = [(max(0, a - reach), min(L, b + reach)) for a, b in regions]
             buf_entry[1].append((want.copy(), written))
 
-        if self.packed:
-            # Each middle filter's real series: its lane of its pair's row, read in place.
-            return {self.sorted_ids[r]: (out[r // 2].real if r % 2 == 0 else out[r // 2].imag)
-                    for r in np.flatnonzero(want_mid)}
-        return {self.sorted_ids[r]: out[r] for r in sel}
+        # Each middle filter's real series: its lane of its pair's row, read in place.
+        return {self.sorted_ids[r]: (out[r // 2].real if r % 2 == 0 else out[r // 2].imag)
+                for r in np.flatnonzero(want_mid)}
 
 
 def _subtract_intervals(regions, covered):
@@ -1270,12 +1238,8 @@ def process_top_template_task(task_args):
 
     t_up_prep = time.perf_counter()
     any_seg = next(segments[i][0] for i in instruments if len(segments[i]) > 0)
-    # Complex final taps: a real-real-complex hierarchy (pycbc_fir_bank --complex-taps).
-    quadrature = bool(len(middle_ids)) and np.iscomplexobj(bank.get_firs(int(middle_ids[0]))[0])
     upper_batch = UpperReferenceBatch(
-        taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2, scales=None,
-        real_input=quadrature,
-    )
+        taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2)
     local_timers['upper_prep'] += time.perf_counter() - t_up_prep
 
     # The power chisq's coarse weights sample each middle filter's spectrum on its block's grid.
@@ -1388,8 +1352,8 @@ def process_top_template_task(task_args):
         for ifo in active_ifos:
             st = segments[ifo][s_num]
             t_ref0 = time.perf_counter()
-            # Quadrature bank: the real top filter's output (real-real-complex hierarchy).
-            series, norm = engine.make_reference_series(st, st.psd, top_template, real=quadrature)
+            # The real top filter's output (real-real-complex hierarchy).
+            series, norm = engine.make_reference_series(st, st.psd, top_template)
             dt_sample = float(st.delta_t)
             amp_scale = float(st.delta_t / engine.decimation_factor)
             if not getattr(args, 'disable_dynamic_snr_renorm', False):
@@ -2305,6 +2269,15 @@ def main():
 
         if bank.num_levels < 2:
             raise ValueError("pycbc_inspiral_fir requires a hierarchical bank with at least 2 FIR levels.")
+        # The hierarchy is real-real-complex: complex final taps (level 1), real taps above.
+        for lvl, grp in bank.level_groups.items():
+            want_complex = lvl == 1
+            for k in bank.level_keys[lvl]:
+                if np.issubdtype(grp[k]['taps'].dtype, np.complexfloating) != want_complex:
+                    raise ValueError(
+                        "%s: level_%d group %s has %s taps; pycbc_inspiral_fir needs complex "
+                        "final (level 1) taps and real taps above (rebuild the bank with the "
+                        "current pycbc_fir_bank)" % (args.bank_file, lvl, k, grp[k]['taps'].dtype))
 
         max_upper_taps = int(bank.level_groups[2].attrs.get('max_taps', 0))
         if max_upper_taps == 0:

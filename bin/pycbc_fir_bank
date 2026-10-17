@@ -4,8 +4,8 @@
 Constructs 2-level or multi-level hierarchical FIR filter banks for gravitational-wave
 matched filtering. Selects coarse parent templates via bottom-up dispersion clustering,
 designs interpolating FIR filters with Toeplitz least-squares and out-of-band peak
-suppression, and prunes redundant parent groups. Supports both real-valued (float32)
-and complex-valued (complex64) filter taps.
+suppression, and prunes redundant parent groups. The hierarchy is real-real-complex:
+the final (level 1) taps are complex (complex64) and the taps above them real (float32).
 """
 
 import argparse
@@ -389,9 +389,6 @@ def main():
         "--max-taps", nargs="+", type=int, default=[301], help="Max taps per level."
     )
     parser.add_argument(
-        "--complex-taps", action="store_true", help="Use complex taps at level 1."
-    )
-    parser.add_argument(
         "--full-resolution",
         action="store_true",
         help="Generate waveforms at full segment-length resolution before "
@@ -444,7 +441,7 @@ def main():
         min_match = float(
             args.min_match[level - 1] if len(args.min_match) > 1 else args.min_match[0]
         )
-        lvl_complex = bool(args.complex_taps) if is_lowest else False
+        lvl_complex = is_lowest       # complex final taps, real above
         min_f_low = float(np.min(fine_bank.table["f_lower"]))
 
         bank_fft_len = max(fft_len, full_fft_len) if args.full_resolution else fft_len

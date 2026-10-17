@@ -2,9 +2,7 @@ import os
 import numpy as np
 
 from pycbc.fft import IFFT
-from pycbc.filter.matchedfilter import (
-    correlate, get_cutoff_indices, matched_filter_core,
-)
+from pycbc.filter.matchedfilter import correlate, get_cutoff_indices
 from pycbc.types import Array, complex64, float32, zeros
 
 # matchedfilter back end is required for ratio/FIR filtering.
@@ -61,8 +59,6 @@ class MatchedFilterRatioControl(object):
                 f"sample rate that evenly divides the bank sample rate."
             )
 
-        self._ref_plan = None
-        self._ref_direct = os.environ.get('PYCBC_RATIO_REFDIRECT', '1') != '0'
 
         # matchedfilter backend mode: 'hier' or 'flat'
         mode = {'matchedfilter': 'flat',
@@ -109,35 +105,24 @@ class MatchedFilterRatioControl(object):
             binsize=self.peak_binsize,
         )
 
-    def make_reference_series(self, stilde, psd, ref_template, real=False):
-        """Return the scaled reference SNR series and its template sigmasq.
+    def make_reference_series(self, stilde, psd, ref_template):
+        """Return the top filter's real output series and its template sigmasq.
 
-        real: the real part only -- the real top filter's output, which a real-real-complex
-        hierarchy (complex final taps) filters -- from a half-size complex-to-real inverse
-        transform of the same one-sided spectrum (Re z = C2R(q) / 2): exact, half the work."""
+        The hierarchy is real-real-complex: the top and middle filters are real
+        and only the final taps are complex, so the middle stage reads the real
+        part of the top template's SNR series. It is computed directly, by a
+        complex-to-real inverse transform of the one-sided spectrum
+        (Re z = C2R(q) / 2). The series is scaled like direct filtering and
+        returned as float32; the template sigmasq is ref_template.sigmasq(psd).
+        """
         h_norm = ref_template.sigmasq(psd)
-        if real and self._ref_direct:
-            snr, norm = self._reference_snr(stilde, psd, ref_template, h_norm, real=True)
-            scale = 0.5 * (norm * stilde.delta_t) / self.decimation_factor
-            out = np.empty(len(snr), dtype=np.float32)
-            np.multiply(snr.numpy(), scale, out=out, casting='same_kind')
-            return out, h_norm
-        if self._ref_direct:
-            snr, norm = self._reference_snr(stilde, psd, ref_template, h_norm)
-        else:
-            snr, _, norm = matched_filter_core(
-                ref_template, stilde, psd=psd,
-                low_frequency_cutoff=ref_template.f_lower,
-                high_frequency_cutoff=self.f_high, h_norm=h_norm)
-        scale = (norm * stilde.delta_t) / self.decimation_factor
-        # The cached IFFT output is overwritten by the next reference; upper
-        # series must survive while all of its middle children are processed.
-        # scale is a float64 scalar: multiplying into a complex64 output keeps the
-        # double-precision product and its rounding, without a complex128 temporary.
-        out = np.empty(len(snr), dtype=np.complex64)
+        snr, norm = self._reference_snr(stilde, ref_template, h_norm)
+        scale = 0.5 * (norm * stilde.delta_t) / self.decimation_factor
+        # The cached IFFT output is overwritten by the next reference; the series
+        # must survive while all of its middle children are processed. scale is a
+        # float64 scalar, so the product keeps double precision until the store.
+        out = np.empty(len(snr), dtype=np.float32)
         np.multiply(snr.numpy(), scale, out=out, casting='same_kind')
-        if real:
-            return np.ascontiguousarray(out.real), h_norm
         return out, h_norm
 
     def prepare_chisq_filters(self, fir_taps, tap_counts, block_length, reach=0):
@@ -171,10 +156,13 @@ class MatchedFilterRatioControl(object):
         return self._chisq_valid
 
     def process_segment(self, stilde, psd, ref_template, filters_f, n_taps, indices,
-                        valid_slice=None, reference_series=None,
-                        profile_template=None):
-        """
-        Process a single data segment through TimeDomainFilterBank.
+                        reference_series, valid_slice=None, profile_template=None):
+        """Filter one middle series with this group's final taps.
+
+        reference_series is the middle filter's real output over the segment
+        (float32, possibly one lane of a packed pair's row, which matchedfilter
+        reads in place). Returns the global template ids, sample indices and
+        complex SNRs of the peaks, the block starts, and the middle sigmasq.
         """
         if valid_slice is None:
             valid_slice = getattr(stilde, 'analyze', None)
@@ -193,30 +181,13 @@ class MatchedFilterRatioControl(object):
                 self._td_bank.set_reference_from_template(stilde, psd, profile, f_high=self.f_high)
                 self._ap_ref_key = id(profile)
 
-        if reference_series is None:
-            if self._ref_direct:
-                snr, norm = self._reference_snr(stilde, psd, ref_template, h_norm)
-            else:
-                snr, _, norm = matched_filter_core(
-                    ref_template, stilde, psd=psd,
-                    low_frequency_cutoff=ref_template.f_lower,
-                    high_frequency_cutoff=self.f_high, h_norm=h_norm)
-            self.ref_snr = snr.numpy()
-            self.ref_snr *= (norm * stilde.delta_t) / self.decimation_factor
-        else:
-            # A real middle series (real-real-complex hierarchy: complex final taps) stays real,
-            # possibly one lane of a packed pair's row, which matchedfilter reads in place.
-            if isinstance(reference_series, np.ndarray) and reference_series.dtype in (np.complex64, np.float32):
-                self.ref_snr = reference_series
-            elif np.iscomplexobj(reference_series):
-                self.ref_snr = np.asarray(reference_series, dtype=np.complex64)
-            else:
-                self.ref_snr = np.asarray(reference_series, dtype=np.float32)
-            if len(self.ref_snr) != (len(stilde) - 1) * 2:
-                raise ValueError('reference series length does not match data segment')
+        if np.iscomplexobj(reference_series):
+            raise TypeError('the middle series must be real: final taps are the only complex stage')
+        series = np.asarray(reference_series, dtype=np.float32)
+        if len(series) != (len(stilde) - 1) * 2:
+            raise ValueError('reference series length does not match data segment')
 
-        res = self._td_bank.filter_series(self.ref_snr, windows=valid_slice, binsize=self.peak_binsize)
-        self.ref_snr = None
+        res = self._td_bank.filter_series(series, windows=valid_slice, binsize=self.peak_binsize)
         local_idxs = res.template_indices
         t_idxs = res.sample_indices
         snr_vals = res.snr
@@ -228,40 +199,28 @@ class MatchedFilterRatioControl(object):
         else:
             return [], [], [], tstarts, h_norm
 
-    def _reference_snr(self, stilde, psd, ref_template, h_norm, real=False):
-        """The reference SNR series, driving the class-based IFFT directly.
+    def _reference_snr(self, stilde, ref_template, h_norm):
+        """The real reference SNR series (unscaled) and its normalisation.
 
-        matched_filter_core goes through pycbc.fft's *function* API, which on
-        the MKL backend builds a DFTI descriptor, uses it once and frees it on
-        every call -- 2 ms of a 3 ms transform at 2^20.  The class API caches
-        the descriptor, which is what it is for, and the plan cache this object
-        already keeps for the block FFTs serves here too.  The buffers are
-        cached with it, so the four per-call allocations go as well.
-
-        Same arithmetic as matched_filter_core, in the same order.
+        Drives the class-based IFFT directly: pycbc.fft's function API builds a
+        DFTI descriptor on the MKL backend, uses it once and frees it on every
+        call -- 2 ms of a 3 ms transform at 2^20. The plan and its buffers are
+        cached instead. Same arithmetic as matched_filter_core, in the same order,
+        but complex-to-real, so the series is twice the real part of z.
         """
         N = (len(stilde) - 1) * 2
         kmin, kmax = get_cutoff_indices(
             ref_template.f_lower, self.f_high, stilde.delta_f, N)
-        if real and kmax > N // 2:
-            raise ValueError('a real reference series needs the upper cutoff below Nyquist')
-        plan, qt, q = self._get_ref_plan(N, kmax, real=real)
-        # Only the low strip is cleared per call for the complex transform.
-        # correlate writes solely [kmin:kmax] and a complex-to-complex execute()
-        # reads qt without writing it, so nothing dirties the region above kmax
-        # -- and kmax derives from self.f_high, an engine attribute, so it is
-        # fixed for the whole run.  Clearing it once with the buffer removes
-        # 4 MB of stores per segment.  kmin comes from the template's f_lower
-        # and does vary, so that strip stays.
-        #
-        # A complex-to-real transform may overwrite its input (FFTW does by
-        # default; MKL does not), so for the real series the band above kmax
-        # is cleared on every call too.  Left in place, the previous call's
-        # scrambled spectrum entered the next reference series and the
-        # middle and final SNRs grew segment by segment.
+        if kmax > N // 2:
+            raise ValueError('the real reference series needs the upper cutoff below Nyquist')
+        plan, qt, q = self._get_ref_plan(N)
+        # correlate writes only [kmin:kmax]. A complex-to-real transform may
+        # overwrite its input (FFTW does by default; MKL does not), so both
+        # outer bands are cleared on every call. Left in place, the previous
+        # call's scrambled spectrum entered the next series and the middle and
+        # final SNRs grew segment by segment.
         qt[:kmin] = 0
-        if real:
-            qt[kmax:] = 0
+        qt[kmax:] = 0
         # stilde arrives overwhitened (see pycbc_inspiral_fir), so there is
         # no PSD division on this path at all.
         correlate(ref_template[kmin:kmax], stilde[kmin:kmax], qt[kmin:kmax])
@@ -269,25 +228,16 @@ class MatchedFilterRatioControl(object):
         norm = (4.0 * stilde.delta_f) / np.sqrt(h_norm)
         return q, norm
 
-    def _get_ref_plan(self, size, kmax, real=False):
-        """Cached IFFT plan and its buffers for the reference filter.
-
-        Keyed on kmax as well as size: zeros() hands back a cleared buffer,
-        which is what lets _reference_snr skip clearing above kmax on every
-        call.  If the upper cutoff ever did change, this reallocates rather
-        than leaving a stale band in the transform.
-        """
-        # real: the one-sided spectrum (size//2 + 1 bins) to a real series of size samples,
-        # its own plan beside the complex one.
+    def _get_ref_plan(self, size):
+        """Cached complex-to-real IFFT plan and its buffers for the reference filter:
+        the one-sided spectrum (size // 2 + 1 bins) to a real series of size samples."""
         plans = self.__dict__.setdefault('_ref_plans', {})
-        key = (size, kmax, bool(real))
-        cached = plans.get(key)
+        cached = plans.get(size)
         if cached is None:
-            qt = zeros(size // 2 + 1 if real else size, dtype=complex64)
-            q = zeros(size, dtype=float32 if real else complex64)
-            plan = IFFT(qt, q)
-            cached = plans[key] = (key, plan, qt, q)
-        _, plan, qt, q = cached
+            qt = zeros(size // 2 + 1, dtype=complex64)
+            q = zeros(size, dtype=float32)
+            cached = plans[size] = (IFFT(qt, q), qt, q)
+        plan, qt, q = cached
         return plan, Array(qt, copy=False), q
 
 
