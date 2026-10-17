@@ -259,7 +259,6 @@ def add_clusterlink_site(sitecat, cp):
     site.add_profiles(Namespace.PEGASUS, key="data.configuration", value="condorio")
     site.add_profiles(Namespace.PEGASUS, key="auxillary.local", value="true")
     site.add_profiles(Namespace.ENV, key="PEGASUS_HOME", value="/opt/clusterlink/pegasus")
-    site.add_profiles(Namespace.PEGASUS, key="nosymlink", value=True)
     site.add_profiles(Namespace.CONDOR, key="universe", value="vanilla")
     site.add_profiles(Namespace.CONDOR, key="should_transfer_files", value="Yes")
     sitecat.add_sites(site)
