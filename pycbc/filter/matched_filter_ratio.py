@@ -1,9 +1,6 @@
 import os
 import numpy as np
 
-from pycbc.fft import IFFT
-from pycbc.filter.matchedfilter import correlate, get_cutoff_indices
-from pycbc.types import Array, complex64, float32, zeros
 
 # matchedfilter back end is required for ratio/FIR filtering.
 try:
@@ -77,53 +74,25 @@ class MatchedFilterRatioControl(object):
         self._device = os.environ.get('PYCBC_RATIO_DEVICE') or None
         self._first_stage_snr = float(os.environ.get(
             'PYCBC_RATIO_FIRST_STAGE_SNR', first_stage_snr))
-        self._td_bank = None
-        self._ap_ref_key = None
 
-    def prepare_filters(self, fir_taps, tap_counts):
-        """Build the fine-stage TimeDomainFilterBank for a batch of taps.
-
-        Nothing is returned: with the peak granularity stated, the bank settles its
-        block sizes at its first reference, so its spectra do not exist yet (the
-        chisq has its own, from prepare_chisq_filters).
-        """
+    def leaf_options(self):
+        """Keyword arguments for a fine bank's matchedfilter TimeDomainFilterBank, as this
+        engine configures it (the search sets the threshold). With the peak granularity
+        stated, the block size is matchedfilter's choice."""
         fft_lengths = None
         if os.environ.get('PYCBC_RATIO_FFT_LENGTH'):
             fft_lengths = [int(x.strip()) for x in os.environ['PYCBC_RATIO_FFT_LENGTH'].split(',') if x.strip()]
-        self._td_bank = _mf.TimeDomainFilterBank(
-            fir_taps, tap_counts,
+        return dict(
             tap_sample_rate=self.tap_sr,
             data_sample_rate=self.engine_sr,
             engine=self._engine_mode,
-            threshold=self.snr_threshold,
             false_dismissal=self._engine_fd,
             first_stage_snr=self._first_stage_snr,
             coarse_band_hz=self._coarse_band_hz,
             device=self._device,
             fft_lengths=fft_lengths,
-            # the peak granularity: with it stated, the block size is matchedfilter's choice
             binsize=self.peak_binsize,
         )
-
-    def make_reference_series(self, stilde, psd, ref_template):
-        """Return the top filter's real output series and its template sigmasq.
-
-        The hierarchy is real-real-complex: the top and middle filters are real
-        and only the final taps are complex, so the middle stage reads the real
-        part of the top template's SNR series. It is computed directly, by a
-        complex-to-real inverse transform of the one-sided spectrum
-        (Re z = C2R(q) / 2). The series is scaled like direct filtering and
-        returned as float32; the template sigmasq is ref_template.sigmasq(psd).
-        """
-        h_norm = ref_template.sigmasq(psd)
-        snr, norm = self._reference_snr(stilde, ref_template, h_norm)
-        scale = 0.5 * (norm * stilde.delta_t) / self.decimation_factor
-        # The cached IFFT output is overwritten by the next reference; the series
-        # must survive while all of its middle children are processed. scale is a
-        # float64 scalar, so the product keeps double precision until the store.
-        out = np.empty(len(snr), dtype=np.float32)
-        np.multiply(snr.numpy(), scale, out=out, casting='same_kind')
-        return out, h_norm
 
     def prepare_chisq_filters(self, fir_taps, tap_counts, block_length, reach=0):
         """Template spectra on the chisq block: length block_length, the convention of filters_f.
@@ -154,91 +123,6 @@ class MatchedFilterRatioControl(object):
     def chisq_valid(self):
         """(T, 2) [start, stop) of each chisq filter's valid lags in its block."""
         return self._chisq_valid
-
-    def process_segment(self, stilde, psd, ref_template, filters_f, n_taps, indices,
-                        reference_series, valid_slice=None, profile_template=None):
-        """Filter one middle series with this group's final taps.
-
-        reference_series is the middle filter's real output over the segment
-        (float32, possibly one lane of a packed pair's row, which matchedfilter
-        reads in place). Returns the global template ids, sample indices and
-        complex SNRs of the peaks, the block starts, and the middle sigmasq.
-        """
-        if valid_slice is None:
-            valid_slice = getattr(stilde, 'analyze', None)
-
-        if isinstance(ref_template, (int, float, np.floating)):
-            h_norm = float(ref_template)
-        elif getattr(self, '_cached_hnorm_key', None) == (id(ref_template), id(psd)):
-            h_norm = self._cached_hnorm
-        else:
-            h_norm = self._cached_hnorm = ref_template.sigmasq(psd)
-            self._cached_hnorm_key = (id(ref_template), id(psd))
-
-        profile = profile_template if profile_template is not None else ref_template
-        if self._engine_mode in ('hier', 'check') and getattr(self, '_ap_ref_key', None) != id(profile):
-            if self._td_bank is not None:
-                self._td_bank.set_reference_from_template(stilde, psd, profile, f_high=self.f_high)
-                self._ap_ref_key = id(profile)
-
-        if np.iscomplexobj(reference_series):
-            raise TypeError('the middle series must be real: final taps are the only complex stage')
-        series = np.asarray(reference_series, dtype=np.float32)
-        if len(series) != (len(stilde) - 1) * 2:
-            raise ValueError('reference series length does not match data segment')
-
-        res = self._td_bank.filter_series(series, windows=valid_slice, binsize=self.peak_binsize)
-        local_idxs = res.template_indices
-        t_idxs = res.sample_indices
-        snr_vals = res.snr
-        tstarts = res.block_starts
-
-        if len(local_idxs) > 0:
-            global_ids = indices[local_idxs]
-            return global_ids, t_idxs, snr_vals, tstarts, h_norm
-        else:
-            return [], [], [], tstarts, h_norm
-
-    def _reference_snr(self, stilde, ref_template, h_norm):
-        """The real reference SNR series (unscaled) and its normalisation.
-
-        Drives the class-based IFFT directly: pycbc.fft's function API builds a
-        DFTI descriptor on the MKL backend, uses it once and frees it on every
-        call -- 2 ms of a 3 ms transform at 2^20. The plan and its buffers are
-        cached instead. Same arithmetic as matched_filter_core, in the same order,
-        but complex-to-real, so the series is twice the real part of z.
-        """
-        N = (len(stilde) - 1) * 2
-        kmin, kmax = get_cutoff_indices(
-            ref_template.f_lower, self.f_high, stilde.delta_f, N)
-        if kmax > N // 2:
-            raise ValueError('the real reference series needs the upper cutoff below Nyquist')
-        plan, qt, q = self._get_ref_plan(N)
-        # correlate writes only [kmin:kmax]. A complex-to-real transform may
-        # overwrite its input (FFTW does by default; MKL does not), so both
-        # outer bands are cleared on every call. Left in place, the previous
-        # call's scrambled spectrum entered the next series and the middle and
-        # final SNRs grew segment by segment.
-        qt[:kmin] = 0
-        qt[kmax:] = 0
-        # stilde arrives overwhitened (see pycbc_inspiral_fir), so there is
-        # no PSD division on this path at all.
-        correlate(ref_template[kmin:kmax], stilde[kmin:kmax], qt[kmin:kmax])
-        plan.execute()
-        norm = (4.0 * stilde.delta_f) / np.sqrt(h_norm)
-        return q, norm
-
-    def _get_ref_plan(self, size):
-        """Cached complex-to-real IFFT plan and its buffers for the reference filter:
-        the one-sided spectrum (size // 2 + 1 bins) to a real series of size samples."""
-        plans = self.__dict__.setdefault('_ref_plans', {})
-        cached = plans.get(size)
-        if cached is None:
-            qt = zeros(size // 2 + 1, dtype=complex64)
-            q = zeros(size, dtype=float32)
-            cached = plans[size] = (IFFT(qt, q), qt, q)
-        plan, qt, q = cached
-        return plan, Array(qt, copy=False), q
 
 
 def get_dynamic_snr_renorm_factor(series, dt=None, window_duration=8.0, hollow_duration=0.5, variance_floor=1.0, scale=None, max_boost_factor=None):

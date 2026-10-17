@@ -37,7 +37,7 @@ from pycbc.vetoes.sgchisq import SingleDetSGChisq
 from pycbc.vetoes.autochisq import SingleDetAutoChisq, autochisq_from_precomputed
 from pycbc.waveform.bank import RatioFilterBank
 from pycbc.waveform.spa_tmplt import spa_tmplt_norm
-from pycbc.filter.matchedfilter import sigmasq_series
+from pycbc.filter.matchedfilter import sigmasq_series, get_cutoff_indices
 
 tstart = time.time()
 TIMERS = collections.defaultdict(float)
@@ -46,266 +46,6 @@ TIMERS = collections.defaultdict(float)
 # -----------------------------------------------------------------------------
 # 1. Filtering Engines & Reference Synthesis
 # -----------------------------------------------------------------------------
-
-class UpperReferenceBatch:
-    """Expand one top series into all middle series in one library call.
-
-    The hierarchy is real-real-complex: the bank's final taps are complex and its
-    top and middle taps real, so the middle filters see the real top output and
-    give real middle series, from which the final filters make the complex SNR.
-    """
-
-    _BUFFERS = {}
-
-    @classmethod
-    def clear_buffers(cls):
-        cls._BUFFERS.clear()
-
-    def __init__(self, taps, counts, middle_ids, series_length):
-        import matchedfilter
-        from matchedfilter import _automatic_series_layout
-
-        counts_arr = np.asarray(counts, dtype=np.int64)
-        sort_order = np.argsort(counts_arr)
-        self.sort_order = sort_order
-        self.sorted_ids = np.asarray(middle_ids, dtype=int)[sort_order]
-        self.series_length = int(series_length)
-        if np.iscomplexobj(taps):
-            raise ValueError('middle taps must be real: final taps are the only complex stage')
-        sorted_taps = taps[sort_order]
-        sorted_counts = counts_arr[sort_order]
-        # The middle outputs are real, so two middle filters run as ONE complex filter,
-        # h_a - i h_b, whose output is out_a + i out_b (the series is correlated against the
-        # conjugate taps). Each is placed so that its own centre tap stays the packed filter's
-        # centre (offset c//2 - c_i//2), so each output is exactly its filter's. Half the
-        # middle transforms; the fine banks read each real series in place as one lane of
-        # its pair's row. Neighbours in length order are paired.
-        npair = (len(self.sorted_ids) + 1) // 2
-        pc = np.array([int(max(sorted_counts[2 * q:2 * q + 2])) for q in range(npair)], dtype=np.int64)
-        ptaps = np.zeros((npair, int(pc.max())), dtype=np.complex64)
-        for r in range(len(self.sorted_ids)):
-            q, lane = divmod(r, 2)
-            c_i = int(sorted_counts[r])
-            o = int(pc[q]) // 2 - c_i // 2
-            ptaps[q, o:o + c_i] += (1.0 if lane == 0 else -1j) * sorted_taps[r, :c_i]
-        self.n_rows = npair
-        self.bank = matchedfilter.TimeDomainFilterBank(
-            ptaps, tap_counts=pc,
-            engine='corr'
-        )
-
-        self._plan = []
-        for g in self.bank._groups:
-            cplan = g.get_correlation_plan()
-            g_indices = g.template_indices
-            g_cnt = len(g_indices)
-            st, _, _ = _automatic_series_layout(self.series_length, cplan.valid)
-            self._plan.append({
-                'cplan': cplan,
-                'g_cnt': g_cnt,
-                'g_slice': slice(int(g_indices[0]), int(g_indices[0]) + g_cnt),
-                'st': st,
-                'valid': cplan.valid,
-            })
-
-    def run(self, top_series, valid_slice=None, ifo=None, pad=4096,
-            windows=None, rows=None):
-        """Return middle-id to real middle series, scaled like direct middle filtering.
-
-        top_series is the top filter's real output (float32).
-
-        valid_slice, or windows (a list of (start, stop) pairs) when given,
-        selects where the middle series is needed; each is widened by pad and
-        only blocks intersecting the result are computed. Blocks are computed
-        independently, so every computed sample equals the whole-range value.
-
-        rows, when given, is the collection of middle ids to compute; the
-        others are skipped entirely and left out of the returned mapping.
-        """
-        if len(top_series) != self.series_length:
-            raise ValueError('top reference length changed between segments')
-
-        if np.iscomplexobj(top_series):
-            raise TypeError('the top series must be real: final taps are the only complex stage')
-
-        L = self.series_length
-        if rows is None:
-            want_mid = np.ones(len(self.sorted_ids), dtype=bool)
-        else:
-            want_mid = np.isin(self.sorted_ids, np.asarray(list(rows), dtype=int))
-        # Internal rows: packed pairs of middle filters.
-        n_req = self.n_rows
-        pad_mid = np.zeros(2 * n_req, dtype=bool)
-        pad_mid[:want_mid.size] = want_mid
-        want = pad_mid[0::2] | pad_mid[1::2]
-        if ifo is not None:
-            buf_key = (ifo, L)
-            buf_entry = UpperReferenceBatch._BUFFERS.get(buf_key)
-            if buf_entry is None or buf_entry[0].shape[0] < n_req:
-                alloc_rows = max(n_req, 32)
-                buf = np.zeros((alloc_rows, L), dtype=np.complex64)
-                buf_entry = [buf, []]
-                UpperReferenceBatch._BUFFERS[buf_key] = buf_entry
-            buf, dirty = buf_entry
-            out = buf[:n_req]
-            # dirty holds (row mask, regions) for what earlier calls wrote.
-            # Clear it only for the rows written now; skipped rows keep their
-            # record so a later call that does compute them clears it then.
-            kept_dirty, stale = [], []
-            for d_mask, d_regions in dirty:
-                if d_mask.size != n_req:
-                    # written for another row layout: treat every row as dirty
-                    d_mask = np.ones(n_req, dtype=bool)
-                hit = d_mask & want
-                if hit.any():
-                    stale.append((hit, d_regions))   # cleared below, except where this call writes
-                rest = d_mask & ~want
-                if rest.any():
-                    kept_dirty.append((rest, d_regions))
-            dirty[:] = kept_dirty
-        else:
-            out = np.zeros((n_req, L), dtype=np.complex64)
-
-        # The real top output stays real (4 bytes a sample) on the CPU, where the library
-        # correlates a real series itself (half-size block transforms). GPU plans read a
-        # complex series, widened once on first use.
-        ser_real = np.ascontiguousarray(top_series, dtype=np.float32)
-        ser = None
-
-        def complex_series():
-            nonlocal ser
-            if ser is None:
-                ser = ser_real.astype(np.complex64)
-            return ser
-
-        pad_val = int(pad) if pad is not None else 4096
-        if windows is not None:
-            raw = [(int(a), int(b)) for a, b in windows]
-        elif valid_slice is not None:
-            vs = 0 if valid_slice.start is None else int(valid_slice.start)
-            ve = L if valid_slice.stop is None else int(valid_slice.stop)
-            if vs < 0:
-                vs = max(0, L + vs)
-            if ve < 0:
-                ve = max(0, L + ve)
-            raw = [(vs, ve)]
-        else:
-            raw = None
-
-        if raw is not None:
-            iv = []
-            for a, b in sorted((max(0, a - pad_val), min(L, b + pad_val)) for a, b in raw):
-                if b <= a:
-                    continue
-                if iv and a <= iv[-1][1]:
-                    iv[-1][1] = max(iv[-1][1], b)
-                else:
-                    iv.append([a, b])
-        else:
-            iv = None
-
-        work = []
-        for p in self._plan:
-            cplan = p['cplan']
-            st = p['st']
-            lo, hi = p['valid']
-            g0 = p['g_slice'].start
-            # contiguous runs of wanted rows inside this plan's row range
-            local = np.flatnonzero(want[p['g_slice']])
-            if local.size == 0:
-                continue
-            cuts = np.flatnonzero(np.diff(local) != 1) + 1
-            runs = [(int(r[0]), int(r[-1]) + 1) for r in np.split(local, cuts)]
-            gaps = []
-            if iv is not None:
-                b_start = st + lo
-                b_end = np.minimum(st + hi, L)
-                keep = np.zeros(st.size, dtype=bool)
-                for v_start, v_stop in iv:
-                    k = (b_start < v_stop) & (b_end > v_start)
-                    if k.any():
-                        k_indices = np.flatnonzero(k)
-                        cov_start = b_start[k_indices[0]]
-                        cov_end = b_end[k_indices[-1]]
-                        if cov_start > v_start:
-                            gaps.append((v_start, cov_start))
-                        if cov_end < v_stop:
-                            gaps.append((cov_end, v_stop))
-                        keep |= k
-                    else:
-                        gaps.append((v_start, v_stop))
-                st_run = st[keep] if keep.any() else np.empty(0, dtype=np.uintp)
-            else:
-                st_run = st
-                if ifo is not None:
-                    gaps.append((0, lo))
-                    if st_run.size > 0:
-                        last_end = min(L, st_run[-1] + hi)
-                        if last_end < L:
-                            gaps.append((last_end, L))
-
-            if st_run.size:
-                cov = np.stack([st_run + lo, np.minimum(st_run + hi, L)], axis=1).astype(np.int64)
-                brk = np.flatnonzero(cov[1:, 0] > cov[:-1, 1]) + 1     # blocks are contiguous within a window
-                covered = [(int(c[0, 0]), int(c[-1, 1])) for c in np.split(cov, brk)]
-            else:
-                covered = []
-            work.append((p, cplan, st_run, lo, hi, g0, runs, gaps, covered))
-
-        if ifo is not None:
-            # What earlier calls wrote in these rows, minus what this call overwrites, goes back to zero.
-            for hit, d_regions in stale:
-                for p, cplan, st_run, lo, hi, g0, runs, gaps, covered in work:
-                    rows = g0 + np.flatnonzero(hit[p['g_slice']])
-                    if rows.size == 0:
-                        continue
-                    for a, b in _subtract_intervals(d_regions, covered):
-                        out[rows, a:b] = 0
-
-        for p, cplan, st_run, lo, hi, g0, runs, gaps, covered in work:
-            for r0, r1 in runs:
-                dest = out[g0 + r0:g0 + r1]
-                for a, b in gaps:
-                    dest[:, a:b] = 0
-                if st_run.size == 0:
-                    continue      # nothing to compute; the C layer rejects an empty block list
-                if cplan._gpu is not None:
-                    cplan._continuous_gpu(complex_series(), st_run, r0, r1 - r0, dest)
-                else:
-                    cplan._execution_plan().correlate_series_continuous_real(
-                        ser_real, st_run, lo, hi, r0, r1 - r0, dest)
-
-        regions = [tuple(x) for x in iv] if iv is not None else [(0, L)]
-        if ifo is not None:
-            # A block writes up to its full valid span, past the requested region by up to a
-            # block: record that reach as written too, so a later call clears it.
-            reach = max((int(p['cplan'].n) for p in self._plan), default=0)
-            written = [(max(0, a - reach), min(L, b + reach)) for a, b in regions]
-            buf_entry[1].append((want.copy(), written))
-
-        # Each middle filter's real series: its lane of its pair's row, read in place.
-        return {self.sorted_ids[r]: (out[r // 2].real if r % 2 == 0 else out[r // 2].imag)
-                for r in np.flatnonzero(want_mid)}
-
-
-def _subtract_intervals(regions, covered):
-    """Parts of the [start, stop) regions that no covered interval contains."""
-    out = []
-    cov = sorted(covered)
-    for a, b in regions:
-        pos = a
-        for c0, c1 in cov:
-            if c1 <= pos or c0 >= b:
-                continue
-            if c0 > pos:
-                out.append((pos, c0))
-            pos = max(pos, c1)
-            if pos >= b:
-                break
-        if pos < b:
-            out.append((pos, b))
-    return out
-
 
 def chisq_middle_spectra(taps, counts, ids, block_length):
     """Each middle filter's spectrum for the power chisq, keyed by middle id.
@@ -1236,71 +976,80 @@ def process_top_template_task(task_args):
 
     logging.info(f"Top template {rank+1}/{n_top} (id={top_idx}) with {len(middle_ids)} middle groups ({fine_cnt} fine templates)")
 
-    t_up_prep = time.perf_counter()
-    any_seg = next(segments[i][0] for i in instruments if len(segments[i]) > 0)
-    upper_batch = UpperReferenceBatch(
-        taps_u, counts_u, middle_ids, (len(any_seg) - 1) * 2)
-    local_timers['upper_prep'] += time.perf_counter() - t_up_prep
+    try:
+        from matchedfilter import search as mf_search
+        from matchedfilter.time_domain import reference_profile
+    except ImportError as exc:
+        raise ImportError(
+            "pycbc_inspiral_fir needs a matchedfilter with matchedfilter.search (the "
+            "hierarchical search; matchedfilter main from 2026-10-17 on)") from exc
 
     # The power chisq's coarse weights sample each middle filter's spectrum on its block's grid.
     # Take it from the taps on a grid set by the chisq block alone, not from the middle stage's
     # own transforms, so how matchedfilter blocks the middle stage cannot move a chisq bin edge.
     upper_f_by_coarse = chisq_middle_spectra(taps_u, counts_u, middle_ids, int(args.chisq_block_length))
 
-    top_groups = []
-    for mid in middle_ids:
+    # The hierarchy below this top: one inner (middle) filter per middle group, each with the
+    # group's fine bank as its leaf. matchedfilter runs it over every segment and calls back
+    # here with each group's peaks while its middle series are held.
+    reach = args.autochi_stride * args.autochi_number_points if args.autochi_stride > 0 else 0
+    groups = {}
+    inner_nodes = []
+    for row, mid in enumerate(middle_ids):
         coarse_idx = int(mid)
         taps, counts, fine_indices, shifts = bank.get_firs(coarse_idx, return_shifts=True)
-        if len(fine_indices) == 0:
-            continue
-        group_engine = MatchedFilterRatioControl(
-            snr_threshold=primary_snr_threshold,
-            delta_f=delta_f,
-            high_frequency_cutoff=args.high_frequency_cutoff,
-            tap_sample_rate=bank.sample_rate,
-            engine_sample_rate=sample_rate,
-            engine=args.ratio_filter_engine,
-            false_dismissal=args.ratio_filter_false_dismissal,
-            coarse_band_hz=args.ratio_filter_band,
-            first_stage_snr=args.ratio_filter_first_stage_snr,
-            peak_window=args.cluster_window,
-        )
-        t_fp0 = time.perf_counter()
-        group_engine.prepare_filters(taps, counts)
-        # The chisq has its own block (--chisq-block-length), centred on each trigger:
-        # independent of how matchedfilter blocks the series for filtering.
-        reach = args.autochi_stride * args.autochi_number_points if args.autochi_stride > 0 else 0
-        filters_f = group_engine.prepare_chisq_filters(taps, counts, args.chisq_block_length, reach=reach)
-        local_timers['filter_prep'] += time.perf_counter() - t_fp0
-        top_groups.append((coarse_idx, counts, fine_indices,
-                           group_engine, filters_f, shifts,
-                           np.arange(len(fine_indices))))
-
-    if not top_groups:
-        del upper_batch
+        children = []
+        if len(fine_indices):
+            t_fp0 = time.perf_counter()
+            group_engine = MatchedFilterRatioControl(
+                snr_threshold=primary_snr_threshold,
+                delta_f=delta_f,
+                high_frequency_cutoff=args.high_frequency_cutoff,
+                tap_sample_rate=bank.sample_rate,
+                engine_sample_rate=sample_rate,
+                engine=args.ratio_filter_engine,
+                false_dismissal=args.ratio_filter_false_dismissal,
+                coarse_band_hz=args.ratio_filter_band,
+                first_stage_snr=args.ratio_filter_first_stage_snr,
+                peak_window=args.cluster_window,
+            )
+            # The chisq has its own block (--chisq-block-length), centred on each trigger:
+            # independent of how matchedfilter blocks the series for filtering.
+            filters_f = group_engine.prepare_chisq_filters(taps, counts, args.chisq_block_length, reach=reach)
+            local_timers['filter_prep'] += time.perf_counter() - t_fp0
+            groups[coarse_idx] = (counts, fine_indices, group_engine, filters_f, shifts)
+            children.append(mf_search.Leaf(taps, counts, lags=shifts, node_id=coarse_idx))
+        inner_nodes.append(mf_search.Inner(taps_u[row], count=int(counts_u[row]),
+                                           children=children, node_id=coarse_idx))
+    if not groups:
         return top_idx, {ifo: {} for ifo in instruments}, worker_asym, dict(local_timers)
 
-    # Chirp-time rejection per injection window: a middle group is filtered
-    # only near injections whose chirp time lies within the rejector window of
-    # one of its fine templates.
-    group_tau = {}
-    rej_pairs = [0, 0]                    # (group, segment) pairs kept, total
-    if inj_reject is not None:
-        tau0_fine = inj_reject['tau0_fine']
-        cw = inj_reject['window']
-        for g_entry in top_groups:
-            t_g = tau0_fine[g_entry[2]]
-            group_tau[g_entry[0]] = (float(t_g.min()) - cw, float(t_g.max()) + cw)
+    t_up_prep = time.perf_counter()
+    seg_ifos = [ifo for ifo in instruments if len(segments[ifo]) > 0]
+    first_seg = segments[seg_ifos[0]][0]
+    n_series = (len(first_seg) - 1) * 2
+    kmin, kmax = get_cutoff_indices(top_template.f_lower, args.high_frequency_cutoff, delta_f, n_series)
+    # The fine banks' gates are calibrated with the top's expected signal spectrum over the
+    # first segment's noise.
+    profile = reference_profile(top_template, first_seg.psd, float(top_template.f_lower or 0.0),
+                                float(args.high_frequency_cutoff or 0.0), delta_f)
+    root = mf_search.Root(top_template.numpy(), (kmin, kmax), children=inner_nodes,
+                          profile=(profile, delta_f), node_id=top_idx)
 
-    # Every block a fine bank reads must lie in computed middle series: pad by the
-    # longest block a bank uses or may still choose (it settles at its first reference).
-    top_pad = max(
-        [4096] + [
-            int(g_entry[3]._td_bank.max_block_length)
-            for g_entry in top_groups
-            if getattr(g_entry[3], '_td_bank', None) is not None
-        ]
-    )
+    # Renormalisation: the fine SNR is multiplied by rf <= rf_max, so a peak needs |z| >= T / rf.
+    renorm_on = not getattr(args, 'disable_dynamic_snr_renorm', False)
+    vfloor = getattr(args, 'dynamic_snr_variance_floor', 1.0)
+    max_boost = getattr(args, 'dynamic_snr_max_boost', None)
+    rf_max = 1.0 / np.sqrt(max(float(vfloor), 1e-12))
+    if max_boost is not None:
+        rf_max = min(rf_max, float(max_boost))
+    search = mf_search.HierarchicalSearch(
+        [root], threshold=primary_snr_threshold,
+        envelope_floor=(1.0 / rf_max) if renorm_on else 1.0,
+        leaf_options=engine.leaf_options(),
+        context=asym_half_span(args, sample_rate, effective_asym_num_bins))
+    local_timers['upper_prep'] += time.perf_counter() - t_up_prep
+    top_pad = search.pad(root)          # builds and calibrates the fine banks (search setup)
 
     power_chisq = RatioPowerChisq(
         args.chisq_bins,
@@ -1316,192 +1065,201 @@ def process_top_template_task(task_args):
     )
     autochisq = RatioAutoChisq(power_chisq, args)
 
-    for s_num in range(num_segs):
-        active_ifos = [ifo for ifo in instruments if s_num < len(segments[ifo])]
-        if not active_ifos:
-            continue
+    # The top's normalisation per segment: its sigmasq over the segment's noise, kept for the
+    # trigger records.
+    norms = {}
 
+    def root_scale_for(ifo):
+        def root_scale(_root, s):
+            st = segments[ifo][s]
+            h_norm = top_template.sigmasq(st.psd)
+            norms[(ifo, s)] = h_norm
+            norm = (4.0 * st.delta_f) / np.sqrt(h_norm)
+            return 0.5 * (norm * st.delta_t) / engine.decimation_factor
+        return root_scale
+
+    inputs = {ifo: mf_search.BlockInput(
+                  [st.numpy() for st in segments[ifo]],
+                  [(st.analyze.start, st.analyze.stop) for st in segments[ifo]],
+                  root_scale_for(ifo), tags=list(segments[ifo]))
+              for ifo in seg_ifos}
+
+    # Chirp-time rejection per injection window: a middle group is filtered
+    # only near injections whose chirp time lies within the rejector window of
+    # one of its fine templates.
+    group_tau = {}
+    rej_pairs = [0, 0]                    # (group, segment) pairs kept, total
+    if inj_reject is not None:
+        tau0_fine = inj_reject['tau0_fine']
+        cw = inj_reject['window']
+        for cid, g in groups.items():
+            t_g = tau0_fine[g[1]]
+            group_tau[cid] = (float(t_g.min()) - cw, float(t_g.max()) + cw)
+    kept_by_seg = {}
+
+    def kept_groups(s_num):
+        """The groups searched in a segment (None: all) and its injections per detector."""
+        if s_num not in kept_by_seg:
+            kept, seg_inj = None, {}
+            if inj_reject is not None:
+                for ifo in seg_ifos:
+                    if s_num < len(segments[ifo]):
+                        injs = getattr(segments[ifo][s_num], 'analyze_injections', None)
+                        seg_inj[ifo] = None if injs is None else [
+                            (a, b, inj_reject['tau0_inj'][ifo][row]) for a, b, row in injs]
+                if all(v is not None for v in seg_inj.values()):
+                    seg_tau = [t for v in seg_inj.values() for _, _, t in v]
+                    kept = {cid for cid, (lo, hi) in group_tau.items()
+                            if any(lo <= t <= hi for t in seg_tau)}
+                rej_pairs[0] += len(groups) if kept is None else len(kept)
+                rej_pairs[1] += len(groups)
+            kept_by_seg[s_num] = (kept, seg_inj)
+        return kept_by_seg[s_num]
+
+    def windows(leaf, s_num, ifo, extra):
+        """A group's search windows in a segment, widened by the injection guard band and
+        extra samples: None for the whole analysed range, empty to skip the group."""
+        kept, seg_inj = kept_groups(s_num)
+        cid = leaf.node_id
+        if kept is not None and cid not in kept:
+            return []
+        st_g = segments[ifo][s_num]
+        margin = injection_guard_samples(args, ifo_sample_rates[ifo], top_pad) + extra
+        if kept is None:
+            return segment_windows(st_g, margin)
+        lo, hi = group_tau[cid]
+        return injection_group_windows(st_g, seg_inj[ifo], lo, hi, margin)
+
+    renorm_factors = {}
+
+    def on_series(ctx):
+        """The top's output per detector: build each renormalisation envelope from it."""
+        t0 = time.perf_counter()
+        envelopes = {}
+        for ifo in ctx.channels:
+            st = ctx.tags[ifo]
+            if not renorm_on:
+                renorm_factors[ifo] = None
+                continue
+            rf = DynamicSNRRenormFactor(
+                ctx.series[ifo], dt=float(st.delta_t),
+                scale=float(st.delta_t / engine.decimation_factor),
+                window_duration=getattr(args, 'dynamic_snr_window', 8.0),
+                hollow_duration=getattr(args, 'dynamic_snr_hollow', 0.5),
+                variance_floor=vfloor, max_boost_factor=max_boost)
+            renorm_factors[ifo] = rf
+            envelopes[ifo] = lambda t, rf=rf: 1.0 / rf[t]
+        local_timers['upper_ref'] += time.perf_counter() - t0
+        return envelopes
+
+    def on_peaks(ctx):
+        """One middle group's fine peaks in a segment: renormalise, select, veto, record."""
+        coarse_idx = ctx.leaf.node_id
+        counts, fine_indices, group_engine, filters_f, shifts = groups[coarse_idx]
+        s_num = ctx.chunk
+        active_ifos = ctx.channels
         can_asym_seg = can_asym_by_seg.get(s_num, False)
+        power_chisq.begin_group()
+        std_trigs = {}
+        h_norms = {ifo: norms[(ifo, s_num)] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
+        middle_series = {ifo: {coarse_idx: ctx.series(ifo)} for ifo in active_ifos}
+        group_engine._td_bank = search.leaf_bank(root, ctx.leaf)   # follow-ups re-filter with it
 
-        kept = None                       # None: every group, as without rejection
-        seg_inj = {}
-        if inj_reject is not None:
-            for ifo in active_ifos:
-                injs = getattr(segments[ifo][s_num], 'analyze_injections', None)
-                seg_inj[ifo] = None if injs is None else [
-                    (a, b, inj_reject['tau0_inj'][ifo][row]) for a, b, row in injs]
-            if all(v is not None for v in seg_inj.values()):
-                seg_tau = [t for v in seg_inj.values() for _, _, t in v]
-                kept = {cid for cid, (lo, hi) in group_tau.items()
-                        if any(lo <= t <= hi for t in seg_tau)}
-            rej_pairs[0] += len(top_groups) if kept is None else len(kept)
-            rej_pairs[1] += len(top_groups)
-            if kept is not None and not kept:
-                continue                  # nothing near this segment's injections
-
-        def group_windows(ifo, cid, margin):
-            st_g = segments[ifo][s_num]
-            if kept is None:
-                return segment_windows(st_g, margin)
-            lo, hi = group_tau[cid]
-            return injection_group_windows(st_g, seg_inj[ifo], lo, hi, margin)
-
-        middle_series = {}
-        norms = {}
-        renorm_factors = {}
         for ifo in active_ifos:
-            st = segments[ifo][s_num]
-            t_ref0 = time.perf_counter()
-            # The real top filter's output (real-real-complex hierarchy).
-            series, norm = engine.make_reference_series(st, st.psd, top_template)
-            dt_sample = float(st.delta_t)
-            amp_scale = float(st.delta_t / engine.decimation_factor)
-            if not getattr(args, 'disable_dynamic_snr_renorm', False):
-                renorm_factors[ifo] = DynamicSNRRenormFactor(
-                    series, dt=dt_sample, scale=amp_scale,
-                    window_duration=getattr(args, 'dynamic_snr_window', 8.0),
-                    hollow_duration=getattr(args, 'dynamic_snr_hollow', 0.5),
-                    variance_floor=getattr(args, 'dynamic_snr_variance_floor', 1.0),
-                    max_boost_factor=getattr(args, 'dynamic_snr_max_boost', None),
+            stilde = ctx.tags[ifo]
+            h_norm = h_norms[ifo]
+            ref_snr = middle_series[ifo][coarse_idx]
+            res = ctx.peaks[ifo]
+            ids_local, t_idxs, snrs, tstarts = (
+                res.template_indices, res.sample_indices, res.snr, res.block_starts)
+
+            rf = renorm_factors.get(ifo)
+            if rf is not None and len(ids_local) > 0:
+                local_shifts = shifts[ids_local] if shifts is not None else 0
+                phys_t = np.clip(t_idxs - local_shifts, 0, len(rf) - 1)
+                snrs_eval = snrs * rf[phys_t]
+            else:
+                snrs_eval = snrs
+
+            cand_indices = select_primary_asym_candidates(
+                a_ids=ids_local,
+                a_tidxs=t_idxs,
+                a_snrs=snrs_eval,
+                sample_rate=ifo_sample_rates[ifo],
+                asym_snr_threshold=primary_snr_threshold,
+                max_primary_per_group_sec=args.asym_max_primary_per_group_sec,
+                stilde=stilde,
+                gps_start_time=ifo_gps_cli_starts[ifo],
+            )
+            ids_local = ids_local[cand_indices]
+            t_idxs = t_idxs[cand_indices]
+            snrs = snrs[cand_indices]
+            tstarts = tstarts[cand_indices]
+
+            if not can_asym_seg:
+                process_and_record_triggers(
+                    ids_local, t_idxs, snrs, tstarts,
+                    stilde, h_norm, coarse_idx, fine_indices,
+                    filters_f, ref_snr, bank,
+                    s_num, ifo, worker_triggers,
+                    args, power_chisq, is_asym=False,
+                    shifts=shifts,
+                    timers=local_timers,
+                    renorm_factor=renorm_factors.get(ifo),
+                    primary_snr_threshold=primary_snr_threshold,
+                    autochisq=autochisq,
+                    chisq_valid=group_engine.chisq_valid,
                 )
             else:
-                renorm_factors[ifo] = None
-            local_timers['upper_ref'] += time.perf_counter() - t_ref0
-            norms[ifo] = norm
+                std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
 
-            t0 = time.perf_counter()
-            unconstrained = bool(os.environ.get('PYCBC_UNCONSTRAINED_UPPER'))
-            v_slice = getattr(st, 'analyze', None) if not unconstrained else None
-            # With injection windows, the middle series is needed only where the
-            # primary search, the asym follow-up (unchanged, over the full
-            # analysis range) and chisq read it: each window widened by the
-            # follow-up's half-span plus light travel, then pad for filter context.
-            mid_windows = None
-            if not unconstrained:
-                # The primary search reaches the guard band past each window;
-                # follow-ups of those primaries read one half-span further.
-                sr_i = ifo_sample_rates[ifo]
-                margin = (injection_guard_samples(args, sr_i, top_pad)
-                          + asym_half_span(args, sr_i, effective_asym_num_bins))
-                if kept is None:
-                    mid_windows = segment_windows(st, margin)
-                else:
-                    mid_windows = [w for cid in kept for w in group_windows(ifo, cid, margin)]
-            middle_series[ifo] = upper_batch.run(
-                series, valid_slice=v_slice, ifo=ifo, pad=top_pad, windows=mid_windows,
-                rows=kept,
+        if can_asym_seg:
+            followup_asym_candidates(
+                std_trigs, active_ifos, s_num, coarse_idx, fine_indices,
+                group_engine, filters_f, shifts, h_norms, middle_series,
+                segments, bank, worker_triggers, worker_asym, power_chisq,
+                args, primary_snr_threshold, effective_asym_num_bins,
+                ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
+                timers=local_timers,
+                renorm_factors=renorm_factors,
+                autochisq=autochisq,
             )
-            local_timers['upper_fir'] += time.perf_counter() - t0
 
-        t_seg_start = time.perf_counter()
-        t_seg_fine_start = local_timers['fine_fir']
-        t_seg_chi_start = local_timers['power_chisq']
-        t_seg_asym_start = local_timers['asym_followup']
+    seg_clock = {'t': time.perf_counter(), 'leaf': 0.0, 'chi': 0.0, 'asym': 0.0,
+                 'top': 0.0, 'mid': 0.0}
 
-        for g_entry in top_groups:
-            coarse_idx, counts, fine_indices, group_engine, filters_f, shifts, local_arange = g_entry
-            if kept is not None and coarse_idx not in kept:
-                continue
-            power_chisq.begin_group()
-            std_trigs = {}
-            h_norms = {ifo: norms[ifo] * sigmasq_ratio_by_middle[coarse_idx] for ifo in active_ifos}
-
-            for ifo in active_ifos:
-                stilde = segments[ifo][s_num]
-                h_norm = h_norms[ifo]
-                ref_snr = middle_series[ifo][coarse_idx]
-                t_fine0 = time.perf_counter()
-                fine_windows = group_windows(
-                    ifo, coarse_idx, injection_guard_samples(args, ifo_sample_rates[ifo], top_pad))
-                ids_local, t_idxs, snrs, tstarts, _ = group_engine.process_segment(
-                    stilde, stilde.psd, h_norm, filters_f, counts,
-                    local_arange,
-                    valid_slice=stilde.analyze if fine_windows is None else fine_windows,
-                    reference_series=ref_snr,
-                    profile_template=top_template,
-                )
-                local_timers['fine_fir'] += time.perf_counter() - t_fine0
-
-                rf = renorm_factors.get(ifo) if renorm_factors else None
-                if rf is not None and len(ids_local) > 0:
-                    local_shifts = shifts[ids_local] if shifts is not None else 0
-                    phys_t = np.clip(t_idxs - local_shifts, 0, len(rf) - 1)
-                    snrs_eval = snrs * rf[phys_t]
-                else:
-                    snrs_eval = snrs
-
-                cand_indices = select_primary_asym_candidates(
-                    a_ids=ids_local,
-                    a_tidxs=t_idxs,
-                    a_snrs=snrs_eval,
-                    sample_rate=ifo_sample_rates[ifo],
-                    asym_snr_threshold=primary_snr_threshold,
-                    max_primary_per_group_sec=args.asym_max_primary_per_group_sec,
-                    stilde=stilde,
-                    gps_start_time=ifo_gps_cli_starts[ifo],
-                )
-                if len(cand_indices) > 0:
-                    ids_local = ids_local[cand_indices]
-                    t_idxs = t_idxs[cand_indices]
-                    snrs = snrs[cand_indices]
-                    tstarts = tstarts[cand_indices]
-                else:
-                    ids_local = ids_local[:0]
-                    t_idxs = t_idxs[:0]
-                    snrs = snrs[:0]
-                    tstarts = tstarts[:0]
-
-                if not can_asym_seg:
-                    process_and_record_triggers(
-                        ids_local, t_idxs, snrs, tstarts,
-                        stilde, h_norm, coarse_idx, fine_indices,
-                        filters_f, ref_snr, bank,
-                        s_num, ifo, worker_triggers,
-                        args, power_chisq, is_asym=False,
-                        shifts=shifts,
-                        timers=local_timers,
-                        renorm_factor=renorm_factors.get(ifo),
-                        primary_snr_threshold=primary_snr_threshold,
-                        autochisq=autochisq,
-                        chisq_valid=group_engine.chisq_valid,
-                    )
-                else:
-                    std_trigs[ifo] = (ids_local, t_idxs, snrs, tstarts)
-
-            if can_asym_seg:
-                followup_asym_candidates(
-                    std_trigs, active_ifos, s_num, coarse_idx, fine_indices,
-                    group_engine, filters_f, shifts, h_norms, middle_series,
-                    segments, bank, worker_triggers, worker_asym, power_chisq,
-                    args, primary_snr_threshold, effective_asym_num_bins,
-                    ifo_sample_rates, ifo_gps_starts, seg_starts, ifo_gps_cli_starts,
-                    timers=local_timers,
-                    renorm_factors=renorm_factors,
-                    autochisq=autochisq,
-                )
-
-        t_seg_dur = max(time.perf_counter() - t_seg_start, 1e-6)
-        n_tmpl_seg = sum(len(g[2]) for g in top_groups if kept is None or g[0] in kept)
-        stilde_ref = segments[active_ifos[0]][s_num]
-        total_analyzed_dur = len(active_ifos) * analyzed_samples(stilde_ref) * stilde_ref.delta_t
+    def on_chunk(ctx):
+        """A segment is done: log its time and throughput."""
+        now = time.perf_counter()
+        t_seg_dur = max(now - seg_clock['t'], 1e-6)
+        kept, _ = kept_groups(ctx.chunk)
+        n_groups = len(groups) if kept is None else len(kept)
+        n_tmpl_seg = sum(len(g[1]) for cid, g in groups.items() if kept is None or cid in kept)
+        stilde_ref = ctx.tags[ctx.channels[0]]
+        total_analyzed_dur = len(ctx.channels) * analyzed_samples(stilde_ref) * stilde_ref.delta_t
         tperf_seg = total_analyzed_dur / t_seg_dur * n_tmpl_seg
-        s_fine = local_timers['fine_fir'] - t_seg_fine_start
-        s_chi = local_timers['power_chisq'] - t_seg_chi_start
-        s_asym = local_timers['asym_followup'] - t_seg_asym_start
-        logging.info(f"[Top {top_idx}] Seg {s_num+1}/{num_segs}: {len(top_groups)} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s]")
-        del middle_series
-        del norms
-        del renorm_factors
+        s_fine = search.timings['leaf'] - seg_clock['leaf']
+        s_chi = local_timers['power_chisq'] - seg_clock['chi']
+        s_asym = local_timers['asym_followup'] - seg_clock['asym']
+        top_now = search.timings['root'] + local_timers['upper_ref']   # the top and its envelope
+        s_top = top_now - seg_clock['top']
+        s_mid = search.timings['inner'] - seg_clock['mid']
+        logging.info(f"[Top {top_idx}] Seg {ctx.chunk+1}/{num_segs}: {n_groups} batches ({n_tmpl_seg} templates) in {t_seg_dur:.2f} s ({tperf_seg:.0f} temp-s/s) [fine={s_fine:.2f}s chi={s_chi:.2f}s asym={s_asym:.2f}s top={s_top:.3f}s mid={s_mid:.3f}s]")
+        seg_clock.update(t=now, leaf=search.timings['leaf'], chi=local_timers['power_chisq'],
+                         asym=local_timers['asym_followup'], top=top_now,
+                         mid=search.timings['inner'])
+        renorm_factors.clear()
 
+    search.run(inputs, windows=windows, on_series=on_series, on_peaks=on_peaks, on_chunk=on_chunk)
+    local_timers['upper_ref'] += search.timings['root']
+    local_timers['upper_fir'] += search.timings['inner']
+    local_timers['fine_fir'] += search.timings['leaf']
+    local_timers['filter_prep'] += search.timings['setup']
 
     if inj_reject is not None:
         logging.info("[Top %d] injection rejection: %d of %d (group, segment) pairs filtered",
                      top_idx, rej_pairs[0], rej_pairs[1])
 
-    del top_groups
-    del upper_batch
-    del top_template
-    UpperReferenceBatch.clear_buffers()
     power_chisq.clear()
     autochisq.clear()
 
