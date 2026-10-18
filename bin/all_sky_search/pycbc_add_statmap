@@ -1,6 +1,5 @@
 #!/bin/env python
-"""
-Calculate total FAR based on statistic ranking for coincidences in times
+"""Calculate total FAR based on statistic ranking for coincidences in times
 with more than one ifo combination available. Cluster to keep foreground
 coincs with the highest stat value.
 """
@@ -115,6 +114,15 @@ parser.add_argument(
     'triggers that are louder than either the "inclusive"'
     ' (little-dogs-in) background, or the "exclusive" '
     '(little-dogs-out) background. [default="none"]',
+)
+parser.add_argument(
+    "--isolate-backgrounds",
+    action="store_true",
+    default=False,
+    help="Isolate false alarm rates so multi-detector coincidences only "
+    "accumulate FAR from multi-detector backgrounds, and single-detector "
+    "candidates only accumulate FAR from single-detector backgrounds. "
+    "[default=False]",
 )
 significance.insert_significance_option_group(parser)
 parser.add_argument("--output-file", help="name of output file")
@@ -327,25 +335,93 @@ for ifo in all_ifos:
         f.create_dataset(f"background_exc/{ifo}/time", data=bg_exc_trig_times[ifo])
         f.create_dataset(f"background_exc/{ifo}/trigger_id", data=bg_exc_trig_ids[ifo])
 
-# fg_times is a tuple of trigger time arrays
-fg_times = (f["foreground/%s/time" % ifo][:] for ifo in all_ifos)
-
-# Cluster using the chosen method. Currently only clustering zerolag,
-# i.e. foreground, so set all timeslide_ids to zero
-cidx = pycbc.events.cluster_coincs_multiifo(
-    f[f"foreground/{args.cluster_stat}"][:],
-    fg_times,
-    np.zeros(n_triggers),
-    0,
-    args.cluster_window,
+# Determine active participating ifos and coinc mean times
+fg_times_list = [f["foreground/%s/time" % ifo][:] for ifo in all_ifos]
+active_ifos_count = np.zeros(n_triggers, dtype=int)
+coinc_mean_times = np.zeros(n_triggers, dtype=float)
+for arr in fg_times_list:
+    valid = arr > 0
+    active_ifos_count += valid.astype(int)
+    coinc_mean_times += np.where(valid, arr, 0.0)
+coinc_mean_times = np.where(
+    active_ifos_count > 0, coinc_mean_times / np.maximum(1, active_ifos_count), 0.0
 )
 
-del fg_times
+# Two-stage prioritized clustering:
+# 1. Multi-detector coincidences (>= 2 ifos) are clustered over args.cluster_window
+# 2. Single-detector candidates (== 1 ifo) are clustered over args.cluster_window
+# 3. Singles occurring within args.cluster_window of a surviving multi-detector coincidence are suppressed
+multi_mask = active_ifos_count >= 2
+singles_mask = active_ifos_count == 1
+
+cidx_multi = np.empty(0, dtype=int)
+if np.any(multi_mask):
+    multi_indices = np.where(multi_mask)[0]
+    cidx_multi_local = pycbc.events.cluster_over_time(
+        f[f"foreground/{args.cluster_stat}"][:][multi_indices],
+        coinc_mean_times[multi_indices],
+        args.cluster_window,
+    )
+    cidx_multi = multi_indices[cidx_multi_local]
+
+cidx_singles = np.empty(0, dtype=int)
+if np.any(singles_mask):
+    singles_indices = np.where(singles_mask)[0]
+    cidx_singles_local = pycbc.events.cluster_over_time(
+        f[f"foreground/{args.cluster_stat}"][:][singles_indices],
+        coinc_mean_times[singles_indices],
+        args.cluster_window,
+    )
+    cidx_singles = singles_indices[cidx_singles_local]
+
+if len(cidx_multi) > 0 and len(cidx_singles) > 0:
+    fg_cluster_stat = f[f"foreground/{args.cluster_stat}"][:]
+    multi_times = coinc_mean_times[cidx_multi]
+    single_times = coinc_mean_times[cidx_singles]
+
+    surv_multi = set(cidx_multi)
+    surv_singles = set(cidx_singles)
+
+    # Cross-compare multi-detector coincidences and singles within args.cluster_window
+    for s_idx, s_t in zip(cidx_singles, single_times):
+        nearby_multi_mask = np.abs(multi_times - s_t) < args.cluster_window
+        if np.any(nearby_multi_mask):
+            nearby_m_indices = cidx_multi[nearby_multi_mask]
+            s_stat = fg_cluster_stat[s_idx]
+            max_m_stat = np.max(fg_cluster_stat[nearby_m_indices])
+            if max_m_stat >= s_stat:
+                # Coincidence is louder than or equal to single: suppress single
+                surv_singles.discard(s_idx)
+            else:
+                # Single is louder than coincidence: single survives and suppresses inferior coincidence(s)
+                for m_idx in nearby_m_indices:
+                    if fg_cluster_stat[m_idx] < s_stat:
+                        surv_multi.discard(m_idx)
+
+    cidx = np.sort(np.array(list(surv_multi | surv_singles), dtype=int))
+elif len(cidx_multi) > 0:
+    cidx = np.sort(cidx_multi)
+elif len(cidx_singles) > 0:
+    cidx = np.sort(cidx_singles)
+else:
+    cidx = np.empty(0, dtype=int)
+
+logging.info(
+    "Clustered events: %d multi-detector coincidences, %d singles preserved (%d total)",
+    len(cidx_multi),
+    len(cidx) - len(cidx_multi),
+    len(cidx),
+)
+del fg_times_list
 
 
 def filter_dataset(h5file, name, idx):
     # Dataset needs to be deleted and remade as it is a different size
-    filtered_dset = h5file[name][:][idx]
+    dset = h5file[name][:]
+    if len(idx) > 0 and len(dset) > 0 and idx.max() >= len(dset):
+        pad = np.zeros(idx.max() + 1 - len(dset), dtype=dset.dtype)
+        dset = np.concatenate([dset, pad])
+    filtered_dset = dset[idx] if len(dset) > 0 else np.empty(0, dtype=dset.dtype)
     del h5file[name]
     h5file[name] = filtered_dset
 
@@ -438,18 +514,76 @@ del ifo_combo_key
 
 logging.info("Combining false alarm rates from all available backgrounds")
 
-# Convert dictionary of whether the ifo combination is available at trigger
-# time into a 2D mask
-# Iterating over all_ifo_combos ensures that ordering remains the same
-isincombo_mask = np.array([list(is_in_combo_time[ct]) for ct in all_ifo_combos])
+
+def compute_combined_fars(
+    combos, ifos, in_combo_time, in_fars, fg_data, isolate_backgrounds=False
+):
+    """
+    Combines FARs across available backgrounds.
+    If isolate_backgrounds is True:
+    - Multi-detector coincidences (>= 2 active IFOs) only accumulate FAR from multi-detector backgrounds (len(ct) >= 4).
+    - Single-detector candidates (1 active IFO) only accumulate FAR from that single detector's background.
+    If isolate_backgrounds is False (default):
+    - Sums FARs across all active background times matching upstream PyCBC behavior.
+    """
+    isincombo_mask = np.array([list(in_combo_time[ct]) for ct in combos])
+    if not isolate_backgrounds:
+        return np.sum(isincombo_mask * in_fars, axis=0)
+
+    stat_arr = (
+        fg_data["stat"][:]
+        if hasattr(fg_data["stat"], "__getitem__")
+        else fg_data["stat"]
+    )
+    n_trigs = len(stat_arr)
+
+    def _get_time(key):
+        if f"{key}/time" in fg_data:
+            return fg_data[f"{key}/time"][:]
+        if f"foreground/{key}/time" in fg_data:
+            return fg_data[f"foreground/{key}/time"][:]
+        return np.zeros(n_trigs)
+
+    n_active = np.zeros(n_trigs, dtype=int)
+    for ifo in ifos:
+        n_active += (_get_time(ifo) > 0).astype(int)
+
+    compat_mask = np.zeros((len(combos), n_trigs), dtype=bool)
+    for ct_idx, ct in enumerate(combos):
+        ct_n_ifos = len(ct) // 2
+        if ct_n_ifos >= 2:
+            compat_mask[ct_idx] = n_active >= 2
+        elif ct_n_ifos == 1:
+            t_ifo = _get_time(ct)
+            compat_mask[ct_idx] = (n_active == 1) & (t_ifo > 0)
+        else:
+            compat_mask[ct_idx] = True
+
+    active_mask = (isincombo_mask > 0) & compat_mask
+    return np.sum(active_mask * in_fars, axis=0)
+
 
 # Create n_combos by n_triggers arrays of FARs
 fg_fars = np.array([list(far[ct]) for ct in all_ifo_combos])
 fg_fars_exc = np.array([list(far_exc[ct]) for ct in all_ifo_combos])
 
-# Combine the FARs with the mask to obtain the new ifars
-fg_fars_out = np.sum(isincombo_mask * fg_fars, axis=0)
-fg_fars_exc_out = np.sum(isincombo_mask * fg_fars_exc, axis=0)
+# Combine the FARs with the compatibility mask to obtain the new ifars
+fg_fars_out = compute_combined_fars(
+    all_ifo_combos,
+    all_ifos,
+    is_in_combo_time,
+    fg_fars,
+    f["foreground"],
+    args.isolate_backgrounds,
+)
+fg_fars_exc_out = compute_combined_fars(
+    all_ifo_combos,
+    all_ifos,
+    is_in_combo_time,
+    fg_fars_exc,
+    f["foreground"],
+    args.isolate_backgrounds,
+)
 
 # Apply any limits as appropriate
 fg_fars_out = significance.apply_far_limit(
@@ -462,7 +596,7 @@ fg_fars_exc_out = significance.apply_far_limit(
 fg_ifar = conv.sec_to_year(1.0 / fg_fars_out)
 fg_ifar_exc = conv.sec_to_year(1.0 / fg_fars_exc_out)
 fg_time = f.attrs["foreground_time"]
-del isincombo_mask, fg_fars, fg_fars_exc, _
+del fg_fars, fg_fars_exc, _
 
 f.attrs["foreground_time_exc"] = f.attrs["foreground_time"]
 if not injection_style:
@@ -477,13 +611,21 @@ if not injection_style:
     f["segments/foreground_veto/start"] = vstart
     f["segments/foreground_veto/end"] = vend
     # Only output non-exclusive ifar/fap if it is _not_ an injection case
-    f["foreground/ifar"][:] = fg_ifar
+    if "foreground/ifar" in f:
+        del f["foreground/ifar"]
+    f["foreground/ifar"] = fg_ifar
+    if "foreground/fap" in f:
+        del f["foreground/fap"]
     f["foreground/fap"] = 1 - np.exp(-conv.sec_to_year(fg_time) / fg_ifar)
 
 del test_times
 
-f["foreground/ifar_exc"][:] = fg_ifar_exc
+if "foreground/ifar_exc" in f:
+    del f["foreground/ifar_exc"]
+f["foreground/ifar_exc"] = fg_ifar_exc
 fg_time_exc = f.attrs["foreground_time_exc"]
+if "foreground/fap_exc" in f:
+    del f["foreground/fap_exc"]
 f["foreground/fap_exc"] = 1 - np.exp(-conv.sec_to_year(fg_time_exc) / fg_ifar_exc)
 
 del fg_ifar_exc, fg_ifar
@@ -675,7 +817,7 @@ while True:
         combined_fg_data.data["stat"]
         == sep_fg_data[maxcombo].data["stat"][:][max_ifar_idx]
     )
-    sep_fg_data[maxcombo] = sep_fg_data[maxcombo].remove(max_ifar_idx)
+    sep_fg_data[maxcombo] = sep_fg_data[maxcombo].remove([max_ifar_idx])
 
     # Add to final dataset and remove from continuing dataset
     final_combined_fg = final_combined_fg + combined_fg_data.select(where_combined)
@@ -761,9 +903,15 @@ while True:
         )
         is_in_combo_time[key][idx_within_segment] = np.ones_like(idx_within_segment)
 
-    isincombo_mask = np.array([list(is_in_combo_time[ct]) for ct in all_ifo_combos])
     fg_fars = np.array([list(far[ct]) for ct in all_ifo_combos])
-    fg_fars_out = np.sum(isincombo_mask * fg_fars, axis=0)
+    fg_fars_out = compute_combined_fars(
+        all_ifo_combos,
+        all_ifos,
+        is_in_combo_time,
+        fg_fars,
+        combined_fg_data.data,
+        args.isolate_backgrounds,
+    )
     fg_fars_out = significance.apply_far_limit(
         fg_fars_out,
         significance_dict,

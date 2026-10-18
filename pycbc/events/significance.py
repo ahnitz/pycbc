@@ -136,6 +136,9 @@ def n_louder_from_fit(
         Information regarding the significance fit
 
     """
+    if len(back_stat) == 0:
+        return np.array([]), np.zeros_like(fore_stat, dtype=float), {}
+
     # Calculate the fitting factor of the ranking statistic distribution
     alpha, sig_alpha = trstats.fit_above_thresh(
         fit_function, back_stat, thresh=fit_threshold, weights=dec_facs
@@ -256,11 +259,19 @@ def get_far(
         bg_n_louder += 1
         fg_n_louder += 1
 
-    bg_far = bg_n_louder / background_time
-    fg_far = fg_n_louder / background_time
+    if background_time == 0:
+        bg_far = np.zeros_like(bg_n_louder, dtype=float)
+        fg_far = np.zeros_like(fg_n_louder, dtype=float)
+    else:
+        bg_far = bg_n_louder / background_time
+        fg_far = fg_n_louder / background_time
 
     if "n_above" in significance_info:
-        significance_info["rate_above"] = significance_info["n_above"] / background_time
+        significance_info["rate_above"] = (
+            (significance_info["n_above"] / background_time)
+            if background_time != 0
+            else 0.0
+        )
 
     return bg_far, fg_far, significance_info
 

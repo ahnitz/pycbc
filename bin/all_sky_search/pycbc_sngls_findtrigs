@@ -20,6 +20,12 @@ parser.add_argument(
     help="File containing single-detector triggers",
 )
 parser.add_argument(
+    "--ifo",
+    type=str,
+    default=None,
+    help="Specify the IFO to analyze from the trigger file",
+)
+parser.add_argument(
     "--template-bank", required=True, help="Template bank file in HDF format"
 )
 parser.add_argument(
@@ -101,7 +107,7 @@ trigger_cut_dict, template_cut_dict = cuts.ingest_cuts_option_group(args)
 
 logging.info("Opening trigger file: %s", trigger_file)
 trigf = io.HFile(trigger_file, "r")
-ifo = list(trigf.keys())[0]
+ifo = args.ifo if args.ifo is not None else list(trigf.keys())[0]
 
 # Set up to only load triggers from the templates of interest
 
@@ -136,6 +142,7 @@ trigs = ReadByTemplate(
     args.segment_name,
     args.veto_files,
     args.gating_veto_windows,
+    ifo=ifo,
 )
 logging.info("%d triggers in file", trigf[ifo + "/snr"].size)
 
@@ -227,17 +234,24 @@ for i, tnum in enumerate(template_ids):
         tids_full = tids_full[cid]
         trigger_times = trigger_times[cid]
 
-    trigger_ids_all += list(tids_full)
-    template_ids_all += list(tnum * np.ones_like(tids_full))
-    trigger_times_all += list(trigger_times)
-    stat_all += list(stat_t)
+    trigger_ids_all.append(tids_full)
+    template_ids_all.append(np.full(len(tids_full), tnum, dtype=int))
+    trigger_times_all.append(trigger_times)
+    stat_all.append(stat_t)
 
 # Perform decimation
+if len(trigger_ids_all) > 0:
+    stat_all = np.concatenate(stat_all)
+    template_ids_all = np.concatenate(template_ids_all)
+    trigger_ids_all = np.concatenate(trigger_ids_all)
+    trigger_times_all = np.concatenate(trigger_times_all)
+else:
+    stat_all = np.array([], dtype=float)
+    template_ids_all = np.array([], dtype=int)
+    trigger_ids_all = np.array([], dtype=int)
+    trigger_times_all = np.array([], dtype=float)
+
 dec_facs = np.ones_like(template_ids_all)
-stat_all = np.array(stat_all)
-template_ids_all = np.array(template_ids_all, dtype=int)
-trigger_ids_all = np.array(trigger_ids_all, dtype=int)
-trigger_times_all = np.array(trigger_times_all)
 
 logging.info("%d events", dec_facs.size)
 for t, f in zip(threshes, factors):

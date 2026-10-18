@@ -7,6 +7,7 @@ import os.path
 import shutil
 import uuid
 
+import h5py
 import numpy
 import numpy.random
 from igwn_segments import infinity
@@ -77,6 +78,13 @@ parser.add_argument(
     type=float,
     help="Interval between timeslides in seconds. Timeslides are"
     " disabled if the option is omitted.",
+)
+parser.add_argument(
+    "--max-timeslide-offset",
+    type=float,
+    default=None,
+    help="Maximum timeslide time offset in seconds. Coincidences with "
+    "timeslide offset larger than this are culled/discarded.",
 )
 parser.add_argument(
     "--loudest-keep-values",
@@ -183,28 +191,63 @@ atexit.register(exit_cleaning)
 # coincs: so, track which templates contain triggers in all ifos
 tids_with_trigs = None
 
+file_ifo_pairs = []
 for i in range(len(args.trigger_files)):
+    src_file = args.trigger_files[i]
     if args.stage_input:
         dest = os.path.join(args.stage_input_dir, str(uuid.uuid4()) + ".hdf")
-        logging.info("Moving %s to shared memory as %s", args.trigger_files[i], dest)
+        logging.info("Moving %s to shared memory as %s", src_file, dest)
         cleanup_files.append(dest)
-        shutil.copyfile(args.trigger_files[i], dest)
+        shutil.copyfile(src_file, dest)
     else:
-        dest = args.trigger_files[i]
+        dest = src_file
 
-    logging.info("Opening trigger file %s: %s" % (i, dest))
+    with HFile(dest, "r") as probe_f:
+        present_ifos = [
+            k
+            for k in probe_f.keys()
+            if isinstance(probe_f[k], h5py.Group)
+            and (
+                "search" in probe_f[k]
+                or "template_id" in probe_f[k]
+                or "template_hash" in probe_f[k]
+            )
+        ]
+        matched_ifos = [
+            ifo for ifo in [args.pivot_ifo, args.fixed_ifo] if ifo in present_ifos
+        ]
+        if not matched_ifos:
+            matched_ifos = sorted(present_ifos)
+        for ifo in matched_ifos:
+            file_ifo_pairs.append((dest, ifo))
+
+bank_tids = None
+for dest, ifo in file_ifo_pairs:
+    logging.info("Opening trigger file for %s: %s" % (ifo, dest))
     reader = ReadByTemplate(
         dest,
         args.template_bank,
         args.segment_name,
         args.veto_files,
         args.gating_veto_windows,
+        ifo=ifo,
     )
-    ifo = reader.ifo
     trigs.ifos.append(ifo)
 
     # We don't have that many triggers, see if we can skip some templates
-    if len(reader.file[ifo]["template_id"]) < 2**27:
+    if "template_boundaries" in reader.file[ifo]:
+        if bank_tids is None:
+            bank_hashes = HFile(args.template_bank, "r")["template_hash"][:]
+            bank_tids = bank_hashes.argsort()
+        tb = reader.file[ifo]["template_boundaries"][:]
+        num_trigs = len(reader.file[ifo]["template_id"])
+        fb = numpy.append(tb[bank_tids], num_trigs)
+        has_trigs_sorted = fb[1:] > fb[:-1]
+        uniq = numpy.sort(bank_tids[has_trigs_sorted]).astype(numpy.int64)
+        if tids_with_trigs is None:
+            tids_with_trigs = numpy.arange(0, num_templates, dtype=numpy.int64)
+        tids_with_trigs = numpy.intersect1d(tids_with_trigs, uniq)
+    elif len(reader.file[ifo]["template_id"]) < 2**27:
         uniq = numpy.unique(reader.file[ifo]["template_id"][:]).astype(numpy.int64)
         if tids_with_trigs is None:
             tids_with_trigs = numpy.arange(0, num_templates, dtype=numpy.int64)
@@ -231,7 +274,7 @@ rank_method = stat.get_statistic_from_opts(args, trigs.ifos)
 
 # Sanity check, time slide interval should be larger than twice the
 # Earth crossing time, which is approximately 0.085 seconds.
-TWOEARTH = 0.085
+TWOEARTH = 0.020
 if args.timeslide_interval is not None and args.timeslide_interval <= TWOEARTH:
     raise parser.error(
         "The time slide interval should be larger than twice the Earth crossing time."
@@ -240,6 +283,44 @@ if args.timeslide_interval is not None and args.timeslide_interval <= TWOEARTH:
 # slide = 0 means don't do timeslides
 if args.timeslide_interval is None:
     args.timeslide_interval = 0.0
+
+# Check for local followup window / non_threshold_time
+t_followup = 0.0
+for sngl in trigs.singles:
+    for ifo in trigs.ifos:
+        if (
+            ifo in sngl.file
+            and "search" in sngl.file[ifo]
+            and "non_threshold_time" in sngl.file[ifo]["search"]
+        ):
+            try:
+                val = float(
+                    numpy.max(
+                        numpy.asarray(sngl.file[ifo]["search/non_threshold_time"])
+                    )
+                )
+                t_followup = max(t_followup, val)
+            except Exception:
+                pass
+
+if args.max_timeslide_offset is not None and args.timeslide_interval > 0:
+    max_slide = int(round(args.max_timeslide_offset / args.timeslide_interval))
+    logging.info(
+        "Enforcing explicit timeslide limit |slide| <= %d (offset <= %.3fs)",
+        max_slide,
+        args.max_timeslide_offset,
+    )
+elif t_followup > 0 and args.timeslide_interval > 0:
+    max_timeslide_offset = t_followup / 2.0
+    max_slide = int(round(max_timeslide_offset / args.timeslide_interval))
+    logging.info(
+        "Detected local followup window %.2fs: enforcing timeslide limit |slide| <= %d (offset <= %.3fs)",
+        t_followup,
+        max_slide,
+        max_timeslide_offset,
+    )
+else:
+    max_slide = None
 
 if args.randomize_template_order:
     seed(0)
@@ -460,6 +541,8 @@ def process_template(tnum):
 
             # index values of the background triggers
             bi = numpy.where(slide != 0)[0]
+            if max_slide is not None:
+                bi = bi[numpy.abs(slide[bi]) <= max_slide]
             bl = bi[cstat[bi] < threshes[-1]]
 
             ti = numpy.concatenate([fi, bl])
@@ -547,6 +630,8 @@ def process_template(tnum):
                 # Keep triggers in the current decimation range
                 test_bi = numpy.where(test_cstat >= threshes[kidx])[0]
                 test_bi = test_bi[test_cstat[test_bi] < threshes[kidx - 1]]
+                if max_slide is not None:
+                    test_bi = test_bi[numpy.abs(set_slide[test_bi]) <= max_slide]
 
                 for i in trigs.ifos:
                     ids[i] = numpy.concatenate([ids[i], test_ids[i][test_bi]])
@@ -613,20 +698,29 @@ f["segments/%s/start" % key], f["segments/%s/end" % key] = trigs.singles[0].vali
 
 f.attrs["timeslide_interval"] = args.timeslide_interval
 f.attrs["coinc_time"] = abs(coinc_segs)
-f.attrs["num_of_ifos"] = len(args.trigger_files)
+f.attrs["num_of_ifos"] = len(trigs.ifos)
 f.attrs["pivot"] = args.pivot_ifo
 f.attrs["fixed"] = args.fixed_ifo
 for i, sngl in zip(trigs.ifos, trigs.singles):
     f.attrs["%s_foreground_time" % i] = abs(sngl.segs)
+    if "%s/search/non_threshold_time" % i in sngl.file:
+        f.attrs["%s_non_threshold_time" % i] = float(
+            sngl.file["%s/search/non_threshold_time" % i][()]
+        )
 f.attrs["ifos"] = " ".join(sorted(trigs.ifos))
 
 # What does this code actually calculate?
 if args.timeslide_interval:
-    maxtrigs = max([abs(sngl.segs) for sngl in trigs.singles])
-    nslides = int(maxtrigs / args.timeslide_interval)
+    if max_slide is not None:
+        nslides = max_slide * 2
+    else:
+        maxtrigs = max([abs(sngl.segs) for sngl in trigs.singles])
+        nslides = int(maxtrigs / args.timeslide_interval)
 else:
     nslides = 0
 f.attrs["num_slides"] = nslides
+if max_slide is not None:
+    f.attrs["max_timeslide_id"] = max_slide
 
 
 logging.info("Done")

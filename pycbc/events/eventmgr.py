@@ -308,7 +308,10 @@ class EventManager:
         nsnrs = ranking.newsnr(
             abs(self.events["snr"]), self.events["chisq"] / self.events["chisq_dof"]
         )
-        self.cut_events_via_mask(nsnrs >= threshold)
+        mask = nsnrs >= threshold
+        if "chisq_dof" in self.events.dtype.names:
+            mask = mask | (self.events["chisq_dof"] < 0)
+        self.cut_events_via_mask(mask)
 
     def keep_near_injection(self, window, injections):
         from pycbc.events.veto import indices_within_times
@@ -632,6 +635,10 @@ class EventManager:
                     f["gating/" + gate_type + "/pad"] = numpy.array(
                         [g[2] for g in gating_info[gate_type]]
                     )
+        if hasattr(self, "non_threshold_time") and self.non_threshold_time is not None:
+            f["search/non_threshold_time"] = numpy.array(
+                [float(self.non_threshold_time)]
+            )
 
         f.f.close()
 

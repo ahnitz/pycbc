@@ -748,6 +748,13 @@ class SingleDetTriggers:
         self.veto_files = [veto_file] if veto_file else []
         self.segment_name = [segment_name] if segment_name else []
 
+    def __contains__(self, key):
+        if hasattr(self, "trigs") and self.trigs is not None and key in self.trigs:
+            return True
+        if hasattr(self, "bank") and self.bank is not None and key in self.bank:
+            return True
+        return hasattr(self, key)
+
     def __getitem__(self, key):
         # Is key in the TRIGGER_MERGE file?
         try:
@@ -1057,8 +1064,16 @@ class SingleDetTriggers:
         return ranking.newsnr(self.snr, self.rchisq)
 
     @property
+    def newsnr_offset125(self):
+        return ranking.newsnr_offset125(self.snr, self.rchisq)
+
+    @property
     def newsnr_sgveto(self):
         return ranking.newsnr_sgveto(self.snr, self.rchisq, self.sgchisq)
+
+    @property
+    def newsnr_sgveto_offset125(self):
+        return ranking.newsnr_sgveto_offset125(self.snr, self.rchisq, self.sgchisq)
 
     @property
     def newsnr_sgveto_psdvar(self):
@@ -1616,8 +1631,19 @@ class ReadByTemplate:
             The requested column of data
 
         """
-        ref = self.file["%s/%s_template" % (self.ifo, col)][num]
-        return self.file["%s/%s" % (self.ifo, col)][ref]
+        t_key = "%s/%s_template" % (self.ifo, col)
+        if t_key in self.file:
+            ref = self.file[t_key][num]
+            return self.file["%s/%s" % (self.ifo, col)][ref]
+        if (
+            "%s/template_boundaries" % self.ifo in self.file
+            and "%s/%s" % (self.ifo, col) in self.file
+        ):
+            ref = self.file["%s/end_time_template" % self.ifo][num]
+            n_trigs = len(self.file["%s/end_time" % self.ifo][ref])
+            start = self.file["%s/template_boundaries" % self.ifo][num]
+            return self.file["%s/%s" % (self.ifo, col)][start : start + n_trigs]
+        raise KeyError("Column %s not found in trigger file" % col)
 
     def set_template(self, num):
         """
@@ -1660,6 +1686,11 @@ class ReadByTemplate:
         trigger_id = self.keep + self.file["%s/template_boundaries" % self.ifo][num]
         return trigger_id
 
+    def __contains__(self, col):
+        if not isinstance(col, str):
+            return False
+        return ("%s/%s" % (self.ifo, col)) in self.file
+
     def __getitem__(self, col):
         """
         Return the column of data for current active template after
@@ -1689,6 +1720,8 @@ class ReadByTemplate:
 chisq_choices = [
     "traditional",
     "cont",
+    "auto",
+    "autochi",
     "bank",
     "max_cont_trad",
     "sg",
@@ -1716,6 +1749,9 @@ def get_chisq_from_file_choice(hdfile, chisq_choice):
         The reduced chi-squared values based on the specified choice.
 
     """
+    if chisq_choice in ["auto", "autochi"]:
+        chisq_choice = "cont"
+
     # Get the reduced chi-squared values
     if chisq_choice in [
         "traditional",
