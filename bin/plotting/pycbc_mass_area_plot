@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/usr/bin/env python
 #
 # Integration of the area laying in the different cbc regions
 # By A. Curiel Barroso

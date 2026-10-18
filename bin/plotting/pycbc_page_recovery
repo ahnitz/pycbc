@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/usr/bin/python
 ''' Make plots of recovered injection parameters
 '''
 import numpy, logging, argparse, sys, matplotlib

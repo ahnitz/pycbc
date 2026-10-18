@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/usr/bin/env python
 
 """Supervise the periodic re-fitting of PyCBC Live single-detector triggers,
 and the associated plots.

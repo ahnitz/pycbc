@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/usr/bin/env python
 
 """
 Splits injections created using pycbc_create_injections into smaller sets.

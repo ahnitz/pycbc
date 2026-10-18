@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/usr/bin/env python
 
 import numpy, h5py, argparse, logging
 from pycbc import init_logging, add_common_pycbc_options

@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/bin/env python
 """Dummy script to pass through stat files and test reranking"""
 import argparse, logging, pycbc
 from pycbc.io import HFile

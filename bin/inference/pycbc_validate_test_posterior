@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/usr/bin/env python
 """ Validate and generate diagnostic plots for a inference file using the
 test posterior model.
 """

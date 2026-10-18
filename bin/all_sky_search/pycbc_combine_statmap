@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/bin/env python
 """ Apply a trials factor based on the number of available detector
 combinations at the time of coincidence. This clusters to find the most
 significant foreground, but leaves the background triggers alone.

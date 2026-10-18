@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/usr/bin/env python
 """
 Finds the loudest snr or newsnr event within a given time window, parses the 
 parameters of the template, and writes them to an hdf and/or stdout.

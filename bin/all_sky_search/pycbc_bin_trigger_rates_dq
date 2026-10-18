@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/usr/bin/env python
 """ Bin triggers by their dq value and calculate trigger rates in each bin
 """
 import logging

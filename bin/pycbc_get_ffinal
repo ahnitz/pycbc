@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#! /usr/bin/env python
 
 """Finds the maximum frequency of waveforms by generating them. Will also report
 the duration of time domain waveforms.

@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/bin/env python
 """ Make histograms of single detector triggers
 """
 

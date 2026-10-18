@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/bin/env python
 """Generate the standardized file detailing the candidates/background to
 follow-up.
 """

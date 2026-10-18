@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/bin/env python
 """
 Remove all coincs in background_exc that contain triggers at time of zerolag
 coincidences from *any* coincidence type with ifar above a certain threshold

@@ -1,4 +1,4 @@
-#!/home/ahnitz/projects/claude/searchdev/pycbc-work/venv-apogee/bin/python
+#!/usr/bin/env python
 """
 Compute source probabilities using mchirp estimation method for all events
 in a chunk with an IFAR above certain threshold.
