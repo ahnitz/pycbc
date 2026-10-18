@@ -1277,6 +1277,8 @@ class RatioFilterBank(FilterBank):
                 )
             }
 
+        self._opened_pid = os.getpid()
+
         # Precompute fine-to-parent sigma rescaling factors from level-1 FIR groups
         self.sigma_sigma_rescale = np.ones(len(self.table))
         for coarse_id in self.level_keys[1]:
@@ -1285,6 +1287,45 @@ class RatioFilterBank(FilterBank):
             sigmas = c_group["sigmas"][:]
             if len(fine_indices) > 0:
                 self.sigma_sigma_rescale[fine_indices] = sigmas[:, 2] / sigmas[:, 0]
+
+    def close_filehandler(self):
+        """Close the underlying HDF5 file handle so forked worker processes can
+        reopen their own independent file handles on demand.
+        """
+        if getattr(self, "filehandler", None) is not None:
+            try:
+                self.filehandler.close()
+            except Exception:
+                pass
+            self.filehandler = None
+            self.fir_group = None
+            self.level_groups = {}
+            self._opened_pid = None
+
+    def _ensure_open(self):
+        pid = os.getpid()
+        fh = getattr(self, "filehandler", None)
+        if (
+            fh is None
+            or not getattr(fh.id, "valid", False)
+            or getattr(self, "_opened_pid", None) != pid
+        ):
+            self.filehandler = h5py.File(self.filename, "r")
+            self.fir_group = self.filehandler["fir_data"]
+            self.level_groups = {
+                lvl: self.fir_group[f"level_{lvl}"]
+                for lvl in range(1, self.num_levels + 1)
+            }
+            self._opened_pid = pid
+
+    def group_template_count(self, coarse_index, level=1):
+        """Return the number of child templates in `coarse_index` at `level`
+        without reading the 2D FIR taps dataset.
+        """
+        self._ensure_open()
+        return int(
+            self.level_groups[level][str(int(coarse_index))]["fine_bank_index"].shape[0]
+        )
 
     @property
     def coarse_keys(self):
@@ -1307,6 +1348,7 @@ class RatioFilterBank(FilterBank):
             or inj_filter_rejector.chirp_time_window is None
         ):
             return
+        self._ensure_open()
 
         injection_parameters = inj_filter_rejector.injection_params.table
         fref = inj_filter_rejector.f_lower
@@ -1362,6 +1404,7 @@ class RatioFilterBank(FilterBank):
         htilde : FrequencySeries
             The decompressed reference waveform.
         """
+        self._ensure_open()
         top_group = self.level_groups[self.num_levels]
         compressed_waveform = pycbc.waveform.compress.CompressedWaveform.from_hdf(
             top_group, str(int(coarse_index)), load_now=True
@@ -1433,6 +1476,7 @@ class RatioFilterBank(FilterBank):
         shifts : np.ndarray, optional
             1D array of integer sample shifts (returned if return_shifts=True).
         """
+        self._ensure_open()
         if level not in self.level_groups:
             msg = f"FIR level {level} not found in bank (num_levels={self.num_levels})."
             raise ValueError(msg)
@@ -1449,7 +1493,7 @@ class RatioFilterBank(FilterBank):
 
         # Sorted by tap count so the engine's batches group similarly-sized
         # filters together (see _execute_blocked_kernel's tap_groups).
-        sort_idx = np.argsort(actual_tap_counts)
+        sort_idx = np.argsort(actual_tap_counts, kind="stable")
         if return_shifts:
             shifts = c_group["sample_shift"][:].astype(np.int64)
             if level == 1:

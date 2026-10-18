@@ -253,5 +253,226 @@ class TestDynamicSNRRenormalize(unittest.TestCase):
         self.assertTrue(np.all(rf_zero_floor <= 1.50))
 
 
+class TestFIRChisqAndSearchHelpers(unittest.TestCase):
+    def test_validate_dynamic_snr_options(self):
+        from pycbc.filter.matched_filter_ratio import validate_dynamic_snr_options
+
+        validate_dynamic_snr_options(1.0, None, disable=False)
+        validate_dynamic_snr_options(0.5, 2.0, disable=False)
+        validate_dynamic_snr_options(-1.0, -5.0, disable=True)
+
+        with self.assertRaises(ValueError):
+            validate_dynamic_snr_options(0.0, None)
+        with self.assertRaises(ValueError):
+            validate_dynamic_snr_options(1e-8, None)
+        with self.assertRaises(ValueError):
+            validate_dynamic_snr_options(1.0, 0.0)
+        with self.assertRaises(ValueError):
+            validate_dynamic_snr_options(1.0, 2e3)
+
+    def test_ifo_trigger_data_schema(self):
+        from pycbc.filter.matched_filter_ratio import IfoTriggerData
+
+        raw = {
+            "template_id": np.array([10, 20], dtype=np.int32),
+            "time_index": np.array([1000, 2000], dtype=np.int64),
+            "snr": np.array([7.0 + 1.0j, 8.0 - 2.0j], dtype=np.complex64),
+            "sigmasq": np.array([1.0, 1.0], dtype=np.float32),
+            "chisq": np.array([12.0, 14.0], dtype=np.float32),
+            "chisq_dof": np.array([14, 14], dtype=np.int32),
+            "sg_chisq": np.array([1.1, 0.9], dtype=np.float32),
+            "is_asym": np.array([False, True], dtype=bool),
+            "extra_unused": np.array([1, 2]),
+        }
+        td = IfoTriggerData.from_dict(raw)
+        self.assertIn("snr", td)
+        self.assertNotIn("cont_chisq", td)
+        self.assertNotIn("extra_unused", td)
+        np.testing.assert_array_equal(td["template_id"], raw["template_id"])
+        np.testing.assert_array_equal(td[0], raw["template_id"])
+        with self.assertRaises(KeyError):
+            _ = td["cont_chisq"]
+
+    def test_chisq_filters_indexing_and_prefetch(self):
+        from pycbc.vetoes.chisq_fir import ChisqFilters
+
+        rng = np.random.default_rng(123)
+        taps = (rng.standard_normal((4, 32)) + 1j * rng.standard_normal((4, 32))).astype(
+            np.complex64
+        )
+        counts = np.array([16, 24, 32, 20], dtype=np.int64)
+        cf_single = ChisqFilters(taps, counts, block_length=256, reach=8)
+        cf_batch = ChisqFilters(taps, counts, block_length=256, reach=8)
+
+        with self.assertRaises(TypeError):
+            _ = cf_single[1:3]
+        with self.assertRaises(TypeError):
+            _ = cf_single[[0, 1]]
+        with self.assertRaises(IndexError):
+            _ = cf_single[4]
+        with self.assertRaises(IndexError):
+            _ = cf_single[-5]
+
+        cf_batch.prefetch([3, 1, -4, 3])
+        for i in range(4):
+            np.testing.assert_allclose(cf_single[i], cf_batch[i], rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(cf_single[-1], cf_single[3])
+
+    def test_ratio_chisq_chain_and_sg_projection(self):
+        import types
+        from pycbc.types import FrequencySeries
+        from pycbc.vetoes.chisq_fir import ChisqFilters, RatioAutoChisq, RatioPowerChisq
+        from pycbc.vetoes.sgchisq import SingleDetSGChisq
+
+        rng = np.random.default_rng(99)
+        sample_rate = 2048.0
+        block_len = 512
+        n_seg = 4096
+        df_seg = sample_rate / n_seg
+        n_freq = n_seg // 2 + 1
+
+        psd = FrequencySeries(np.ones(n_freq, dtype=np.float32), delta_f=df_seg)
+        psd._cache_key = ("H1", 0)
+        stilde_arr = (
+            rng.standard_normal(n_freq) + 1j * rng.standard_normal(n_freq)
+        ).astype(np.complex64)
+        stilde = FrequencySeries(stilde_arr, delta_f=df_seg)
+        stilde.psd = psd
+        stilde._is_whitened = True
+        stilde._cache_key = ("H1", 0)
+        stilde.analyze = slice(256, n_seg - 256)
+        stilde.cumulative_index = 0
+
+        top_arr = np.ones(n_freq, dtype=np.complex64)
+        top_template = FrequencySeries(top_arr, delta_f=df_seg)
+        top_template.f_lower = 20.0
+
+        taps = np.zeros((2, 32), dtype=np.complex64)
+        taps[:, 16] = 1.0 + 0.0j
+        counts = np.array([32, 32], dtype=np.int64)
+        filters_f = ChisqFilters(taps, counts, block_length=block_len, reach=10)
+
+        ref_snr = (
+            rng.standard_normal(n_seg) + 1j * rng.standard_normal(n_seg)
+        ).astype(np.complex64)
+        ref_snr[1024] = 12.0 + 0.0j
+        ref_snr[2048] = 9.0 + 0.0j
+
+        pchisq = RatioPowerChisq(
+            num_bins=8,
+            snr_threshold=5.0,
+            sample_rate=sample_rate,
+            flow=20.0,
+            f_final=800.0,
+            chisq_window=0.1,
+            chisq_iterations=10,
+            top_template=top_template,
+            upper_f_by_coarse={},
+        )
+        args = types.SimpleNamespace(
+            autochi_stride=2,
+            autochi_number_points=4,
+            autochi_onesided=None,
+            autochi_two_phase=False,
+            autochi_reverse_template=False,
+            autochi_max_valued=False,
+            autochi_max_valued_dof=None,
+            autochi_max_rchisq=100.0,
+            signal_consistency_chain=None,
+        )
+        achisq = RatioAutoChisq(pchisq, args)
+
+        bank_stub = types.SimpleNamespace(
+            table={
+                "template_hash": np.array([101, 102], dtype=np.int64),
+                "f_lower": np.array([20.0, 20.0], dtype=np.float32),
+                0: {"mass1": 30.0, "mass2": 30.0, "spin1z": 0.0, "spin2z": 0.0},
+                1: {"mass1": 25.0, "mass2": 25.0, "spin1z": 0.0, "spin2z": 0.0},
+            }
+        )
+        sg = SingleDetSGChisq(
+            bank_stub,
+            num_bins=8,
+            snr_threshold=5.0,
+            chisq_locations=[],
+        )
+        sg.do = True
+        sg.params = {101: "20-0.5,20-0.6", 102: "20-0.5,20-0.6"}
+
+        ids_local = np.array([0, 1], dtype=np.int32)
+        t_idxs = np.array([1024, 2048], dtype=np.int64)
+        snrs = np.array([12.0 + 0.0j, 9.0 + 0.0j], dtype=np.complex64)
+        fine_indices = np.array([0, 1], dtype=np.int32)
+
+        chi, dof, auto, fpeak = pchisq.compute(
+            ids_local,
+            t_idxs,
+            snrs,
+            fine_indices,
+            stilde,
+            ref_snr,
+            filters_f,
+            coarse_idx=0,
+            args=args,
+            autochisq=achisq,
+            sg_chisq=sg,
+            bank=bank_stub,
+        )
+        self.assertEqual(len(chi), 2)
+        self.assertEqual(len(dof), 2)
+        self.assertIsNotNone(auto)
+        self.assertTrue(np.all(np.isfinite(chi)))
+        self.assertTrue(np.all(np.isfinite(auto)))
+        self.assertTrue(np.all(fpeak > 0))
+        self.assertEqual(len(pchisq.ref_f_cache), 0)
+        self.assertTrue(np.all(np.isfinite(pchisq.last_sg_vals)))
+        self.assertTrue(np.all(pchisq.last_sg_vals > 0))
+
+    def test_ratio_filter_bank_handle_and_group_count(self):
+        import tempfile
+        import os
+        import h5py
+        from pycbc.waveform.bank import RatioFilterBank
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test_ratio_bank.hdf")
+            with h5py.File(path, "w") as f:
+                f.attrs["parameters"] = np.array(["mass1", "mass2", "f_lower", "approximant"], dtype="S")
+                f.create_dataset("mass1", data=np.array([30.0, 29.0, 28.0], dtype=np.float32))
+                f.create_dataset("mass2", data=np.array([30.0, 29.0, 28.0], dtype=np.float32))
+                f.create_dataset("template_hash", data=np.array([1, 2, 3], dtype=np.int64))
+                f.create_dataset("approximant", data=np.array([b"IMRPhenomD"] * 3))
+                f.create_dataset("f_lower", data=np.array([20.0, 20.0, 20.0], dtype=np.float32))
+
+                fd = f.create_group("fir_data")
+                fd.attrs["num_levels"] = 1
+                fd.attrs["sample_rate"] = 2048.0
+                lvl1 = fd.create_group("level_1")
+                grp0 = lvl1.create_group("0")
+                grp0.create_dataset("taps", data=np.ones((3, 16), dtype=np.complex64))
+                grp0.create_dataset("actual_tap_count", data=np.array([12, 8, 12], dtype=np.int32))
+                grp0.create_dataset("fine_bank_index", data=np.array([0, 1, 2], dtype=np.int32))
+                grp0.create_dataset("sample_shift", data=np.array([0, 0, 0], dtype=np.int32))
+                grp0.create_dataset("sigmas", data=np.ones((3, 3), dtype=np.float32))
+
+            bank = RatioFilterBank(
+                path,
+                filter_length=2049,
+                delta_f=0.5,
+                dtype=np.complex64,
+                load_compressed=False,
+            )
+            self.assertEqual(bank.group_template_count(0, 1), 3)
+            bank.close_filehandler()
+            self.assertIsNone(bank.filehandler)
+            # Lazy reopen on access
+            self.assertEqual(bank.group_template_count(0, 1), 3)
+            taps, counts, indices = bank.get_firs(0, 1)
+            # Equal tap counts (indices 0 and 2 both have 12 taps) preserve relative order (stable sort)
+            np.testing.assert_array_equal(indices, np.array([1, 0, 2], dtype=np.int32))
+            bank.close_filehandler()
+
+
 if __name__ == '__main__':
     unittest.main()
+
