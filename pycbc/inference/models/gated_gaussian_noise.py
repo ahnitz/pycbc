@@ -13,8 +13,7 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-"""
-This module provides model classes that assume the noise is Gaussian and
+"""This module provides model classes that assume the noise is Gaussian and
 introduces a gate to remove given times from the data, using the inpainting
 method to fill the removed part such that it does not enter the likelihood.
 """
@@ -48,8 +47,7 @@ from .gaussian_noise import (
 
 
 class BaseGatedGaussian(BaseGaussianNoise):
-    r"""
-    Base model for gated gaussian.
+    r"""Base model for gated gaussian.
 
     Provides additional routines for applying a time-domain gate to data.
     See :py:class:`GatedGaussianNoise` for more details.
@@ -87,6 +85,10 @@ class BaseGatedGaussian(BaseGaussianNoise):
         if paint_method is None:
             paint_method = kwargs.get("paint-method", "toeplitz")
         self.paint_method = paint_method
+        paint_ridge = kwargs.get("paint_ridge")
+        if paint_ridge is None:
+            paint_ridge = kwargs.get("paint-ridge", 1e-10)
+        self.paint_ridge = float(paint_ridge)
         self._cov_matrices = {}
         # cache samples and linear regression for determinant extrapolation
         self._cov_samples = {}
@@ -109,8 +111,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
 
     @classmethod
     def from_config(cls, cp, data_section="data", data=None, psds=None, **kwargs):
-        """
-        Adds additional keyword arguments based on config file.
+        """Adds additional keyword arguments based on config file.
 
         Additional keyword arguments are:
 
@@ -146,8 +147,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
 
     @BaseGaussianNoise.psds.setter
     def psds(self, psds):
-        """
-        Sets the psds, and calculates the weight and norm from them.
+        """Sets the psds, and calculates the weight and norm from them.
         The data and the low and high frequency cutoffs must be set first.
         """
         # check that the data has been set
@@ -189,8 +189,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
         self._overwhitened_data = self.whiten(self.data, 2, inplace=False)
 
     def _set_covfit(self, det):
-        """
-        Sets the fit function for estimating the covariance determinant.
+        """Sets the fit function for estimating the covariance determinant.
 
         This must be called after the PSDs have been set, otherwise a
         ValueError will be raised.
@@ -206,8 +205,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
         self._cov_regressions[det] = fit
 
     def logdet_fit(self, cov, p):
-        """
-        Construct a linear regression from a sample of truncated covariance
+        """Construct a linear regression from a sample of truncated covariance
         matrices.
 
         Returns the sample points used for linear fit generation as well as the
@@ -247,8 +245,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
 
     @BaseGaussianNoise.normalize.setter
     def normalize(self, normalize):
-        """
-        Clears the current stats if the normalization state is changed.
+        """Clears the current stats if the normalization state is changed.
 
         If normalize is set to True, the fit to the covariance determinant
         will be calculated if it hasn't yet and PSDs are set.
@@ -275,8 +272,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
         return lindex, rindex
 
     def det_lognorm(self, det, start_index=None, end_index=None):
-        """
-        Calculate the normalization term from the truncated covariance
+        """Calculate the normalization term from the truncated covariance
         matrix.
 
         Determinant is estimated using a linear fit to logdet vs truncated
@@ -306,20 +302,16 @@ class BaseGatedGaussian(BaseGaussianNoise):
         return -numpy.inf
 
     def _loglr(self):
-        r"""
-        Computes the log likelihood ratio.
-
+        r"""Computes the log likelihood ratio.
         Returns
         -------
         float
             The value of the log likelihood ratio evaluated at the given point.
-
         """
         return self._loglikelihood() - self._lognl()
 
     def whiten(self, data, whiten, inplace=False):
-        """
-        Whitens the given data.
+        """Whitens the given data.
 
         Parameters
         ----------
@@ -338,7 +330,6 @@ class BaseGatedGaussian(BaseGaussianNoise):
         dict :
             Dictionary of FrequencySeries after the requested whitening has
             been applied.
-
         """
         if not inplace:
             data = {det: d.copy() for det, d in data.items()}
@@ -354,14 +345,13 @@ class BaseGatedGaussian(BaseGaussianNoise):
         return data
 
     def invert_covariance(self, det):
-        """
-        Get the uninverted covariance matrix for the model's inverse PSDs.
+        """Get the uninverted covariance matrix for the model's inverse PSDs.
         Once the inverse matrix is calculated for a given gate time in this
         detector, store to cache; future calls of this function will pull from
         that cache instead.
         """
-        # don't bother with covariance matrix if we're using toeplitz solver
-        if self.paint_method == "toeplitz":
+        # don't bother with covariance matrix if we're using toeplitz or cholesky solver
+        if self.paint_method in ("toeplitz", "cholesky"):
             return None
         # check if there are cache results for this gate length
         lindex, rindex = self.gate_indices(det)
@@ -375,7 +365,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
         except KeyError:
             invpsd = self._invpsds[det]
             # construct and invert covariance matrix
-            invmat = invert_covariance(invpsd, lindex, rindex)
+            invmat = invert_covariance(invpsd, lindex, rindex, ridge=self.paint_ridge)
             cov_matrices[det] = invmat
             # cache results
             self._cov_matrices[int(rindex - lindex)] = cov_matrices
@@ -383,8 +373,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
 
     @abstractmethod
     def get_waveforms(self):
-        """
-        The waveforms generated using the current parameters.
+        """The waveforms generated using the current parameters.
 
         If the waveforms haven't been generated yet, they will be generated,
         resized to the same length as the data, and cached. If the
@@ -395,36 +384,30 @@ class BaseGatedGaussian(BaseGaussianNoise):
         -------
         dict :
             Dictionary of detector names -> waveforms
-
         """
 
     @abstractmethod
     def get_gated_waveforms(self):
-        """
-        Generates and gates waveforms using the current parameters.
+        """Generates and gates waveforms using the current parameters.
 
         Returns
         -------
         dict :
             Dictionary of detector names -> FrequencySeries.
-
         """
 
     def get_data(self):
-        """
-        Return a copy of the data.
+        """Return a copy of the data.
 
         Returns
         -------
         dict :
             Dictionary of detector names -> FrequencySeries.
-
         """
         return {det: d.copy() for det, d in self.data.items()}
 
     def get_gated_data(self):
-        """
-        Return a copy of the gated data.
+        """Return a copy of the gated data.
 
         The gated data will be cached for faster retrieval.
 
@@ -432,7 +415,6 @@ class BaseGatedGaussian(BaseGaussianNoise):
         -------
         dict :
             Dictionary of detector names -> FrequencySeries.
-
         """
         gate_times = self.get_gate_times()
         out = {}
@@ -458,6 +440,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
                     method="paint",
                     paint_method=self.paint_method,
                     paint_invmat=invmat,
+                    paint_ridge=self.paint_ridge,
                 )
                 dtilde = d.to_frequencyseries()
                 # save for next time
@@ -466,8 +449,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
         return out
 
     def get_gate_times(self):
-        """
-        Gets the time to apply a gate based on the current sky position.
+        """Gets the time to apply a gate based on the current sky position.
 
         If the parameter ``gatefunc`` is set to ``'hmeco'``, the gate times
         will be calculated based on the hybrid MECO of the given set of
@@ -483,7 +465,6 @@ class BaseGatedGaussian(BaseGaussianNoise):
         -------
         dict :
             Dictionary of detector names -> (gate start, gate width)
-
         """
         params = self.current_params
         try:
@@ -515,8 +496,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
         return gatetimes
 
     def _get_gate_times(self, gatestart, gateend, ra, dec):
-        """
-        Calculates the gate times in each detector.
+        """Calculates the gate times in each detector.
 
         Parameters
         ----------
@@ -533,7 +513,6 @@ class BaseGatedGaussian(BaseGaussianNoise):
         -------
         dict :
             Dictionary of detector names -> (gate start, gate width)
-
         """
         gatetimes = {}
         for det in self._invpsds:
@@ -548,14 +527,12 @@ class BaseGatedGaussian(BaseGaussianNoise):
         return gatetimes
 
     def get_gate_times_hmeco(self):
-        """
-        Gets the time to apply a gate based on the current sky position.
+        """Gets the time to apply a gate based on the current sky position.
 
         Returns
         -------
         dict :
             Dictionary of detector names -> (gate start, gate width)
-
         """
         # generate the template waveform
         wfs = self.get_waveforms()
@@ -589,8 +566,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
         return gatetimes
 
     def condition_number(self, det, lindex, rindex):
-        """
-        Calculate the condition number associated with the inverse
+        """Calculate the condition number associated with the inverse
         covariance matrix used to gate and inpaint. Throws a warning if the
         condition number is greater than 1e16.
 
@@ -608,7 +584,6 @@ class BaseGatedGaussian(BaseGaussianNoise):
         float :
             The condition number of the inverse covariance matrix constructed
             from the inverse PSD with the given gate length.
-
         """
         gate_idx_len = int(rindex - lindex)
         if gate_idx_len not in self._cond.keys():
@@ -660,6 +635,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
                 method="paint",
                 paint_method=self.paint_method,
                 paint_invmat=invmat,
+                paint_ridge=self.paint_ridge,
             )
             # convert to the frequency series
             gated_d = gated_dt.to_frequencyseries()
@@ -682,8 +658,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
 
     @staticmethod
     def _fd_data_from_strain_dict(opts, strain_dict, psd_strain_dict):
-        """
-        Wrapper around :py:func:`data_utils.fd_data_from_strain_dict`.
+        """Wrapper around :py:func:`data_utils.fd_data_from_strain_dict`.
 
         Ensures that if the PSD is estimated from data, the inverse spectrum
         truncation uses a Hann window. Sets the low frequency cutoff for the
@@ -705,8 +680,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
         return out
 
     def write_metadata(self, fp, group=None):
-        """
-        Adds writing the psds, and analyzed detectors.
+        """Adds writing the psds, and analyzed detectors.
 
         The analyzed detectors, their analysis segments, and the segments
         used for psd estimation are written as
@@ -723,7 +697,6 @@ class BaseGatedGaussian(BaseGaussianNoise):
             If provided, the metadata will be written to the attrs specified
             by group, i.e., to ``fp[group].attrs``. Otherwise, metadata is
             written to the top-level attrs (``fp.attrs``).
-
         """
         BaseDataModel.write_metadata(self, fp, group=group)
         attrs = fp.getattrs(group=group)
@@ -751,8 +724,7 @@ class BaseGatedGaussian(BaseGaussianNoise):
 
 
 class GatedGaussianNoise(BaseGatedGaussian):
-    r"""
-    Model that applies a time domain gate, assuming stationary Gaussian
+    r"""Model that applies a time domain gate, assuming stationary Gaussian
     noise.
 
     The gate start and end times are set by providing ``t_gate_start`` and
@@ -811,8 +783,7 @@ class GatedGaussianNoise(BaseGatedGaussian):
 
     @catch_waveform_error
     def _loglikelihood(self):
-        r"""
-        Computes the log likelihood after removing the power within the
+        r"""Computes the log likelihood after removing the power within the
         given time window,
 
         .. math::
@@ -825,7 +796,6 @@ class GatedGaussianNoise(BaseGatedGaussian):
         -------
         float
             The value of the log likelihood.
-
         """
         # generate the template waveform
         wfs = self.get_waveforms()
@@ -854,6 +824,7 @@ class GatedGaussianNoise(BaseGatedGaussian):
                 method="paint",
                 paint_method=self.paint_method,
                 paint_invmat=invmat,
+                paint_ridge=self.paint_ridge,
             )
             gated_rtilde = gated_res.to_frequencyseries()
             # overwhiten
@@ -864,10 +835,8 @@ class GatedGaussianNoise(BaseGatedGaussian):
 
     @property
     def _extra_stats(self):
-        """
-        Adds ``loglr``, plus ``cplx_loglr`` and ``optimal_snrsq`` in each
-        detector.
-        """
+        """Adds ``loglr``, plus ``cplx_loglr`` and ``optimal_snrsq`` in each
+        detector."""
         return ["loglr", "maxl_phase"] + [f"{det}_optimal_snrsq" for det in self._data]
 
     def _nowaveform_loglr(self):
@@ -882,8 +851,7 @@ class GatedGaussianNoise(BaseGatedGaussian):
 
     @property
     def multi_signal_support(self):
-        """
-        The list of classes that this model supports in a multi-signal
+        """The list of classes that this model supports in a multi-signal
         likelihood
         """
         return [type(self)]
@@ -941,6 +909,7 @@ class GatedGaussianNoise(BaseGatedGaussian):
                 method="paint",
                 paint_method=self.paint_method,
                 paint_invmat=invmat,
+                paint_ridge=self.paint_ridge,
             )
             h = ht.to_frequencyseries()
             out[det] = h
@@ -948,8 +917,7 @@ class GatedGaussianNoise(BaseGatedGaussian):
 
 
 class GatedGaussianMargPol(BaseGatedGaussian):
-    r"""
-    Gated gaussian model with numerical marginalization over polarization.
+    r"""Gated gaussian model with numerical marginalization over polarization.
 
     This implements the GatedGaussian likelihood with an explicit numerical
     marginalization over polarization angle. This is accomplished using
@@ -1039,6 +1007,7 @@ class GatedGaussianMargPol(BaseGatedGaussian):
                     method="paint",
                     paint_method=self.paint_method,
                     paint_invmat=invmat,
+                    paint_ridge=self.paint_ridge,
                 )
                 h = ht.to_frequencyseries()
                 pols.append(h)
@@ -1046,14 +1015,11 @@ class GatedGaussianMargPol(BaseGatedGaussian):
         return out
 
     def get_gate_times_hmeco(self):
-        """
-        Gets the time to apply a gate based on the current sky position.
-
+        """Gets the time to apply a gate based on the current sky position.
         Returns
         -------
         dict :
             Dictionary of detector names -> (gate start, gate width)
-
         """
         # generate the template waveform
         wfs = self.get_waveforms()
@@ -1095,8 +1061,7 @@ class GatedGaussianMargPol(BaseGatedGaussian):
 
     @catch_waveform_error
     def _loglikelihood(self):
-        r"""
-        Computes the log likelihood after removing the power within the
+        r"""Computes the log likelihood after removing the power within the
         given time window,
 
         .. math::
@@ -1109,7 +1074,6 @@ class GatedGaussianMargPol(BaseGatedGaussian):
         -------
         float
             The value of the log likelihood.
-
         """
         # generate the template waveform
         wfs = self.get_waveforms()
@@ -1178,8 +1142,7 @@ class GatedGaussianMargPol(BaseGatedGaussian):
 
     @property
     def multi_signal_support(self):
-        """
-        The list of classes that this model supports in a multi-signal
+        """The list of classes that this model supports in a multi-signal
         likelihood
         """
         return [type(self)]
@@ -1214,8 +1177,7 @@ class GatedGaussianMargPol(BaseGatedGaussian):
 
 
 class GatedGaussianMargPhase(BaseGatedGaussian):
-    r"""
-    Gated Gaussian noise model that analytically marginalizes over the
+    r"""Gated Gaussian noise model that analytically marginalizes over the
     phase of a signal.
 
     The phase to be marginalized over is specified by the user using the
@@ -1342,6 +1304,7 @@ class GatedGaussianMargPhase(BaseGatedGaussian):
                 method="paint",
                 paint_method=self.paint_method,
                 paint_invmat=invmat,
+                paint_ridge=self.paint_ridge,
             )
             hst = hst.gate(
                 gatestartdelay + dgatedelay / 2,
@@ -1351,6 +1314,7 @@ class GatedGaussianMargPhase(BaseGatedGaussian):
                 method="paint",
                 paint_method=self.paint_method,
                 paint_invmat=invmat,
+                paint_ridge=self.paint_ridge,
             )
             hc = hct.to_frequencyseries()
             hs = hst.to_frequencyseries()
@@ -1433,8 +1397,7 @@ class GatedGaussianMargPhase(BaseGatedGaussian):
 
     @property
     def multi_signal_support(self):
-        """
-        The list of classes that this model supports in a multi-signal
+        """The list of classes that this model supports in a multi-signal
         likelihood
         """
         return [type(self)]
@@ -1459,8 +1422,7 @@ class GatedGaussianMargPhase(BaseGatedGaussian):
 
 
 class GatedGaussianMultimodeMargPhase(BaseGatedGaussian):
-    r"""
-    Gated Gaussian noise model that analytically marginalizes over the
+    r"""Gated Gaussian noise model that analytically marginalizes over the
     phase of a signal.
 
     The phase to be marginalized over is specified by the user using the
@@ -1596,8 +1558,7 @@ class GatedGaussianMultimodeMargPhase(BaseGatedGaussian):
 
     @classmethod
     def from_config(cls, cp, data_section="data", data=None, psds=None, **kwargs):
-        """
-        Adds additional keyword arguments based on config file.
+        """Adds additional keyword arguments based on config file.
 
         Additional keyword arguments are:
 
@@ -1703,10 +1664,8 @@ class GatedGaussianMultimodeMargPhase(BaseGatedGaussian):
         ]
 
     def _snr_scale_factor(self, wfs, gated_wfs, mode, snr=None):
-        """
-        Compute scale factor to get the desired network SNR given a set of
-        waveforms.
-        """
+        """Compute scale factor to get the desired network SNR given a set of
+        waveforms."""
         if snr is None:
             return 1.0
         thismode = {det: wfs[det][mode] for det in self.det_names}
@@ -1834,8 +1793,7 @@ class GatedGaussianMultimodeMargPhase(BaseGatedGaussian):
 
     @property
     def multi_signal_support(self):
-        """
-        The list of classes that this model supports in a multi-signal
+        """The list of classes that this model supports in a multi-signal
         likelihood
         """
         return [type(self)]

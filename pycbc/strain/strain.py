@@ -164,6 +164,7 @@ def detect_loud_glitches(
         psd,
         int(psd_duration * strain.sample_rate),
         low_frequency_cutoff=low_freq_cutoff,
+        high_frequency_cutoff=high_freq_cutoff,
         trunc_method="hann",
     )
     kmin = int(low_freq_cutoff / psd.delta_f)
@@ -410,11 +411,24 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
     else:
         raise ValueError(f"Unrecognized precision {precision}")
 
+    invpsd_gating = None
+
+    def _get_gating_invpsd():
+        nonlocal invpsd_gating
+        if invpsd_gating is None:
+            flow = getattr(opt, "strain_high_pass", 20.0) or 20.0
+            psd_seg_len = min(16.0, max(2.0, strain.duration / 4.0))
+            invpsd_gating = 1.0 / strain.filter_psd(psd_seg_len, strain.delta_f, flow)
+        return invpsd_gating
+
     if opt.gating_file is not None:
         logger.info("Gating times contained in gating file")
         gate_params = numpy.loadtxt(opt.gating_file)
         if len(gate_params.shape) == 1:
             gate_params = [gate_params]
+        paint_m = getattr(opt, "paint_method", "cholesky")
+        paint_r = getattr(opt, "paint_ridge", 1e-3)
+        invpsd = _get_gating_invpsd() if opt.gating_method == "paint" else None
         for gate_time, gate_window, gate_taper in gate_params:
             strain = strain.gate(
                 gate_time,
@@ -422,6 +436,9 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
                 method=opt.gating_method,
                 copy=False,
                 taper_width=gate_taper,
+                invpsd=invpsd,
+                paint_method=paint_m,
+                paint_ridge=paint_r,
             )
         gating_info["file"] = [
             gp
@@ -431,6 +448,9 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
         ]
 
     if opt.autogating_threshold is not None:
+        paint_m = getattr(opt, "paint_method", "cholesky")
+        paint_r = getattr(opt, "paint_ridge", 1e-3)
+        invpsd = _get_gating_invpsd() if opt.gating_method == "paint" else None
         gating_info["auto"] = []
         for _ in range(opt.autogating_max_iterations):
             glitch_times = detect_loud_glitches(
@@ -451,6 +471,9 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
                     method=opt.gating_method,
                     copy=False,
                     taper_width=gate_taper,
+                    invpsd=invpsd,
+                    paint_method=paint_m,
+                    paint_ridge=paint_r,
                 )
             if len(glitch_times) > 0:
                 logger.info(
@@ -818,6 +841,19 @@ def insert_strain_option_group(parser, gps_times=True):
         default="taper",
         help="Choose the method for gating. Default: `taper`",
         choices=["hard", "taper", "paint"],
+    )
+    data_reading_group.add_argument(
+        "--paint-method",
+        type=str,
+        default="cholesky",
+        choices=["cholesky", "toeplitz", "matmul"],
+        help="Solver method for inpainting. Default: `cholesky`",
+    )
+    data_reading_group.add_argument(
+        "--paint-ridge",
+        type=float,
+        default=1e-3,
+        help="Diagonal regularization ridge parameter for inpainting. Default: 1e-3",
     )
     # Optional
     data_reading_group.add_argument(
@@ -1246,6 +1282,24 @@ def insert_strain_option_group_multi_ifo(parser, gps_times=True):
         help="Choose the method for gating. Default: `taper`",
         choices=["hard", "taper", "paint"],
     )
+    data_reading_group_multi.add_argument(
+        "--paint-method",
+        type=str,
+        nargs="+",
+        action=MultiDetOptionAction,
+        default="cholesky",
+        choices=["cholesky", "toeplitz", "matmul"],
+        help="Solver method for inpainting. Default: `cholesky`",
+    )
+    data_reading_group_multi.add_argument(
+        "--paint-ridge",
+        type=float,
+        nargs="+",
+        action=MultiDetOptionAction,
+        default=1e-3,
+        metavar="IFO:RIDGE",
+        help="Diagonal regularization ridge parameter for inpainting. Default: 1e-3",
+    )
 
     # Optional
     data_reading_group_multi.add_argument(
@@ -1428,12 +1482,16 @@ class StrainSegments:
         filter_inj_only=False,
         injection_window=None,
         allow_zero_padding=False,
+        inpaint_edges=False,
+        merge_injection_windows=False,
     ):
         """
         Determine how to chop up the strain data into smaller segments
         for analysis.
         """
         self._fourier_segments = None
+        self._inpaint_invpsd = None
+        self.inpaint_edges = inpaint_edges
         self.strain = strain
 
         self.delta_t = strain.delta_t
@@ -1528,19 +1586,24 @@ class StrainSegments:
         # Remove segments that are outside trig start and end
         segment_slices_red = []
         analyze_slices_red = []
+        analyze_windows_red = []
+        analyze_injections_red = []
         trig_start_idx = (trigger_start - int(strain.start_time)) * strain.sample_rate
         trig_end_idx = (trigger_end - int(strain.start_time)) * strain.sample_rate
 
-        if filter_inj_only and hasattr(strain, "injections"):
+        filter_injections = (
+            filter_inj_only or injection_window is not None
+        ) and hasattr(strain, "injections")
+        if filter_injections:
             end_times = strain.injections.end_times()
-            end_times = [
-                time
-                for time in end_times
+            inj_rows = [
+                row
+                for row, time in enumerate(end_times)
                 if float(time) < trigger_end and float(time) > trigger_start
             ]
             inj_idx = [
-                (float(time) - float(strain.start_time)) * strain.sample_rate
-                for time in end_times
+                (float(end_times[row]) - float(strain.start_time)) * strain.sample_rate
+                for row in inj_rows
             ]
 
         for seg, ana in zip(self.segment_slices, self.analyze_slices):
@@ -1557,24 +1620,97 @@ class StrainSegments:
             if trig_end_idx < cum_end:
                 stop -= cum_end - trig_end_idx
 
-            if filter_inj_only and hasattr(strain, "injections"):
+            if filter_injections:
                 analyze_this = False
-                inj_window = strain.sample_rate * 8
-                for inj_id in inj_idx:
-                    if inj_id < (cum_end + inj_window) and inj_id > (
-                        cum_start - inj_window
-                    ):
+                inj_pad = int(
+                    (injection_window if injection_window is not None else 8)
+                    * strain.sample_rate
+                )
+                matching_injs = []
+                matching_rows = []
+                for inj_row, inj_id in zip(inj_rows, inj_idx):
+                    if (cum_start - inj_pad) < inj_id < (cum_end + inj_pad):
                         analyze_this = True
+                        matching_injs.append(inj_id)
+                        matching_rows.append(inj_row)
 
                 if not analyze_this:
+                    continue
+
+                if injection_window is not None and matching_injs:
+                    win_points = int(injection_window * strain.sample_rate)
+                    windows = []
+                    per_injection = []
+                    for inj_row, inj_id in zip(matching_rows, matching_injs):
+                        inj_pos = int(inj_id - seg.start)
+                        w_start = max(start, inj_pos - win_points)
+                        w_stop = min(stop, inj_pos + win_points)
+                        if w_start < w_stop:
+                            windows.append([w_start, w_stop])
+                            per_injection.append(
+                                (int(w_start), int(w_stop), int(inj_row))
+                            )
+
+                    if not windows:
+                        continue
+
+                    # Merge overlapping windows
+                    windows.sort(key=lambda x: x[0])
+                    merged_windows = [windows[0]]
+                    for cur in windows[1:]:
+                        prev = merged_windows[-1]
+                        if cur[0] <= prev[1]:
+                            prev[1] = max(prev[1], cur[1])
+                        else:
+                            merged_windows.append(cur)
+
+                    if merge_injection_windows:
+                        segment_slices_red.append(seg)
+                        analyze_slices_red.append(slice(start, stop))
+                        analyze_windows_red.append(
+                            [(int(a), int(b)) for a, b in merged_windows]
+                        )
+                        analyze_injections_red.append(per_injection)
+                        continue
+                    for w_start, w_stop in merged_windows:
+                        segment_slices_red.append(seg)
+                        analyze_slices_red.append(slice(w_start, w_stop))
+                        analyze_windows_red.append(None)
+                        analyze_injections_red.append(None)
                     continue
 
             if start < stop:
                 segment_slices_red.append(seg)
                 analyze_slices_red.append(slice(start, stop))
+                analyze_windows_red.append(None)
+                analyze_injections_red.append(None)
 
         self.segment_slices = segment_slices_red
         self.analyze_slices = analyze_slices_red
+        self.analyze_windows = analyze_windows_red
+        self.analyze_injections = analyze_injections_red
+
+    def _get_inpaint_invpsd(self):
+        if self._inpaint_invpsd is None:
+            psd_seg_len = min(16.0, max(2.0, self.strain.duration / 4.0))
+            psd_raw = self.strain.filter_psd(psd_seg_len, self.delta_f, 20.0)
+            freqs = psd_raw.sample_frequencies.numpy()
+            f_low = 20.0
+            f_taper = 4.0
+            f_start = max(0.0, f_low - f_taper)
+            taper = numpy.ones(len(freqs), dtype=numpy.float64)
+            taper[freqs < f_start] = 0.0
+            mid = (freqs >= f_start) & (freqs < f_low)
+            if numpy.any(mid):
+                taper[mid] = 0.5 * (
+                    1.0 - numpy.cos(numpy.pi * (freqs[mid] - f_start) / f_taper)
+                )
+            psd_vals = numpy.maximum(psd_raw.numpy(), 1e-60)
+            inv_vals = numpy.where(taper > 0, taper / psd_vals, 0.0)
+            self._inpaint_invpsd = FrequencySeries(inv_vals, delta_f=self.delta_f)
+            if hasattr(self.strain, "precision") and self.strain.precision == "single":
+                self._inpaint_invpsd = self._inpaint_invpsd.astype(numpy.float32)
+        return self._inpaint_invpsd
 
     def fourier_segments(self):
         """
@@ -1587,20 +1723,74 @@ class StrainSegments:
         """
         if not self._fourier_segments:
             self._fourier_segments = []
-            for seg_slice, ana in zip(self.segment_slices, self.analyze_slices):
-                if seg_slice.start >= 0 and seg_slice.stop <= len(self.strain):
-                    freq_seg = make_frequency_series(self.strain[seg_slice])
-                # Assume that we cannot have a case where we both zero-pad on
-                # both sides
-                elif seg_slice.start < 0:
-                    strain_chunk = self.strain[: seg_slice.stop]
-                    strain_chunk.prepend_zeros(-seg_slice.start)
-                    freq_seg = make_frequency_series(strain_chunk)
-                elif seg_slice.stop > len(self.strain):
-                    strain_chunk = self.strain[seg_slice.start :]
-                    strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
-                    freq_seg = make_frequency_series(strain_chunk)
+            cached_freq_segs = {}
+            from collections import Counter
+
+            slice_counts = Counter((s.start, s.stop) for s in self.segment_slices)
+            windows = getattr(self, "analyze_windows", None) or [None] * len(
+                self.segment_slices
+            )
+            injections = getattr(self, "analyze_injections", None) or [None] * len(
+                self.segment_slices
+            )
+            for seg_slice, ana, wins, injs in zip(
+                self.segment_slices, self.analyze_slices, windows, injections
+            ):
+                key = (seg_slice.start, seg_slice.stop)
+                if key in cached_freq_segs:
+                    freq_seg = cached_freq_segs[key].copy()
+                else:
+                    if seg_slice.start >= 0 and seg_slice.stop <= len(self.strain):
+                        base_seg = make_frequency_series(self.strain[seg_slice])
+                    # Assume that we cannot have a case where we both zero-pad on
+                    # both sides
+                    elif seg_slice.start < 0:
+                        strain_chunk = self.strain[: seg_slice.stop]
+                        strain_chunk.prepend_zeros(-seg_slice.start)
+                        if self.inpaint_edges and not getattr(
+                            self.strain, "_is_overwhitened", False
+                        ):
+                            from pycbc.strain.gate import gate_and_paint
+
+                            invpsd = self._get_inpaint_invpsd()
+                            gate_and_paint(
+                                strain_chunk,
+                                0,
+                                -seg_slice.start,
+                                invpsd,
+                                copy=False,
+                                method="toeplitz",
+                                ridge=1e-3,
+                            )
+                        base_seg = make_frequency_series(strain_chunk)
+                    elif seg_slice.stop > len(self.strain):
+                        orig_len = len(self.strain) - seg_slice.start
+                        strain_chunk = self.strain[seg_slice.start :]
+                        strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
+                        if self.inpaint_edges and not getattr(
+                            self.strain, "_is_overwhitened", False
+                        ):
+                            from pycbc.strain.gate import gate_and_paint
+
+                            invpsd = self._get_inpaint_invpsd()
+                            gate_and_paint(
+                                strain_chunk,
+                                orig_len,
+                                len(strain_chunk),
+                                invpsd,
+                                copy=False,
+                                method="toeplitz",
+                                ridge=1e-3,
+                            )
+                        base_seg = make_frequency_series(strain_chunk)
+                    if slice_counts[key] > 1:
+                        cached_freq_segs[key] = base_seg
+                        freq_seg = base_seg.copy()
+                    else:
+                        freq_seg = base_seg
                 freq_seg.analyze = ana
+                freq_seg.analyze_windows = wins
+                freq_seg.analyze_injections = injs
                 freq_seg.cumulative_index = seg_slice.start + ana.start
                 freq_seg.seg_slice = seg_slice
                 self._fourier_segments.append(freq_seg)
@@ -1623,6 +1813,8 @@ class StrainSegments:
             filter_inj_only=opt.filter_inj_only,
             injection_window=opt.injection_window,
             allow_zero_padding=opt.allow_zero_padding,
+            inpaint_edges=getattr(opt, "inpaint_edges", False),
+            merge_injection_windows=getattr(opt, "merge_injection_windows", False),
         )
 
     @classmethod
@@ -1668,6 +1860,12 @@ class StrainSegments:
             help="Allow for zero padding of data to "
             "analyze requested times, if needed.",
         )
+        segment_group.add_argument(
+            "--inpaint-edges",
+            action="store_true",
+            help="Use regularized Toeplitz edge inpainting on "
+            "zero-padded segment boundaries.",
+        )
         # Injection optimization options
         segment_group.add_argument(
             "--filter-inj-only",
@@ -1702,7 +1900,10 @@ class StrainSegments:
             trigger_start=opt.trig_start_time[ifo],
             trigger_end=opt.trig_end_time[ifo],
             filter_inj_only=opt.filter_inj_only,
+            injection_window=getattr(opt, "injection_window", None),
             allow_zero_padding=opt.allow_zero_padding,
+            inpaint_edges=getattr(opt, "inpaint_edges", False),
+            merge_injection_windows=getattr(opt, "merge_injection_windows", False),
         )
 
     @classmethod
@@ -1775,9 +1976,22 @@ class StrainSegments:
             "requested times, if needed.",
         )
         segment_group.add_argument(
+            "--inpaint-edges",
+            action="store_true",
+            help="Use regularized Toeplitz edge inpainting on "
+            "zero-padded segment boundaries.",
+        )
+        segment_group.add_argument(
             "--filter-inj-only",
             action="store_true",
             help="Analyze only segments that contain an injection.",
+        )
+        segment_group.add_argument(
+            "--injection-window",
+            default=None,
+            type=float,
+            metavar="WINDOW",
+            help="Window to analyze in seconds around an injection.",
         )
 
     required_opts_list = [
@@ -1957,6 +2171,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         max_buffer,
         sample_rate,
         low_frequency_cutoff=20,
+        high_frequency_cutoff=None,
         highpass_frequency=15.0,
         highpass_reduction=200.0,
         highpass_bandwidth=5.0,
@@ -2082,6 +2297,9 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         )
 
         self.low_frequency_cutoff = low_frequency_cutoff
+        if high_frequency_cutoff is None:
+            high_frequency_cutoff = 0.9 * (sample_rate / 2.0)
+        self.high_frequency_cutoff = high_frequency_cutoff
 
         # Set up status buffers
         self.analyze_flags = analyze_flags
@@ -2353,6 +2571,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                     psdt,
                     int(self.sample_rate * self.psd_inverse_length),
                     low_frequency_cutoff=self.low_frequency_cutoff,
+                    high_frequency_cutoff=self.high_frequency_cutoff,
                 )
                 psdt._delta_f = fseries.delta_f
 
@@ -2361,6 +2580,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                     psd,
                     int(self.sample_rate * self.psd_inverse_length),
                     low_frequency_cutoff=self.low_frequency_cutoff,
+                    high_frequency_cutoff=self.high_frequency_cutoff,
                 )
 
                 psd.psdt = psdt
@@ -2614,6 +2834,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
             idq_threshold=args.idq_threshold,
             sample_rate=args.sample_rate,
             low_frequency_cutoff=args.low_frequency_cutoff,
+            high_frequency_cutoff=getattr(args, "high_frequency_cutoff", None),
             highpass_frequency=args.highpass_frequency,
             highpass_reduction=args.highpass_reduction,
             highpass_bandwidth=args.highpass_bandwidth,
