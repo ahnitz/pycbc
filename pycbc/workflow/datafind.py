@@ -88,7 +88,7 @@ def setup_datafind_workflow(workflow, scienceSegs, outputDir, seg_file=None, tag
         FIXME: Filenames may not be unique with current codes!
 
     Returns
-    -------
+    --------
     datafindOuts : OutGroupList
         List of all the datafind output files for use later in the pipeline.
     sci_avlble_file : SegFile
@@ -102,7 +102,6 @@ def setup_datafind_workflow(workflow, scienceSegs, outputDir, seg_file=None, tag
     sci_avlble_name : string
         The name with which the analysable time is stored in the
         sci_avlble_file.
-
     """
     if tags is None:
         tags = []
@@ -154,7 +153,7 @@ def setup_datafind_workflow(workflow, scienceSegs, outputDir, seg_file=None, tag
     elif datafind_method == "FROM_PREGENERATED_LCF_FILES":
         ifos = scienceSegs.keys()
         datafindcaches, datafindouts = setup_datafind_from_pregenerated_lcf_files(
-            cp, ifos, outputDir, tags=tags
+            cp, ifos, outputDir, tags=tags, scienceSegs=scienceSegs
         )
     else:
         msg = """Entry datafind-method in [workflow-datafind] does not have "
@@ -391,7 +390,7 @@ def setup_datafind_runtime_cache_multi_calls_perifo(
     themselves.)
 
     Parameters
-    ----------
+    -----------
     cp : ConfigParser.ConfigParser instance
         This contains a representation of the information stored within the
         workflow configuration files
@@ -409,7 +408,7 @@ def setup_datafind_runtime_cache_multi_calls_perifo(
         FIXME: Filenames may not be unique with current codes!
 
     Returns
-    -------
+    --------
     datafindcaches : list of glue.lal.Cache instances
        The glue.lal.Cache representations of the various calls to the datafind
        server and the returned frame files.
@@ -482,7 +481,7 @@ def setup_datafind_runtime_cache_single_call_perifo(
     themselves.)
 
     Parameters
-    ----------
+    -----------
     cp : ConfigParser.ConfigParser instance
         This contains a representation of the information stored within the
         workflow configuration files
@@ -500,7 +499,7 @@ def setup_datafind_runtime_cache_single_call_perifo(
         FIXME: Filenames may not be unique with current codes!
 
     Returns
-    -------
+    --------
     datafindcaches : list of glue.lal.Cache instances
        The glue.lal.Cache representations of the various calls to the datafind
        server and the returned frame files.
@@ -586,7 +585,7 @@ def setup_datafind_runtime_frames_single_call_perifo(
     files as input.
 
     Parameters
-    ----------
+    -----------
     cp : ConfigParser.ConfigParser instance
         This contains a representation of the information stored within the
         workflow configuration files
@@ -604,7 +603,7 @@ def setup_datafind_runtime_frames_single_call_perifo(
         FIXME: Filenames may not be unique with current codes!
 
     Returns
-    -------
+    --------
     datafindcaches : list of glue.lal.Cache instances
        The glue.lal.Cache representations of the various calls to the datafind
        server and the returned frame files.
@@ -638,7 +637,7 @@ def setup_datafind_runtime_frames_multi_calls_perifo(
     files as input.
 
     Parameters
-    ----------
+    -----------
     cp : ConfigParser.ConfigParser instance
         This contains a representation of the information stored within the
         workflow configuration files
@@ -656,7 +655,7 @@ def setup_datafind_runtime_frames_multi_calls_perifo(
         FIXME: Filenames may not be unique with current codes!
 
     Returns
-    -------
+    --------
     datafindcaches : list of glue.lal.Cache instances
        The glue.lal.Cache representations of the various calls to the datafind
        server and the returned frame files.
@@ -673,13 +672,15 @@ def setup_datafind_runtime_frames_multi_calls_perifo(
     return datafindcaches, datafindouts
 
 
-def setup_datafind_from_pregenerated_lcf_files(cp, ifos, outputDir, tags=None):
+def setup_datafind_from_pregenerated_lcf_files(
+    cp, ifos, outputDir, tags=None, scienceSegs=None
+):
     """
     This function is used if you want to run with pregenerated lcf frame
     cache files.
 
     Parameters
-    ----------
+    -----------
     cp : ConfigParser.ConfigParser instance
         This contains a representation of the information stored within the
         workflow configuration files
@@ -696,13 +697,12 @@ def setup_datafind_from_pregenerated_lcf_files(cp, ifos, outputDir, tags=None):
         the Files and uniqueify the actual filename.
 
     Returns
-    -------
+    --------
     datafindcaches : list of glue.lal.Cache instances
        The glue.lal.Cache representations of the various calls to the datafind
        server and the returned frame files.
     datafindOuts : pycbc.workflow.core.FileList
         List of all the datafind output files for use later in the pipeline.
-
     """
     from glue import lal
 
@@ -718,6 +718,14 @@ def setup_datafind_from_pregenerated_lcf_files(cp, ifos, outputDir, tags=None):
         curr_cache = lal.Cache.fromfilenames(
             [frame_cache_file_name], coltype=lal.LIGOTimeGPS
         )
+        if scienceSegs and ifo in scienceSegs:
+            curr_cache = lal.Cache(
+                [
+                    entry
+                    for entry in curr_cache
+                    if scienceSegs[ifo].intersects_segment(entry.segment)
+                ]
+            )
         curr_cache.ifo = ifo
         datafindcaches.append(curr_cache)
     datafindouts = convert_cachelist_to_filelist(datafindcaches)
@@ -731,15 +739,14 @@ def convert_cachelist_to_filelist(datafindcache_list):
     containing all frames within those caches.
 
     Parameters
-    ----------
+    -----------
     datafindcache_list : list of glue.lal.Cache objects
         The list of cache files to convert.
 
     Returns
-    -------
+    --------
     datafind_filelist : FileList of frame File objects
         The list of frame files.
-
     """
     prev_file = None
     prev_name = None
@@ -809,10 +816,9 @@ def get_science_segs_from_datafind_outs(datafindcaches):
         List of all the datafind output files.
 
     Returns
-    -------
+    --------
     newScienceSegs : Dictionary of ifo keyed igwn_segments.segmentlist instances
         The times covered by the frames found in datafindOuts.
-
     """
     newScienceSegs = {}
     for cache in datafindcaches:
@@ -834,17 +840,16 @@ def get_missing_segs_from_frame_file_cache(datafindcaches):
     then be used to update the science times if needed.
 
     Parameters
-    ----------
+    -----------
     datafindcaches : OutGroupList
         List of all the datafind output files.
 
     Returns
-    -------
+    --------
     missingFrameSegs : Dict. of ifo keyed igwn_segments.segmentlist instances
         The times corresponding to missing frames found in datafindOuts.
     missingFrames: Dict. of ifo keyed lal.Cache instances
         The list of missing frames
-
     """
     from glue import lal
 
@@ -882,17 +887,16 @@ def get_segment_summary_times(scienceFile, segmentName):
     for the flag given by segmentName.
 
     Parameters
-    ----------
+    -----------
     scienceFile : SegFile
         The segment file that we want to use to determine this.
     segmentName : string
         The DQ flag to search for times in the segment_summary table.
 
     Returns
-    -------
+    ---------
     summSegList : igwn_segments.segmentlist
         The times that are covered in the segment summary table.
-
     """
     # Parse the segmentName
     segmentName = segmentName.split(":")
@@ -971,7 +975,7 @@ def run_datafind_instance(
         FIXME: Filenames may not be unique with current codes!
 
     Returns
-    -------
+    --------
     dfCache : glue.lal.Cache instance
        The glue.lal.Cache representation of the call to the datafind
        server and the returned frame files.
@@ -1099,8 +1103,7 @@ def log_datafind_command(
 
 
 def datafind_keep_unique_backups(backup_outs, orig_outs):
-    """
-    This function will take a list of backup datafind files, presumably
+    """This function will take a list of backup datafind files, presumably
     obtained by querying a remote datafind server, e.g. CIT, and compares
     these against a list of original datafind files, presumably obtained by
     querying the local datafind server. Only the datafind files in the backup
@@ -1108,17 +1111,16 @@ def datafind_keep_unique_backups(backup_outs, orig_outs):
     to use only files that are missing from the local cluster.
 
     Parameters
-    ----------
+    -----------
     backup_outs : FileList
         List of datafind files from the remote datafind server.
     orig_outs : FileList
         List of datafind files from the local datafind server.
 
     Returns
-    -------
+    --------
     FileList
         List of datafind files in backup_outs and not in orig_outs.
-
     """
     # NOTE: This function is not optimized and could be made considerably
     #       quicker if speed becomes in issue. With 4s frame files this might

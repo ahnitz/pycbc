@@ -153,6 +153,8 @@ class PyCBCFindSnglsExecutable(Executable):
         segs = trig_files.get_times_covered_by_files()
         seg = segments.segment(segs[0][0], segs[-1][1])
         node = Node(self)
+        if self.ifo_list and len(self.ifo_list) == 1 and "--ifo" not in node._options:
+            node.add_opt("--ifo", self.ifo_list[0])
         node.add_input_opt("--template-bank", bank_file)
         node.add_input_list_opt("--trigger-files", trig_files)
         if len(stat_files) > 0:
@@ -334,10 +336,8 @@ class PyCBCAddStatmap(PyCBCCombineStatmap):
 
 
 class PyCBCExcludeZerolag(Executable):
-    """
-    Remove times of zerolag coincidences of all types from exclusive
-    background
-    """
+    """Remove times of zerolag coincidences of all types from exclusive
+    background"""
 
     current_retention_level = Executable.MERGED_TRIGGERS
 
@@ -385,17 +385,36 @@ def merge_single_detector_hdf_files(
         tags = []
     make_analysis_dir(out_dir)
     out = FileList()
-    for ifo in workflow.ifos:
+    if workflow.cp.has_option(
+        "workflow-coincidence", "single-merge-file"
+    ) or workflow.cp.has_option("workflow-coincidence", "multi-detector-merge"):
         node = MergeExecutable(
-            workflow.cp, "hdf_trigger_merge", ifos=ifo, out_dir=out_dir, tags=tags
+            workflow.cp,
+            "hdf_trigger_merge",
+            ifos=workflow.ifos,
+            out_dir=out_dir,
+            tags=tags,
         ).create_node()
         node.add_input_opt("--bank-file", bank_file)
-        node.add_input_list_opt(
-            "--trigger-files", trigger_files.find_output_with_ifo(ifo)
-        )
+        unique_trigs = FileList(list(dict.fromkeys(trigger_files)))
+        node.add_input_list_opt("--trigger-files", unique_trigs)
         node.new_output_file_opt(workflow.analysis_time, ".hdf", "--output-file")
         workflow += node
         out += node.output_files
+    else:
+        for ifo in workflow.ifos:
+            node = MergeExecutable(
+                workflow.cp, "hdf_trigger_merge", ifos=ifo, out_dir=out_dir, tags=tags
+            ).create_node()
+            node.add_input_opt("--bank-file", bank_file)
+            if "--ifo" not in node._options:
+                node.add_opt("--ifo", ifo)
+            node.add_input_list_opt(
+                "--trigger-files", trigger_files.find_output_with_ifo(ifo)
+            )
+            node.new_output_file_opt(workflow.analysis_time, ".hdf", "--output-file")
+            workflow += node
+            out += node.output_files
     return out
 
 
@@ -406,9 +425,10 @@ def setup_trigger_fitting(
         return FileList()
     smoothed_fit_files = FileList()
     for i in workflow.ifos:
-        ifo_insp = [insp for insp in insps if (insp.ifo == i)]
-        assert len(ifo_insp) == 1
-        ifo_insp = ifo_insp[0]
+        ifo_insp_list = insps.find_output_with_ifo(i)
+        if not ifo_insp_list:
+            continue
+        ifo_insp = ifo_insp_list[0]
         raw_exe = PyCBCFitByTemplateExecutable(
             workflow.cp, "fit_by_template", ifos=i, out_dir=output_dir, tags=tags
         )
@@ -556,12 +576,12 @@ def setup_interval_coinc_inj(
     )
 
     ifiles = {}
-    for ifo, ifi in zip(*inj_trig_files.categorize_by_attr("ifo")):
-        ifiles[ifo] = ifi[0]
+    for f in inj_trig_files:
+        for ifo in f.ifo_list:
+            if ifo not in ifiles:
+                ifiles[ifo] = f
 
-    injinj_files = FileList()
-    for ifo in ifiles:  # ifiles is keyed on ifo
-        injinj_files.append(ifiles[ifo])
+    injinj_files = FileList(list(dict.fromkeys(ifiles.values())))
 
     findcoinc_exe = PyCBCFindCoincExecutable(
         workflow.cp,
@@ -619,7 +639,10 @@ def setup_interval_coinc(
     make_analysis_dir(out_dir)
     logger.info("Setting up coincidence")
 
-    ifos, _ = trig_files.categorize_by_attr("ifo")
+    try:
+        ifos, _ = trig_files.categorize_by_attr("ifo")
+    except (ValueError, AttributeError, TypeError):
+        ifos = sorted(list({ifo for f in trig_files for ifo in f.ifo_list}))
     findcoinc_exe = PyCBCFindCoincExecutable(
         workflow.cp, "coinc", ifos=ifos, tags=tags, out_dir=out_dir
     )
@@ -658,12 +681,26 @@ def setup_interval_coinc(
 
 
 def setup_sngls(
-    workflow, hdfbank, trig_files, stat_files, veto_file, veto_name, out_dir, tags=None
+    workflow,
+    hdfbank,
+    trig_files,
+    stat_files,
+    veto_file,
+    veto_name,
+    out_dir,
+    tags=None,
+    ifo=None,
 ):
     """
     This function sets up getting statistic values for single-detector triggers
     """
-    ifos, _ = trig_files.categorize_by_attr("ifo")
+    if ifo is not None:
+        ifos = [ifo]
+    else:
+        try:
+            ifos, _ = trig_files.categorize_by_attr("ifo")
+        except (ValueError, AttributeError, TypeError):
+            ifos = sorted(list({ifo for f in trig_files for ifo in f.ifo_list}))
     findsngls_exe = PyCBCFindSnglsExecutable(
         workflow.cp, "sngls", ifos=ifos, tags=tags, out_dir=out_dir
     )
@@ -708,12 +745,19 @@ def setup_sngls_inj(
     veto_name,
     out_dir,
     tags=None,
+    ifo=None,
 ):
     """
     This function sets up getting statistic values for single-detector triggers
     from injections
     """
-    ifos, _ = inj_trig_files.categorize_by_attr("ifo")
+    if ifo is not None:
+        ifos = [ifo]
+    else:
+        try:
+            ifos, _ = inj_trig_files.categorize_by_attr("ifo")
+        except (ValueError, AttributeError, TypeError):
+            ifos = sorted(list({ifo for f in inj_trig_files for ifo in f.ifo_list}))
     findsnglsinj_exe = PyCBCFindSnglsExecutable(
         workflow.cp, "sngls", ifos=ifos, tags=tags, out_dir=out_dir
     )
@@ -754,9 +798,10 @@ def select_files_by_ifo_combination(ifocomb, insps):
     This function selects single-detector files ('insps') for a given ifo combination
     """
     inspcomb = FileList()
-    for ifo, ifile in zip(*insps.categorize_by_attr("ifo")):
-        if ifo in ifocomb:
-            inspcomb += ifile
+    for f in insps:
+        if any(ifo in ifocomb for ifo in f.ifo_list):
+            if f not in inspcomb:
+                inspcomb.append(f)
 
     return inspcomb
 

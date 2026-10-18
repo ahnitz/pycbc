@@ -34,6 +34,7 @@ from pycbc.io import HFile
 
 def calculate_time_slide_duration(pifo_segments, fifo_segments, offset=0):
     """Returns the amount of coincident time between two segmentlists."""
+
     # dertermine how much coincident time
     overlap = pifo_segments.coalesce() & fifo_segments.coalesce().shift(offset)
     duration = abs(overlap.coalesce())
@@ -238,12 +239,35 @@ if interval == 0:
     # background
     tsids = numpy.array([0])
 else:
-    min_tsid = numpy.rint(min_tsid) // opts.decimation_factor
-    max_tsid = numpy.rint(max_tsid) // opts.decimation_factor
+    min_tsid = numpy.rint(min_tsid)
+    max_tsid = numpy.rint(max_tsid)
 
-    tsids = (
-        numpy.arange(min_tsid, max_tsid, 1).astype(numpy.int64) * opts.decimation_factor
-    )
+    if (
+        "background_time" in fp.attrs
+        and "foreground_time" in fp.attrs
+        and fp.attrs["foreground_time"] > 0
+    ):
+        ratio = fp.attrs["background_time"] / fp.attrs["foreground_time"]
+        if ratio < (max_tsid - min_tsid) / 2:
+            n_half = int(round(ratio / 2.0))
+            eff_dec = 1 if n_half <= 50 else max(1, opts.decimation_factor)
+            tsids = numpy.arange(-n_half, n_half + 1, eff_dec).astype(numpy.int64)
+        else:
+            eff_dec = max(1, opts.decimation_factor)
+            tsids = (
+                numpy.arange(min_tsid // eff_dec, max_tsid // eff_dec, 1).astype(
+                    numpy.int64
+                )
+                * eff_dec
+            )
+    else:
+        eff_dec = max(1, opts.decimation_factor)
+        tsids = (
+            numpy.arange(min_tsid // eff_dec, max_tsid // eff_dec, 1).astype(
+                numpy.int64
+            )
+            * eff_dec
+        )
 
 allbkg_dur = 0
 allbkg_ifars = []
@@ -291,9 +315,10 @@ for tsid in tsids:
         empty_slide_count += 1
 
 allbkg_ifars = numpy.array(allbkg_ifars)
-allbkg_ifars = allbkg_ifars * (fp.attrs["foreground_time"] / allbkg_dur)
 allbkg_ifars.sort()
-allbkg_cumnum = numpy.arange(len(allbkg_ifars), 0, -1)
+allbkg_cumnum = numpy.arange(len(allbkg_ifars), 0, -1) * (
+    fp.attrs["foreground_time"] / allbkg_dur
+)
 plt.loglog(
     allbkg_ifars,
     allbkg_cumnum,
@@ -366,9 +391,13 @@ if opts.open_box and len(fore_cumnum) > 100:
     plt.ylim(0.8, 1.1 * len(fore_cumnum))
     plt.xlim(0.9 * min(fore_ifar))
 elif len(allbkg_cumnum) > 0:
-    # If we have < 100 foreground triggers (or this is closed box), scale the
-    # plot around the cumulative background (the green line).
-    plt.ylim(0.8, 1.1 * len(allbkg_cumnum))
+    # Scale the plot around the cumulative background
+    min_cumnum = max(1e-5, min(allbkg_cumnum))
+    max_cumnum = max(
+        1.1 * len(fore_cumnum) if (opts.open_box and len(fore_cumnum) > 0) else 1.0,
+        10.0,
+    )
+    plt.ylim(min_cumnum * 0.8, max_cumnum)
     plt.xlim(0.9 * min(allbkg_ifars))
 plt.grid()
 plt.legend(loc="upper right", fontsize=9)

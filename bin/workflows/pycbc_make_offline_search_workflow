@@ -356,8 +356,9 @@ ifo_ids = {}
 ifo_precedence_list = workflow.cp.get_opt_tags(
     "workflow-coincidence", "timeslide-precedence", ["full_data"]
 )
-for ifo, _ in zip(*insps.categorize_by_attr("ifo")):
-    ifo_ids[ifo] = ifo_precedence_list.index(ifo)
+for ifo in workflow.ifos:
+    if ifo in ifo_precedence_list and len(insps.find_output_with_ifo(ifo)) > 0:
+        ifo_ids[ifo] = ifo_precedence_list.index(ifo)
 
 # Generate the possible detector combinations
 if workflow.cp.has_option_tags("workflow-data_quality", "no-coinc-veto", tags=None):
@@ -418,6 +419,7 @@ for ifo in ifo_ids:
         final_veto_name,
         output_dir,
         tags=ctagsngl,
+        ifo=ifo,
     )
 
 # check to see if workflow should stop at statmap jobs.
@@ -491,7 +493,10 @@ data_analysed_name = "DATA_ANALYSED"
 data_analysed_segs = {}
 insp_files_seg_dict = segments.segmentlistdict()
 
-for ifo, files in zip(*ind_insps.categorize_by_attr("ifo")):
+for ifo in workflow.ifos:
+    files = ind_insps.find_output_with_ifo(ifo)
+    if not files:
+        continue
     trig_generated_segs[ifo] = segments.segmentlist([f.segment for f in files])
     data_analysed_segs[ifo] = segments.segmentlist(
         [f.metadata["data_seg"] for f in files]
@@ -607,8 +612,12 @@ snrchi = wf.make_snrchi_plot(
 layout.group_layout(rdir["single_triggers"], snrchi)
 
 hist_summ = []
-for insp in full_insps:
-    outdir = rdir["single_triggers/%s_binned_triggers" % insp.ifo]
+for ifo in workflow.ifos:
+    ifo_insps = full_insps.find_output_with_ifo(ifo)
+    if not ifo_insps:
+        continue
+    insp = ifo_insps[0]
+    outdir = rdir["single_triggers/%s_binned_triggers" % ifo]
     singles_plots = wf.make_singles_plot(
         workflow,
         [insp],
@@ -617,11 +626,12 @@ for insp in full_insps:
         "closed_box",
         outdir,
         tags=["full_data"],
+        ifo=ifo,
     )
     layout.group_layout(outdir, singles_plots)
     # make non-summary hists using the bank file
     # currently, none of these are made
-    outdir = rdir["single_triggers/%s_trigger_histograms" % insp.ifo]
+    outdir = rdir["single_triggers/%s_trigger_histograms" % ifo]
     wf.make_single_hist(
         workflow,
         insp,
@@ -631,11 +641,12 @@ for insp in full_insps:
         bank_file=hdfbank,
         exclude="summ",
         tags=["full_data"],
+        ifo=ifo,
     )
 
     # make summary hists for all templates together
     # currently, 2 per ifo: snr and newsnr
-    outdir = rdir["single_triggers/%s_trigger_histograms" % insp.ifo]
+    outdir = rdir["single_triggers/%s_trigger_histograms" % ifo]
     allhists = wf.make_single_hist(
         workflow,
         insp,
@@ -644,14 +655,22 @@ for insp in full_insps:
         outdir,
         require="summ",
         tags=["full_data"],
+        ifo=ifo,
     )
     layout.group_layout(outdir, allhists)
 
     # make hists of newsnr split up by parameter
     # currently, 1 per ifo split by template duration
-    outdir = rdir["single_triggers/%s_binned_histograms" % insp.ifo]
+    outdir = rdir["single_triggers/%s_binned_histograms" % ifo]
     binhists = wf.make_binned_hist(
-        workflow, insp, censored_veto, "closed_box", outdir, hdfbank, tags=["full_data"]
+        workflow,
+        insp,
+        censored_veto,
+        "closed_box",
+        outdir,
+        hdfbank,
+        tags=["full_data"],
+        ifo=ifo,
     )
     layout.group_layout(outdir, binhists)
     # put raw SNR and binned newsnr hist in summary
@@ -672,8 +691,12 @@ for insp_file in full_insps:
     for tag in insp_file.tags:
         excl_subsecs.add(tag)
 
-for insp_file in full_insps:
-    curr_ifo = insp_file.ifo
+for ifo in workflow.ifos:
+    ifo_insps = full_insps.find_output_with_ifo(ifo)
+    if not ifo_insps:
+        continue
+    insp_file = ifo_insps[0]
+    curr_ifo = ifo
     for subsec in workflow.cp.get_subsections("workflow-sngl_minifollowups"):
         if subsec in excl_subsecs:
             continue
@@ -693,6 +716,7 @@ for insp_file in full_insps:
             fg_file=censored_veto,
             fg_name="closed_box",
             tags=insp_file.tags + [subsec],
+            ifo=curr_ifo,
         )
 
 ##################### COINC FULL_DATA plots ###################################
@@ -908,7 +932,12 @@ for inj_file, tag in zip(inj_files, inj_tags):
         "workflow-injections", "compute-optimal-snr", tags=ctags
     ):
         optimal_snr_file = wf.compute_inj_optimal_snr(
-            workflow, inj_file, psd_files, "inj_files", tags=ctags
+            workflow,
+            inj_file,
+            psd_files,
+            "inj_files",
+            datafind_files=datafind_files,
+            tags=ctags,
         )
         file_for_injfind = optimal_snr_file
     else:
@@ -985,6 +1014,7 @@ for inj_file, tag in zip(inj_files, inj_tags):
             final_veto_name,
             output_dir,
             tags=ctagsngl,
+            ifo=ifo,
         )
 
     combctags = [tag, "injections"]
@@ -1075,28 +1105,53 @@ for inj_file, tag in zip(inj_files, inj_tags):
         layout.group_layout(rdir["search_sensitivity/%s" % tag], s)
 
     # Minifollowups
-    curr_dir_nam = f"injections/followup_of_{tag}"
-    if workflow.cp.has_option_tags(
-        "workflow-injection_minifollowups", "subsection-suffix", tags=[tag]
-    ):
-        suf_str = workflow.cp.get_opt_tags(
+    inj_subsecs = workflow.cp.get_subsections("workflow-injection_minifollowups")
+    if not inj_subsecs:
+        curr_dir_nam = f"injections/followup_of_{tag}"
+        if workflow.cp.has_option_tags(
             "workflow-injection_minifollowups", "subsection-suffix", tags=[tag]
+        ):
+            suf_str = workflow.cp.get_opt_tags(
+                "workflow-injection_minifollowups", "subsection-suffix", tags=[tag]
+            )
+            curr_dir_nam += "_" + suf_str
+        currdir = rdir[curr_dir_nam]
+        wf.setup_injection_minifollowups(
+            workflow,
+            found_inj,
+            inj_file,
+            insps,
+            hdfbank,
+            insp_files_seg_file,
+            data_analysed_name,
+            trig_generated_name,
+            "daxes",
+            currdir,
+            tags=[tag],
         )
-        curr_dir_nam += "_" + suf_str
-    currdir = rdir[curr_dir_nam]
-    wf.setup_injection_minifollowups(
-        workflow,
-        found_inj,
-        inj_file,
-        insps,
-        hdfbank,
-        insp_files_seg_file,
-        data_analysed_name,
-        trig_generated_name,
-        "daxes",
-        currdir,
-        tags=[tag],
-    )
+    else:
+        for subsec in inj_subsecs:
+            sec_name = f"workflow-injection_minifollowups-{subsec}"
+            dir_str = subsec
+            if workflow.cp.has_option(sec_name, "section-header"):
+                dir_str = workflow.cp.get(sec_name, "section-header")
+            elif workflow.cp.has_option(sec_name, "subsection-suffix"):
+                dir_str = workflow.cp.get(sec_name, "subsection-suffix")
+            curr_dir_nam = f"injections/followup_of_{tag}_{dir_str}"
+            currdir = rdir[curr_dir_nam]
+            wf.setup_injection_minifollowups(
+                workflow,
+                found_inj,
+                inj_file,
+                insps,
+                hdfbank,
+                insp_files_seg_file,
+                data_analysed_name,
+                trig_generated_name,
+                "daxes",
+                currdir,
+                tags=[tag, subsec],
+            )
 
     # If option given, make throughput plots
     if workflow.cp.has_option_tags(

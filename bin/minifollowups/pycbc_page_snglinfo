@@ -97,11 +97,15 @@ parser.add_argument(
     help="Optional. Set a maximum number of columns to be used in the output table",
 )
 pystat.insert_statistic_option_group(
-    parser, default_ranking_statistic="single_ranking_only"
+    parser,
+    default_ranking_statistic="single_ranking_only",
+    default_sngl_ranking="newsnr_sgveto_psdvar",
 )
 
 
 args = parser.parse_args()
+if getattr(args, "sngl_ranking", None) is None:
+    args.sngl_ranking = "newsnr_sgveto_psdvar"
 
 init_logging(args.verbose)
 
@@ -203,6 +207,12 @@ data[0].append("%5.2f" % sngl_file.rchisq[0])
 data[0].append("%i" % sngl_file.get_column("chisq_dof")[0])
 headers.append("&chi;<sup>2</sup><sub>r</sub>")
 headers.append("&chi;<sup>2</sup>&nbsp;bins")
+try:
+    if sngl_file.auto_rchisq is not None:
+        data[0].append("%5.2f" % sngl_file.auto_rchisq[0])
+        headers.append("auto&nbsp;&chi;<sup>2</sup><sub>r</sub>")
+except:
+    pass
 try:
     data[0].append("%5.2f" % sngl_file.sgchisq[0])
     headers.append("sg&chi;<sup>2</sup>")

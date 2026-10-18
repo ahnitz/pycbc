@@ -52,8 +52,7 @@ def setup_foreground_minifollowups(
     out_dir,
     tags=None,
 ):
-    """
-    Create plots that followup the Nth loudest coincident injection
+    """Create plots that followup the Nth loudest coincident injection
     from a statmap produced HDF file.
 
     Parameters
@@ -85,7 +84,6 @@ def setup_foreground_minifollowups(
     layout: list
         A list of tuples which specify the displayed file layout for the
         minifollops plots.
-
     """
     logger.info("Entering minifollowups module")
 
@@ -143,6 +141,9 @@ def setup_foreground_minifollowups(
     # determine if a staging site has been specified
     job = SubWorkflow(fil.name, is_planned=False)
     input_files = [tmpltbank_file, coinc_file, insp_segs] + single_triggers
+    for f in workflow._inputs:
+        if f not in input_files:
+            input_files.append(f)
     job.add_inputs(*input_files)
     job.set_subworkflow_properties(
         map_file, staging_site=workflow.staging_site, cache_file=workflow.cache_file
@@ -166,9 +167,9 @@ def setup_single_det_minifollowups(
     fg_name=None,
     statfiles=None,
     tags=None,
+    ifo=None,
 ):
-    """
-    Create plots that followup the Nth loudest clustered single detector
+    """Create plots that followup the Nth loudest clustered single detector
     triggers from a merged single detector trigger HDF file.
 
     Parameters
@@ -192,13 +193,13 @@ def setup_single_det_minifollowups(
         statistic.
     tags: {None, optional}
         Tags to add to the minifollowups executables
-
+    ifo: {None, optional}
+        IFO to follow up when single_trig_file contains multiple detectors.
     Returns
     -------
     layout: list
         A list of tuples which specify the displayed file layout for the
         minifollops plots.
-
     """
     logger.info("Entering minifollowups module")
 
@@ -213,7 +214,14 @@ def setup_single_det_minifollowups(
     makedir(dax_output)
 
     # turn the config file into a File class
-    curr_ifo = single_trig_file.ifo
+    if ifo is not None:
+        curr_ifo = ifo
+    elif hasattr(single_trig_file, "ifo_list") and len(single_trig_file.ifo_list) == 1:
+        curr_ifo = single_trig_file.ifo_list[0]
+    elif hasattr(single_trig_file, "ifo"):
+        curr_ifo = single_trig_file.ifo
+    else:
+        curr_ifo = workflow.ifos[0]
     config_path = os.path.abspath(
         dax_output + "/" + curr_ifo + "_".join(tags) + "singles_minifollowup.ini"
     )
@@ -274,6 +282,9 @@ def setup_single_det_minifollowups(
         input_files.append(veto_file)
     if statfiles:
         input_files += statfiles
+    for f in workflow._inputs:
+        if f not in input_files:
+            input_files.append(f)
     job.add_inputs(*input_files)
     job.set_subworkflow_properties(
         map_file, staging_site=workflow.staging_site, cache_file=workflow.cache_file
@@ -295,8 +306,7 @@ def setup_injection_minifollowups(
     out_dir,
     tags=None,
 ):
-    """
-    Create plots that followup the closest missed injections
+    """Create plots that followup the closest missed injections
 
     Parameters
     ----------
@@ -324,7 +334,6 @@ def setup_injection_minifollowups(
     layout: list
         A list of tuples which specify the displayed file layout for the
         minifollops plots.
-
     """
     logger.info("Entering injection minifollowups module")
 
@@ -347,7 +356,11 @@ def setup_injection_minifollowups(
     config_file = resolve_url_to_file(config_path)
 
     exe = Executable(
-        workflow.cp, "injection_minifollowup", ifos=workflow.ifos, out_dir=dax_output
+        workflow.cp,
+        "injection_minifollowup",
+        ifos=workflow.ifos,
+        out_dir=dax_output,
+        tags=tags,
     )
 
     node = exe.create_node()
@@ -381,6 +394,9 @@ def setup_injection_minifollowups(
     job = SubWorkflow(fil.name, is_planned=False)
     input_files = [tmpltbank_file, injection_file, inj_xml_file, insp_segs]
     input_files += single_triggers
+    for f in workflow._inputs:
+        if f not in input_files:
+            input_files.append(f)
     job.add_inputs(*input_files)
     job.set_subworkflow_properties(
         map_file, staging_site=workflow.staging_site, cache_file=workflow.cache_file
@@ -390,9 +406,48 @@ def setup_injection_minifollowups(
     logger.info("Leaving injection minifollowups module")
 
 
-class SingleTemplateExecutable(PlotExecutable):
+def _get_workflow_datafind_files(workflow):
+    """Return cached FileList of frame files from pregenerated LCF files if configured."""
+    if hasattr(workflow, "_cached_datafind_files"):
+        return workflow._cached_datafind_files
+    df_files = None
+    if workflow.cp.has_option("workflow-datafind", "datafind-method"):
+        method = workflow.cp.get("workflow-datafind", "datafind-method")
+        if method == "FROM_PREGENERATED_LCF_FILES":
+            from pycbc.workflow.datafind import (
+                setup_datafind_from_pregenerated_lcf_files,
+            )
+
+            sci_segs = {
+                ifo: segments.segmentlist([workflow.analysis_time])
+                for ifo in workflow.ifos
+            }
+            _, df_files = setup_datafind_from_pregenerated_lcf_files(
+                workflow.cp, workflow.ifos, ".", scienceSegs=sci_segs
+            )
+    workflow._cached_datafind_files = df_files
+    return df_files
+
+
+def _stage_frame_files_for_node(workflow, curr_exe, node, ifo, data_seg):
+    """If no frame-cache/frame-type/frame-files is configured on curr_exe,
+    stage the overlapping frame files from pregenerated LCF files via --frame-files.
     """
-    Class to be used for to create workflow.Executable instances for the
+    if (
+        not curr_exe.has_opt("frame-cache")
+        and not curr_exe.has_opt("frame-type")
+        and not curr_exe.has_opt("frame-files")
+        and "--frame-files" not in node._options
+    ):
+        df_files = _get_workflow_datafind_files(workflow)
+        if df_files:
+            needed = df_files.find_all_output_in_range(ifo, data_seg)
+            if needed:
+                node.add_input_list_opt("--frame-files", needed)
+
+
+class SingleTemplateExecutable(PlotExecutable):
+    """Class to be used for to create workflow.Executable instances for the
     pycbc_single_template executable. Basically inherits directly from
     PlotExecutable.
     """
@@ -401,8 +456,7 @@ class SingleTemplateExecutable(PlotExecutable):
 
 
 class SingleTimeFreqExecutable(PlotExecutable):
-    """
-    Class to be used for to create workflow.Executable instances for the
+    """Class to be used for to create workflow.Executable instances for the
     pycbc_plot_singles_timefreq executable. Basically inherits directly from
     PlotExecutable.
     """
@@ -411,8 +465,7 @@ class SingleTimeFreqExecutable(PlotExecutable):
 
 
 class PlotQScanExecutable(PlotExecutable):
-    """
-    Class to be used for to create workflow.Executable instances for the
+    """Class to be used for to create workflow.Executable instances for the
     pycbc_plot_qscan executable. Basically inherits directly from
     PlotExecutable.
     """
@@ -447,11 +500,14 @@ def get_single_template_params(curr_idx, times, bank_data, bank_id, fsdt, tids):
 
     """
     params = {}
+    curr_idx = int(curr_idx)
+    bank_id = int(bank_id)
     for ifo in times:
         params["%s_end_time" % ifo] = times[ifo][curr_idx]
         try:
             # Only present for precessing, so may not exist
-            params["u_vals_%s" % ifo] = fsdt[ifo][ifo]["u_vals"][tids[ifo][curr_idx]]
+            tid = int(tids[ifo][curr_idx])
+            params["u_vals_%s" % ifo] = fsdt[ifo][ifo]["u_vals"][tid]
         except:
             pass
 
@@ -500,12 +556,11 @@ def make_single_template_files(
     use_mean_time=False,
     use_exact_inj_params=False,
 ):
-    """
-    Function for creating jobs to run the pycbc_single_template code and
+    """Function for creating jobs to run the pycbc_single_template code and
     add these jobs to the workflow.
 
     Parameters
-    ----------
+    -----------
     workflow : workflow.Workflow instance
         The pycbc.workflow.Workflow instance to add these jobs to.
     segs : workflow.File instance
@@ -552,10 +607,9 @@ def make_single_template_files(
         but instead use the injection closest to the filter time as a template.
 
     Returns
-    -------
+    --------
     output_files : workflow.FileList
         The list of workflow.Files created in this function.
-
     """
     tags = [] if tags is None else tags
     makedir(out_dir)
@@ -607,6 +661,29 @@ def make_single_template_files(
         node.add_input_opt("--injection-file", inj_file)
     node.add_opt("--data-read-name", data_read_name)
     node.add_opt("--data-analyzed-name", analyzed_name)
+    pad_data = int(curr_exe.get_opt("pad-data")) if curr_exe.has_opt("pad-data") else 0
+    seg_path = (
+        segs.storage_path
+        if getattr(segs, "storage_path", None)
+        else getattr(segs, "name", None)
+    )
+    if seg_path and os.path.exists(seg_path):
+        from pycbc.events import select_segments_by_definer
+
+        data_segs = select_segments_by_definer(seg_path, data_read_name, ifo)
+        matching = [s for s in data_segs if s[0] <= trig_time <= s[1]]
+        if matching:
+            frame_seg = segments.segment(
+                [
+                    min(int(s[0]) for s in matching) - pad_data,
+                    max(int(s[1]) for s in matching) + pad_data,
+                ]
+            )
+        else:
+            frame_seg = workflow.analysis_time
+    else:
+        frame_seg = workflow.analysis_time
+    _stage_frame_files_for_node(workflow, curr_exe, node, ifo, frame_seg)
     node.new_output_file_opt(
         workflow.analysis_time, ".hdf", "--output-file", store_file=store_file
     )
@@ -629,13 +706,12 @@ def make_single_template_plots(
     params_str=None,
     use_exact_inj_params=False,
 ):
-    """
-    Function for creating jobs to run the pycbc_single_template code and
+    """Function for creating jobs to run the pycbc_single_template code and
     to run the associated plotting code pycbc_single_template_plots and add
     these jobs to the workflow.
 
     Parameters
-    ----------
+    -----------
     workflow : workflow.Workflow instance
         The pycbc.workflow.Workflow instance to add these jobs to.
     segs : workflow.File instance
@@ -683,14 +759,13 @@ def make_single_template_plots(
         but instead use the injection closest to the filter time as a template.
 
     Returns
-    -------
+    --------
     hdf_files : workflow.FileList
         The list of workflow.Files created by single_template jobs
         in this function.
     plot_files : workflow.FileList
         The list of workflow.Files created by single_template_plot jobs
         in this function.
-
     """
     tags = [] if tags is None else tags
     makedir(out_dir)
@@ -832,7 +907,13 @@ def make_coinc_info(
     node = PlotExecutable(
         workflow.cp, name, ifos=workflow.ifos, out_dir=out_dir, tags=tags
     ).create_node()
-    node.add_input_list_opt("--single-trigger-files", singles)
+    unique_singles = []
+    seen = set()
+    for s in singles:
+        if s.name not in seen:
+            seen.add(s.name)
+            unique_singles.append(s)
+    node.add_input_list_opt("--single-trigger-files", unique_singles)
     node.add_input_opt("--statmap-file", coinc_file)
     node.add_input_opt("--bank-file", bank)
     if sort_order:
@@ -933,15 +1014,14 @@ def make_qscan_plot(
     time_window=100,
     tags=None,
 ):
-    """
-    Generate a make_qscan node and add it to workflow.
+    """Generate a make_qscan node and add it to workflow.
 
     This function generates a single node of the plot_qscan executable
     and adds it to the current workflow. Parent/child relationships are set by
     the input/output files automatically.
 
     Parameters
-    ----------
+    -----------
     workflow: pycbc.workflow.core.Workflow
         The workflow class that stores the jobs that will be run.
     ifo: str
@@ -967,7 +1047,6 @@ def make_qscan_plot(
         cases.
     tags: list (optional, default=None)
         List of tags to add to the created nodes, which determine file naming.
-
     """
     tags = [] if tags is None else tags
     makedir(out_dir)
@@ -985,6 +1064,7 @@ def make_qscan_plot(
 
     # Then if data_segments is available, check against that, and move if
     # needed
+    pad_data = int(curr_exe.get_opt("pad-data")) if curr_exe.has_opt("pad-data") else 0
     if data_segments is not None:
         # Assumes coalesced, so trig_time can only be within one segment
         for seg in data_segments:
@@ -1007,11 +1087,6 @@ def make_qscan_plot(
             err_msg += "does not seem to lie within any data segments. "
             err_msg += "This shouldn't be possible, please ask for help!"
             raise ValueError(err_msg)
-        # Check for pad-data
-        if curr_exe.has_opt("pad-data"):
-            pad_data = int(curr_exe.get_opt("pad-data"))
-        else:
-            pad_data = 0
         # We only read data that's available. The code must handle the case
         # of not much data being available.
         end = min(end, data_seg[1] - pad_data)
@@ -1020,6 +1095,13 @@ def make_qscan_plot(
     node.add_opt("--gps-start-time", int(start))
     node.add_opt("--gps-end-time", int(end))
     node.add_opt("--center-time", trig_time)
+    _stage_frame_files_for_node(
+        workflow,
+        curr_exe,
+        node,
+        ifo,
+        segments.segment([int(start) - pad_data, int(end) + pad_data]),
+    )
 
     if injection_file is not None:
         node.add_input_opt("--injection-file", injection_file)
@@ -1039,16 +1121,16 @@ def make_singles_timefreq(
     time_window=10,
     data_segments=None,
     tags=None,
+    ifo=None,
 ):
-    """
-    Generate a singles_timefreq node and add it to workflow.
+    """Generate a singles_timefreq node and add it to workflow.
 
     This function generates a single node of the singles_timefreq executable
     and adds it to the current workflow. Parent/child relationships are set by
     the input/output files automatically.
 
     Parameters
-    ----------
+    -----------
     workflow: pycbc.workflow.core.Workflow
         The workflow class that stores the jobs that will be run.
     single: pycbc.workflow.core.File instance
@@ -1077,14 +1159,22 @@ def make_singles_timefreq(
         trigger. This **must** be coalesced.
     tags: list (optional, default=None)
         List of tags to add to the created nodes, which determine file naming.
-
     """
     tags = [] if tags is None else tags
     makedir(out_dir)
     name = "plot_singles_timefreq"
 
+    target_ifo = (
+        ifo
+        if ifo is not None
+        else (
+            single.ifo
+            if len(getattr(single, "ifo_list", [])) <= 1
+            else single.ifo_list[0]
+        )
+    )
     curr_exe = SingleTimeFreqExecutable(
-        workflow.cp, name, ifos=[single.ifo], out_dir=out_dir, tags=tags
+        workflow.cp, name, ifos=[target_ifo], out_dir=out_dir, tags=tags
     )
 
     # Determine start/end times, using data segments if needed.
@@ -1098,6 +1188,7 @@ def make_singles_timefreq(
 
     # Then if data_segments is available, check against that, and move if
     # needed
+    pad_data = int(curr_exe.get_opt("pad-data")) if curr_exe.has_opt("pad-data") else 0
     if data_segments is not None:
         # Assumes coalesced, so trig_time can only be within one segment
         for seg in data_segments:
@@ -1112,7 +1203,7 @@ def make_singles_timefreq(
                 if veto_file:
                     node.add_input_opt("--veto-file", veto_file)
 
-                node.add_opt("--detector", single.ifo)
+                node.add_opt("--detector", target_ifo)
                 node.new_output_file_opt(
                     workflow.analysis_time, ".png", "--output-file"
                 )
@@ -1123,11 +1214,6 @@ def make_singles_timefreq(
             err_msg += "does not seem to lie within any data segments. "
             err_msg += "This shouldn't be possible, please ask for help!"
             raise ValueError(err_msg)
-        # Check for pad-data
-        if curr_exe.has_opt("pad-data"):
-            pad_data = int(curr_exe.get_opt("pad-data"))
-        else:
-            pad_data = 0
         if abs(data_seg) < (2 * time_window + 2 * pad_data):
             tl = 2 * time_window + 2 * pad_data
             err_msg = f"I was asked to use {tl} seconds of data "
@@ -1148,11 +1234,18 @@ def make_singles_timefreq(
     node.add_opt("--gps-start-time", int(start))
     node.add_opt("--gps-end-time", int(end))
     node.add_opt("--center-time", trig_time)
+    _stage_frame_files_for_node(
+        workflow,
+        curr_exe,
+        node,
+        target_ifo,
+        segments.segment([int(start) - pad_data, int(end) + pad_data]),
+    )
 
     if veto_file:
         node.add_input_opt("--veto-file", veto_file)
 
-    node.add_opt("--detector", single.ifo)
+    node.add_opt("--detector", target_ifo)
     node.new_output_file_opt(workflow.analysis_time, ".png", "--output-file")
     workflow += node
     return node.output_files
@@ -1240,7 +1333,6 @@ def make_upload_files(
     -------
     all_output_files: FileList
         List of all output files from this process
-
     """
     logging.info("Setting up upload files")
     indiv_xml_exe = Executable(
@@ -1324,8 +1416,7 @@ def setup_upload_prep_minifollowups(
     out_dir,
     tags=None,
 ):
-    """
-    Create plots that followup the Nth loudest coincident injection
+    """Create plots that followup the Nth loudest coincident injection
     from a statmap produced HDF file.
 
     Parameters
@@ -1364,7 +1455,6 @@ def setup_upload_prep_minifollowups(
     layout: list
         A list of tuples which specify the displayed file layout for the
         minifollowups plots.
-
     """
     logger.info("Entering minifollowups module")
 

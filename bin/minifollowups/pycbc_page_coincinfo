@@ -204,8 +204,8 @@ for ifo in files:
 
     row_labels.append(ifo)
     d = files[ifo]
-    i = idx[ifo]
-    tid = d["template_id"][i]
+    i = int(idx[ifo])
+    tid = int(d["template_id"][i])
     rchisq = d["chisq"][i] / (d["chisq_dof"][i] * 2 - 2)
     mchirp = (
         pycbc.pnutils.mass1_mass2_to_mchirp_eta(bank["mass1"][tid], bank["mass2"][tid])
@@ -262,6 +262,21 @@ for ifo in files:
     data[-1].append("%i" % d["chisq_dof"][i])
     headers.append("&chi;<sup>2</sup><sub>r</sub>")
     headers.append("&chi;<sup>2</sup>&nbsp;bins")
+    try:
+        if "cont_chisq" in d:
+            auto_val = d["cont_chisq"][i]
+            auto_dof = d["cont_chisq_dof"][i] if "cont_chisq_dof" in d else 1
+            r_auto = auto_val / max(1.0, float(auto_dof))
+            data[-1].append("%5.2f" % r_auto)
+            headers.append("auto&nbsp;&chi;<sup>2</sup><sub>r</sub>")
+        elif "auto_chisq" in d:
+            auto_val = d["auto_chisq"][i]
+            auto_dof = d["auto_chisq_dof"][i] if "auto_chisq_dof" in d else 1
+            r_auto = auto_val / max(1.0, float(auto_dof))
+            data[-1].append("%5.2f" % r_auto)
+            headers.append("auto&nbsp;&chi;<sup>2</sup><sub>r</sub>")
+    except:
+        pass
     try:
         data[-1].append("%5.2f" % d["sg_chisq"][i])
         headers.append("sg&nbsp;&chi;<sup>2</sup>")

@@ -136,7 +136,7 @@ class Executable(pegasus_workflow.Executable):
         Initialize the Executable class.
 
         Parameters
-        ----------
+        -----------
         cp : ConfigParser object
             The ConfigParser object holding the workflow configuration settings
         name : string
@@ -161,7 +161,6 @@ class Executable(pegasus_workflow.Executable):
             Place condor files associated with this executable under a
             sub-directory (named according to the executable name) in the
             submitdir.
-
         """
         if isinstance(ifos, str):
             self.ifo_list = [ifos]
@@ -330,8 +329,7 @@ class Executable(pegasus_workflow.Executable):
 
     @property
     def ifo(self):
-        """
-        Return the ifo.
+        """Return the ifo.
 
         If only one ifo in the ifo list this will be that ifo. Otherwise an
         error is raised.
@@ -349,16 +347,14 @@ class Executable(pegasus_workflow.Executable):
         return self.get_transformation()
 
     def add_ini_profile(self, cp, sec):
-        """
-        Add profile from configuration file.
+        """Add profile from configuration file.
 
         Parameters
-        ----------
+        -----------
         cp : ConfigParser object
             The ConfigParser object holding the workflow configuration settings
         sec : string
             The section containing options for this job.
-
         """
         for opt in cp.options(sec):
             namespace = opt.split("|")[0]
@@ -370,17 +366,15 @@ class Executable(pegasus_workflow.Executable):
             self.add_profile(namespace, key, value)
 
     def _add_ini_opts(self, cp, sec, ignore_existing=False):
-        """
-        Add job-specific options from configuration file.
+        """Add job-specific options from configuration file.
 
         Parameters
-        ----------
+        -----------
         cp : ConfigParser object
             The ConfigParser object holding the workflow configuration
             settings
         sec : string
             The section containing options for this job.
-
         """
         for opt in cp.options(sec):
             if opt in self.all_added_options:
@@ -445,16 +439,14 @@ class Executable(pegasus_workflow.Executable):
                 self.common_options += [opt, value]
 
     def add_opt(self, opt, value=None):
-        """
-        Add option to job.
+        """Add option to job.
 
         Parameters
-        ----------
+        -----------
         opt : string
             Name of option (e.g. --output-file-format)
         value : string, (default=None)
             The value for the option (no value if set to None).
-
         """
         if value is None:
             self.common_options += [opt]
@@ -462,19 +454,17 @@ class Executable(pegasus_workflow.Executable):
             self.common_options += [opt, value]
 
     def get_opt(self, opt):
-        """
-        Get value of option from configuration file
+        """Get value of option from configuration file
 
         Parameters
-        ----------
+        -----------
         opt : string
             Name of option (e.g. output-file-format)
 
         Returns
-        -------
+        --------
         value : string
             The value for the option. Returns None if option not present.
-
         """
         for sec in self.sections:
             try:
@@ -487,14 +477,12 @@ class Executable(pegasus_workflow.Executable):
         return None
 
     def has_opt(self, opt):
-        """
-        Check if option is present in configuration file
+        """Check if option is present in configuration file
 
         Parameters
-        ----------
+        -----------
         opt : string
             Name of option (e.g. output-file-format)
-
         """
         for sec in self.sections:
             val = self.cp.has_option(sec, opt)
@@ -504,25 +492,22 @@ class Executable(pegasus_workflow.Executable):
         return False
 
     def create_node(self, **kwargs):
-        """
-        Default node constructor.
+        """Default node constructor.
 
         This is usually overridden by subclasses of Executable.
         """
         return Node(self, **kwargs)
 
     def update_current_retention_level(self, value):
-        """
-        Set a new value for the current retention level.
+        """Set a new value for the current retention level.
 
         This updates the value of self.retain_files for an updated value of the
         retention level.
 
         Parameters
-        ----------
+        -----------
         value : int
             The new value to use for the retention level.
-
         """
         # Determine the level at which output files should be kept
         self.current_retention_level = value
@@ -574,8 +559,7 @@ class Executable(pegasus_workflow.Executable):
                 self.retain_files = True
 
     def update_current_tags(self, tags):
-        """
-        Set a new set of tags for this executable.
+        """Set a new set of tags for this executable.
 
         Update the set of tags that this job will use. This updated default
         file naming and shared options. It will *not* update the pegasus
@@ -583,10 +567,9 @@ class Executable(pegasus_workflow.Executable):
         different nodes.
 
         Parameters
-        ----------
+        -----------
         tags : list
             The new list of tags to consider.
-
         """
         if tags is None:
             tags = []
@@ -614,7 +597,7 @@ class Executable(pegasus_workflow.Executable):
         sections = [self.name]
         if self.ifo_list is not None:
             if len(self.ifo_list) > 1:
-                sec_tags = tags + self.ifo_list + [self.ifo_string]
+                sec_tags = tags + [self.ifo_string]
             else:
                 sec_tags = tags + self.ifo_list
         else:
@@ -654,15 +637,13 @@ class Executable(pegasus_workflow.Executable):
             )
 
     def update_output_directory(self, out_dir=None):
-        """
-        Update the default output directory for output files.
+        """Update the default output directory for output files.
 
         Parameters
-        ----------
+        -----------
         out_dir : string (optional, default=None)
             If provided use this as the output directory. Else choose this
             automatically from the tags.
-
         """
         # Determine the output directory
         if out_dir is not None:
@@ -680,8 +661,7 @@ class Executable(pegasus_workflow.Executable):
             make_analysis_dir(self.out_dir)
 
     def _set_pegasus_profile_options(self):
-        """
-        Set the pegasus-profile settings for this Executable.
+        """Set the pegasus-profile settings for this Executable.
 
         These are a property of the Executable and not of nodes that it will
         spawn. Therefore it *cannot* be updated without also changing values
@@ -709,7 +689,6 @@ class Workflow(pegasus_workflow.Workflow):
         ----------
         args : argparse.ArgumentParser
             The command line options to initialize a CBC workflow.
-
         """
         # Parse ini file
         self.cp = WorkflowConfigParser.from_cli(args)
@@ -871,10 +850,18 @@ class Workflow(pegasus_workflow.Workflow):
         self.output_map_file = output_map_file
 
         if self.in_workflow:
+            cleanup = None
+            if (
+                hasattr(self, "cp")
+                and self.cp
+                and self.cp.has_option("workflow", "cleanup")
+            ):
+                cleanup = self.cp.get("workflow", "cleanup")
             self._as_job.set_subworkflow_properties(
                 output_map_file,
                 staging_site=self.staging_site,
                 cache_file=self.cache_file,
+                cleanup=cleanup,
             )
             self._as_job.add_planner_args(**self._as_job.pycbc_planner_args)
 
@@ -915,12 +902,11 @@ class Workflow(pegasus_workflow.Workflow):
         )
 
     def save_config(self, fname, output_dir, cp=None):
-        """
-        Writes configuration file to disk and returns a pycbc.workflow.File
+        """Writes configuration file to disk and returns a pycbc.workflow.File
         instance for the configuration file.
 
         Parameters
-        ----------
+        -----------
         fname : string
             The filename of the configuration file written to disk.
         output_dir : string
@@ -932,7 +918,6 @@ class Workflow(pegasus_workflow.Workflow):
         -------
         FileList
             The FileList object with the configuration file.
-
         """
         cp = self.cp if cp is None else cp
         ini_file_path = os.path.abspath(os.path.join(output_dir, fname))
@@ -1018,7 +1003,7 @@ class Node(pegasus_workflow.Node):
         information and then add that file as output of this node.
 
         Parameters
-        ----------
+        -----------
         valid_seg : igwn_segments.segment
             The time span over which the job is valid for.
         extension : string
@@ -1035,7 +1020,6 @@ class Node(pegasus_workflow.Node):
             This file is to be added to the output mapper and will be stored
             in the specified output location if True. If false file will be
             removed when no longer needed in the workflow.
-
         """
         if tags is None:
             tags = []
@@ -1065,8 +1049,7 @@ class Node(pegasus_workflow.Node):
         return fil
 
     def add_multiifo_input_list_opt(self, opt, inputs):
-        """
-        Add an option that determines a list of inputs from multiple
+        """Add an option that determines a list of inputs from multiple
         detectors. Files will be supplied as --opt ifo1:input1 ifo2:input2
         .....
         """
@@ -1075,15 +1058,21 @@ class Node(pegasus_workflow.Node):
         self.add_raw_arg(opt)
         self.add_raw_arg(" ")
         for infile in inputs:
-            self.add_raw_arg(infile.ifo)
-            self.add_raw_arg(":")
-            self.add_raw_arg(infile.name)
-            self.add_raw_arg(" ")
+            if hasattr(infile, "ifo_list") and len(infile.ifo_list) > 1:
+                for ifo in infile.ifo_list:
+                    self.add_raw_arg(ifo)
+                    self.add_raw_arg(":")
+                    self.add_raw_arg(infile.name)
+                    self.add_raw_arg(" ")
+            else:
+                self.add_raw_arg(infile.ifo)
+                self.add_raw_arg(":")
+                self.add_raw_arg(infile.name)
+                self.add_raw_arg(" ")
             self.add_input(infile)
 
     def add_multiifo_output_list_opt(self, opt, outputs):
-        """
-        Add an option that determines a list of outputs from multiple
+        """Add an option that determines a list of outputs from multiple
         detectors. Files will be supplied as --opt ifo1:input1 ifo2:input2
         .....
         """
@@ -1092,10 +1081,17 @@ class Node(pegasus_workflow.Node):
         self.add_raw_arg(opt)
         self.add_raw_arg(" ")
         for outfile in outputs:
-            self.add_raw_arg(outfile.ifo)
-            self.add_raw_arg(":")
-            self.add_raw_arg(outfile.name)
-            self.add_raw_arg(" ")
+            if hasattr(outfile, "ifo_list") and len(outfile.ifo_list) > 1:
+                for ifo in outfile.ifo_list:
+                    self.add_raw_arg(ifo)
+                    self.add_raw_arg(":")
+                    self.add_raw_arg(outfile.name)
+                    self.add_raw_arg(" ")
+            else:
+                self.add_raw_arg(outfile.ifo)
+                self.add_raw_arg(":")
+                self.add_raw_arg(outfile.name)
+                self.add_raw_arg(" ")
             self.add_output(outfile)
 
     def new_multiifo_output_list_opt(
@@ -1108,8 +1104,7 @@ class Node(pegasus_workflow.Node):
         store_file=None,
         use_tmp_subdirs=False,
     ):
-        """
-        Add an option that determines a list of outputs from multiple
+        """Add an option that determines a list of outputs from multiple
         detectors. Files will be supplied as --opt ifo1:input1 ifo2:input2
         .....
         File names are created internally from the provided extension and
@@ -1237,7 +1232,6 @@ class File(pegasus_workflow.File):
             This is a list of descriptors describing what this file is. For
             e.g. this might be ["BNSINJECTIONS" ,"LOWMASS","CAT_2_VETO"].
             These are used in file naming.
-
         """
         self.metadata = {}
 
@@ -1321,8 +1315,7 @@ class File(pegasus_workflow.File):
             self.storage_path = None
 
     def __getstate__(self):
-        """
-        Allow the workflow.File to be picklable. This disables the usage of
+        """Allow the workflow.File to be picklable. This disables the usage of
         the internal cache entry.
         """
         for i, seg in enumerate(self.segment_list):
@@ -1443,18 +1436,18 @@ class FileList(list):
         attribute (eg. 'segment', 'ifo', 'description').
 
         Parameters
-        ----------
+        -----------
         attribute : string
            File object attribute to categorize FileList
 
         Returns
-        -------
+        --------
         keys : list
            A list of values for an attribute
         groups : list
            A list of FileLists
-
         """
+
         # need to sort FileList otherwise using groupby without sorting does
         # 'AAABBBCCDDAABB' -> ['AAA','BBB','CC','DD','AA','BB']
         # and using groupby with sorting does
@@ -1471,14 +1464,13 @@ class FileList(list):
         return keys, groups
 
     def find_output(self, ifo, time):
-        """
-        Returns one File most appropriate at the given time/time range.
+        """Returns one File most appropriate at the given time/time range.
 
         Return one File that covers the given time, or is most
         appropriate for the supplied time range.
 
         Parameters
-        ----------
+        -----------
         ifo : string
            Name of the ifo (or ifos) that the file should be valid for.
         time : int/float/LIGOGPStime or tuple containing two values
@@ -1490,10 +1482,9 @@ class FileList(list):
            self.find_output_in_range
 
         Returns
-        -------
+        --------
         pycbc_file : pycbc.workflow.File instance
            The File that corresponds to the time or time range
-
         """
         # Determine whether I have a specific time, or a range of times
         try:
@@ -1515,7 +1506,7 @@ class FileList(list):
         Return File that covers the given time.
 
         Parameters
-        ----------
+        -----------
         ifo : string
            Name of the ifo (or ifos) that the File should correspond to
         time : int/float/LIGOGPStime
@@ -1523,10 +1514,9 @@ class FileList(list):
            File covers the time this will return None.
 
         Returns
-        -------
+        --------
         list of File classes
            The Files that corresponds to the time.
-
         """
         # Get list of Files that overlap time, for given ifo
         outFiles = [i for i in self if ifo in i.ifo_list and time in i.segment_list]
@@ -1548,17 +1538,16 @@ class FileList(list):
         largest overlap with the supplied time range.
 
         Parameters
-        ----------
+        -----------
         ifo : string
            Name of the ifo (or ifos) that the File should correspond to
         current_segment : igwn_segments.segment
            The segment of time that files must intersect.
 
         Returns
-        -------
+        --------
         FileList class
            The list of Files that are most appropriate for the time range
-
         """
         currsegment_list = segments.segmentlist([current_segment])
 
@@ -1593,7 +1582,7 @@ class FileList(list):
         overlap the supplied time window, will return None.
 
         Parameters
-        ----------
+        -----------
         ifo : string
            Name of the ifo (or ifos) that the File should correspond to
         start : int/float/LIGOGPStime
@@ -1602,10 +1591,9 @@ class FileList(list):
            The end of the time range of interest
 
         Returns
-        -------
+        --------
         File class
            The File that is most appropriate for the time range
-
         """
         currsegment_list = segments.segmentlist([segments.segment(start, end)])
 
@@ -1676,7 +1664,7 @@ class FileList(list):
         Find all files who have tag in self.tags
 
         Parameters
-        ----------
+        -----------
         tag : string
            Tag used to seive the file names
         fail_if_not_single_file : boolean
@@ -1684,14 +1672,13 @@ class FileList(list):
            user expects to find a single file with the desired tag in its name
 
         Returns
-        -------
+        --------
         FileList/File class
            If fail_if_not_single_file is False the FileList
            Containing File instances with tag in self.tags is returned,
            otherwise the single File with tag in self.tags is returned
            (if the sanity check requested with fail_if_not_single_file=True is
            passed)
-
         """
         # Enforce upper case
         tag = tag.upper()
@@ -1824,8 +1811,7 @@ class FileList(list):
         pickle.dump(self, f)
 
     def to_file_object(self, name, out_dir):
-        """
-        Dump to a pickle file and return an File object reference
+        """Dump to a pickle file and return an File object reference
 
         Parameters
         ----------
@@ -1837,7 +1823,6 @@ class FileList(list):
         Returns
         -------
         file : AhopeFile
-
         """
         make_analysis_dir(out_dir)
 
@@ -1877,7 +1862,7 @@ class SegFile(File):
         we key by dict[ifo:name].
 
         Parameters
-        ----------
+        ------------
         ifo_list : string or list (required)
             See File.__init__
         description : string (required)
@@ -1902,11 +1887,10 @@ class SegFile(File):
     def from_segment_list(
         cls, description, segmentlist, name, ifo, seg_summ_list=None, **kwargs
     ):
-        """
-        Initialize a SegFile object from a segmentlist.
+        """Initialize a SegFile object from a segmentlist.
 
         Parameters
-        ----------
+        ------------
         description : string (required)
             See File.__init__
         segmentlist : igwn_segments.segmentslist
@@ -1919,7 +1903,6 @@ class SegFile(File):
             Specify the segment_summary segmentlist that goes along with the
             segmentlist. Default=None, in this case segment_summary is taken
             from the valid_segment of the SegFile class.
-
         """
         seglistdict = segments.segmentlistdict()
         seglistdict[ifo + ":" + name] = segmentlist
@@ -1935,11 +1918,10 @@ class SegFile(File):
     def from_multi_segment_list(
         cls, description, segmentlists, names, ifos, seg_summ_lists=None, **kwargs
     ):
-        """
-        Initialize a SegFile object from a list of segmentlists.
+        """Initialize a SegFile object from a list of segmentlists.
 
         Parameters
-        ----------
+        ------------
         description : string (required)
             See File.__init__
         segmentlists : List of igwn_segments.segmentslist
@@ -1952,7 +1934,6 @@ class SegFile(File):
             Specify the segment_summary segmentlists that go along with the
             segmentlists. Default=None, in this case segment_summary is taken
             from the valid_segment of the SegFile class.
-
         """
         seglistdict = segments.segmentlistdict()
         for name, ifo, segmentlist in zip(names, ifos, segmentlists):
@@ -1979,11 +1960,10 @@ class SegFile(File):
         seg_summ_dict=None,
         **kwargs,
     ):
-        """
-        Initialize a SegFile object from a segmentlistdict.
+        """Initialize a SegFile object from a segmentlistdict.
 
         Parameters
-        ----------
+        ------------
         description : string (required)
             See File.__init__
         segmentlistdict : igwn_segments.segmentslistdict
@@ -1999,7 +1979,6 @@ class SegFile(File):
             exists on disk and so there is no need to write again.
         seg_summ_dict : igwn_segments.segmentslistdict
             Optional. See SegFile.__init__.
-
         """
         if ifo_list is None:
             ifo_set = set([i.split(":")[0] for i in segmentlistdict.keys()])
@@ -2049,10 +2028,9 @@ class SegFile(File):
         xml segment table.
 
         Parameters
-        ----------
+        -----------
         xml_file : file object
             file object for segment xml file
-
         """
         # load xmldocument and SegmentDefTable and SegmentTables
         fp = open(xml_file, "rb")
@@ -2114,11 +2092,10 @@ class SegFile(File):
         these segments.
 
         Parameters
-        ----------
+        -----------
         minSegLength : int
             Maximum length of science segments. Segments shorter than this will
             be removed.
-
         """
         newsegment_list = segments.segmentlist()
         for key, seglist in self.segment_dict.items():
@@ -2186,6 +2163,7 @@ class SegFile(File):
         url = urljoin("file:", pathname2url(self.storage_path))
         if not override_file_if_exists or not self.has_pfn(url, site="local"):
             self.add_pfn(url, site="local")
+        makedir(os.path.dirname(self.storage_path))
         ligolw_utils.write_filename(outdoc, self.storage_path)
 
 
@@ -2198,7 +2176,7 @@ def make_external_call(
     http://docs.python.org/2/library/subprocess.html
 
     Parameters
-    ----------
+    -----------
     cmdList : list of strings
         This list of strings contains the command to be run. See the subprocess
         documentation for more details.
@@ -2221,10 +2199,9 @@ def make_external_call(
         and out_basename options.
 
     Returns
-    -------
+    --------
     exitCode : int
         The code returned by the process.
-
     """
     if out_dir:
         outBase = os.path.join(out_dir, out_basename)
@@ -2291,7 +2268,11 @@ class CalledProcessErrorMod(Exception):
 
 
 def resolve_url_to_file(
-    curr_pfn, attrs=None, hash_max_chunks=10, hash_chunk_size=int(1e6)
+    curr_pfn,
+    attrs=None,
+    hash_max_chunks=10,
+    hash_chunk_size=int(1e6),
+    copy_to_cwd=False,
 ):
     """
     Resolves a PFN into a workflow.File object.
@@ -2341,6 +2322,7 @@ def resolve_url_to_file(
             curr_pfn,
             hash_max_chunks=hash_max_chunks,
             hash_chunk_size=hash_chunk_size,
+            copy_to_cwd=copy_to_cwd,
         )
         # Create File object with default local path
         curr_file = File.from_path(local_file_path, attrs=attrs)
@@ -2364,7 +2346,7 @@ def configparser_value_to_file(cp, sec, opt, attrs=None):
     and option in the workflow configuration parser.
 
     Parameters
-    ----------
+    -----------
     cp : ConfigParser object
          The ConfigParser object holding the workflow configuration settings
     sec : string
@@ -2374,10 +2356,9 @@ def configparser_value_to_file(cp, sec, opt, attrs=None):
     attrs : list to specify the 4 attributes of the file.
 
     Returns
-    -------
+    --------
     fileobj_from_path : workflow.File object obtained from the path
         specified by opt, within sec, in cp.
-
     """
     path = cp.get(sec, opt)
     fileobj_from_path = resolve_url_to_file(path, attrs=attrs)
@@ -2390,15 +2371,14 @@ def get_full_analysis_chunk(science_segs):
     and return a single segment spanning that full time.
 
     Parameters
-    ----------
+    -----------
     science_segs : ifo-keyed dictionary of igwn_segments.segmentlist instances
         The list of times that are being analysed in this workflow.
 
     Returns
-    -------
+    --------
     fullSegment : igwn_segments.segment
         The segment spanning the first and last time point contained in science_segs.
-
     """
     extents = [science_segs[ifo].extent() for ifo in science_segs.keys()]
     min, max = extents[0]
@@ -2473,8 +2453,7 @@ def resolve_td_option(val_str, valid_seg):
 
 
 def add_workflow_settings_cli(parser, include_subdax_opts=False):
-    """
-    Adds workflow options to an argument parser.
+    """Adds workflow options to an argument parser.
 
     Parameters
     ----------
@@ -2484,7 +2463,6 @@ def add_workflow_settings_cli(parser, include_subdax_opts=False):
         If True, will add output-map and dax-file-directory options
         to the parser. These can be used for workflows that are
         generated as a subdax of another workflow. Default is False.
-
     """
     wfgrp = parser.add_argument_group("Options for setting workflow files")
     wfgrp.add_argument("--workflow-name", required=True, help="Name of the workflow.")

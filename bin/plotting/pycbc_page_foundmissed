@@ -29,6 +29,9 @@ labels = {
     "comb_optimal_snr": "Combined Optimal SNR",
     "decisive_optimal_snr": "Decisive Optimal SNR",
     "max_optimal_snr": "Maximum Optimal SNR",
+    "comb_optimal_mf_snr": "Combined Optimal Matched-Filter SNR",
+    "decisive_optimal_mf_snr": "Decisive Optimal Matched-Filter SNR",
+    "max_optimal_mf_snr": "Maximum Optimal Matched-Filter SNR",
     "redshift": "Redshift",
     "time": "Time (s)",
     "effective_spin": "Effective Inspiral Spin",
@@ -181,17 +184,35 @@ if args.distance_type == "redshift":
     dvals["redshift"] = f["injections/redshift"][:]
 
 if "snr" in args.distance_type:  # only evaluate SNRs if needed
-    opt_snrsq_arr = [f["injections/optimal_snr_%s" % ifo][:] ** 2.0 for ifo in ifos]
-    dvals["comb_optimal_snr"] = numpy.array(
-        [numpy.sqrt(sum(opt_snrsq)) for opt_snrsq in zip(*opt_snrsq_arr)]
-    )
-    # Decisive optimal SNR is the 2nd largest optimal SNR
-    dvals["decisive_optimal_snr"] = numpy.array(
-        [numpy.sqrt(sorted(opt_snrsq)[-2]) for opt_snrsq in zip(*opt_snrsq_arr)]
-    )
-    dvals["max_optimal_snr"] = numpy.array(
-        [numpy.sqrt(max(opt_snrsq)) for opt_snrsq in zip(*opt_snrsq_arr)]
-    )
+    if "mf" in args.distance_type:
+        opt_snrsq_arr = [
+            numpy.nan_to_num(f["injections/optimal_mf_snr_%s" % ifo][:], nan=0.0) ** 2.0
+            for ifo in ifos
+        ]
+        dvals["comb_optimal_mf_snr"] = numpy.array(
+            [numpy.sqrt(sum(opt_snrsq)) for opt_snrsq in zip(*opt_snrsq_arr)]
+        )
+        dvals["decisive_optimal_mf_snr"] = numpy.array(
+            [numpy.sqrt(sorted(opt_snrsq)[-2]) for opt_snrsq in zip(*opt_snrsq_arr)]
+        )
+        dvals["max_optimal_mf_snr"] = numpy.array(
+            [numpy.sqrt(max(opt_snrsq)) for opt_snrsq in zip(*opt_snrsq_arr)]
+        )
+    else:
+        opt_snrsq_arr = [
+            numpy.nan_to_num(f["injections/optimal_snr_%s" % ifo][:], nan=0.0) ** 2.0
+            for ifo in ifos
+        ]
+        dvals["comb_optimal_snr"] = numpy.array(
+            [numpy.sqrt(sum(opt_snrsq)) for opt_snrsq in zip(*opt_snrsq_arr)]
+        )
+        # Decisive optimal SNR is the 2nd largest optimal SNR
+        dvals["decisive_optimal_snr"] = numpy.array(
+            [numpy.sqrt(sorted(opt_snrsq)[-2]) for opt_snrsq in zip(*opt_snrsq_arr)]
+        )
+        dvals["max_optimal_snr"] = numpy.array(
+            [numpy.sqrt(max(opt_snrsq)) for opt_snrsq in zip(*opt_snrsq_arr)]
+        )
 
 fdvals = dvals[args.distance_type][found]
 mdvals = dvals[args.distance_type][missed]
@@ -278,15 +299,20 @@ if args.gradient_far:
         c.set_label("False Alarm Rate $(yr^{-1})$, %s" % far_title)
 
         # Set up tick labels - there will be 5 if possible
-        min_tick = numpy.ceil(min(numpy.log10(color)))
-        max_tick = numpy.floor(max(numpy.log10(color)))
-        tick_step = max(1, numpy.floor((max_tick - min_tick) / 5))
-        ticks = numpy.arange(min_tick, max_tick, tick_step)
-        c.set_ticks(numpy.power(10, ticks))
-    except (TypeError, ZeroDivisionError):
-        # Can't make colorbar if no quiet found injections
-        if len(fvals):
-            raise
+        color_pos = color[numpy.isfinite(color) & (color > 0)]
+        if len(color_pos) > 0:
+            min_tick = numpy.ceil(min(numpy.log10(color_pos)))
+            max_tick = numpy.floor(max(numpy.log10(color_pos)))
+            if (
+                numpy.isfinite(min_tick)
+                and numpy.isfinite(max_tick)
+                and max_tick > min_tick
+            ):
+                tick_step = max(1, numpy.floor((max_tick - min_tick) / 5))
+                ticks = numpy.arange(min_tick, max_tick, tick_step)
+                c.set_ticks(numpy.power(10, ticks))
+    except (TypeError, ZeroDivisionError, ValueError):
+        pass
 
 if args.missed_on_top:
     caption += "Missed injections are shown on top of found injections."

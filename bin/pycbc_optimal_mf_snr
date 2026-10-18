@@ -1,0 +1,608 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2026 Alex Nitz, Antigravity AI
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+
+"""
+Compute optimal and optimal matched-filter (MF) SNRs for every injection
+in an input HDF file and store the results in HDF file datasets:
+- optimal_snr_<ifo>: deterministic signal strength sqrt(<h|h>)
+- optimal_mf_snr_<ifo>: realized matched-filter SNR max|<s+h|h>|/sigma in detector noise
+"""
+
+import argparse
+import glob
+import logging
+import multiprocessing
+import os
+
+import numpy as np
+
+import pycbc
+import pycbc.inject
+import pycbc.pnutils
+import pycbc.psd
+from pycbc.filter import (
+    highpass,
+    make_frequency_series,
+    matched_filter,
+    resample_to_delta_t,
+    sigma,
+)
+from pycbc.frame import read_frame
+from pycbc.io.hdf import HFile
+from pycbc.types import (
+    FrequencySeries,
+    MultiDetOptionAction,
+    TimeSeries,
+    float32,
+    load_frequencyseries,
+    zeros,
+)
+
+
+class TimeVaryingPSD:
+    def __init__(self, file_name, length=None, delta_f=None, f_low=None, f_high=None):
+        with HFile(file_name, "r") as f:
+            self.file_name = file_name
+            detector = tuple(f.keys())[0]
+            self.start_times = f[detector + "/start_time"][:]
+            self.end_times = f[detector + "/end_time"][:]
+            self.file_f_low = f.attrs.get("low_frequency_cutoff", 0.0)
+            self.file_f_high = f.attrs.get("high_frequency_cutoff", None)
+        self._curr_psd = {}
+        self._curr_psd_index = {}
+        self.detector = detector
+        self.length = length
+        self.delta_f = delta_f
+        self.f_low = f_low
+        self.f_high = f_high
+
+    def __call__(self, time=None):
+        mask = np.logical_and(self.start_times <= time, self.end_times > time)
+        if not mask.any():
+            return None
+        center_times = (self.start_times[mask] + self.end_times[mask]) / 2.0
+        closest_idx = np.argmin(abs(center_times - time))
+        return self.get_psd(np.flatnonzero(mask)[closest_idx])
+
+    def get_psd(self, index):
+        curr_pid = multiprocessing.current_process().pid
+        if curr_pid not in self._curr_psd_index:
+            self._curr_psd_index[curr_pid] = -1
+        if not index == self._curr_psd_index[curr_pid]:
+            group = self.detector + "/psds/" + str(index)
+            psd = load_frequencyseries(self.file_name, group=group)
+            if psd.dtype != np.float32:
+                psd = psd.astype(np.float32)
+            if self.delta_f is not None and psd.delta_f != self.delta_f:
+                psd = pycbc.psd.interpolate(psd, self.delta_f)
+            if self.length is not None and self.length != len(psd):
+                psd2 = FrequencySeries(
+                    zeros(self.length, dtype=psd.dtype), delta_f=psd.delta_f
+                )
+                if self.length > len(psd):
+                    psd2[:] = np.inf
+                    psd2[0 : len(psd)] = psd
+                else:
+                    psd2[:] = psd[0 : self.length]
+                psd = psd2
+            eff_f_low = self.f_low if self.f_low is not None else self.file_f_low
+            if eff_f_low is not None and eff_f_low > 0:
+                k = int(eff_f_low / psd.delta_f)
+                psd[0:k] = np.inf
+            eff_f_high = self.f_high if self.f_high is not None else self.file_f_high
+            if eff_f_high is not None and eff_f_high > 0:
+                k_high = int(eff_f_high / psd.delta_f)
+                if k_high < len(psd):
+                    psd[k_high:] = np.inf
+            self._curr_psd[curr_pid] = psd
+            self._curr_psd_index[curr_pid] = index
+        return self._curr_psd[curr_pid]
+
+
+class FrameBufferReader:
+    """Memory-efficient cached frame reader that loads frame segments on demand."""
+
+    def __init__(
+        self,
+        frame_files,
+        channel_name,
+        sample_rate,
+        highpass_freq=15.0,
+        autogating_threshold=45.0,
+        autogating_cluster=2.0,
+        autogating_width=0.25,
+        autogating_taper=0.25,
+    ):
+        self.channel_name = channel_name
+        self.sample_rate = sample_rate
+        self.delta_t = 1.0 / sample_rate
+        self.highpass_freq = highpass_freq
+        self.autogating_threshold = autogating_threshold
+        self.autogating_cluster = autogating_cluster
+        self.autogating_width = autogating_width
+        self.autogating_taper = autogating_taper
+        self.current_ts = None
+        self.catalog = []
+
+        # Parse catalog
+        for f in frame_files:
+            clean_f = f.replace("file://localhost", "").replace("file://", "")
+            base = os.path.basename(clean_f)
+            base_no_ext = os.path.splitext(base)[0]
+            parts = base_no_ext.split("-")
+            try:
+                st = int(parts[-2])
+                dur = int(parts[-1])
+                self.catalog.append((st, st + dur, clean_f))
+            except (ValueError, IndexError):
+                # Fallback: inspect file
+                self.catalog.append((0, 2000000000, clean_f))
+        self.catalog.sort()
+
+    def get_data(self, start_time, duration):
+        end_time = start_time + duration
+        pad = 16.0
+
+        # Check cache hit
+        if self.current_ts is not None:
+            if (
+                self.current_ts.start_time <= start_time
+                and self.current_ts.end_time >= end_time
+            ):
+                return self.current_ts.time_slice(start_time, end_time)
+
+        # Buffer up to 1024s into the future to amortize read/resample/highpass across adjacent injections
+        buf_duration = max(duration, 1024.0)
+        req_st = start_time - pad
+        req_et = start_time + buf_duration + pad
+
+        matching = [
+            f for st, et, f in self.catalog if not (et <= req_st or st >= req_et)
+        ]
+        if not matching:
+            return None
+
+        f_st = min(st for st, et, f in self.catalog if f in matching)
+        f_et = max(et for st, et, f in self.catalog if f in matching)
+        load_st = max(f_st, req_st)
+        load_et = min(f_et, req_et)
+        if load_et - load_st < duration:
+            return None
+
+        try:
+            raw = read_frame(
+                matching, self.channel_name, start_time=load_st, end_time=load_et
+            )
+            raw_arr = raw.numpy()
+            if np.isnan(raw_arr).all():
+                return None
+            if np.isnan(raw_arr).any():
+                raw_arr = np.nan_to_num(raw_arr, nan=0.0)
+                raw = TimeSeries(raw_arr, delta_t=raw.delta_t, epoch=raw.start_time)
+
+            ds = resample_to_delta_t(raw, self.delta_t).astype(float32)
+            if self.highpass_freq and self.highpass_freq > 0:
+                ds = highpass(ds, self.highpass_freq)
+            ds *= pycbc.DYN_RANGE_FAC
+
+            # Precondition with autogating to eliminate large instrumental glitches
+            if self.autogating_threshold is not None and self.autogating_threshold > 0:
+                from pycbc.strain.strain import detect_loud_glitches, gate_data
+
+                glitches = detect_loud_glitches(
+                    ds,
+                    psd_duration=4.0,
+                    psd_stride=2.0,
+                    threshold=self.autogating_threshold,
+                    cluster_window=self.autogating_cluster,
+                    low_freq_cutoff=20.0,
+                    corrupt_time=2.0,
+                )
+                if len(glitches) > 0:
+                    logging.info(
+                        "Autogating %d glitches in %s [%d-%d]",
+                        len(glitches),
+                        self.channel_name,
+                        load_st,
+                        load_et,
+                    )
+                    gate_params = [
+                        (gt, self.autogating_width, self.autogating_taper)
+                        for gt in glitches
+                    ]
+                    ds = gate_data(ds, gate_params)
+
+            # Drop filter corrupt time at ends
+            safe_st = int(load_st + pad)
+            safe_et = int(load_et - pad)
+            if safe_et - safe_st >= duration:
+                ds = ds.time_slice(safe_st, safe_et)
+            self.current_ts = ds
+
+            # Return requested slice
+            if (
+                self.current_ts.start_time <= start_time
+                and self.current_ts.end_time >= end_time
+            ):
+                return self.current_ts.time_slice(start_time, end_time)
+            safe_start = max(
+                self.current_ts.start_time,
+                min(self.current_ts.end_time - duration, start_time),
+            )
+            return self.current_ts.time_slice(safe_start, safe_start + duration)
+        except Exception as e:
+            logging.debug(
+                "Failed to read frame data for %s [%d-%d]: %s",
+                self.channel_name,
+                load_st,
+                load_et,
+                e,
+            )
+            return None
+
+
+def parse_injection_range(num_inj, rangestr):
+    part = int(rangestr.split("/")[0])
+    pieces = int(rangestr.split("/")[1])
+    tmin = num_inj * part // pieces
+    tmax = num_inj * (part + 1) // pieces
+    return tmin, tmax
+
+
+def get_gc_end_time(injection):
+    try:
+        return float(injection.geocent_end_time)
+    except AttributeError:
+        return float(injection.tc)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    pycbc.add_common_pycbc_options(parser)
+    parser.add_argument(
+        "--input-file",
+        "--injection-file",
+        "-i",
+        dest="input_file",
+        required=True,
+        help="Input HDF file defining injections",
+    )
+    parser.add_argument(
+        "--output-file",
+        "-o",
+        required=True,
+        help="Output HDF file storing optimal and optimal MF SNRs",
+    )
+    parser.add_argument(
+        "--injection-fraction-range",
+        default="0/1",
+        help="Optional, analyze only a certain range of injections. Format PART/NUM_PARTS",
+    )
+    parser.add_argument(
+        "--cores",
+        default=1,
+        type=int,
+        help="Parallelize the computation over cores (for pipeline compatibility)",
+    )
+    parser.add_argument(
+        "--f-low",
+        "--low-frequency-cutoff",
+        dest="f_low",
+        type=float,
+        default=20.0,
+        help="Low frequency cutoff for matched filtering (default 20.0 Hz)",
+    )
+    parser.add_argument(
+        "--f-high",
+        "--high-frequency-cutoff",
+        dest="f_high",
+        type=float,
+        default=None,
+        help="High frequency cutoff for matched filtering (default 0.9 * nyquist)",
+    )
+    parser.add_argument(
+        "--seg-length",
+        type=float,
+        default=256.0,
+        help="Segment duration in seconds (default 256.0 s)",
+    )
+    parser.add_argument(
+        "--sample-rate",
+        type=float,
+        default=2048.0,
+        help="Data sample rate in Hz (default 2048.0 Hz)",
+    )
+    parser.add_argument(
+        "--time-window",
+        type=float,
+        default=0.05,
+        help="Search window around arrival time for peak MF SNR in seconds (default 0.05 s)",
+    )
+    parser.add_argument(
+        "--ifos", nargs="+", required=True, help="Detectors to analyze (e.g. H1 L1)"
+    )
+    parser.add_argument(
+        "--channel-name",
+        nargs="*",
+        action=MultiDetOptionAction,
+        metavar="DETECTOR:CHANNEL",
+        help="Channel name for each detector (e.g. H1:GWOSC-4KHZ_R1_STRAIN)",
+    )
+    parser.add_argument(
+        "--frame-files",
+        nargs="*",
+        action=pycbc.types.MultiDetOptionAppendAction,
+        metavar="DETECTOR:FILES",
+        help="Frame files for each detector",
+    )
+    parser.add_argument(
+        "--frame-cache",
+        nargs="*",
+        action=pycbc.types.MultiDetOptionAppendAction,
+        metavar="DETECTOR:CACHE",
+        help="Frame cache files for each detector",
+    )
+    parser.add_argument(
+        "--autogating-threshold",
+        type=float,
+        default=45.0,
+        help="Glitch autogating threshold in sigma (default 45.0; matching search pipeline; set <= 0 to disable)",
+    )
+    parser.add_argument(
+        "--autogating-cluster",
+        type=float,
+        default=2.0,
+        help="Cluster window for autogating in seconds (default 2.0)",
+    )
+    parser.add_argument(
+        "--autogating-width",
+        type=float,
+        default=0.25,
+        help="Autogate zeroed half-width in seconds (default 0.25)",
+    )
+    parser.add_argument(
+        "--autogating-taper",
+        type=float,
+        default=0.25,
+        help="Autogate taper duration in seconds (default 0.25)",
+    )
+    parser.add_argument(
+        "--time-varying-psds",
+        nargs="*",
+        metavar="FILE",
+        help="Time-varying PSD HDF files",
+    )
+    parser.add_argument("--progress", action="store_true", help="Show progress bar")
+
+    opts = parser.parse_args()
+    pycbc.init_logging(opts.verbose)
+
+    detectors = opts.ifos
+    seg_len = opts.seg_length
+    sample_rate = opts.sample_rate
+    delta_t = 1.0 / sample_rate
+    delta_f = 1.0 / seg_len
+    tlen = int(seg_len * sample_rate)
+    flen = tlen // 2 + 1
+    f_low = opts.f_low
+    f_high = opts.f_high
+    if f_high is None:
+        f_high = 0.9 * (sample_rate / 2.0)
+    logging.info("Frequency cutoffs: f_low=%.1f Hz, f_high=%.1f Hz", f_low, f_high)
+
+    logging.info("Loading PSDs for %s", detectors)
+    psds = {}
+    if opts.time_varying_psds:
+        for tvpsd_file in opts.time_varying_psds:
+            tvpsd = TimeVaryingPSD(tvpsd_file, flen, delta_f, f_low, f_high)
+            psds[tvpsd.detector] = tvpsd
+
+    logging.info("Initializing frame readers for %s", detectors)
+    frame_readers = {}
+    for det in detectors:
+        channel = None
+        if getattr(opts, "channel_name", None) and det in opts.channel_name:
+            channel = opts.channel_name[det]
+        if not channel:
+            channel = f"{det}:GWOSC-4KHZ_R1_STRAIN"
+
+        files = []
+        if getattr(opts, "frame_files", None) and det in opts.frame_files:
+            spec = opts.frame_files[det]
+            if isinstance(spec, str):
+                files = spec.split(",")
+            else:
+                for item in spec:
+                    files.extend(item.split(","))
+        elif getattr(opts, "frame_cache", None) and det in opts.frame_cache:
+            cache_files = opts.frame_cache[det]
+            if isinstance(cache_files, str):
+                cache_files = [cache_files]
+            for cache_file in cache_files:
+                with open(cache_file) as cf:
+                    for line in cf:
+                        parts = line.strip().split()
+                        if parts:
+                            files.append(
+                                parts[-1]
+                                .replace("file://localhost", "")
+                                .replace("file://", "")
+                            )
+        else:
+            cand_files = sorted(glob.glob(f"frames/*{det}*.gwf")) + sorted(
+                glob.glob(f"../frames/*{det}*.gwf")
+            )
+            if not cand_files:
+                cand_files = sorted(
+                    glob.glob(
+                        f"/home/ahnitz/projects/claude/searchdev/bbh_test/frames/*{det}*.gwf"
+                    )
+                )
+            if not cand_files:
+                cand_files = sorted(glob.glob(f"tests/search_test/frames/*{det}*.gwf"))
+            if not cand_files:
+                cand_files = sorted(
+                    glob.glob(
+                        f"/home/ahnitz/projects/claude/searchdev/tests/search_test/frames/*{det}*.gwf"
+                    )
+                )
+            if cand_files:
+                files = cand_files
+
+        if not files:
+            raise ValueError(f"No frame files found for detector {det}")
+        logging.info(
+            "Detector %s: %d frame files loaded for channel %s",
+            det,
+            len(files),
+            channel,
+        )
+        frame_readers[det] = FrameBufferReader(
+            files,
+            channel,
+            sample_rate,
+            highpass_freq=15.0,
+            autogating_threshold=opts.autogating_threshold,
+            autogating_cluster=opts.autogating_cluster,
+            autogating_width=opts.autogating_width,
+            autogating_taper=opts.autogating_taper,
+        )
+
+    logging.info("Loading injections from %s", opts.input_file)
+    injections = pycbc.inject.InjectionSet(opts.input_file)
+    inj_table = injections.table
+
+    if "simulation_id" not in inj_table.fieldnames:
+        inj_table = inj_table.add_fields(np.arange(len(inj_table)), "simulation_id")
+
+    num_injections = len(inj_table)
+    imin, imax = parse_injection_range(num_injections, opts.injection_fraction_range)
+    inj_table = inj_table[imin:imax]
+
+    # Add output fields if not present
+    for det in detectors:
+        for col_prefix in ["optimal_snr_", "optimal_mf_snr_"]:
+            col_name = col_prefix + det
+            if col_name not in inj_table.fieldnames:
+                inj_table = inj_table.add_fields(
+                    np.zeros(len(inj_table), dtype=np.float32), col_name
+                )
+
+    injections.table = inj_table
+    num_injections = len(inj_table)
+    logging.info(
+        "Processing %d injections (slice %d:%d) across %s",
+        num_injections,
+        imin,
+        imax,
+        detectors,
+    )
+
+    iterator = range(num_injections)
+    if opts.progress:
+        try:
+            from tqdm import tqdm
+
+            iterator = tqdm(iterator, total=num_injections)
+        except ImportError:
+            pass
+
+    n_win = int(opts.time_window * sample_rate)
+
+    for idx in iterator:
+        inj = inj_table[idx]
+        tc = get_gc_end_time(inj)
+        sim_id = int(inj.simulation_id)
+        # Position injection arrival time comfortably in the interior of the segment
+        ideal_start_time = int(tc - seg_len / 2.0)
+
+        for det in detectors:
+            psd_func = psds.get(det)
+            if psd_func is None:
+                continue
+            psd = psd_func(tc)
+            if psd is None:
+                # Detector off
+                inj_table["optimal_snr_" + det][idx] = 0.0
+                inj_table["optimal_mf_snr_" + det][idx] = 0.0
+                continue
+
+            # 1. Read detector noise around injection
+            data = frame_readers[det].get_data(ideal_start_time, int(seg_len))
+            if data is None:
+                inj_table["optimal_snr_" + det][idx] = 0.0
+                inj_table["optimal_mf_snr_" + det][idx] = 0.0
+                continue
+
+            start_time = int(data.start_time)
+
+            # 2. Generate template waveform in zero noise (scaled by DYN_RANGE_FAC)
+            wave_ts = TimeSeries(
+                zeros(tlen, dtype=float32), delta_t=delta_t, epoch=start_time
+            )
+            injections.apply(
+                wave_ts,
+                det,
+                distance_scale=1.0 / pycbc.DYN_RANGE_FAC,
+                simulation_ids=[sim_id],
+            )
+            wave_fd = make_frequency_series(wave_ts)
+
+            # Deterministic optimal SNR
+            sig = sigma(
+                wave_fd,
+                psd=psd,
+                low_frequency_cutoff=f_low,
+                high_frequency_cutoff=f_high,
+            )
+            inj_table["optimal_snr_" + det][idx] = float(sig)
+
+            # 3. Add injection to real detector data
+            data_with_inj = data + wave_ts
+
+            # 4. Matched filter: shift template merger to t=0 so peak occurs at physical arrival time tc
+            try:
+                shift_time = float(tc - start_time)
+                freqs = wave_fd.sample_frequencies.numpy()
+                phase_shift = np.exp(2j * np.pi * freqs * shift_time).astype(
+                    np.complex64
+                )
+                wave_fd_shifted = FrequencySeries(
+                    wave_fd.numpy() * phase_shift, delta_f=wave_fd.delta_f, epoch=0
+                )
+
+                snr_ts = matched_filter(
+                    wave_fd_shifted,
+                    data_with_inj,
+                    psd=psd,
+                    low_frequency_cutoff=f_low,
+                    high_frequency_cutoff=f_high,
+                    sigmasq=sig**2,
+                )
+                tc_idx = int(round((tc - float(snr_ts.start_time)) * sample_rate))
+                idx_min = max(0, tc_idx - n_win)
+                idx_max = min(len(snr_ts), tc_idx + n_win)
+                peak_snr = abs(snr_ts[idx_min:idx_max]).numpy().max()
+                inj_table["optimal_mf_snr_" + det][idx] = float(peak_snr)
+            except Exception as e:
+                logging.debug(
+                    "Matched filter failed for injection %d on %s: %s", idx, det, e
+                )
+                inj_table["optimal_mf_snr_" + det][idx] = 0.0
+
+    logging.info("Writing updated injection file to %s", opts.output_file)
+    os.makedirs(os.path.dirname(os.path.abspath(opts.output_file)), exist_ok=True)
+    pycbc.inject.InjectionSet.write(opts.output_file, inj_table)
+    logging.info(
+        "Completed optimal MF SNR calculation for %d injections", num_injections
+    )
+
+
+if __name__ == "__main__":
+    main()

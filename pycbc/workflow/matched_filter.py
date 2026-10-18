@@ -60,7 +60,7 @@ def setup_matchedfltr_workflow(
     there is data and a template bank file.
 
     Parameters
-    ----------
+    -----------
     Workflow : pycbc.workflow.core.Workflow
         The workflow instance that the coincidence jobs will be added to.
     science_segs : ifo-keyed dictionary of igwn_segments.segmentlist instances
@@ -88,7 +88,6 @@ def setup_matchedfltr_workflow(
         any intermediate products produced within this stage of the workflow.
         If you require access to any intermediate products produced at this
         stage you can call the various sub-functions directly.
-
     """
     if tags is None:
         tags = []
@@ -150,7 +149,7 @@ def setup_matchedfltr_dax_generated(
     Executable and Job sub-classes (see jobutils.py).
 
     Parameters
-    ----------
+    -----------
     workflow : pycbc.workflow.core.Workflow
         The Workflow instance that the coincidence jobs will be added to.
     science_segs : ifo-keyed dictionary of igwn_segments.segmentlist instances
@@ -178,7 +177,6 @@ def setup_matchedfltr_dax_generated(
         any intermediate products produced within this stage of the workflow.
         If you require access to any intermediate products produced at this
         stage you can call the various sub-functions directly.
-
     """
     if tags is None:
         tags = []
@@ -239,7 +237,7 @@ def setup_matchedfltr_dax_generated_multi(
     needed to define Executable and Job sub-classes (see jobutils.py).
 
     Parameters
-    ----------
+    -----------
     workflow : pycbc.workflow.core.Workflow
         The Workflow instance that the coincidence jobs will be added to.
     science_segs : ifo-keyed dictionary of igwn_segments.segmentlist instances
@@ -268,7 +266,6 @@ def setup_matchedfltr_dax_generated_multi(
         any intermediate products produced within this stage of the workflow.
         If you require access to any intermediate products produced at this
         stage you can call the various sub-functions directly.
-
     """
     if tags is None:
         tags = []
@@ -348,6 +345,155 @@ def setup_matchedfltr_dax_generated_multi(
                 output_dir,
                 parents=tmplt_banks,
             )
+    elif match_fltr_exe in ["pycbc_inspiral_fir", "pycbc_inspiral"]:
+        exe_class = select_matchedfilter_class(match_fltr_exe)
+
+        from igwn_segments import segment
+
+        coincident_only = cp.has_option("workflow-matchedfilter", "coincident-only")
+        if coincident_only:
+            analysis_segs = science_segs[ifos[0]]
+            for ifo in ifos[1:]:
+                analysis_segs = analysis_segs & science_segs[ifo]
+            seg_active_map = [(seg, tuple(ifos)) for seg in analysis_segs]
+        else:
+            bounds = set()
+            for s_list in science_segs.values():
+                for seg in s_list:
+                    bounds.add(seg[0])
+                    bounds.add(seg[1])
+            sorted_bounds = sorted(bounds)
+            raw_slices = []
+            for s, e in zip(sorted_bounds[:-1], sorted_bounds[1:]):
+                seg = segment([s, e])
+                active = tuple(
+                    sorted(
+                        ifo for ifo in ifos if science_segs[ifo].intersects_segment(seg)
+                    )
+                )
+                if active:
+                    raw_slices.append((seg, active))
+            seg_active_map = []
+            for seg, active in raw_slices:
+                if (
+                    seg_active_map
+                    and seg_active_map[-1][1] == active
+                    and seg_active_map[-1][0][1] == seg[0]
+                ):
+                    seg_active_map[-1] = (
+                        segment([seg_active_map[-1][0][0], seg[1]]),
+                        active,
+                    )
+                else:
+                    seg_active_map.append((seg, active))
+
+        if cp.has_option("workflow-matchedfilter", "target-job-duration"):
+            target_duration = int(
+                cp.get("workflow-matchedfilter", "target-job-duration")
+            )
+        else:
+            target_duration = 2048
+
+        if cp.has_option("workflow-matchedfilter", "min-analysis-length"):
+            min_analysis_length = int(
+                cp.get("workflow-matchedfilter", "min-analysis-length")
+            )
+        else:
+            min_analysis_length = 0
+
+        pad_data = 8
+        if cp.has_option("inspiral", "pad-data"):
+            pad_data = int(cp.get("inspiral", "pad-data"))
+
+        start_pad = 0
+        if cp.has_option("inspiral", "segment-start-pad"):
+            start_pad = int(cp.get("inspiral", "segment-start-pad"))
+
+        end_pad = 0
+        if cp.has_option("inspiral", "segment-end-pad"):
+            end_pad = int(cp.get("inspiral", "segment-end-pad"))
+
+        job_instances = {}
+
+        def get_job_instance(active_ifos):
+            key = tuple(active_ifos)
+            if key not in job_instances:
+                job_instances[key] = exe_class(
+                    workflow.cp,
+                    "inspiral",
+                    ifo=active_ifos if len(active_ifos) > 1 else active_ifos[0],
+                    out_dir=output_dir,
+                    injection_file=injection_file,
+                    tags=tags,
+                )
+            return job_instances[key]
+
+        for curr_seg, active_ifos in seg_active_map:
+            seg_len = abs(curr_seg)
+            throwaway = start_pad + end_pad + 2 * pad_data
+            if min_analysis_length and seg_len < min_analysis_length:
+                continue
+            if seg_len <= throwaway:
+                continue
+
+            ana_start = curr_seg[0] + start_pad + pad_data
+            ana_end = curr_seg[1] - end_pad - pad_data
+            ana_len = ana_end - ana_start
+
+            num_jobs = max(1, int(round(ana_len / float(target_duration))))
+            job_dur = ana_len / float(num_jobs)
+
+            for job_idx in range(num_jobs):
+                v_start = int(round(ana_start + job_idx * job_dur))
+                v_end = int(round(ana_start + (job_idx + 1) * job_dur))
+                if job_idx == num_jobs - 1:
+                    v_end = int(ana_end)
+
+                valid_seg = segment([v_start, v_end])
+                d_start = (
+                    curr_seg[0]
+                    if job_idx == 0
+                    else int(round(v_start - start_pad - pad_data))
+                )
+                d_end = (
+                    curr_seg[1]
+                    if job_idx == num_jobs - 1
+                    else int(round(v_end + end_pad + pad_data))
+                )
+                data_seg = segment([d_start, d_end])
+
+                job_ifos = list(active_ifos)
+                curr_job = get_job_instance(job_ifos)
+
+                curr_dfouts = FileList([])
+                if datafind_outs:
+                    for ifo in job_ifos:
+                        df = datafind_outs.find_all_output_in_range(
+                            ifo, data_seg, useSplitLists=True
+                        )
+                        if df:
+                            curr_dfouts.extend(df)
+
+                for split_bank in tmplt_banks:
+                    tag = list(tags)
+                    if (
+                        len(tmplt_banks) > 1
+                        and hasattr(split_bank, "tag_str")
+                        and split_bank.tag_str
+                    ):
+                        tag.append(split_bank.tag_str)
+                    node = curr_job.create_node(
+                        data_seg,
+                        valid_seg,
+                        parent=split_bank,
+                        df_parents=curr_dfouts or None,
+                        tags=tag,
+                    )
+                    workflow.add_node(node)
+                    curr_out_files = [
+                        i for i in node.output_files if "PSD_FILE" not in i.tags
+                    ]
+                    inspiral_outs.extend(curr_out_files)
     else:
         # Select the appropriate class
         raise ValueError("Not currently supported.")

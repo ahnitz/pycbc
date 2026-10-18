@@ -21,19 +21,27 @@
 #
 # =============================================================================
 #
+import gc
+
 import numpy
 from numpy.random import RandomState
 
 import pycbc.psd
-from pycbc.types import TimeSeries, complex_same_precision_as
+from pycbc.types import FrequencySeries, TimeSeries, complex_same_precision_as
+
+try:
+    import ctypes
+
+    _libc = ctypes.CDLL("libc.so.6")
+except Exception:
+    _libc = None
 
 # This constant need to be constant to be able to recover identical results.
 BLOCK_SAMPLES = 1638400
 
 
 def block(seed, sample_rate):
-    """
-    Return block of normal random numbers
+    """Return block of normal random numbers
 
     Parameters
     ----------
@@ -43,10 +51,9 @@ def block(seed, sample_rate):
         Sets the variance of the white noise
 
     Returns
-    -------
+    --------
     noise : numpy.ndarray
         Array of random numbers
-
     """
     num = BLOCK_SAMPLES
     rng = RandomState(seed % 2**32)
@@ -55,8 +62,7 @@ def block(seed, sample_rate):
 
 
 def normal(start, end, sample_rate=16384, seed=0):
-    """
-    Generate data with a white Gaussian (normal) distribution
+    """Generate data with a white Gaussian (normal) distribution
 
     Parameters
     ----------
@@ -71,10 +77,9 @@ def normal(start, end, sample_rate=16384, seed=0):
         The seed to generate the noise.
 
     Returns
-    -------
+    --------
     noise : TimeSeries
         A TimeSeries containing gaussian noise
-
     """
     # This is reproduceable because we used fixed seeds from known values
     block_dur = BLOCK_SAMPLES / sample_rate
@@ -103,8 +108,7 @@ def colored_noise(
     filter_duration=128,
     scale=1.0,
 ):
-    """
-    Create noise from a PSD
+    """Create noise from a PSD
 
     Return noise from the chosen PSD. Note that if unique noise is desired
     a unique seed should be provided.
@@ -128,10 +132,9 @@ def colored_noise(
         The duration in seconds of the coloring filter
 
     Returns
-    -------
+    --------
     noise : TimeSeries
         A TimeSeries containing gaussian noise colored by the given psd.
-
     """
     psd = psd.copy()
 
@@ -183,8 +186,14 @@ def colored_noise(
 
     kmin = int(low_frequency_cutoff / psd.delta_f)
     psd[:kmin].clear()
-    asd = (psd.squared_norm()) ** 0.25
-    del psd
+    a = psd.data.real**2
+    a += psd.data.imag**2
+    a **= 0.25
+    asd = FrequencySeries(a, delta_f=psd.delta_f)
+    del psd, a
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
 
     white_noise = normal(
         start_time - filter_duration,
@@ -193,12 +202,27 @@ def colored_noise(
         sample_rate=sample_rate,
     )
     white_noise = white_noise.to_frequencyseries()
-    # Here we color. Do not want to duplicate memory here though so use '*='
-    white_noise *= asd * scale
+    if scale != 1.0:
+        asd *= scale
+    white_noise *= asd
     del asd
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
+
     colored = white_noise.to_timeseries(delta_t=1.0 / sample_rate)
     del white_noise
-    return colored.time_slice(start_time, end_time)
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
+
+    res = colored.time_slice(start_time, end_time)
+    res = TimeSeries(res.numpy().copy(), delta_t=res.delta_t, epoch=res.start_time)
+    del colored
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
+    return res
 
 
 def noise_from_string(
@@ -211,8 +235,7 @@ def noise_from_string(
     filter_duration=128,
     scale=1.0,
 ):
-    """
-    Create noise from an analytic PSD
+    """Create noise from an analytic PSD
 
     Return noise from the chosen PSD. Note that if unique noise is desired
     a unique seed should be provided.
@@ -236,10 +259,9 @@ def noise_from_string(
         The duration in seconds of the coloring filter
 
     Returns
-    -------
+    --------
     noise : TimeSeries
         A TimeSeries containing gaussian noise colored by the given psd.
-
     """
     delta_f = 1.0 / filter_duration
     flen = int(sample_rate / delta_f) // 2 + 1

@@ -68,13 +68,32 @@ class PyCBCOptimalSNRExecutable(Executable):
 
     current_retention_level = Executable.ALL_TRIGGERS
 
-    def create_node(self, workflow, inj_file, precalc_psd_files, group_str):
+    def create_node(
+        self, workflow, inj_file, precalc_psd_files, group_str, datafind_files=None
+    ):
         node = Node(self)
         _, ext = os.path.splitext(inj_file.name)
         node.add_input_opt("--input-file", inj_file)
         node.add_opt("--injection-fraction-range", group_str)
         node.add_opt("--ifos", " ".join(workflow.ifos))
         node.add_input_list_opt("--time-varying-psds", precalc_psd_files)
+        if not self.has_opt("channel-name") and "--channel-name" not in node._options:
+            channel_names = []
+            for ifo in workflow.ifos:
+                if self.cp.has_option_tags(
+                    "workflow", f"{ifo.lower()}-channel-name", []
+                ):
+                    cname = self.cp.get_opt_tags(
+                        "workflow", f"{ifo.lower()}-channel-name", []
+                    )
+                    if cname:
+                        channel_names.append(
+                            f"{ifo}:{cname}" if ":" not in cname else cname
+                        )
+            if channel_names:
+                node.add_opt("--channel-name", " ".join(channel_names))
+        if datafind_files is not None and len(datafind_files) > 0:
+            node.add_multiifo_input_list_opt("--frame-files", datafind_files)
         node.new_output_file_opt(workflow.analysis_time, ext, "--output-file")
         return node
 
@@ -91,8 +110,10 @@ class PyCBCMergeHDFExecutable(Executable):
         return node
 
 
-def compute_inj_optimal_snr(workflow, inj_file, precalc_psd_files, out_dir, tags=None):
-    """Set up a job for computing optimal SNRs of a sim_inspiral file."""
+def compute_inj_optimal_snr(
+    workflow, inj_file, precalc_psd_files, out_dir, datafind_files=None, tags=None
+):
+    "Set up a job for computing optimal SNRs of a sim_inspiral file."
     if tags is None:
         tags = []
 
@@ -111,7 +132,9 @@ def compute_inj_optimal_snr(workflow, inj_file, precalc_psd_files, out_dir, tags
         opt_snr_exe = PyCBCOptimalSNRExecutable(
             workflow.cp, "optimal_snr", ifos=workflow.ifos, out_dir=out_dir, tags=tags
         )
-        node = opt_snr_exe.create_node(workflow, inj_file, precalc_psd_files, "0/1")
+        node = opt_snr_exe.create_node(
+            workflow, inj_file, precalc_psd_files, "0/1", datafind_files=datafind_files
+        )
         workflow += node
 
         return node.output_files[0]
@@ -127,7 +150,13 @@ def compute_inj_optimal_snr(workflow, inj_file, precalc_psd_files, out_dir, tags
             tags=tags + [str(i)],
         )
         opt_snr_exe.update_current_retention_level(Executable.INTERMEDIATE_PRODUCT)
-        node = opt_snr_exe.create_node(workflow, inj_file, precalc_psd_files, group_str)
+        node = opt_snr_exe.create_node(
+            workflow,
+            inj_file,
+            precalc_psd_files,
+            group_str,
+            datafind_files=datafind_files,
+        )
         opt_snr_split_files += [node.output_files[0]]
         workflow += node
 
@@ -142,7 +171,7 @@ def compute_inj_optimal_snr(workflow, inj_file, precalc_psd_files, out_dir, tags
 
 
 def cut_distant_injections(workflow, inj_file, out_dir, tags=None):
-    """Set up a job for removing injections that are too distant to be seen"""
+    "Set up a job for removing injections that are too distant to be seen"
     if tags is None:
         tags = []
 
@@ -156,8 +185,7 @@ def cut_distant_injections(workflow, inj_file, out_dir, tags=None):
 
 
 def inj_to_hdf(workflow, inj_file, out_dir, tags=None):
-    """
-    Convert injection file to hdf format.
+    """Convert injection file to hdf format.
 
     If the file is already PyCBC HDF format, this will just make a copy.
     """
@@ -184,7 +212,7 @@ def setup_injection_workflow(
     inspinj) there are currently no subfunctions in this moudle.
 
     Parameters
-    ----------
+    -----------
     workflow : pycbc.workflow.core.Workflow
         The Workflow instance that the coincidence jobs will be added to.
     output_dir : path
@@ -199,14 +227,13 @@ def setup_injection_workflow(
         by this call to the workflow. This will be used in output names.
 
     Returns
-    -------
+    --------
     inj_files : pycbc.workflow.core.FileList
         The list of injection files created by this call.
     inj_tags : list of strings
         The tag corresponding to each injection file and used to uniquely
         identify them. The FileList class contains functions to search
         based on tags.
-
     """
     if tags is None:
         tags = []

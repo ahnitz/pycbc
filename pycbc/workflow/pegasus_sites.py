@@ -7,8 +7,7 @@
 #
 # =============================================================================
 #
-"""
-This module provides default site catalogs, which should be suitable for
+"""This module provides default site catalogs, which should be suitable for
 most use cases. You can override individual details here. It should also be
 possible to implement a new site, but not sure how that would work in practice.
 """
@@ -49,6 +48,7 @@ urllib.parse.uses_netloc.append("gsiftp")
 
 KNOWN_SITES = [
     "local",
+    "clusterlink",
     "condorpool_symlink",
     "condorpool_copy",
     "condorpool_shared",
@@ -257,6 +257,22 @@ def add_osg_site(sitecat, cp):
     sitecat.add_sites(site)
 
 
+def add_clusterlink_site(sitecat, cp):
+    """User-owned SSH federation; Clusterlink supplies the environment."""
+    site = Site("clusterlink", arch=Arch.X86_64, os_type=OS.LINUX)
+    add_site_pegasus_profile(site, cp)
+    site.add_profiles(Namespace.PEGASUS, key="style", value="condor")
+    site.add_profiles(Namespace.PEGASUS, key="data.configuration", value="condorio")
+    site.add_profiles(Namespace.PEGASUS, key="auxillary.local", value="true")
+    site.add_profiles(
+        Namespace.ENV, key="PEGASUS_HOME", value="/opt/clusterlink/pegasus"
+    )
+    site.add_profiles(Namespace.CONDOR, key="universe", value="vanilla")
+    site.add_profiles(Namespace.CONDOR, key="should_transfer_files", value="Yes")
+    site.add_profiles(Namespace.CONDOR, key="My.ClusterlinkEligible", value="True")
+    sitecat.add_sites(site)
+
+
 def add_site(sitecat, sitename, cp, out_dir=None):
     """Add site sitename to site catalog"""
     # Allow local site scratch to be overriden for any site which uses it
@@ -283,6 +299,8 @@ def add_site(sitecat, sitename, cp, out_dir=None):
         add_condorpool_copy_site(sitecat, cp)
     elif sitename == "condorpool_shared":
         add_condorpool_shared_site(sitecat, cp, out_dir, local_url)
+    elif sitename == "clusterlink":
+        add_clusterlink_site(sitecat, cp)
     elif sitename == "osg":
         add_osg_site(sitecat, cp)
     else:

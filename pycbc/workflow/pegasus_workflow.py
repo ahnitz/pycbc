@@ -230,15 +230,23 @@ class Node(ProfileShortcuts):
     # private functions to add input and output data sources/sinks
     def _add_input(self, inp):
         """Add as source of input data"""
-        self._inputs += [inp]
-        self._dax_node.add_inputs(inp)
+        if inp not in self._inputs:
+            self._inputs += [inp]
+        try:
+            self._dax_node.add_inputs(inp)
+        except dax.errors.DuplicateError:
+            pass
 
     def _add_output(self, out):
         """Add as destination of output data"""
-        self._outputs += [out]
+        if out not in self._outputs:
+            self._outputs += [out]
         out.node = self
         stage_out = out.storage_path is not None
-        self._dax_node.add_outputs(out, stage_out=stage_out)
+        try:
+            self._dax_node.add_outputs(out, stage_out=stage_out)
+        except dax.errors.DuplicateError:
+            pass
 
     # public functions to add options, arguments with or without data sources
     def add_input(self, inp):
@@ -674,7 +682,16 @@ class Workflow:
         # Other options
         planner_args["cluster"] = ["label,horizontal"]
         planner_args["relative_dir"] = "work"
-        planner_args["cleanup"] = "inplace"
+        cleanup = "inplace"
+        if (
+            hasattr(self, "cp")
+            and self.cp
+            and self.cp.has_option("workflow", "cleanup")
+        ):
+            cleanup = self.cp.get("workflow", "cleanup")
+        elif getattr(self, "cache_file", None):
+            cleanup = "none"
+        planner_args["cleanup"] = cleanup
         # This quietens the planner a bit. We cannot set the verbosity
         # directly, which would be better. So be careful, if changing the
         # pegasus.mode property, it will change the verbosity (a lot).
@@ -740,6 +757,20 @@ class SubWorkflow(dax.SubWorkflow):
         super().__init__(*args, **kwargs)
         self.pycbc_planner_args = {}
 
+    def add_inputs(self, *input_files, **kwargs):
+        for f in input_files:
+            try:
+                super().add_inputs(f, **kwargs)
+            except dax.errors.DuplicateError:
+                pass
+
+    def add_outputs(self, *output_files, **kwargs):
+        for f in output_files:
+            try:
+                super().add_outputs(f, **kwargs)
+            except dax.errors.DuplicateError:
+                pass
+
     def add_into_workflow(self, container_wflow):
         """Add this Job into a container Workflow"""
         self.add_planner_args(**self.pycbc_planner_args)
@@ -758,7 +789,9 @@ class SubWorkflow(dax.SubWorkflow):
 
         self.pycbc_planner_args[value] = option
 
-    def set_subworkflow_properties(self, output_map_file, staging_site, cache_file):
+    def set_subworkflow_properties(
+        self, output_map_file, staging_site, cache_file, cleanup=None
+    ):
 
         self.add_planner_arg(
             "pegasus.dir.storage.mapper.replica.file",
@@ -784,7 +817,9 @@ class SubWorkflow(dax.SubWorkflow):
         bname = os.path.splitext(os.path.basename(self.file))[0]
         self.add_planner_arg("basename", bname)
         self.add_planner_arg("output_sites", ["local"])
-        self.add_planner_arg("cleanup", "inplace")
+        if cleanup is None:
+            cleanup = "none" if cache_file else "inplace"
+        self.add_planner_arg("cleanup", cleanup)
         self.add_planner_arg("cluster", ["label", "horizontal"])
         self.add_planner_arg("verbose", 3)
 

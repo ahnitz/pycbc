@@ -115,8 +115,7 @@ def parse_injection_range(num_inj, rangestr):
 
 
 def get_gc_end_time(injection):
-    """
-    Return the geocenter end time of an injection. Required for seamless
+    """Return the geocenter end time of an injection. Required for seamless
     compatibility with LIGOLW and HDF injection objects, which use different
     names.
     """
@@ -166,6 +165,14 @@ if __name__ == "__main__":
         default=30.0,
         help="Start frequency of matched-filter integration "
         "in Hz (default %(default)s)",
+    )
+    parser.add_argument(
+        "--f-high",
+        "--high-frequency-cutoff",
+        type=float,
+        default=None,
+        help="End frequency of matched-filter integration "
+        "in Hz (defaults to 0.9 * Nyquist)",
     )
     parser.add_argument(
         "--seg-length",
@@ -272,10 +279,8 @@ if __name__ == "__main__":
             psds[det] = TimeIndependentPSD(psds[det].astype(float32))
 
     def get_injection(injections, det, injection_time, simulation_id):
-        """
-        Do an injection from the injection XML file, specified by
-        IFO and end time
-        """
+        """Do an injection from the injection XML file, specified by
+        IFO and end time"""
         # leave 4 s of padding at the end for possible ringdown
         start_time = int(injection_time + 4.0 - seg_len)
         strain = TimeSeries(
@@ -316,7 +321,12 @@ if __name__ == "__main__":
                 )
                 raise
             logging.debug("Injection %s at %s completed", inj.simulation_id, det)
-            sval = sigma(wave, psd=psd, low_frequency_cutoff=f_low)
+            f_high = opts.f_high
+            if f_high is None and psd is not None:
+                f_high = 0.9 * ((len(psd) - 1) * psd.delta_f)
+            sval = sigma(
+                wave, psd=psd, low_frequency_cutoff=f_low, high_frequency_cutoff=f_high
+            )
             if ligolw:
                 setattr(inj, column, sval)
             else:

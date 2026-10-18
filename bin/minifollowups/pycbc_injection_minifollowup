@@ -37,13 +37,14 @@ from pycbc.workflow.core import resolve_url_to_file
 legal_distance_types = [
     "decisive_optimal_snr",
     "comb_optimal_snr",
+    "decisive_optimal_mf_snr",
+    "comb_optimal_mf_snr",
     "dec_chirp_distance",
 ]
 
 
 def sort_injections(args, inj_group, missed):
-    """
-    Return an array of indices to sort the missed injections from most to
+    """Return an array of indices to sort the missed injections from most to
     least likely to be detected, according to a metric of choice.
 
     Parameters
@@ -61,8 +62,35 @@ def sort_injections(args, inj_group, missed):
     -------
     missed_sorted : array
         Array of indices of missed injections sorted as requested.
-
     """
+    if len(missed) == 0:
+        return missed
+
+    if getattr(args, "prioritize_network_snr", None) is not None:
+        prefix = (
+            "optimal_mf_snr_"
+            if "mf" in getattr(args, "distance_type", "")
+            else "optimal_snr_"
+        )
+        optimal_snrs = [
+            inj_group[dsn][:][missed]
+            for dsn in inj_group.keys()
+            if dsn.startswith(prefix)
+        ]
+        if optimal_snrs:
+            optimal_snrs = numpy.vstack(optimal_snrs)
+            net_opt_snr = numpy.sqrt((optimal_snrs**2).sum(axis=0))
+            is_priority = net_opt_snr >= args.prioritize_network_snr
+            priority_missed = missed[is_priority]
+            priority_snr = net_opt_snr[is_priority]
+            priority_sorted = priority_missed[priority_snr.argsort()[::-1]]
+
+            other_missed = missed[~is_priority]
+            other_args = copy.copy(args)
+            other_args.prioritize_network_snr = None
+            other_sorted = sort_injections(other_args, inj_group, other_missed)
+            return numpy.concatenate([priority_sorted, other_sorted])
+
     if not hasattr(args, "distance_type"):
         raise ValueError("Distance type not provided")
     if args.distance_type not in legal_distance_types:
@@ -71,7 +99,14 @@ def sort_injections(args, inj_group, missed):
             f"allowed types are {', '.join(legal_distance_types)}"
         )
 
-    if "optimal_snr" in args.distance_type:
+    if "optimal_mf_snr" in args.distance_type:
+        optimal_snrs = [
+            inj_group[dsn][:][missed]
+            for dsn in inj_group.keys()
+            if dsn.startswith("optimal_mf_snr_")
+        ]
+        assert optimal_snrs, "These injections do not have optimal MF SNRs"
+    elif "optimal_snr" in args.distance_type:
         optimal_snrs = [
             inj_group[dsn][:][missed]
             for dsn in inj_group.keys()
@@ -79,7 +114,7 @@ def sort_injections(args, inj_group, missed):
         ]
         assert optimal_snrs, "These injections do not have optimal SNRs"
 
-    if args.distance_type == "decisive_optimal_snr":
+    if args.distance_type in ["decisive_optimal_snr", "decisive_optimal_mf_snr"]:
         # descending order of decisive (2nd largest) optimal SNR
         dec_snr = numpy.array([sorted(snrs)[-2] for snrs in zip(*optimal_snrs)])
         if args.maximum_decisive_snr is not None:
@@ -88,7 +123,7 @@ def sort_injections(args, inj_group, missed):
         sorter = dec_snr.argsort()[::-1]
         return missed[sorter]
 
-    if args.distance_type == "comb_optimal_snr":
+    if args.distance_type in ["comb_optimal_snr", "comb_optimal_mf_snr"]:
         # descending order of network optimal SNR
         optimal_snrs = numpy.vstack(optimal_snrs)
         net_opt_snrs_squared = (optimal_snrs**2).sum(axis=0)
@@ -171,9 +206,37 @@ parser.add_argument(
 )
 parser.add_argument(
     "--distance-type",
-    required=True,
+    required=False,
     choices=legal_distance_types,
+    default=None,
     help="How to sort missed injections from most to least likely to be detected",
+)
+parser.add_argument(
+    "--prioritize-network-snr",
+    type=float,
+    default=None,
+    help="If given, prioritize missed injections with network "
+    "optimal SNR >= this threshold, placing them first, "
+    "sorted descending by network optimal SNR.",
+)
+parser.add_argument(
+    "--injection-category",
+    default="missed",
+    choices=["missed", "found", "all"],
+    help="Category of injections to follow up: 'missed' (default), 'found', or 'all'.",
+)
+parser.add_argument(
+    "--sort-variable",
+    default=None,
+    choices=["optimal_snr", "ifar", "stat"],
+    help="Variable to sort injections by. If 'ifar', sorts ascending (worst IFAR first). "
+    "If 'stat', sorts ascending (worst ranking statistic first).",
+)
+parser.add_argument(
+    "--min-network-snr",
+    type=float,
+    default=None,
+    help="If given, only follow up injections with network optimal SNR >= this value.",
 )
 wf.add_workflow_command_line_group(parser)
 wf.add_workflow_settings_cli(parser, include_subdax_opts=True)
@@ -196,12 +259,20 @@ injection_xml_file = resolve_url_to_file(os.path.abspath(args.injection_xml_file
 insp_segs = resolve_url_to_file(os.path.abspath(args.inspiral_segments))
 
 single_triggers = []
+single_triggers_by_ifo = {}
 insp_data_seglists = {}
 insp_analysed_seglists = {}
 for ifo in args.single_detector_triggers:
     fname = args.single_detector_triggers[ifo]
-    strig_file = resolve_url_to_file(os.path.abspath(fname), attrs={"ifos": ifo})
-    single_triggers.append(strig_file)
+    shared_ifos = [
+        det for det, path in args.single_detector_triggers.items() if path == fname
+    ]
+    strig_file = resolve_url_to_file(
+        os.path.abspath(fname), attrs={"ifos": shared_ifos}
+    )
+    if strig_file not in single_triggers:
+        single_triggers.append(strig_file)
+    single_triggers_by_ifo[ifo] = strig_file
     insp_data_seglists[ifo] = select_segments_by_definer(
         args.inspiral_segments, segment_name=args.inspiral_data_read_name, ifo=ifo
     )
@@ -216,19 +287,88 @@ for ifo in args.single_detector_triggers:
 
 f = HFile(args.injection_file, "r")
 inj_def = f["injections"]
-missed = f["missed/after_vetoes"][:]
-if args.ifar_threshold is not None:
-    try:  # injections may not have (inclusive) IFAR present
-        ifars = f["found_after_vetoes"]["ifar"][:]
-    except KeyError:
-        ifars = f["found_after_vetoes"]["ifar_exc"][:]
-        logging.warning("Inclusive IFAR not found, using exclusive")
-    lgc_arr = ifars < args.ifar_threshold
-    missed = numpy.append(missed, f["found_after_vetoes"]["injection_index"][lgc_arr])
 
-# Get the trigger SNRs and times
-# But only ones which are within a small window of the missed injection
-missed_inj_times = numpy.sort(inj_def["tc"][:][missed])
+# Calculate network optimal SNR for all injections
+prefix = (
+    "optimal_mf_snr_"
+    if getattr(args, "distance_type", None) and "mf" in args.distance_type
+    else "optimal_snr_"
+)
+optimal_snrs = [inj_def[dsn][:] for dsn in inj_def.keys() if dsn.startswith(prefix)]
+if not optimal_snrs and prefix != "optimal_snr_":
+    optimal_snrs = [
+        inj_def[dsn][:] for dsn in inj_def.keys() if dsn.startswith("optimal_snr_")
+    ]
+if optimal_snrs:
+    optimal_snrs = numpy.vstack(optimal_snrs)
+    net_opt_snr_all = numpy.sqrt((optimal_snrs**2).sum(axis=0))
+else:
+    net_opt_snr_all = numpy.zeros(len(inj_def["tc"]))
+
+# Select injections by category
+if args.injection_category == "found":
+    if "found_after_vetoes" in f and "injection_index" in f["found_after_vetoes"]:
+        inj_candidates = f["found_after_vetoes/injection_index"][:]
+    else:
+        inj_candidates = numpy.array([], dtype=numpy.int64)
+elif args.injection_category == "all":
+    inj_candidates = numpy.arange(len(inj_def["tc"]))
+else:  # 'missed'
+    inj_candidates = f["missed/after_vetoes"][:]
+    if args.ifar_threshold is not None:
+        try:  # injections may not have (inclusive) IFAR present
+            ifars = f["found_after_vetoes"]["ifar"][:]
+        except KeyError:
+            ifars = f["found_after_vetoes"]["ifar_exc"][:]
+            logging.warning("Inclusive IFAR not found, using exclusive")
+        lgc_arr = ifars < args.ifar_threshold
+        inj_candidates = numpy.append(
+            inj_candidates, f["found_after_vetoes"]["injection_index"][lgc_arr]
+        )
+
+# Filter by min network SNR if requested
+if args.min_network_snr is not None and len(inj_candidates) > 0:
+    valid_snr = net_opt_snr_all[inj_candidates] >= args.min_network_snr
+    inj_candidates = inj_candidates[valid_snr]
+
+# Sort the injections
+if args.sort_variable in ["ifar", "stat"]:
+    if len(inj_candidates) > 0:
+        found_idx_arr = f["found_after_vetoes/injection_index"][:]
+        if args.sort_variable == "ifar":
+            try:
+                all_vals = f["found_after_vetoes/ifar"][:]
+            except KeyError:
+                all_vals = f["found_after_vetoes/ifar_exc"][:]
+            default_val = 0.0
+        else:
+            all_vals = f["found_after_vetoes/stat"][:]
+            default_val = -numpy.inf
+        val_map = dict(zip(found_idx_arr, all_vals))
+        cand_vals = numpy.array(
+            [val_map.get(idx, default_val) for idx in inj_candidates]
+        )
+        # Sort ascending (worst IFAR/stat first); break ties with descending network SNR
+        cand_snrs = net_opt_snr_all[inj_candidates]
+        sort_order = numpy.lexsort((-cand_snrs, cand_vals))
+        inj_candidates = inj_candidates[sort_order]
+else:
+    if args.distance_type is None:
+        args.distance_type = "comb_optimal_snr"
+    inj_candidates = sort_injections(args, inj_def, inj_candidates)
+
+missed = inj_candidates
+
+# figure out how many injections to follow up
+num_events = int(
+    workflow.cp.get_opt_tags(
+        "workflow-injection_minifollowups", "num-events", args.tags or []
+    )
+)
+num_events = min(num_events, len(missed))
+
+# Get the trigger SNRs and times for the injections being followed up
+missed_inj_times = numpy.sort(inj_def["tc"][:][missed[:num_events]])
 
 # Note: Adding Earth diameter in light seconds to the window here
 # to allow for different IFO's arrival times of the injection
@@ -253,8 +393,9 @@ def nearby_missedinj(endtime, snr):
     -------
     boolean array
         True for triggers which are close to any missed injection
-
     """
+    if len(missed_inj_times) == 0:
+        return numpy.zeros(len(endtime), dtype=bool)
     left = numpy.searchsorted(missed_inj_times - safe_window, endtime)
     right = numpy.searchsorted(missed_inj_times + safe_window, endtime)
     return left != right
@@ -263,25 +404,16 @@ def nearby_missedinj(endtime, snr):
 trigger_idx = {}
 trigger_snrs = {}
 trigger_times = {}
-# This finds the triggers near to _any_ missed injection
-for trig in single_triggers:
-    ifo = trig.ifo
-    with HFile(trig.lfn, "r") as trig_f:
+# This finds the triggers near to the followed up injections
+for ifo in args.single_detector_triggers:
+    fname = args.single_detector_triggers[ifo]
+    with HFile(fname, "r") as trig_f:
         trigger_idx[ifo], data_tuple = trig_f.select(
             nearby_missedinj,
             f"{ifo}/end_time",
             f"{ifo}/snr",
         )
     trigger_times[ifo], trigger_snrs[ifo] = data_tuple
-
-# figure out how many injections to follow up
-num_events = int(
-    workflow.cp.get_opt_tags("workflow-injection_minifollowups", "num-events", "")
-)
-num_events = min(num_events, len(missed))
-
-# sort the injections
-missed = sort_injections(args, inj_def, missed)
 
 # loop over sorted missed injections to be followed up
 found_inj_idxes = f["found_after_vetoes/injection_index"][:]
@@ -297,8 +429,7 @@ for num_event in range(num_events):
     inj_params = {}
     for val in ["mass1", "mass2", "spin1z", "spin2z", "tc"]:
         inj_params[val] = inj_def[val][injection_index]
-    for single in single_triggers:
-        ifo = single.ifo
+    for ifo in args.single_detector_triggers:
         det = Detector(ifo)
         ifo_time = time + det.time_delay_from_earth_center(lon, lat, time)
         for seg in insp_analysed_seglists[ifo]:
@@ -309,7 +440,7 @@ for num_event in range(num_events):
 
         ifo_times += " %s:%s " % (ifo, ifo_time)
         inj_params[ifo + "_end_time"] = ifo_time
-    all_times = [inj_params[sngl.ifo + "_end_time"] for sngl in single_triggers]
+    all_times = [inj_params[ifo + "_end_time"] for ifo in args.single_detector_triggers]
     inj_params["mean_time"] = coinc.mean_if_greater_than_zero(all_times)[0]
 
     layouts += [
@@ -342,9 +473,8 @@ for num_event in range(num_events):
             )
         ]
 
-    for sngl in single_triggers:
+    for ifo in args.single_detector_triggers:
         # Find the triggers close to _this_ injection at this IFO
-        ifo = sngl.ifo
         trig_tdiff = abs(inj_params[ifo + "_end_time"] - trigger_times[ifo])
         nearby = trig_tdiff < args.nearby_triggers_window
         if not any(nearby):
@@ -356,6 +486,7 @@ for num_event in range(num_events):
         # Convert to the index in the trigger file
         nearby_trigger_idx = trigger_idx[ifo][nearby][loudest]
         # Make the info snippet
+        sngl = single_triggers_by_ifo[ifo]
         sngl_info = mini.make_sngl_ifo(
             workflow,
             sngl,
@@ -376,27 +507,29 @@ for num_event in range(num_events):
         tags=args.tags + [str(num_event)],
     )
 
-    for single in single_triggers:
+    for ifo in args.single_detector_triggers:
+        sngl = single_triggers_by_ifo[ifo]
         checkedtime = time
-        if inj_params[single.ifo + "_end_time"] == -1.0:
+        if inj_params[ifo + "_end_time"] == -1.0:
             checkedtime = inj_params["mean_time"]
-        for seg in insp_analysed_seglists[single.ifo]:
+        for seg in insp_analysed_seglists[ifo]:
             if checkedtime in seg:
                 files += mini.make_singles_timefreq(
                     workflow,
-                    single,
+                    sngl,
                     tmpltbank_file,
                     checkedtime,
                     args.output_dir,
-                    data_segments=insp_data_seglists[single.ifo],
+                    data_segments=insp_data_seglists[ifo],
                     tags=args.tags + [str(num_event)],
+                    ifo=ifo,
                 )
                 files += mini.make_qscan_plot(
                     workflow,
-                    single.ifo,
+                    ifo,
                     checkedtime,
                     args.output_dir,
-                    data_segments=insp_data_seglists[single.ifo],
+                    data_segments=insp_data_seglists[ifo],
                     injection_file=injection_xml_file,
                     tags=args.tags + [str(num_event)],
                 )
@@ -405,7 +538,7 @@ for num_event in range(num_events):
             logging.info(
                 "Trigger time %s is not valid in %s, skipping singles plots",
                 checkedtime,
-                single.ifo,
+                ifo,
             )
 
     _, norm_plot = mini.make_single_template_plots(
