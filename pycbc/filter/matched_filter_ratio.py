@@ -829,7 +829,6 @@ class TopTemplateSearch:
                         taps,
                         counts,
                         lags=shifts,
-                        ids=fine_indices,
                         node_id=coarse_idx,
                     )
                 )
