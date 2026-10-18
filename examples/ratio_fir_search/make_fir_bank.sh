@@ -12,30 +12,16 @@ set -e
 # check between the fine template and the ratio-filter reconstruction),
 # not a general property of the method -- it's high here mainly to make
 # comparing against a plain pycbc_inspiral run easier to interpret.
-#
-# Bank storage note: pycbc_fir_bank automatically writes the fine and coarse
-# template bank waveforms with compressed representations enabled, and stores
-# the FIR filter datasets (taps, actual_tap_count, sigmas) with HDF5 gzip
-# compression (level 4).
 
 export OMP_NUM_THREADS=1
 
 pycbc_fir_bank \
-    --coarse-bank bank_coarse.hdf \
     --fine-bank bank_full.hdf \
     --output-file fir_full_bank.hdf \
     --psd-model aLIGOZeroDetHighPower \
+    --segment-length ${SEGMENT_LENGTH:-512} \
     --sample-rate 2048 \
-    --f-low 20.0 \
-    --n-taps 251 \
-    --max-taps 1501 \
-    --tap-step 100 \
-    --min-match 0.99999 \
-    --delta-f 0.5 \
-    --regularization-type ridge \
-    --regularization-magnitude .0001 \
-    --ratio-cap 1000 \
-    --max-tap-value 100000 \
-    --search-depth 1 \
+    --max-taps ${MAX_TAPS:-301 1501} \
+    --min-match ${MIN_MATCH:-0.99999} \
     --n-processes 1 \
-    --verbose
+    --verbose "$@"
