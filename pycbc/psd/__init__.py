@@ -91,6 +91,13 @@ def from_cli(
         f_low = low_frequency_cutoff
     sample_rate = (length - 1) * 2 * delta_f
 
+    if getattr(opt, "psd_high_frequency_cutoff", None) is not None:
+        f_high = opt.psd_high_frequency_cutoff
+    elif getattr(opt, "high_frequency_cutoff", None) is not None:
+        f_high = opt.high_frequency_cutoff
+    else:
+        f_high = 0.9 * (sample_rate / 2.0)
+
     try:
         psd_estimation = opt.psd_estimation is not None
     except AttributeError:
@@ -141,17 +148,73 @@ def from_cli(
 
     elif psd_estimation:
         # estimate PSD from data
-        psd = welch(
-            strain,
-            avg_method=opt.psd_estimation,
-            seg_len=int(opt.psd_segment_length * sample_rate + 0.5),
-            seg_stride=int(opt.psd_segment_stride * sample_rate + 0.5),
-            num_segments=opt.psd_num_segments,
-            require_exact_data_fit=False,
-        )
+        method = getattr(opt, "psd_estimation_method", None) or "welch"
+        if opt.psd_estimation in (
+            "line-continuum",
+            "line_continuum",
+            "multitaper",
+            "trimmed-welch",
+            "trimmed_welch",
+        ):
+            method = opt.psd_estimation
 
-        if delta_f != psd.delta_f:
-            psd = interpolate(psd, delta_f, length)
+        clean_method = str(method).lower().replace("_", "-")
+        if clean_method == "line-continuum":
+            pilot_seg_len_s = opt.psd_segment_length or 16.0
+            pilot_seg_stride_s = opt.psd_segment_stride or (pilot_seg_len_s / 2.0)
+            n_knots = getattr(opt, "psd_line_continuum_knots", 64) or 64
+            line_thresh = getattr(opt, "psd_line_continuum_threshold", 3.5) or 3.5
+            psd = line_continuum(
+                strain,
+                length=length,
+                delta_f=delta_f,
+                f_low=f_low,
+                f_high=f_high,
+                n_knots=n_knots,
+                pilot_seg_len_s=pilot_seg_len_s,
+                pilot_seg_stride_s=pilot_seg_stride_s,
+                line_snr_threshold=line_thresh,
+            )
+        elif clean_method == "multitaper":
+            nw = getattr(opt, "psd_multitaper_nw", 3.0) or 3.0
+            avg_m = (
+                opt.psd_estimation
+                if opt.psd_estimation in ("median", "mean")
+                else "median"
+            )
+            psd = multitaper(
+                strain,
+                seg_len=int(opt.psd_segment_length * sample_rate + 0.5),
+                seg_stride=int(opt.psd_segment_stride * sample_rate + 0.5),
+                NW=nw,
+                avg_method=avg_m,
+            )
+            if delta_f != psd.delta_f:
+                psd = interpolate(psd, delta_f, length)
+        elif clean_method == "trimmed-welch":
+            psd = trimmed_welch(
+                strain,
+                seg_len=int(opt.psd_segment_length * sample_rate + 0.5),
+                seg_stride=int(opt.psd_segment_stride * sample_rate + 0.5),
+            )
+            if delta_f != psd.delta_f:
+                psd = interpolate(psd, delta_f, length)
+        else:
+            avg_m = (
+                opt.psd_estimation
+                if opt.psd_estimation in ("mean", "median", "median-mean")
+                else "median"
+            )
+            psd = welch(
+                strain,
+                avg_method=avg_m,
+                seg_len=int(opt.psd_segment_length * sample_rate + 0.5),
+                seg_stride=int(opt.psd_segment_stride * sample_rate + 0.5),
+                num_segments=opt.psd_num_segments,
+                require_exact_data_fit=False,
+            )
+            if delta_f != psd.delta_f:
+                psd = interpolate(psd, delta_f, length)
 
     else:
         # Shouldn't be possible to get here
@@ -171,6 +234,7 @@ def from_cli(
             int(opt.psd_inverse_length * sample_rate),
             which_spectrum=which_spectrum,
             low_frequency_cutoff=f_low,
+            high_frequency_cutoff=f_high,
             low_frequency_fill_value=fill_value,
             trunc_method=opt.invpsd_trunc_method,
         )
@@ -276,6 +340,14 @@ def insert_psd_option_group(parser, output=True, include_data_options=True):
         "cutoff of the matched filter/likelihood "
         "integral will be used.",
     )
+    psd_options.add_argument(
+        "--psd-high-frequency-cutoff",
+        type=float,
+        help="(Optional) The high frequency cutoff for the "
+        "PSD. If not specified, the high frequency "
+        "cutoff of the matched filter/likelihood "
+        "integral will be used.",
+    )
     # Truncation options if specifying psd-inverse-length
     psd_options.add_argument(
         "--invpsd-trunc-method",
@@ -375,7 +447,47 @@ def insert_psd_option_group(parser, output=True, include_data_options=True):
         psd_options.add_argument(
             "--psd-estimation",
             help="Measure PSD from the data, using given average method.",
-            choices=["mean", "median", "median-mean"],
+            choices=[
+                "mean",
+                "median",
+                "median-mean",
+                "line-continuum",
+                "line_continuum",
+                "multitaper",
+                "trimmed-welch",
+                "trimmed_welch",
+            ],
+        )
+        psd_options.add_argument(
+            "--psd-estimation-method",
+            default="welch",
+            choices=[
+                "welch",
+                "line-continuum",
+                "line_continuum",
+                "multitaper",
+                "trimmed-welch",
+                "trimmed_welch",
+            ],
+            help="Algorithm used for data-driven PSD estimation (default: welch).",
+        )
+        psd_options.add_argument(
+            "--psd-line-continuum-knots",
+            type=int,
+            default=64,
+            help="(Optional) Number of spline knots for line-continuum PSD estimation (default: 64).",
+        )
+        psd_options.add_argument(
+            "--psd-line-continuum-threshold",
+            type=float,
+            default=3.5,
+            help="(Optional) Line detection SNR threshold for line-continuum PSD estimation (default: 3.5).",
+        )
+        psd_options.add_argument(
+            "--psd-multitaper-nw",
+            type=float,
+            default=3.0,
+            help="(Optional) Time-halfbandwidth product NW for multitaper PSD estimation (default: 3.0).",
         )
         psd_options.add_argument(
             "--psd-segment-length",
@@ -465,7 +577,38 @@ def insert_psd_option_group_multi_ifo(parser):
         metavar="IFO:FILE",
         help="Measure PSD from the data, using given "
         "average method. Choose from "
-        "mean, median or median-mean.",
+        "mean, median, median-mean, line-continuum, multitaper or trimmed-welch.",
+    )
+    psd_options.add_argument(
+        "--psd-estimation-method",
+        nargs="+",
+        action=MultiDetOptionAction,
+        metavar="IFO:METHOD",
+        help="Algorithm used for data-driven PSD estimation.",
+    )
+    psd_options.add_argument(
+        "--psd-line-continuum-knots",
+        type=int,
+        nargs="+",
+        action=MultiDetOptionAction,
+        metavar="IFO:KNOTS",
+        help="(Optional) Number of spline knots for line-continuum PSD estimation.",
+    )
+    psd_options.add_argument(
+        "--psd-line-continuum-threshold",
+        type=float,
+        nargs="+",
+        action=MultiDetOptionAction,
+        metavar="IFO:THRESH",
+        help="(Optional) Line detection SNR threshold for line-continuum PSD estimation.",
+    )
+    psd_options.add_argument(
+        "--psd-multitaper-nw",
+        type=float,
+        nargs="+",
+        action=MultiDetOptionAction,
+        metavar="IFO:NW",
+        help="(Optional) Time-halfbandwidth product NW for multitaper PSD estimation.",
     )
     psd_options.add_argument(
         "--psd-low-frequency-cutoff",
@@ -475,6 +618,17 @@ def insert_psd_option_group_multi_ifo(parser):
         metavar="IFO:FREQ",
         help="(Optional) The low frequency cutoff for the "
         "PSD. If not specified, the low frequency "
+        "cutoff of the matched filter/likelihood "
+        "integral will be used.",
+    )
+    psd_options.add_argument(
+        "--psd-high-frequency-cutoff",
+        nargs="+",
+        type=float,
+        action=MultiDetOptionAction,
+        metavar="IFO:FREQ",
+        help="(Optional) The high frequency cutoff for the "
+        "PSD. If not specified, the high frequency "
         "cutoff of the matched filter/likelihood "
         "integral will be used.",
     )

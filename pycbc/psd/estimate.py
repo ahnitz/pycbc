@@ -226,6 +226,7 @@ def inverse_spectrum_truncation(
     max_filter_len,
     which_spectrum="invasd",
     low_frequency_cutoff=None,
+    high_frequency_cutoff=None,
     low_frequency_fill_value=0.0,
     trunc_method=None,
 ):
@@ -246,6 +247,9 @@ def inverse_spectrum_truncation(
     low_frequency_cutoff : {None, int}
         Frequencies below `low_frequency_cutoff` are set to value specified by
         `low_frequency_fill_value`.
+    high_frequency_cutoff : {None, float}
+        Frequencies above `high_frequency_cutoff` are zeroed out in the
+        inverse spectrum. If None, defaults to 0.9 * Nyquist.
     low_frequency_fill_value : {float, 'fmin'}
         Value to set PSD to at frequencies below `low_frequency_cutoff`.
         Default 0. If 'fmin', set to the value of the PSD at the low frequency
@@ -279,6 +283,13 @@ def inverse_spectrum_truncation(
         low_frequency_cutoff < 0.0 or low_frequency_cutoff > psd.sample_frequencies[-1]
     ):
         raise ValueError("low_frequency_cutoff must be within the bandwidth of the PSD")
+    if high_frequency_cutoff is not None and (
+        high_frequency_cutoff < 0.0
+        or high_frequency_cutoff > psd.sample_frequencies[-1]
+    ):
+        raise ValueError(
+            "high_frequency_cutoff must be within the bandwidth of the PSD"
+        )
 
     N = (len(psd) - 1) * 2
 
@@ -290,17 +301,31 @@ def inverse_spectrum_truncation(
     if low_frequency_cutoff:
         kmin = int(low_frequency_cutoff / psd.delta_f)
 
+    kmax = N // 2
+    if high_frequency_cutoff is not None:
+        kmax = min(kmax, int(high_frequency_cutoff / psd.delta_f))
+
     # set values below low frequency cutoff
     if low_frequency_fill_value != 0.0:
         if low_frequency_fill_value == "fmin":
             low_frequency_fill_value = 1.0 / psd[kmin]
         inv_spectrum[:kmin] = float(low_frequency_fill_value)
 
-    inv_spectrum[kmin : N // 2] = 1.0 / psd[kmin : N // 2]
+    if kmax > kmin:
+        inv_band = 1.0 / psd[kmin:kmax]
+        bad = (
+            numpy.isnan(inv_band._data)
+            | numpy.isinf(inv_band._data)
+            | (inv_band._data < 0)
+        )
+        inv_band._data[bad] = 0.0
+        inv_spectrum[kmin:kmax] = inv_band
+    inv_spectrum._data[kmax:] = 0.0
 
     # if truncating asd, take sqrt
     if which_spectrum == "invasd":
-        inv_spectrum[: N // 2] = inv_spectrum[: N // 2] ** 0.5
+        inv_spectrum[:kmax] = inv_spectrum[:kmax] ** 0.5
+        inv_spectrum._data[kmax:] = 0.0
     elif which_spectrum != "invpsd":
         raise ValueError(
             f"Invalid which_spectrum input {which_spectrum}; "
@@ -424,3 +449,384 @@ def bandlimited_interpolate(series, delta_f):
     fft(padded_series_in_time, interpolated_series)
 
     return interpolated_series
+
+
+def trimmed_welch(timeseries, seg_len=4096, seg_stride=2048, alpha=0.20):
+    """Robust Trimmed-Mean Welch PSD estimator.
+
+    Discards the lowest alpha and highest alpha fraction of periodograms at each bin,
+    mitigating both transient loud glitches/signals and deep nulls.
+    Corrects for the finite-sample trimmed mean bias on Chi-squared (2 DOF) noise.
+
+    Parameters
+    ----------
+    timeseries : TimeSeries
+        Input PyCBC TimeSeries.
+    seg_len : int, optional
+        Segment length in samples (default: 4096).
+    seg_stride : int, optional
+        Segment stride in samples (default: 2048).
+    alpha : float, optional
+        Fraction to trim from each end (default: 0.20).
+
+    Returns
+    -------
+    psd : FrequencySeries
+        Bias-corrected estimated PSD.
+    """
+    fs = float(timeseries.sample_rate)
+    delta_f = 1.0 / (seg_len / fs)
+    num_segs = (len(timeseries) - seg_len) // seg_stride + 1
+    if num_segs < 1:
+        raise ValueError("timeseries too short for seg_len")
+    w = numpy.hanning(seg_len)
+    w_sum_sq = numpy.sum(w**2)
+
+    seg_specs = []
+    for i in range(num_segs):
+        seg = timeseries[i * seg_stride : i * seg_stride + seg_len].numpy()
+        seg_spec = numpy.abs(numpy.fft.rfft(w * seg)) ** 2 * (2.0 / (fs * w_sum_sq))
+        # Halve DC and Nyquist components to be consistent with T010095 & PyCBC convention
+        seg_spec[0] /= 2.0
+        seg_spec[-1] /= 2.0
+        seg_specs.append(seg_spec)
+    seg_specs = numpy.array(seg_specs)
+
+    k_trim = int(num_segs * alpha)
+    sorted_specs = numpy.sort(seg_specs, axis=0)
+    if k_trim > 0 and 2 * k_trim < num_segs:
+        trimmed = sorted_specs[k_trim : num_segs - k_trim, :]
+        raw_psd = numpy.mean(trimmed, axis=0)
+        # Analytical expectation of trimmed standard exponential distribution:
+        bias_factor = float(
+            1.0
+            + (alpha * numpy.log(alpha) - (1.0 - alpha) * numpy.log(1.0 - alpha))
+            / (1.0 - 2.0 * alpha)
+        )
+    else:
+        raw_psd = numpy.median(sorted_specs, axis=0)
+        bias_factor = median_bias(num_segs)
+
+    corrected_psd = raw_psd / bias_factor
+    return FrequencySeries(
+        corrected_psd,
+        delta_f=delta_f,
+        epoch=timeseries.start_time,
+        dtype=timeseries.dtype,
+    )
+
+
+def multitaper(timeseries, seg_len=4096, seg_stride=2048, NW=3.0, avg_method="median"):
+    """Multitaper Spectral Estimator using Discrete Prolate Spheroidal Sequences (DPSS).
+
+    Applies K = 2*NW - 1 orthonormal Slepian tapers per segment to minimize spectral
+    leakage across steep dynamic range gradients (e.g. seismic wall at 15-20 Hz).
+    Combines segments via median or mean for non-Gaussian glitch robustness.
+
+    Parameters
+    ----------
+    timeseries : TimeSeries
+        Input PyCBC TimeSeries.
+    seg_len : int, optional
+        Segment length in samples (default: 4096).
+    seg_stride : int, optional
+        Segment stride in samples (default: 2048).
+    NW : float, optional
+        Time-halfbandwidth product (default: 3.0).
+    avg_method : {'median', 'mean'}, optional
+        Segment averaging method (default: 'median').
+
+    Returns
+    -------
+    psd : FrequencySeries
+        Bias-corrected estimated PSD.
+    """
+    from scipy import stats
+    from scipy.signal.windows import dpss
+
+    fs = float(timeseries.sample_rate)
+    delta_f = 1.0 / (seg_len / fs)
+    K = int(2 * NW - 1)
+    tapers, _ = dpss(seg_len, NW=NW, Kmax=K, return_ratios=True)
+
+    num_segs = (len(timeseries) - seg_len) // seg_stride + 1
+    if num_segs < 1:
+        raise ValueError("timeseries too short for seg_len")
+    seg_psds = []
+    for i in range(num_segs):
+        seg = timeseries[i * seg_stride : i * seg_stride + seg_len].numpy()
+        tapered = tapers * seg[None, :]
+        spec = numpy.abs(numpy.fft.rfft(tapered, axis=1)) ** 2 * (2.0 / fs)
+        # Halve DC and Nyquist components to be consistent with T010095 & PyCBC convention
+        spec[:, 0] /= 2.0
+        spec[:, -1] /= 2.0
+        seg_psd = numpy.mean(spec, axis=0)
+        seg_psds.append(seg_psd)
+    seg_psds = numpy.array(seg_psds)
+
+    if avg_method == "median":
+        psd_raw = numpy.median(seg_psds, axis=0)
+        bias = float(stats.gamma.ppf(0.5, a=K) / K)
+        psd_est = psd_raw / bias
+    elif avg_method == "mean":
+        psd_est = numpy.mean(seg_psds, axis=0)
+    else:
+        raise ValueError(f"Unknown avg_method: {avg_method}")
+
+    return FrequencySeries(
+        psd_est,
+        delta_f=delta_f,
+        epoch=timeseries.start_time,
+        dtype=timeseries.dtype,
+    )
+
+
+# Backwards compatibility aliases
+estimate_psd_trimmed_welch = trimmed_welch
+estimate_psd_multitaper = multitaper
+
+
+def line_continuum(
+    timeseries,
+    length=None,
+    delta_f=None,
+    f_low=20.0,
+    f_high=None,
+    n_knots=64,
+    pilot_seg_len_s=16.0,
+    pilot_seg_stride_s=None,
+    line_snr_threshold=3.5,
+    max_lines=400,
+    seg_len=None,
+    seg_stride=None,
+):
+    """Two-component Line-Continuum spectral estimator.
+
+    Decomposes the PSD into an unbiased, shape-preserving PCHIP spline continuum
+    plus a sum of Cauchy-Lorentzian spectral lines with smoothed wings.
+    Guarantees strict continuum lower-bounds and eliminates inverted drops.
+
+    Parameters
+    ----------
+    timeseries : TimeSeries
+        Input PyCBC TimeSeries.
+    length : int, optional
+        Length in frequency samples of output FrequencySeries.
+    delta_f : float, optional
+        Frequency resolution in Hz. If None, defaults to 1.0 / pilot_seg_len_s.
+    f_low : float, optional
+        Lower frequency cutoff in Hz (default: 20.0).
+    f_high : float, optional
+        Upper frequency cutoff in Hz (default: 0.9 * Nyquist).
+    n_knots : int, optional
+        Number of logarithmically-spaced spline knots (default: 64).
+    pilot_seg_len_s : float, optional
+        Duration in seconds of the pilot Welch segments (default: 16.0s).
+    pilot_seg_stride_s : float, optional
+        Stride in seconds between consecutive pilot segments.
+    line_snr_threshold : float, optional
+        Threshold ratio over smoothed baseline to detect lines (default: 3.5).
+    max_lines : int, optional
+        Maximum number of lines to model (default: 400).
+    seg_len : int, optional
+        Alternative way to specify pilot segment length in samples.
+    seg_stride : int, optional
+        Alternative way to specify pilot segment stride in samples.
+
+    Returns
+    -------
+    psd : FrequencySeries
+        Estimated PSD as a PyCBC FrequencySeries.
+    """
+    import scipy.signal as sig
+    from scipy.interpolate import PchipInterpolator
+    from scipy.ndimage import gaussian_filter1d
+
+    fs = float(timeseries.sample_rate)
+    if seg_len is not None:
+        pilot_seg_len_s = seg_len / fs
+    if seg_stride is not None:
+        pilot_seg_stride_s = seg_stride / fs
+
+    if delta_f is None:
+        delta_f = 1.0 / pilot_seg_len_s
+
+    if length is None:
+        length = int(round((fs / 2.0) / delta_f)) + 1
+
+    f_low = float(f_low)
+    f_high = float(f_high) if f_high is not None else 0.9 * (fs / 2.0)
+    n_knots = int(n_knots)
+    line_snr_threshold = float(line_snr_threshold)
+    max_lines = int(max_lines)
+
+    seg_len_samples = int(round(pilot_seg_len_s * fs))
+    seg_len_samples = min(seg_len_samples, len(timeseries) // 2)
+    if seg_len_samples <= 0:
+        seg_len_samples = len(timeseries)
+
+    if pilot_seg_stride_s is not None:
+        seg_stride_samples = int(round(pilot_seg_stride_s * fs))
+    else:
+        seg_stride_samples = max(1, seg_len_samples // 2)
+
+    pilot_fs = welch(
+        timeseries,
+        seg_len=seg_len_samples,
+        seg_stride=seg_stride_samples,
+        avg_method="median",
+    )
+
+    freqs = pilot_fs.sample_frequencies.numpy().astype(numpy.float64)
+    p_vals = pilot_fs.numpy().astype(numpy.float64)
+    df = float(pilot_fs.delta_f)
+
+    mask = (freqs >= max(10.0, f_low - 5.0)) & (freqs <= f_high)
+    f_sub = freqs[mask]
+    p_sub = p_vals[mask]
+    p_sub = numpy.maximum(
+        numpy.nan_to_num(p_sub, nan=1e-46, posinf=1e-30, neginf=1e-60), 1e-60
+    )
+
+    smooth_p = 10.0 ** gaussian_filter1d(
+        numpy.log10(p_sub), sigma=max(1, int(round(2.5 / df)))
+    )
+    excess_ratio = p_sub / numpy.maximum(smooth_p, 1e-60)
+
+    peaks, _ = sig.find_peaks(
+        excess_ratio,
+        height=line_snr_threshold,
+        distance=max(1, int(round(0.3 / df))),
+    )
+    if len(peaks) > 0:
+        order = numpy.argsort(excess_ratio[peaks])[::-1]
+        peaks = peaks[order[:max_lines]]
+
+    lines = []
+    is_line = numpy.zeros(len(f_sub), dtype=bool)
+    for p_idx in peaks:
+        f0 = float(f_sub[p_idx])
+        amp = float(p_sub[p_idx] - smooth_p[p_idx])
+        if amp <= 0:
+            continue
+        gamma = max(1.5 * df, 0.12)
+        lines.append((f0, amp, gamma))
+        k_lo = max(0, p_idx - int(round(3.0 * gamma / df)))
+        k_hi = min(len(f_sub), p_idx + int(round(3.0 * gamma / df)) + 1)
+        is_line[k_lo:k_hi] = True
+
+    clean_f = f_sub[~is_line]
+    clean_p = p_sub[~is_line]
+    if len(clean_f) < n_knots:
+        clean_f = f_sub
+        clean_p = p_sub
+
+    log_clean_f = numpy.log10(clean_f)
+    log_clean_p = numpy.log10(numpy.maximum(clean_p, 1e-60))
+
+    knots_log_f = numpy.linspace(log_clean_f[0], log_clean_f[-1], n_knots)
+    knots_f = 10.0**knots_log_f
+    half_w = 0.5 * (knots_log_f[1] - knots_log_f[0])
+
+    knots_log_p = []
+    for kf in knots_log_f:
+        win = (log_clean_f >= kf - half_w) & (log_clean_f <= kf + half_w)
+        if numpy.sum(win) > 2:
+            knots_log_p.append(numpy.median(log_clean_p[win]))
+        else:
+            knots_log_p.append(numpy.interp(kf, log_clean_f, log_clean_p))
+
+    knots_val = numpy.nan_to_num(
+        numpy.array(knots_log_p, dtype=numpy.float64),
+        nan=-46.0,
+        posinf=-30.0,
+        neginf=-60.0,
+    )
+    spline = PchipInterpolator(knots_log_f, knots_val)
+
+    freq_grid = numpy.arange(length, dtype=numpy.float64) * delta_f
+    valid_f = numpy.clip(freq_grid, knots_f[0], knots_f[-1])
+    psd_vals = 10.0 ** spline(numpy.log10(valid_f))
+
+    if len(lines) > 0:
+        is_sorted = len(freq_grid) > 1 and freq_grid[1] > freq_grid[0]
+        for f0, amp, gamma in lines:
+            w_taper = max(10.0 * gamma, 1.0)
+            w_cut = max(20.0 * gamma, 2.0)
+            if is_sorted:
+                i_lo = int(numpy.searchsorted(freq_grid, f0 - w_cut))
+                i_hi = int(numpy.searchsorted(freq_grid, f0 + w_cut))
+                if i_hi > i_lo:
+                    f_line = freq_grid[i_lo:i_hi]
+                    df_line = numpy.abs(f_line - f0)
+                    lorentz = amp * (gamma**2) / (df_line**2 + gamma**2)
+                    mid_wing = df_line > w_taper
+                    if numpy.any(mid_wing):
+                        taper = 0.5 * (
+                            1.0
+                            + numpy.cos(
+                                numpy.pi
+                                * (df_line[mid_wing] - w_taper)
+                                / (w_cut - w_taper)
+                            )
+                        )
+                        lorentz[mid_wing] *= taper
+                    psd_vals[i_lo:i_hi] += lorentz
+            else:
+                df_line = numpy.abs(freq_grid - f0)
+                mask_line = df_line <= w_cut
+                if numpy.any(mask_line):
+                    df_sub = df_line[mask_line]
+                    lorentz = amp * (gamma**2) / (df_sub**2 + gamma**2)
+                    mid_wing = df_sub > w_taper
+                    if numpy.any(mid_wing):
+                        taper = 0.5 * (
+                            1.0
+                            + numpy.cos(
+                                numpy.pi
+                                * (df_sub[mid_wing] - w_taper)
+                                / (w_cut - w_taper)
+                            )
+                        )
+                        lorentz[mid_wing] *= taper
+                    psd_vals[mask_line] += lorentz
+
+    psd_vals[freq_grid < f_low] = 1e30
+    if f_high is not None:
+        psd_vals[freq_grid > f_high] = 1e30
+
+    return FrequencySeries(
+        psd_vals,
+        delta_f=delta_f,
+        epoch=timeseries.start_time,
+        dtype=timeseries.dtype,
+    )
+
+
+def estimate_psd(timeseries, method="welch", **kwargs):
+    """Unified entry-point for data-driven PSD estimation.
+
+    Parameters
+    ----------
+    timeseries : TimeSeries
+        PyCBC TimeSeries containing strain data.
+    method : {'welch', 'line_continuum', 'line-continuum', 'multitaper', 'trimmed_welch', 'trimmed-welch'}
+        PSD estimation algorithm to employ (default: 'welch').
+    **kwargs :
+        Additional arguments passed to the specific estimator.
+
+    Returns
+    -------
+    psd : FrequencySeries
+        Estimated PSD.
+    """
+    clean_method = str(method).lower().replace("-", "_")
+    if clean_method == "welch":
+        return welch(timeseries, **kwargs)
+    if clean_method in ("line_continuum", "linecontinuum"):
+        return line_continuum(timeseries, **kwargs)
+    if clean_method == "multitaper":
+        return multitaper(timeseries, **kwargs)
+    if clean_method in ("trimmed_welch", "trimmedwelch"):
+        return trimmed_welch(timeseries, **kwargs)
+    raise ValueError(f"Unknown PSD estimation method: {method}")
