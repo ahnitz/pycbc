@@ -951,6 +951,47 @@ class TestOverwhiten(unittest.TestCase):
         self.assertEqual(len(dow_blk), len(ts))
         self.assertTrue(meta_blk["inpainted_edges"])
 
+    def test_query_stream_rejects_gaps_and_handles_overlaps(self):
+        """Test OverwhitenedDataset._query_stream rejects gaps/mismatched rates and trims overlaps."""
+        from types import SimpleNamespace
+        reader = object.__new__(pycbc.filter.OverwhitenedDataset)
+        reader.start_time, reader.end_time = 0.0, 6.0
+        reader.gated_segments, reader.valid_segments, reader.boundary_pad = [], [], 0.0
+
+        # 1. Gapped chunks [0, 2] and [4, 6] must raise ValueError
+        reader.chunks = [
+            SimpleNamespace(start_time=0.0, end_time=2.0),
+            SimpleNamespace(start_time=4.0, end_time=6.0),
+        ]
+        reader._read_stream_chunk = lambda c, *args: TimeSeries(
+            np.array([c.start_time, c.start_time + 1.0]), delta_t=1.0, epoch=c.start_time
+        )
+        with self.assertRaisesRegex(ValueError, "gap"):
+            reader._query_stream("dow", 0.0, 6.0)
+
+        # 2. Overlapping chunks [0, 4] and [2, 6] on same grid are deduplicated cleanly
+        reader.chunks = [
+            SimpleNamespace(start_time=0.0, end_time=4.0),
+            SimpleNamespace(start_time=2.0, end_time=6.0),
+        ]
+        reader._read_stream_chunk = lambda c, *args: TimeSeries(
+            np.arange(c.start_time, c.end_time, 1.0), delta_t=1.0, epoch=c.start_time
+        )
+        res = reader._query_stream("dow", 0.0, 6.0)
+        np.testing.assert_array_equal(res.numpy(), np.arange(0.0, 6.0, 1.0))
+        np.testing.assert_array_equal(res.sample_times.numpy(), np.arange(0.0, 6.0, 1.0))
+
+        # 3. Sample-rate mismatch raises ValueError
+        reader.chunks = [
+            SimpleNamespace(start_time=0.0, end_time=2.0, dt=1.0),
+            SimpleNamespace(start_time=2.0, end_time=4.0, dt=0.5),
+        ]
+        reader._read_stream_chunk = lambda c, *args: TimeSeries(
+            np.zeros(int((c.end_time - c.start_time) / c.dt)), delta_t=c.dt, epoch=c.start_time
+        )
+        with self.assertRaisesRegex(ValueError, "sample spacing mismatch"):
+            reader._query_stream("dow", 0.0, 4.0)
+
 
 if __name__ == "__main__":
     unittest.main()

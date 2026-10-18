@@ -93,26 +93,8 @@ def construct_regularized_kernels(psd_base, fs, duration, f_low=18.0, f_taper=4.
     """
     N_full = int(round(duration * fs))
     delta_f_full = 1.0 / duration
-
-    # Support CompactInstantaneousPSD directly as psd_base or interpolate FrequencySeries
-    if hasattr(psd_base, "eval_psd"):
-        freqs_eval = np.fft.rfftfreq(N_full, 1.0 / fs)
-        psd_vals = psd_base.eval_psd(freqs_eval, include_lines=True)
-        psd_full = FrequencySeries(psd_vals, delta_f=delta_f_full)
-    else:
-        psd_full = pycbc.psd.interpolate(psd_base, delta_f_full)
-    freqs_full = psd_full.sample_frequencies.numpy()
-
-    # C^2 smooth highpass taper
-    taper_full = np.ones(len(freqs_full), dtype=np.float64)
-    f_start = max(0.0, f_low - f_taper)
-    taper_full[freqs_full < f_start] = 0.0
-    mid = (freqs_full >= f_start) & (freqs_full < f_low)
-    if np.any(mid) and f_taper > 0:
-        taper_full[mid] = 0.5 * (1.0 - np.cos(np.pi * (freqs_full[mid] - f_start) / f_taper))
     if f_high is None:
         f_high = 0.9 * (fs / 2.0)
-    taper_full[freqs_full >= f_high] = 0.0
 
     # For large duration streams, compute inverse spectrum truncation and FIR taps
     # on a compact frequency grid (e.g. 64s). The FIR filter impulse response is bounded
@@ -142,6 +124,24 @@ def construct_regularized_kernels(psd_base, fs, duration, f_low=18.0, f_taper=4.
 
         psd_ist_ow = FrequencySeries(1.0 / np.maximum(invpsd_full, 1e-60), delta_f=delta_f_full)
         return invpsd_full, w_kernel_full, fir_dow, fir_w, psd_ist_ow, delta_f_full
+
+    # Support CompactInstantaneousPSD directly as psd_base or interpolate FrequencySeries
+    if hasattr(psd_base, "eval_psd"):
+        freqs_eval = np.fft.rfftfreq(N_full, 1.0 / fs)
+        psd_vals = psd_base.eval_psd(freqs_eval, include_lines=True)
+        psd_full = FrequencySeries(psd_vals, delta_f=delta_f_full)
+    else:
+        psd_full = pycbc.psd.interpolate(psd_base, delta_f_full)
+    freqs_full = psd_full.sample_frequencies.numpy()
+
+    # C^2 smooth highpass taper
+    taper_full = np.ones(len(freqs_full), dtype=np.float64)
+    f_start = max(0.0, f_low - f_taper)
+    taper_full[freqs_full < f_start] = 0.0
+    mid = (freqs_full >= f_start) & (freqs_full < f_low)
+    if np.any(mid) and f_taper > 0:
+        taper_full[mid] = 0.5 * (1.0 - np.cos(np.pi * (freqs_full[mid] - f_start) / f_taper))
+    taper_full[freqs_full >= f_high] = 0.0
 
     # Safe filter truncation bounds: max_filter_duration cannot exceed half stream duration
     max_filt_dur_bound = max(1.0 / fs, min(float(max_filter_duration), (duration / 2.0) - 1.0 / fs))
@@ -1273,10 +1273,26 @@ class OverwhitenedData:
         """List of (start_gps, end_gps) tuples for gated/inpainted data."""
         return [(float(s[0]), float(s[1])) for s in self.gated_segments]
 
+    _MAX_OPEN_HANDLES = 16
+
     def _get_h5_file(self, file_path):
-        if file_path not in self._open_handles:
-            self._open_handles[file_path] = h5py.File(file_path, "r")
-        return self._open_handles[file_path]
+        handles = getattr(self, "_open_handles", None)
+        if handles is None:
+            handles = self._open_handles = {}
+        if file_path in handles:
+            fh = handles.pop(file_path)
+            handles[file_path] = fh
+            return fh
+        while len(handles) >= self._MAX_OPEN_HANDLES:
+            oldest_key = next(iter(handles))
+            old_fh = handles.pop(oldest_key)
+            try:
+                old_fh.close()
+            except Exception:
+                pass
+        fh = h5py.File(file_path, "r")
+        handles[file_path] = fh
+        return fh
 
     def is_valid(self, t):
         """Check if GPS time `t` falls in certified valid data (past boundary, non-gated)."""
@@ -1365,16 +1381,53 @@ class OverwhitenedData:
         if not slices:
             raise ValueError(f"No samples found in range [{start_time}, {end_time}]")
 
-        if len(slices) == 1:
-            return slices[0]
+        slices.sort(key=lambda s: float(s.start_time))
+        dt0 = float(slices[0].delta_t)
+        tol = 1e-5 * dt0
 
-        total_len = sum(len(s) for s in slices)
-        combined = np.empty(total_len, dtype=np.float64)
-        cur = 0
-        for s in slices:
-            combined[cur : cur + len(s)] = s.numpy()
-            cur += len(s)
-        res_ts = TimeSeries(combined, delta_t=slices[0].delta_t, epoch=slices[0].start_time)
+        if float(slices[0].start_time) > start_time + 0.5 * dt0 + tol:
+            raise ValueError(
+                f"Requested start_time ({start_time}) is not covered; first chunk starts at {float(slices[0].start_time)}"
+            )
+
+        trimmed = [slices[0].numpy()]
+        cur_end = float(slices[0].start_time) + len(slices[0]) * dt0
+
+        for s in slices[1:]:
+            dt_s = float(s.delta_t)
+            if abs(dt_s - dt0) > 1e-9 * max(dt0, dt_s):
+                raise ValueError(
+                    f"Chunk sample spacing mismatch: {dt_s} vs {dt0}"
+                )
+            s_start = float(s.start_time)
+            gap = s_start - cur_end
+            if gap > 0.5 * dt0 + tol:
+                raise ValueError(
+                    f"Requested time range [{start_time}, {end_time}] spans a gap between chunks at [{cur_end}, {s_start}]"
+                )
+            offset_samples = int(round((cur_end - s_start) / dt0))
+            if abs((cur_end - s_start) - offset_samples * dt0) > tol:
+                raise ValueError(
+                    f"Chunk starting at {s_start} is misaligned with sample grid (expected {cur_end - offset_samples * dt0})"
+                )
+            arr = s.numpy()
+            if offset_samples < len(arr):
+                arr_tail = arr[max(0, offset_samples):]
+                if len(arr_tail) > 0:
+                    trimmed.append(arr_tail)
+                    cur_end += len(arr_tail) * dt0
+
+        if cur_end < end_time - 0.5 * dt0 - tol:
+            raise ValueError(
+                f"Requested end_time ({end_time}) is not covered; last chunk ends at {cur_end}"
+            )
+
+        if len(trimmed) == 1:
+            res_ts = slices[0]
+        else:
+            combined = np.concatenate(trimmed).astype(np.float64, copy=False)
+            res_ts = TimeSeries(combined, delta_t=dt0, epoch=slices[0].start_time)
+
         res_ts.gating_info = [(float(s[0]), float(s[1])) for s in self.gated_segments]
         res_ts.valid_segments = self.valid_segments
         res_ts.boundary_pad = self.boundary_pad
