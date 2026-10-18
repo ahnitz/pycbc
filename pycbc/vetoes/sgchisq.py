@@ -1,25 +1,39 @@
-"""Chisq based on sine-gaussian tiles.
+"""
+Chisq based on sine-gaussian tiles.
 See https://arxiv.org/abs/1709.08974 for a discussion.
 """
 
+from collections import OrderedDict
+
 import numpy
 
-from pycbc.waveform.utils import apply_fseries_time_shift
-from pycbc.filter import sigma
-from pycbc.waveform import sinegauss
-from pycbc.vetoes.chisq import SingleDetPowerChisq
 from pycbc.events import ranking
+from pycbc.filter import sigma
+from pycbc.types import FrequencySeries
+from pycbc.vetoes.chisq import SingleDetPowerChisq
+from pycbc.waveform import sinegauss
+from pycbc.waveform.utils import apply_fseries_time_shift
+
+
+def _unit_psd_for(template, psd):
+    if len(template) == len(psd) and abs(template.delta_f - psd.delta_f) < 1e-9:
+        return psd
+    return FrequencySeries(
+        numpy.ones(len(template), dtype=numpy.float32), delta_f=template.delta_f
+    )
+
 
 class SingleDetSGChisq(SingleDetPowerChisq):
-    """Class that handles precomputation and memory management for efficiently
+    """
+    Class that handles precomputation and memory management for efficiently
     running the sine-Gaussian chisq
     """
-    returns = {'sg_chisq': numpy.float32}
 
-    def __init__(self, bank, num_bins=0,
-                       snr_threshold=None,
-                       chisq_locations=None):
-        """ Create sine-Gaussian Chisq Calculator
+    returns = {"sg_chisq": numpy.float32}
+
+    def __init__(self, bank, num_bins=0, snr_threshold=None, chisq_locations=None):
+        """
+        Create sine-Gaussian Chisq Calculator
 
         Parameters
         ----------
@@ -35,6 +49,7 @@ class SingleDetSGChisq(SingleDetPowerChisq):
             The offset is relative to the end frequency of the approximant.
             The region is a boolean expression such as 'mtotal>40' indicating
             which templates to apply this set of sine-Gaussians to.
+
         """
         if snr_threshold is not None and chisq_locations is not None:
             self.do = True
@@ -43,8 +58,8 @@ class SingleDetSGChisq(SingleDetPowerChisq):
             self.params = {}
             for descr in chisq_locations:
                 region, values = descr.split(":")
-                mask = bank.table.parse_boolargs([(1, region), (0, 'else')])[0]
-                hashes = bank.table['template_hash'][mask.astype(bool)]
+                mask = bank.table.parse_boolargs([(1, region), (0, "else")])[0]
+                hashes = bank.table["template_hash"][mask.astype(bool)]
                 for h in hashes:
                     self.params[h] = values
         else:
@@ -53,163 +68,31 @@ class SingleDetSGChisq(SingleDetPowerChisq):
     @staticmethod
     def insert_option_group(parser):
         group = parser.add_argument_group("Sine-Gaussian Chisq")
-        group.add_argument("--sgchisq-snr-threshold", type=float,
-            help="Minimum SNR threshold to use SG chisq")
-        group.add_argument("--sgchisq-locations", type=str, nargs='+',
+        group.add_argument(
+            "--sgchisq-snr-threshold",
+            type=float,
+            help="Minimum SNR threshold to use SG chisq",
+        )
+        group.add_argument(
+            "--sgchisq-locations",
+            type=str,
+            nargs="+",
             help="Frequency offsets and quality factors of the sine-Gaussians"
-                 " to use, format 'region-boolean:q1-offset1,q2-offset2'. "
-                 "Offset is relative to the end frequency of the approximant."
-                 " Region is a boolean expression selecting templates to "
-                 "apply the sine-Gaussians to, ex. 'mtotal>40'")
+            " to use, format 'region-boolean:q1-offset1,q2-offset2'. "
+            "Offset is relative to the end frequency of the approximant."
+            " Region is a boolean expression selecting templates to "
+            "apply the sine-Gaussians to, ex. 'mtotal>40'",
+        )
 
     @classmethod
     def from_cli(cls, args, bank, chisq_bins):
-        return cls(bank, chisq_bins,
-                   args.sgchisq_snr_threshold,
-                   args.sgchisq_locations)
+        return cls(bank, chisq_bins, args.sgchisq_snr_threshold, args.sgchisq_locations)
 
-    def values_from_fpeak(self, stilde, thash, fpeak, psd, snrv, snr_norm,
-                          bchisq, bchisq_dof, indices, flow=20.0, epoch=0.0,
-                          template=None):
-        """ Calculate sine-Gaussian chisq directly from template peak frequency
-        and template hash, with optional template projection subtraction.
-
-        Parameters
-        ----------
-        stilde: pycbc.types.FrequencySeries
-            The overwhitened strain
-        thash: int
-            The template hash for looking up sine-Gaussian locations
-        fpeak: float
-            The estimated peak/termination frequency of the template in Hz
-        psd: pycbc.types.FrequencySeries
-            The power spectral density of the data
-        snrv: numpy.ndarray
-            The peak unnormalized complex SNR values
-        snr_norm: float
-            The normalization factor for the snr
-        bchisq: numpy.ndarray
-            The Bruce Allen power chisq values for these triggers
-        bchisq_dof: numpy.ndarray
-            The degrees of freedom of the Bruce chisq
-        indices: numpy.ndarray
-            The indices of the snr peaks.
-        flow: float, optional
-            Low frequency cutoff (default 20.0 Hz)
-        epoch: float, optional
-            Epoch offset for time shifting (default 0.0)
-        template: pycbc.types.FrequencySeries, optional
-            The waveform template being analyzed, used to subtract expected
-            signal power projection from sine-Gaussian tiles.
-
-        Returns
-        -------
-        chisq: Array
-            Chisq values, one for each sample index
+    def values(
+        self, stilde, template, psd, snrv, snr_norm, bchisq, bchisq_dof, indices
+    ):
         """
-        if not self.do:
-            return None
-
-        if thash not in self.params:
-            return numpy.ones(len(snrv))
-        values = self.params[thash].split(',')
-
-        fstop = len(stilde) * stilde.delta_f * 0.9
-        delta_f = stilde.delta_f
-        N = (len(stilde) - 1) * 2
-        dt = 1.0 / (N * delta_f)
-        kmin_base = int(flow / psd.delta_f)
-
-        # If any sine-gaussian tile has an upper frequency near nyquist return 1
-        for descr in values:
-            q, offset = descr.split('-')
-            if (fpeak + float(offset) + 50.0) > fstop:
-                return numpy.ones(len(snrv))
-
-        # Template norm sigma_h for proper unit-normalized projection
-        if template is not None:
-            if hasattr(template, 'sigmasq'):
-                hsigma = float(numpy.sqrt(template.sigmasq(psd)))
-            else:
-                flow_tmpl = getattr(template, 'f_lower', float(template.delta_f))
-                hsigma = float(sigma(template, psd=psd, low_frequency_cutoff=flow_tmpl))
-        else:
-            hsigma = 0.0
-
-        chisq = numpy.ones(len(snrv))
-        gtem = [None for _ in values]
-        gsigma_list = [None for _ in values]
-        gh_proj = [None for _ in values]
-        for i, snrvi in enumerate(snrv):
-            # Skip if newsnr too low
-            snr = abs(snrvi * snr_norm)
-            nsnr = ranking.newsnr(snr, bchisq[i] / bchisq_dof[i])
-            if nsnr < self.snr_threshold:
-                continue
-
-            time = float(epoch) + dt * indices[i]
-            # Shift the time of interest to be centered on 0
-            stilde_shift = apply_fseries_time_shift(stilde, -time)
-
-            # Only apply the sine-Gaussian in a +-50 Hz range around the
-            # central frequency
-            qwindow = 50
-            chisq[i] = 0
-            dof = 0
-
-            # Calculate the sum of SNR^2 for the sine-Gaussians specified
-            for idxx, descr in enumerate(values):
-                # Get the q and frequency offset from the descriptor
-                q, offset = descr.split('-')
-                q, offset = float(q), float(offset)
-                fcen = fpeak + offset
-                t_flow = max(kmin_base * delta_f, fcen - qwindow)
-                fhigh = fcen + qwindow
-
-                kmin = int(t_flow / delta_f)
-                kmax = int(fhigh / delta_f)
-
-                # Calculate sine-gaussian tile and template projection
-                if gtem[idxx] is None:
-                    gtem[idxx] = sinegauss.fd_sine_gaussian(
-                        1.0, q, fcen, t_flow,
-                        len(stilde) * delta_f,
-                        delta_f
-                    ).astype(numpy.complex64)
-                    gsigma_list[idxx] = sigma(gtem[idxx], psd=psd,
-                                              low_frequency_cutoff=t_flow,
-                                              high_frequency_cutoff=fhigh)
-                    if template is not None and hsigma > 0:
-                        g_tile = gtem[idxx][kmin:kmax]
-                        tmpl_overwhite = template[kmin:kmax] / psd[kmin:kmax]
-                        gh_proj[idxx] = (g_tile * tmpl_overwhite).sum() * (
-                            4.0 * delta_f / (gsigma_list[idxx] * hsigma)
-                        )
-                    else:
-                        gh_proj[idxx] = 0.0
-
-                gsigma = gsigma_list[idxx]
-                # Calculate the SNR of the tile
-                gsnr = (gtem[idxx][kmin:kmax] * stilde_shift[kmin:kmax]).sum()
-                gsnr *= 4.0 * delta_f / gsigma
-
-                # Subtract expected template projection to prevent loud genuine
-                # signals from self-vetoing due to high-frequency leakage
-                if gh_proj[idxx] is not None and gh_proj[idxx] != 0.0:
-                    z = snrvi * snr_norm
-                    gsnr -= z * gh_proj[idxx]
-
-                chisq[i] += abs(gsnr)**2.0
-                dof += 2
-            if dof == 0:
-                chisq[i] = 1
-            else:
-                chisq[i] /= dof
-        return chisq
-
-    def values(self, stilde, template, psd, snrv, snr_norm,
-                     bchisq, bchisq_dof, indices):
-        """ Calculate sine-Gaussian chisq
+        Calculate sine-Gaussian chisq
 
         Parameters
         ----------
@@ -227,37 +110,334 @@ class SingleDetSGChisq(SingleDetPowerChisq):
             The Bruce Allen power chisq values for these triggers
         bchisq_dof: numpy.ndarray
             The degrees of freedom of the Bruce chisq
-        indices: numpy.ndarray
+        indics: numpy.ndarray
             The indices of the snr peaks.
 
         Returns
         -------
         chisq: Array
             Chisq values, one for each sample index
+
         """
         if not self.do:
             return None
 
-        thash = getattr(getattr(template, 'params', None), 'template_hash', None)
+        chisq = numpy.ones(len(snrv))
+        if template.params.template_hash not in self.params:
+            return chisq
+
+        # Skip triggers whose newsnr is too low
+        snr = abs(numpy.array(snrv) * snr_norm)
+        rchisq = numpy.array(bchisq) / numpy.array(bchisq_dof)
+        nsnr = ranking.newsnr(snr, rchisq)
+        above = nsnr >= self.snr_threshold
+        if not above.any():
+            return chisq
+
+        num_samples = (len(template) - 1) * 2
+        dt = 1.0 / (num_samples * template.delta_f)
+        times = float(template.epoch) + dt * numpy.array(indices)[above]
+        snrs = numpy.array(snrv)[above] * snr_norm
+        chisq[above] = self.values_at(stilde, psd, template, psd, times, snrs=snrs)
+        return chisq
+
+    def peak_frequency(self, template, psd):
+        """
+        Estimate the frequency up to which the template has power, from
+        which the sine-Gaussian tiles are offset.
+
+        The power per frequency is assumed constant over the last two chisq
+        bins, so the estimate is the second-to-last bin edge plus the width
+        of the second-to-last bin. The last bin edge is not used, as it need
+        not be where the waveform ends.
+        """
+        fpeak = getattr(template, "fpeak", None)
+        if fpeak is not None and fpeak > 0:
+            return float(fpeak)
+        bins = getattr(template, "bins", None)
+        if bins is None:
+            bins = self.cached_chisq_bins(template, psd)
+        elif isinstance(bins, tuple):
+            bins = bins[0]
+        fstep = bins[-2] - bins[-3]
+        return float((bins[-2] + fstep) * template.delta_f)
+
+    def values_from_fpeak(
+        self,
+        stilde,
+        thash,
+        fpeak,
+        psd,
+        snrv,
+        snr_norm,
+        bchisq,
+        bchisq_dof,
+        indices,
+        flow=20.0,
+        epoch=0.0,
+        template=None,
+    ):
+        """Calculate sine-Gaussian chisq from a precomputed peak frequency."""
+        if not self.do:
+            return None
+        chisq = numpy.ones(len(snrv))
         if thash is None or thash not in self.params:
-            return numpy.ones(len(snrv))
+            return chisq
+        snr = abs(numpy.asarray(snrv) * snr_norm)
+        rchisq = numpy.asarray(bchisq) / numpy.maximum(numpy.asarray(bchisq_dof), 1)
+        nsnr = ranking.newsnr(snr, rchisq)
+        above = nsnr >= self.snr_threshold
+        if not above.any():
+            return chisq
+        num_samples = (len(stilde) - 1) * 2
+        dt = 1.0 / (num_samples * stilde.delta_f)
+        times = float(epoch) + dt * numpy.asarray(indices)[above]
+        snrs = numpy.asarray(snrv)[above] * snr_norm
+        import types
 
-        # Get the chisq bins to use as the frequency reference point
-        bins = self.cached_chisq_bins(template, psd)
+        if template is None:
+            tmpl = types.SimpleNamespace(
+                params=types.SimpleNamespace(template_hash=thash),
+                f_lower=float(flow),
+                fpeak=float(fpeak),
+                delta_f=stilde.delta_f,
+            )
+            chisq[above] = self.values_at(
+                stilde, psd, tmpl, psd, times, whitened=True, snrs=None
+            )
+        else:
+            if getattr(template, "fpeak", None) is None:
+                template.fpeak = float(fpeak)
+            if getattr(template, "f_lower", None) is None:
+                template.f_lower = float(flow)
+            if not hasattr(template, "params") or not hasattr(
+                template.params, "template_hash"
+            ):
+                template.params = types.SimpleNamespace(template_hash=thash)
+            chisq[above] = self.values_at(
+                stilde, psd, template, _unit_psd_for(template, psd), times, whitened=True, snrs=snrs
+            )
+        return chisq
 
-        # Estimate the maximum frequency up to which the waveform has
-        # power by approximating power per frequency
-        # as constant over the last 2 chisq bins. We cannot use the final
-        # chisq bin edge as it does not have to be where the waveform
-        # terminates.
-        fstep = (bins[-2] - bins[-3])
-        fpeak = (bins[-2] + fstep) * template.delta_f
+    def values_at(
+        self, stilde, psd, template, template_psd, times, whitened=True, snrs=None
+    ):
+        """
+        Calculate the sine-Gaussian chisq of a template at the given
+        times.
 
-        return self.values_from_fpeak(
-            stilde, thash, fpeak, psd, snrv, snr_norm,
-            bchisq, bchisq_dof, indices,
-            flow=float(getattr(template, 'f_lower', 20.0)),
-            epoch=float(getattr(template, 'epoch', 0.0)),
-            template=template
+        Unlike values, the template need not be on the data's frequency
+        grid: it is only used to place the tiles, from its peak frequency
+        and low frequency cutoff.
+
+        A signal that matches the template also contributes to any tile that
+        overlaps the template, by an amount that grows with the square of
+        its SNR, so a loud signal could fail the test. If the triggers' SNRs
+        are given, that contribution, the trigger's SNR times the
+        normalized overlap <tile|template>, is subtracted from
+        each tile's SNR. Subtracting it also removes part of the noise, a
+        fraction |<tile|template>|^2 of the tile's noise power, so each
+        tile's squared SNR is divided by 1 - |<tile|template>|^2 to keep the
+        chisq's mean at 1 in noise.
+
+        Parameters
+        ----------
+        stilde: pycbc.types.FrequencySeries
+            The data, divided by its PSD (overwhitened) unless whitened is
+            False
+        psd: pycbc.types.FrequencySeries
+            The power spectral density of the data
+        template: pycbc.types.FrequencySeries
+            The template, on any frequency grid, with its f_lower and params
+            attributes; params.template_hash selects the tiles to use (see
+            chisq_locations).
+        template_psd: pycbc.types.FrequencySeries
+            The PSD on the template's frequency grid: all ones if the
+            template is already whitened. Used to find the template's peak
+            frequency (see peak_frequency) and its overlap with the tiles.
+        times: numpy.ndarray
+            The times of the triggers, in seconds from the start of stilde
+        whitened: bool, optional
+            Whether stilde is already divided by the PSD. If not, only the
+            frequencies the tiles read are divided by it.
+        snrs: numpy.ndarray, optional
+            The normalized complex SNR of each trigger. If given, the
+            template's response is removed from each tile.
+
+        Returns
+        -------
+        chisq: numpy.ndarray
+            The sine-Gaussian chisq at each time. It is 1 if the template has
+            no tiles, or if a tile would reach within 10% of the Nyquist
+            frequency.
+
+        """
+        chisq = numpy.ones(len(times))
+        template_hash = template.params.template_hash
+        if template_hash not in self.params:
+            return chisq
+        project = snrs is not None
+        tiles = self._cached_tiles(
+            stilde,
+            psd,
+            template_hash,
+            self.peak_frequency(template, template_psd),
+            template.f_lower,
+            template if project else None,
+            template_psd,
         )
+        if tiles is None:
+            return chisq
 
+        # Only the frequencies the tiles cover are read. They are time
+        # shifted in double precision: the phase f * t of the shift reaches
+        # ~1e5 cycles, which single precision cannot hold accurately
+        klo = min(tile[1] for tile in tiles)
+        khi = max(tile[2] for tile in tiles)
+        band = stilde.numpy()[klo:khi].astype(numpy.complex128)
+        if not whitened:
+            band /= psd.numpy()[klo:khi]
+        band = FrequencySeries(band, delta_f=stilde.delta_f)
+        for i, time in enumerate(times):
+            # Shift the data so the trigger time is at 0. The band starts at
+            # frequency klo * delta_f, so the shift of the band's first
+            # sample is applied separately
+            shifted = apply_fseries_time_shift(band, -time).numpy() * numpy.exp(
+                2j * numpy.pi * klo * stilde.delta_f * time
+            )
+            chisq[i] = 0
+            for gtem, kmin, kmax, gsigma, overlap in tiles:
+                gsnr = (
+                    gtem.numpy()[kmin:kmax] * shifted[kmin - klo : kmax - klo]
+                ).sum()
+                gsnr *= 4.0 * gtem.delta_f / gsigma
+                if project:
+                    gsnr -= snrs[i] * overlap
+                    chisq[i] += abs(gsnr) ** 2 / (1 - abs(overlap) ** 2)
+                else:
+                    chisq[i] += abs(gsnr) ** 2
+            chisq[i] /= 2 * len(tiles)
+        return chisq
+
+    @staticmethod
+    def _overlaps(tiles, template, template_psd, psd):
+        """
+        Return the normalized overlap of each tile with the template,
+        <tile|template> / (|tile| |template|).
+
+        The overlap is computed on the template's frequency grid. The
+        template is whitened by template_psd, and the tile by the data's
+        PSD at the same frequencies.
+        """
+        df = template.delta_f
+        # Only positive frequencies below the data's Nyquist frequency
+        npos = min(len(template), int(len(psd) * psd.delta_f / df))
+        tpsd = numpy.asarray(template_psd)[:npos]
+        h = numpy.zeros(npos, dtype=complex)
+        good = tpsd > 0
+        h[good] = numpy.asarray(template)[:npos][good] / numpy.sqrt(tpsd[good])
+        hnorm = numpy.sqrt(4 * df * numpy.sum(abs(h) ** 2))
+
+        def on_template_grid(series, k):
+            """
+            Return series, given on the data's frequency grid, at the
+            template's frequency samples k.
+            """
+            ratio = df / series.delta_f
+            if abs(ratio - round(ratio)) < 1e-9:
+                return numpy.asarray(series)[(k * round(ratio))]
+            data_f = numpy.arange(len(series)) * series.delta_f
+            return numpy.interp(k * df, data_f, numpy.asarray(series))
+
+        out = []
+        for gtem, kmin, kmax, _ in tiles:
+            fmin, fmax = kmin * gtem.delta_f, kmax * gtem.delta_f
+            k = numpy.arange(
+                int(numpy.ceil(fmin / df)), min(int(numpy.ceil(fmax / df)), npos)
+            )
+            g = on_template_grid(gtem, k) / numpy.sqrt(on_template_grid(psd, k))
+            gnorm = numpy.sqrt(4 * df * numpy.sum(abs(g) ** 2))
+            if gnorm == 0 or hnorm == 0:
+                out.append(0.0)
+                continue
+            out.append(4 * df * numpy.sum(g * h[k]) / (gnorm * hnorm))
+        return out
+
+    def _cached_tiles(
+        self,
+        stilde,
+        psd,
+        template_hash,
+        fpeak,
+        f_lower,
+        template=None,
+        template_psd=None,
+    ):
+        """
+        Return the result of _tiles, with each tile's overlap with the
+        template appended (0 if no template is given), cached for the 16
+        templates used most recently. Triggers are often evaluated one at a
+        time, in an order that moves between templates.
+        """
+        cache = self.__dict__.setdefault("_tile_cache", OrderedDict())
+        key = (
+            template_hash,
+            fpeak,
+            f_lower,
+            len(stilde),
+            stilde.delta_f,
+            template is not None,
+        )
+        entry = cache.get(key)
+        # The psd is held by the entry, so it cannot be another one reusing
+        # its id
+        if entry is not None and entry[0] is psd:
+            cache.move_to_end(key)
+            return entry[1]
+        tiles = self._tiles(stilde, psd, self.params[template_hash], fpeak, f_lower)
+        if tiles is not None:
+            overlaps = (
+                [0] * len(tiles)
+                if template is None
+                else self._overlaps(tiles, template, template_psd, psd)
+            )
+            tiles = [(*tile, o) for tile, o in zip(tiles, overlaps, strict=False)]
+        cache[key] = (psd, tiles)
+        if len(cache) > 16:
+            cache.popitem(last=False)
+        return tiles
+
+    @staticmethod
+    def _tiles(stilde, psd, values, fpeak, f_lower):
+        """
+        Return, for each sine-Gaussian tile, the tile, the first and last
+        frequency index it covers and its norm; or None if any tile would
+        reach within 10% of the data's Nyquist frequency.
+        """
+        # Only apply the sine-Gaussian in a +-50 Hz range around the
+        # central frequency
+        qwindow = 50
+        # 90% of the Nyquist frequency of the data, which avoids issues
+        # near Nyquist due to resample filtering
+        fstop = len(stilde) * stilde.delta_f * 0.9
+        delta_f = stilde.delta_f
+        kmin = int(f_lower / psd.delta_f)
+        tiles = []
+        for descr in values.split(","):
+            q, offset = descr.split("-")
+            q, offset = float(q), float(offset)
+            fcen = fpeak + offset
+            flow = max(kmin * delta_f, fcen - qwindow)
+            fhigh = fcen + qwindow
+            if fhigh > fstop:
+                return None
+            kmin = int(flow / delta_f)
+            kmax = int(fhigh / delta_f)
+            gtem = sinegauss.fd_sine_gaussian(
+                1.0, q, fcen, flow, len(stilde) * delta_f, delta_f
+            ).astype(numpy.complex64)
+            gsigma = sigma(
+                gtem, psd=psd, low_frequency_cutoff=flow, high_frequency_cutoff=fhigh
+            )
+            tiles.append((gtem, kmin, kmax, gsigma))
+        return tiles

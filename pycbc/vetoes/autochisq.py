@@ -13,18 +13,27 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-from pycbc.filter import make_frequency_series
-from pycbc.filter import  matched_filter_core
-from pycbc.types import Array
-import numpy as np
 import logging
 
-BACKEND_PREFIX="pycbc.vetoes.autochisq_"
+import numpy as np
+
+from pycbc.filter import make_frequency_series, matched_filter_core
+from pycbc.types import Array
+
+BACKEND_PREFIX = "pycbc.vetoes.autochisq_"
 
 
-def autochisq_from_precomputed(sn, corr_sn, hautocorr, indices,
-                       stride=1, num_points=None, oneside=None,
-                       twophase=True, maxvalued=False):
+def autochisq_from_precomputed(
+    sn,
+    corr_sn,
+    hautocorr,
+    indices,
+    stride=1,
+    num_points=None,
+    oneside=None,
+    twophase=True,
+    maxvalued=False,
+):
     """
     Compute correlation (two sided) between template and data
     and compares with autocorrelation of the template: C(t) = IFFT(A*A/S(f))
@@ -65,63 +74,66 @@ def autochisq_from_precomputed(sn, corr_sn, hautocorr, indices,
         number of degrees of freedom
     autochisq: Array[float]
         autochisq values corresponding to the time instances defined by indices
+
     """
     Nsnr = len(sn)
 
     achisq = np.zeros(len(indices))
-    num_points_all = int(Nsnr/stride)
+    num_points_all = int(Nsnr / stride)
     if num_points is None:
         num_points = num_points_all
-    if (num_points > num_points_all):
-        num_points = num_points_all
+    num_points = min(num_points, num_points_all)
 
     snrabs = np.abs(sn[indices])
     cphi_array = (sn[indices]).real / snrabs
     sphi_array = (sn[indices]).imag / snrabs
 
-    start_point = - stride*num_points
-    end_point = stride*num_points+1
-    if oneside == 'left':
+    start_point = -stride * num_points
+    end_point = stride * num_points + 1
+    if oneside == "left":
         achisq_idx_list = np.arange(start_point, 0, stride)
-    elif oneside == 'right':
+    elif oneside == "right":
         achisq_idx_list = np.arange(stride, end_point, stride)
     else:
         achisq_idx_list_pt1 = np.arange(start_point, 0, stride)
         achisq_idx_list_pt2 = np.arange(stride, end_point, stride)
-        achisq_idx_list = np.append(achisq_idx_list_pt1,
-                                    achisq_idx_list_pt2)
+        achisq_idx_list = np.append(achisq_idx_list_pt1, achisq_idx_list_pt2)
 
     hauto_corr_vec = hautocorr[achisq_idx_list]
-    hauto_norm = hauto_corr_vec.real*hauto_corr_vec.real
+    hauto_norm = hauto_corr_vec.real * hauto_corr_vec.real
     # REMOVE THIS LINE TO REPRODUCE OLD RESULTS
-    hauto_norm += hauto_corr_vec.imag*hauto_corr_vec.imag
+    hauto_norm += hauto_corr_vec.imag * hauto_corr_vec.imag
     chisq_norm = 1.0 - hauto_norm
 
-    for ip,ind in enumerate(indices):
+    for ip, ind in enumerate(indices):
         curr_achisq_idx_list = achisq_idx_list + ind
 
         cphi = cphi_array[ip]
         sphi = sphi_array[ip]
         # By construction, the other "phase" of the SNR is 0
-        snr_ind =  sn[ind].real*cphi + sn[ind].imag*sphi
+        snr_ind = sn[ind].real * cphi + sn[ind].imag * sphi
 
         # Wrap index if needed (maybe should fail in this case?)
         if curr_achisq_idx_list[0] < 0:
             curr_achisq_idx_list[curr_achisq_idx_list < 0] += Nsnr
         if curr_achisq_idx_list[-1] > (Nsnr - 1):
-            curr_achisq_idx_list[curr_achisq_idx_list > (Nsnr-1)] -= Nsnr
+            curr_achisq_idx_list[curr_achisq_idx_list > (Nsnr - 1)] -= Nsnr
 
-        z = corr_sn[curr_achisq_idx_list].real*cphi + \
-             corr_sn[curr_achisq_idx_list].imag*sphi
-        dz = z - hauto_corr_vec.real*snr_ind
-        curr_achisq_list = dz*dz/chisq_norm
+        z = (
+            corr_sn[curr_achisq_idx_list].real * cphi
+            + corr_sn[curr_achisq_idx_list].imag * sphi
+        )
+        dz = z - hauto_corr_vec.real * snr_ind
+        curr_achisq_list = dz * dz / chisq_norm
 
         if twophase:
             chisq_norm = 1.0 - hauto_norm
-            z = -corr_sn[curr_achisq_idx_list].real*sphi + \
-                 corr_sn[curr_achisq_idx_list].imag*cphi
-            dz = z - hauto_corr_vec.imag*snr_ind
-            curr_achisq_list += dz*dz/chisq_norm
+            z = (
+                -corr_sn[curr_achisq_idx_list].real * sphi
+                + corr_sn[curr_achisq_idx_list].imag * cphi
+            )
+            dz = z - hauto_corr_vec.imag * snr_ind
+            curr_achisq_list += dz * dz / chisq_norm
 
         if maxvalued:
             achisq[ip] = curr_achisq_list.max()
@@ -136,18 +148,28 @@ def autochisq_from_precomputed(sn, corr_sn, hautocorr, indices,
 
     return dof, achisq
 
-class SingleDetAutoChisq(object):
-    """Class that handles precomputation and memory management for efficiently
+
+class SingleDetAutoChisq:
+    """
+    Class that handles precomputation and memory management for efficiently
     running the auto chisq in a single detector inspiral analysis.
     """
-    def __init__(self, stride, num_points, onesided=None, twophase=False,
-                 reverse_template=False, take_maximum_value=False,
-                 maximal_value_dof=None):
+
+    def __init__(
+        self,
+        stride,
+        num_points,
+        onesided=None,
+        twophase=False,
+        reverse_template=False,
+        take_maximum_value=False,
+        maximal_value_dof=None,
+    ):
         """
         Initialize autochisq calculation instance
 
         Parameters
-        -----------
+        ----------
         stride : int
             Number of sample points between points at which auto-chisq is
             calculated.
@@ -170,6 +192,7 @@ class SingleDetAutoChisq(object):
         maximal_value_dof : int, required if using take_maximum_value
             If using take_maximum_value the expected value is not known. This
             value specifies what to store in the cont_chisq_dof output.
+
         """
         if stride > 0:
             self.do = True
@@ -179,13 +202,13 @@ class SingleDetAutoChisq(object):
             self.num_points = num_points
             self.stride = stride
             self.one_sided = onesided
-            if (onesided is not None):
+            if onesided is None:
                 self.dof = self.dof * 2
             self.two_phase = twophase
             if self.two_phase:
                 self.dof = self.dof * 2
             self.reverse_template = reverse_template
-            self.take_maximum_value=take_maximum_value
+            self.take_maximum_value = take_maximum_value
             if self.take_maximum_value:
                 if maximal_value_dof is None:
                     err_msg = "Must provide the maximal_value_dof keyword "
@@ -199,13 +222,106 @@ class SingleDetAutoChisq(object):
         else:
             self.do = False
 
-    def values(self, sn, indices, template, psd, norm, stilde=None,
-               low_frequency_cutoff=None, high_frequency_cutoff=None):
+    @staticmethod
+    def insert_option_group(parser):
+        """Add the auto-chisq options to an argument parser."""
+        group = parser.add_argument_group("Auto chisq")
+        group.add_argument(
+            "--autochi-number-points",
+            type=int,
+            default=0,
+            help="The number of points to use, in both "
+            "directions if doing a two-sided auto-chisq, "
+            "to calculate the auto-chisq statistic.",
+        )
+        group.add_argument(
+            "--autochi-stride",
+            type=int,
+            default=0,
+            help="The gap, in sample points, between the "
+            "points at which to calculate auto-chisq.",
+        )
+        group.add_argument(
+            "--autochi-two-phase",
+            action="store_true",
+            default=False,
+            help="If given auto-chisq will be calculated by "
+            "testing against both phases of the SNR "
+            "time-series. If not given, only the phase "
+            "matching the trigger will be used.",
+        )
+        group.add_argument(
+            "--autochi-onesided",
+            action="store",
+            default=None,
+            choices=["left", "right"],
+            help="Decide whether to calculate auto-chisq using "
+            "points on both sides of the trigger or only "
+            "on one side. If not given points on both "
+            "sides will be used. If given, with either "
+            "'left' or 'right', only points on that side "
+            "(right = forward in time, left = back in "
+            "time) will be used.",
+        )
+        group.add_argument(
+            "--autochi-reverse-template",
+            action="store_true",
+            default=False,
+            help="If given, time-reverse the template before "
+            "calculating the auto-chisq statistic. This "
+            "will come at additional computational cost "
+            "as the SNR time-series will need recomputing"
+            " for the time-reversed template.",
+        )
+        group.add_argument(
+            "--autochi-max-valued",
+            action="store_true",
+            default=False,
+            help="If given, store only the maximum value of "
+            "the auto-chisq over all points tested. A "
+            "disadvantage of this is that the mean value "
+            "will not be known analytically.",
+        )
+        group.add_argument(
+            "--autochi-max-valued-dof",
+            action="store",
+            metavar="INT",
+            type=int,
+            help="If using --autochi-max-valued this value "
+            "denotes the pre-calculated mean value that "
+            "will be stored as the auto-chisq degrees-of-"
+            "freedom value.",
+        )
+
+    @classmethod
+    def from_cli(cls, args):
+        """Create the auto-chisq from the options of insert_option_group."""
+        return cls(
+            args.autochi_stride,
+            args.autochi_number_points,
+            onesided=args.autochi_onesided,
+            twophase=args.autochi_two_phase,
+            reverse_template=args.autochi_reverse_template,
+            take_maximum_value=args.autochi_max_valued,
+            maximal_value_dof=args.autochi_max_valued_dof,
+        )
+
+    def values(
+        self,
+        sn,
+        indices,
+        template,
+        psd,
+        norm,
+        stilde=None,
+        low_frequency_cutoff=None,
+        high_frequency_cutoff=None,
+    ):
         """
         Calculate the auto-chisq at the specified indices.
 
         Parameters
-        -----------
+        ----------
         sn : Array[complex]
             SNR time series of the template for which auto-chisq is being
             computed. Provided unnormalized.
@@ -232,6 +348,7 @@ class SingleDetAutoChisq(object):
         requested sample indices
 
         dof: int, approx number of statistical degrees of freedom
+
         """
         if not (self.do and len(indices) > 0):
             return None, None
@@ -249,9 +366,9 @@ class SingleDetAutoChisq(object):
                     htilde,
                     psd=psd,
                     low_frequency_cutoff=low_frequency_cutoff,
-                    high_frequency_cutoff=high_frequency_cutoff
+                    high_frequency_cutoff=high_frequency_cutoff,
                 )
-                Pt = Pt * (1./ Pt[0])
+                Pt = Pt * (1.0 / Pt[0])
                 self._autocor = Array(Pt, copy=True)
             else:
                 Pt, _, P_norm = matched_filter_core(
@@ -259,14 +376,14 @@ class SingleDetAutoChisq(object):
                     htilde,
                     psd=psd,
                     low_frequency_cutoff=low_frequency_cutoff,
-                    high_frequency_cutoff=high_frequency_cutoff
+                    high_frequency_cutoff=high_frequency_cutoff,
                 )
 
                 # T-reversed template has same norm as forward template
                 # so we can normalize using that
                 # FIXME: Here sigmasq has to be cast to a float or the
                 #        code is really slow ... why??
-                norm_fac = P_norm / float(((template.sigmasq(psd))**0.5))
+                norm_fac = P_norm / float((template.sigmasq(psd)) ** 0.5)
                 Pt *= norm_fac
                 self._autocor = Array(Pt, copy=True)
             self._autocor_id = key
@@ -274,13 +391,13 @@ class SingleDetAutoChisq(object):
         logging.debug("...Calculating autochisquare")
         sn = sn * norm
         if self.reverse_template:
-            assert(stilde is not None)
+            assert stilde is not None
             asn, _, ahnrm = matched_filter_core(
                 htilde.conj(),
                 stilde,
                 low_frequency_cutoff=low_frequency_cutoff,
                 high_frequency_cutoff=high_frequency_cutoff,
-                h_norm=template.sigmasq(psd)
+                h_norm=template.sigmasq(psd),
             )
             correlation_snr = asn * ahnrm
         else:
@@ -289,24 +406,25 @@ class SingleDetAutoChisq(object):
         achi_list = np.array([])
         index_list = np.array(indices)
         dof, achi_list = autochisq_from_precomputed(
-            sn, correlation_snr,
+            sn,
+            correlation_snr,
             self._autocor,
             index_list,
             stride=self.stride,
             num_points=self.num_points,
             oneside=self.one_sided,
             twophase=self.two_phase,
-            maxvalued=self.take_maximum_value
+            maxvalued=self.take_maximum_value,
         )
         self.dof = dof
         return achi_list, dof
 
 
 class SingleDetSkyMaxAutoChisq(SingleDetAutoChisq):
-    """Stub for precessing auto chisq if anyone ever wants to code it up.
-    """
+    """Stub for precessing auto chisq if anyone ever wants to code it up."""
+
     def __init__(self, *args, **kwds):
-        super(SingleDetSkyMaxAutoChisq, self).__init__(*args, **kwds)
+        super().__init__(*args, **kwds)
 
     def values(self, *args, **kwargs):
         if self.do:
@@ -314,5 +432,3 @@ class SingleDetSkyMaxAutoChisq(SingleDetAutoChisq):
             err_msg += "been written. If you want to use it, why not help "
             err_msg += "write it?"
             raise NotImplementedError(err_msg)
-        else:
-            return None
