@@ -8,11 +8,6 @@ except ImportError:
     _mf = None
 
 
-def matchedfilter_available():
-    """True if the matchedfilter back end can be used."""
-    return _mf is not None
-
-
 def _require_matchedfilter():
     if _mf is None:
         raise ImportError("matchedfilter is required for ratio/FIR filtering but is not installed")
