@@ -6,7 +6,7 @@ from pycbc.filter.matchedfilter_cpu import (
     fast_multiply_analytic_cython,
     find_peaks_in_block_cython,
 )
-from pycbc.types import complex64, zeros
+from pycbc.types import Array, FrequencySeries, complex64, zeros
 
 
 class MatchedFilterRatioControl:
@@ -123,6 +123,12 @@ class MatchedFilterRatioControl:
         )
 
         self.ref_snr = snr.numpy() * (norm * stilde.delta_t)
+        # What fine_template and fine_correlation need for this batch
+        self._batch = (stilde, psd, ref_template, filters_f, n_taps)
+        self._fine_templates = {}
+        self._fine_correlations = {}
+        self._ref_blocks = {}
+        self._ref_weight = None
 
         local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
             self.ref_snr, filters_f, n_taps, valid_slice
@@ -132,6 +138,100 @@ class MatchedFilterRatioControl:
             global_ids = indices[local_idxs]
             return global_ids, t_idxs, snr_vals, tstarts, h_norm
         return [], [], [], tstarts, h_norm
+
+    def fine_template(self, i, params):
+        """
+        Return fine template i of the last process_segment batch, divided
+        by the square root of the PSD (whitened), on the frequency grid of
+        the engine's blocks.
+
+        The fine templates are never generated: each is reconstructed as
+        its ratio filter times the reference template.
+
+        Parameters
+        ----------
+        i : int
+            The index of the template's ratio filter in the batch.
+        params : object
+            The template's parameters, set as its params attribute.
+
+        """
+        if i not in self._fine_templates:
+            stilde, psd, ref_template, filters_f, _ = self._batch
+            n = self.fir_fft_len
+            delta_f = self.engine_sr / n
+            if self._ref_weight is None:
+                # Interpolating rather than decimating avoids a delta_f
+                # mismatch
+                dec = int(delta_f / stilde.delta_f)
+                w = ref_template[::dec] / psd[::dec] ** 0.5
+                newf = np.arange(0, n) * delta_f
+                self._ref_weight = np.interp(newf, w.sample_frequencies, w)
+            # The correlation of a template h with the data s is
+            # conj(h) * s / psd, and the engine computes the fine template's
+            # as ratio * conj(reference) * s / psd, so the fine template is
+            # given by conj(ratio) * reference
+            tmplt = FrequencySeries(
+                np.conj(filters_f[i]) * self._ref_weight / self.engine_sr,
+                delta_f=delta_f,
+                dtype=stilde.dtype,
+            )
+            tmplt.params = params
+            tmplt.f_lower = ref_template.f_lower
+            self._fine_templates[i] = tmplt
+        return self._fine_templates[i]
+
+    def fine_correlation(self, i, t, tstart, reach=0):
+        """
+        Return the frequency-domain correlation of fine template i of the
+        last process_segment batch with the data, over a block around time
+        t: the ratio filter times the FFT of a block of the reference SNR
+        series.
+
+        The block is the one starting at tstart, in which the trigger was
+        found, unless a sample within reach of t lies where that block's
+        output is not exact: within half the ratio filter's length of the
+        block's edges, where the filter wraps around the block. A block
+        centred on t is then used.
+
+        Parameters
+        ----------
+        i : int
+            The index of the template's ratio filter in the batch.
+        t : int
+            The sample of the trigger in the segment.
+        tstart : int
+            The first sample of the block the trigger was found in.
+        reach : int, optional
+            The number of samples either side of t that must be exact.
+
+        Returns
+        -------
+        corr : pycbc.types.FrequencySeries
+            The correlation, normalized so that ifft(corr) * len(corr) is the
+            unnormalized SNR series of the template over the block.
+        index : int
+            The sample of the block at which the trigger is.
+
+        """
+        _, _, _, filters_f, n_taps = self._batch
+        n = self.fir_fft_len
+        t, tstart = int(t), int(tstart)
+        half = int(n_taps[i]) // 2
+        if t - reach - tstart < half or t + reach - tstart >= n - half:
+            tstart = min(max(t - n // 2, 0), len(self.ref_snr) - n)
+        key = (i, tstart)
+        if key not in self._fine_correlations:
+            if tstart not in self._ref_blocks:
+                ref = self.ref_snr[tstart : tstart + n]
+                ref_f = zeros(len(ref), dtype=complex64)
+                FFT(Array(ref, dtype=complex64), ref_f).execute()
+                self._ref_blocks[tstart] = ref_f.numpy()
+            corr = FrequencySeries(
+                filters_f[i] * self._ref_blocks[tstart], delta_f=self.engine_sr / n
+            )
+            self._fine_correlations[key] = corr / n
+        return self._fine_correlations[key], t - tstart
 
     def _fft_all_filters(self, taps, counts):
         """Helper to FFT all filters, batch_size rows at a time."""
