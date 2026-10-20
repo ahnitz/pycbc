@@ -10,14 +10,9 @@ set -e
 
 export OMP_NUM_THREADS=1
 
-# MKL for the FFTs.  The reference matched filter is a 2^20 inverse per segment
-# and FFTW here plans at measure level 0 with no wisdom, taking 10.6 ms where
-# MKL takes 2.4 ms for the same transform.  Triggers are unchanged: 893/893
-# with the same SNRs to 2.9e-06, which is float32 rounding.
 pycbc_inspiral_fir \
     --ratio-filter-engine ${ENGINE:-matchedfilter-hierarchical} \
     --output ${OUT:-fir.hdf} \
-    --fft-backends ${FFTB:-mkl} \
     --disable-dynamic-snr-renorm \
     --pad-data 8 \
     --strain-high-pass 15 \
@@ -32,17 +27,8 @@ pycbc_inspiral_fir \
     --psd-segment-stride 8 \
     --psd-inverse-length 16 \
     --psd-num-segments 63 \
-    --psdvar-segment 8 \
-    --psdvar-short-segment 0.25 \
-    --psdvar-long-segment 512 \
-    --psdvar-psd-duration 8 \
-    --psdvar-psd-stride 4 \
-    --psdvar-low-freq 20 \
-    --psdvar-high-freq 480 \
     --low-frequency-cutoff 20 \
-    --snr-threshold ${SNR:-5.0} \
     --asym-snr-threshold ${SNR:-5.0} \
-    --asym-max-primary-per-group-sec 0 \
     --cluster-window 1 \
     --chisq-snr-threshold 6 \
     --chisq-bins 64 \

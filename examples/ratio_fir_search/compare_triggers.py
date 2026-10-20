@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""Compare triggers from the FIR/ratio search (run_fir_search.sh) against
+"""
+Compare triggers from the FIR/ratio search (run_fir_search.sh) against
 the plain matched-filter reference search (run_reference_search.sh).
 
 For each FIR-search trigger, finds the closest-in-time reference trigger
@@ -46,6 +47,9 @@ def matched_snr_diffs(reference, fir, sample_rate):
     ref_hash = reference["template_hash"]
     ref_snr = reference["snr"]
     diffs = []
+    ref_snrs = []
+    fir_snrs = []
+    times = []
     for i in range(len(fir["end_time"])):
         t = fir["end_time"][i]
         mask = ref_hash == fir["template_hash"][i]
@@ -54,8 +58,12 @@ def matched_snr_diffs(reference, fir, sample_rate):
         rt = ref_time[mask]
         j = np.abs(rt - t).argmin()
         if abs(rt[j] - t) < tol:
-            diffs.append(fir["snr"][i] - ref_snr[mask][j])
-    return np.array(diffs)
+            rs = ref_snr[mask][j]
+            diffs.append(fir["snr"][i] - rs)
+            ref_snrs.append(rs)
+            fir_snrs.append(fir["snr"][i])
+            times.append(t)
+    return (np.array(diffs), np.array(ref_snrs), np.array(fir_snrs), np.array(times))
 
 
 def main():
@@ -77,13 +85,16 @@ def main():
         help="Minimum fraction of triggers that must match between "
         "reference and FIR searches.",
     )
+    parser.add_argument(
+        "--output-plot", default=None, help="Path to save trigger comparison plot."
+    )
     args = parser.parse_args()
 
     reference = load_triggers(args.reference_file)
     fir = load_triggers(args.fir_file)
     min_match, sample_rate = fir_bank_params(args.fir_bank_file)
 
-    diffs = matched_snr_diffs(reference, fir, sample_rate)
+    diffs, ref_snrs, fir_snrs, times = matched_snr_diffs(reference, fir, sample_rate)
     if len(diffs) == 0:
         raise SystemExit(
             "No triggers matched between the two searches -- "
@@ -105,6 +116,38 @@ def main():
     print(f"mismatch-predicted SNR-difference std: {predicted_std:.6g}")
     print(f"measured SNR-difference std:           {measured_std:.6g}")
     print(f"ratio (measured / predicted):          {ratio:.2f}x")
+
+    if args.output_plot:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5))
+        ref_mag = np.abs(ref_snrs)
+        fir_mag = np.abs(fir_snrs)
+        diff_mag = np.abs(diffs)
+        ax1.scatter(ref_mag, fir_mag, s=8, alpha=0.5)
+        lims = [min(ref_mag.min(), fir_mag.min()), max(ref_mag.max(), fir_mag.max())]
+        ax1.plot(lims, lims, "r--", label="y = x")
+        ax1.set_xlabel("Reference |SNR|")
+        ax1.set_ylabel("FIR |SNR|")
+        ax1.legend()
+        ax1.set_title("Reference vs FIR SNR")
+
+        ax2.scatter(times, diff_mag, s=8, alpha=0.5)
+        pred_label = f"Predicted std ({predicted_std:.4g})"
+        meas_label = f"Measured std ({measured_std:.4g})"
+        ax2.axhline(predicted_std, color="r", linestyle="--", label=pred_label)
+        ax2.axhline(measured_std, color="b", linestyle=":", label=meas_label)
+        ax2.set_xlabel("GPS End Time (s)")
+        ax2.set_ylabel("|SNR Difference|")
+        ax2.legend()
+        ax2.set_title("SNR Difference vs Time")
+
+        fig.tight_layout()
+        fig.savefig(args.output_plot, dpi=150)
+        plt.close(fig)
 
     if match_frac < args.min_match_fraction:
         raise SystemExit(

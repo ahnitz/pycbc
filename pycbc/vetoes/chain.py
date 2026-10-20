@@ -162,9 +162,6 @@ class _AutoStage(_Stage):
 
     def evaluate(self, batch, j):
         est = self.estimator
-        if hasattr(est, "evaluate_trigger"):
-            val = est.evaluate_trigger(batch, j)
-            return None if val is None else {"cont_chisq": val}
         corr, index = batch.correlation(j, est.stride * est.num_points)
         if corr is None:
             return None
@@ -192,10 +189,16 @@ class _AutoStage(_Stage):
         """
         tid = batch.template_id[j]
         if tid not in batch.autocorrelations:
-            power = np.abs(np.asarray(batch.template(j))) ** 2
-            power[len(power) // 2 + 1 :] = 0
-            autocor = np.fft.ifft(power)
-            batch.autocorrelations[tid] = autocor / autocor[0]
+            tmplt = batch.template(j)
+            autocor = getattr(tmplt, "autocorrelation", None)
+            if autocor is None:
+                power = np.abs(np.asarray(tmplt)) ** 2
+                power[len(power) // 2 + 1 :] = 0
+                autocor = np.fft.ifft(power)
+                autocor = autocor / autocor[0]
+                if hasattr(tmplt, "__dict__"):
+                    tmplt.autocorrelation = autocor
+            batch.autocorrelations[tid] = autocor
         return batch.autocorrelations[tid]
 
 
@@ -308,7 +311,7 @@ class SignalConsistencyChain:
                         "which no earlier step provides"
                     )
                 self.steps.append((param, func, value, action, step))
-        logger.debug("Signal consistency chain: %s", self.description)
+        logger.info("Signal consistency chain: %s", self.description)
 
     @staticmethod
     def _parse_threshold(step):
@@ -441,6 +444,8 @@ class SignalConsistencyChain:
         return func(stat, value)
 
     def _run_stage(self, stage, batch, vals, alive):
+        if not np.any(alive):
+            return
         start = time.perf_counter()
         priority = np.abs(batch.snr)
         times = batch.time_index
@@ -528,7 +533,9 @@ class SignalConsistencyChain:
         SingleDetSGChisq.insert_option_group(parser)
 
     @classmethod
-    def from_cli(cls, args, bank, sample_rate):
+    def from_cli(
+        cls, args, bank, sample_rate, power_chisq=None, sg_chisq=None
+    ):
         """
         Create the chain from the options added by insert_option_group.
 
@@ -542,15 +549,27 @@ class SignalConsistencyChain:
         sample_rate : float
             The sample rate of the SNR time series, to convert
             --chisq-window to samples.
+        power_chisq : SingleDetPowerChisq, optional
+            Custom power-chisq estimator (defaults to SingleDetPowerChisq).
+        sg_chisq : SingleDetSGChisq, optional
+            Pre-built sine-Gaussian chisq estimator.
 
         """
         if args.autochi_reverse_template:
             raise ValueError("The chain does not support --autochi-reverse-template")  # noqa: TRY003
         # The tests' SNR thresholds are steps of the chain, not of the
         # estimators
-        power = SingleDetPowerChisq(args.chisq_bins)
+        power = (
+            SingleDetPowerChisq(args.chisq_bins)
+            if power_chisq is None
+            else power_chisq
+        )
         auto = SingleDetAutoChisq.from_cli(args)
-        sg = SingleDetSGChisq.from_cli(args, bank, args.chisq_bins)
+        sg = (
+            SingleDetSGChisq.from_cli(args, bank, str(args.chisq_bins))
+            if sg_chisq is None
+            else sg_chisq
+        )
         extra = ["psd_var_val"] if getattr(args, "psdvar_segment", None) else []
         steps = args.signal_consistency_chain
         if steps is None:

@@ -1,15 +1,12 @@
-"""Signal-consistency (power, auto, and sine-Gaussian chisq) estimators for
-hierarchical / ratio FIR matched filtering.
+"""Signal-consistency estimators and filter spectra for hierarchical / ratio FIR
+matched filtering.
 """
 
-import time
 import types
 
 import numpy as np
 
-from pycbc.types import FrequencySeries, float32
-from pycbc.vetoes.autochisq import SingleDetAutoChisq, autochisq_from_precomputed
-from pycbc.vetoes.chain import SignalConsistencyChain
+from pycbc.types import FrequencySeries
 from pycbc.vetoes.chisq import (
     SingleDetPowerChisq,
     power_chisq_bin_weights,
@@ -31,9 +28,7 @@ def _require_matchedfilter():
 
 def _psd_cache_key(stilde):
     psd = getattr(stilde, "psd", None)
-    if psd is None:
-        return None
-    return getattr(psd, "_cache_key", id(psd))
+    return None if psd is None else getattr(psd, "_cache_key", id(psd))
 
 
 def _stilde_cache_key(stilde):
@@ -89,15 +84,11 @@ class ChisqFilters:
     def prefetch(self, indices):
         """Batch-compute and cache spectra for any uncached row indices in `indices`."""
         n = len(self._counts)
-        missing = []
-        seen = set()
-        for raw_i in np.asarray(indices).ravel():
-            i = int(raw_i)
-            if i < 0:
-                i += n
-            if 0 <= i < n and i not in self._rows and i not in seen:
-                seen.add(i)
-                missing.append(i)
+        missing = [
+            i
+            for i in dict.fromkeys(int(x) % n for x in np.asarray(indices).ravel())
+            if 0 <= i < n and i not in self._rows
+        ]
         if not missing:
             return
         idx = np.asarray(missing, dtype=np.int64)
@@ -153,144 +144,41 @@ def chisq_middle_spectra(taps, counts, ids, block_length):
     return out
 
 
-class RatioBlockInputs:
-    """Inputs for SignalConsistencyChain on one middle group's triggers.
-    Each trigger's chisq block is centred on it (clipped to the series).
-    """
-
-    def __init__(
-        self,
-        power_chisq,
-        ids_local,
-        t_idxs,
-        snrs,
-        fine_indices,
-        stilde,
-        ref_snr,
-        filters_f,
-        coarse_idx,
-        bank=None,
-        shifts=None,
-    ):
-        self.power_chisq = power_chisq
-        self.ids_local = np.asarray(ids_local)
-        self.t_idxs = np.asarray(t_idxs)
-        self.snrs = np.asarray(snrs)
-        self.fine_indices = np.asarray(fine_indices)
-        self.stilde = stilde
-        self.ref_snr = ref_snr
-        self.filters_f = filters_f
-        self.coarse_idx = coarse_idx
-        self.bank = bank
-        local_shifts = shifts[self.ids_local] if shifts is not None else 0
-        self.phys_t = self.t_idxs - local_shifts
-        self.template_id = self.fine_indices[self.ids_local]
-        self.block_len = filters_f.block_length
-        self.power_chisq.coarse_weight(stilde, coarse_idx, self.block_len)
-        self.templates = {}
-
-    def template(self, j):
-        """The whitened fine template on the block's grid, with its power
-        chisq bins (None if unusable) and template metadata for SG chisq.
-        """
-        local_id = int(self.ids_local[j])
-        if local_id not in self.templates:
-            n_half = self.block_len // 2 + 1
-            coarse_w = self.power_chisq.coarse_weight(
-                self.stilde, self.coarse_idx, self.block_len
-            )[1]
-            fine = np.zeros(self.block_len, dtype=np.complex64)
-            if coarse_w is not None:
-                fine[:n_half] = coarse_w * np.conj(self.filters_f[local_id][:n_half])
-            tmplt = FrequencySeries(
-                fine, delta_f=self.power_chisq.sample_rate / self.block_len
-            )
-            tmplt.bins = self.power_chisq.bins(
-                self.stilde,
-                self.coarse_idx,
-                local_id,
-                self.filters_f,
-                self.block_len,
-            )
-            gid = int(self.template_id[j])
-            if self.bank is not None and getattr(self.bank, "table", None) is not None:
-                tmplt.f_lower = float(self.bank.table["f_lower"][gid])
-                tmplt.params = types.SimpleNamespace(
-                    template_hash=self.bank.table["template_hash"][gid]
-                )
-            else:
-                tmplt.f_lower = float(self.power_chisq.flow)
-                tmplt.params = types.SimpleNamespace(template_hash=gid)
-            self.templates[local_id] = tmplt
-        return self.templates[local_id]
-
-    def correlation(self, j, reach=0):
-        local_id = int(self.ids_local[j])
-        t_idx = int(self.t_idxs[j])
-        tstart = min(
-            max(t_idx - self.block_len // 2, 0),
-            len(self.ref_snr) - self.block_len,
-        )
-        if reach > 0 and hasattr(self.filters_f, "valid"):
-            valid_start, valid_stop = self.filters_f.valid[local_id]
-            if (
-                t_idx - reach - tstart < valid_start
-                or t_idx + reach - tstart >= valid_stop
-            ):
-                return None, None
-        ref_f = self.power_chisq.ref_spectrum(
-            self.stilde, self.coarse_idx, self.ref_snr, tstart, self.block_len
-        )
-        if ref_f is None:
-            return None, None
-        corr = (self.filters_f[local_id] * ref_f) / self.block_len
-        return corr, t_idx - tstart
-
-
 class RatioPowerChisq(SingleDetPowerChisq):
-    """Calculates fast power chisq for ratio/FIR filtering using reconstructed
-    frequency-domain template spectra and exact template-power bin weighting.
+    """Fast power chisq and block template/correlation reconstruction for
+    hierarchical ratio/FIR filtering.
     """
 
     def __init__(
         self,
         num_bins,
-        snr_threshold,
         sample_rate,
         flow=20.0,
         f_final=800.0,
-        chisq_window=1.0,
-        chisq_iterations=None,
         top_template=None,
         upper_f_by_coarse=None,
     ):
-        super().__init__(num_bins=num_bins, snr_threshold=snr_threshold)
+        super().__init__(num_bins=num_bins)
         if self.do and self.num_bins is not None:
             self.num_bins = int(self.num_bins)
-        if self.snr_threshold is not None:
-            self.snr_threshold = float(self.snr_threshold)
         self.sample_rate = float(sample_rate)
         self.flow = float(flow)
         self.f_final = float(f_final)
-        self.chisq_window_samp = int(chisq_window * self.sample_rate)
-        self.max_iterations = chisq_iterations
         self.top_template = top_template
         self.upper_f_by_coarse = (
             upper_f_by_coarse if upper_f_by_coarse is not None else {}
         )
 
-        self.bins_cache = {}
+        self.template_cache = {}
         self.psd_cache = {}
         self.coarse_w_cache = {}
         self.ref_f_cache = {}
-        self.chains = {}
 
     def clear(self):
-        self.bins_cache.clear()
+        self.template_cache.clear()
         self.psd_cache.clear()
         self.coarse_w_cache.clear()
         self.ref_f_cache.clear()
-        self.chains.clear()
 
     def begin_group(self):
         """Release the block spectra of the previous (segment, middle group) pass."""
@@ -320,90 +208,120 @@ class RatioPowerChisq(SingleDetPowerChisq):
                 upper_f = self.upper_f_by_coarse.get(coarse_idx)
                 if upper_f is not None:
                     step_u = max(1, len(upper_f) // block_len)
-                    upper_dec = np.conj(upper_f[::step_u][:n_half])
-                    coarse_dec = top_dec * upper_dec
+                    coarse_dec = top_dec * np.conj(upper_f[::step_u][:n_half])
                 else:
                     coarse_dec = top_dec
-                kmax_w = min(int(self.f_final / df), n_half - 1)
-                coarse_dec[kmax_w:] = 0.0
-                psd_safe = np.maximum(psd_pad, 1e-30)
-                cw = (coarse_dec / np.sqrt(psd_safe)).astype(np.complex64)
-                cw[kmax_w:] = 0.0
+                kmin = int(self.flow / df)
+                kmax = min(int(self.f_final / df), n_half - 1)
+                cw = (coarse_dec / np.sqrt(np.maximum(psd_pad, 1e-30))).astype(
+                    np.complex64
+                )
+                cw[:kmin] = 0.0
+                cw[kmax:] = 0.0
                 self.coarse_w_cache[coarse_key] = cw
             else:
                 self.coarse_w_cache[coarse_key] = None
         return psd_key, self.coarse_w_cache[coarse_key]
 
     def ref_spectrum(self, stilde, coarse_idx, ref_snr, tstart, block_len):
-        """FFT of the block of the middle series starting at tstart, or None
-        if the series is too short.
+        """Band-limited FFT of the block of the middle series starting at tstart,
+        or None if the series is too short.
         """
         cache_key = (_stilde_cache_key(stilde), coarse_idx, tstart, block_len)
         if cache_key not in self.ref_f_cache:
             ref = ref_snr[tstart : tstart + block_len]
             if ref is None or len(ref) < block_len:
                 return None
-            self.ref_f_cache[cache_key] = np.fft.fft(ref).astype(np.complex64)
+            df = self.sample_rate / block_len
+            kmin = int(self.flow / df)
+            kmax = min(int(self.f_final / df), block_len // 2)
+            spec = np.fft.fft(ref).astype(np.complex64)
+            spec[:kmin] = 0.0
+            spec[kmax:] = 0.0
+            self.ref_f_cache[cache_key] = spec
         return self.ref_f_cache[cache_key]
 
-    def bins(self, stilde, coarse_idx, local_id, filters_f, block_len):
-        """(bins, p, inv_wb, k_freqs, center_phases, bin_starts) of a
-        template, or None if it has no usable bins.
+    def template(self, stilde, coarse_idx, local_id, gid, filters_f, bank=None):
+        """Return the whitened fine template on the block grid with its power-chisq
+        bins and SG-chisq metadata attached, cached per (psd, coarse_idx, local_id).
         """
+        block_len = filters_f.block_length
         df = self.sample_rate / block_len
         n_half = block_len // 2 + 1
         psd_key, coarse_w = self.coarse_weight(stilde, coarse_idx, block_len)
-        bins_key = (psd_key, coarse_idx, local_id)
-        if bins_key not in self.bins_cache:
-            if coarse_w is None:
-                return None
-            ratio = filters_f[local_id]
-            ratio_dec = np.conj(ratio[:n_half])
-            fine_w = coarse_w * ratio_dec
+        key = (psd_key, coarse_idx, local_id)
+        if key not in self.template_cache:
+            fine = np.zeros(block_len, dtype=np.complex64)
+            bins = None
+            chisq_plan = None
+            if coarse_w is not None:
+                fine_w = coarse_w * np.conj(filters_f[local_id][:n_half])
+                fine[:n_half] = fine_w
+                kmin = int(self.flow / df)
+                kmax = min(int(self.f_final / df), n_half - 1)
+                s_vec = np.cumsum(np.abs(fine_w, dtype=np.float64) ** 2)
+                if s_vec[kmax - 1] > 0 and self.do:
+                    raw_bins = power_chisq_bins_from_sigmasq_series(
+                        s_vec, self.num_bins, kmin, kmax
+                    )
+                    bins, weights = power_chisq_bin_weights(s_vec, raw_bins)
+                    bins = bins.astype(np.int32)
+                    p = len(bins) - 1
+                    if p >= 2:
+                        inv_wb = weights.astype(np.float32)
+                        k_freqs = np.arange(bins[0], bins[-1], dtype=np.float32)
+                        center_phases = np.exp(
+                            (2j * np.pi * (block_len // 2) / block_len) * k_freqs
+                        ).astype(np.complex64)
+                        bin_starts = bins[:-1] - bins[0]
+                        chisq_plan = (
+                            bins,
+                            p,
+                            inv_wb,
+                            k_freqs,
+                            center_phases,
+                            bin_starts,
+                        )
+            tmplt = FrequencySeries(fine, delta_f=df)
+            tmplt.bins = bins
+            tmplt._chisq_plan = chisq_plan
+            if bank is not None and getattr(bank, "table", None) is not None:
+                tmplt.f_lower = float(bank.table["f_lower"][gid])
+                tmplt.params = types.SimpleNamespace(
+                    template_hash=bank.table["template_hash"][gid]
+                )
+            else:
+                tmplt.f_lower = float(self.flow)
+                tmplt.params = types.SimpleNamespace(template_hash=gid)
+            self.template_cache[key] = tmplt
+        return self.template_cache[key]
 
-            kmin = int(self.flow / df)
-            kmax = min(int(self.f_final / df), n_half - 1)
-            power = np.abs(fine_w, dtype=np.float64) ** 2
-            power[:kmin] = 0.0
-            power[kmax:] = 0.0
-
-            s_vec = np.zeros(n_half, dtype=np.float64)
-            s_vec[kmin:kmax] = np.cumsum(power[kmin:kmax], dtype=np.float64)
-            s_vec[kmax:] = s_vec[kmax - 1]
-            if s_vec[kmax - 1] <= 0:
-                self.bins_cache[bins_key] = None
-                return None
-
-            raw_bins = power_chisq_bins_from_sigmasq_series(
-                s_vec, self.num_bins, kmin, kmax
-            )
-            bins, weights = power_chisq_bin_weights(s_vec, raw_bins)
-            bins = bins.astype(np.int32)
-            p = len(bins) - 1
-            if p < 2:
-                self.bins_cache[bins_key] = None
-                return None
-            inv_wb = weights.astype(np.float32)
-            k_freqs = np.arange(bins[0], bins[-1], dtype=np.float32)
-            center_phases = np.exp(
-                (2j * np.pi * (block_len // 2) / block_len) * k_freqs
-            ).astype(np.complex64)
-            bin_starts = bins[:-1] - bins[0]
-            self.bins_cache[bins_key] = (
-                bins,
-                p,
-                inv_wb,
-                k_freqs,
-                center_phases,
-                bin_starts,
-            )
-        return self.bins_cache.get(bins_key)
+    def correlation(
+        self, stilde, coarse_idx, local_id, t_idx, ref_snr, filters_f, reach=0
+    ):
+        """Return (corr, index_in_block) for trigger at sample t_idx on the chisq
+        block centred on t_idx, or (None, None) if reach exceeds the valid FIR lags.
+        """
+        block_len = filters_f.block_length
+        tstart = min(max(t_idx - block_len // 2, 0), len(ref_snr) - block_len)
+        if reach > 0 and hasattr(filters_f, "valid"):
+            valid_start, valid_stop = filters_f.valid[local_id]
+            if (
+                t_idx - reach - tstart < valid_start
+                or t_idx + reach - tstart >= valid_stop
+            ):
+                return None, None
+        ref_f = self.ref_spectrum(stilde, coarse_idx, ref_snr, tstart, block_len)
+        if ref_f is None:
+            return None, None
+        return (filters_f[local_id] * ref_f) / block_len, t_idx - tstart
 
     def values(self, corr, snrv, snr_norm, psd, indices, template):
         """Power chisq with unequal-weight bins, for SignalConsistencyChain."""
-        if corr is None or getattr(template, "bins", None) is None:
+        plan = getattr(template, "_chisq_plan", None)
+        if corr is None or plan is None:
             return None, None
-        bins, p, inv_wb, k_freqs, center_phases, bin_starts = template.bins
+        bins, p, inv_wb, k_freqs, center_phases, bin_starts = plan
         dt = int(indices[0])
         block_len = len(corr)
         if dt == block_len // 2:
@@ -419,255 +337,3 @@ class RatioPowerChisq(SingleDetPowerChisq):
             0.0, float(np.sum((np.abs(z_b) ** 2) * inv_wb) - abs(rho_sum) ** 2)
         )
         return [float(chi_val)], [2 * p - 2]
-
-    def chain(self, autochisq=None, max_rchi=None, sg_chisq=None, steps=None):
-        """Build or retrieve the SignalConsistencyChain for this configuration."""
-        auto_on = autochisq is not None and getattr(autochisq, "do", False)
-        sg_on = sg_chisq is not None and getattr(sg_chisq, "do", False)
-        steps_key = tuple(steps) if steps is not None else None
-        key = (auto_on, max_rchi, sg_on, steps_key)
-        if key not in self.chains:
-            num_b = int(self.num_bins) if self.num_bins is not None else 64
-            defaults = {
-                "chisq": 2 * num_b - 2,
-                "chisq_dof": 2 * num_b - 2,
-            }
-            if auto_on:
-                defaults["cont_chisq"] = autochisq.dof
-            if sg_on:
-                defaults["sg_chisq"] = 1.0
-            if steps is None:
-                chain_steps = []
-                if self.do:
-                    if self.snr_threshold:
-                        chain_steps.append(f"snr:{self.snr_threshold!r}:lower:skip")
-                    chain_steps.append("power")
-                if auto_on:
-                    if max_rchi is not None and max_rchi > 0:
-                        chain_steps.append(f"traditional:{max_rchi!r}:upper_inc:skip")
-                    chain_steps.append("auto")
-                if sg_on:
-                    chain_steps.append(
-                        f"newsnr:{sg_chisq.snr_threshold!r}:lower_inc:skip"
-                    )
-                    chain_steps.append("sg")
-            else:
-                chain_steps = list(steps)
-            self.chains[key] = SignalConsistencyChain(
-                self if self.do else None,
-                autochisq if auto_on else None,
-                sg_chisq if sg_on else None,
-                steps=chain_steps,
-                window=self.chisq_window_samp,
-                max_iterations=self.max_iterations,
-                defaults=defaults,
-            )
-        return self.chains[key]
-
-    def compute(
-        self,
-        ids_local,
-        t_idxs,
-        snrs,
-        fine_indices,
-        stilde,
-        ref_snr,
-        filters_f,
-        coarse_idx,
-        args,
-        autochisq=None,
-        sg_chisq=None,
-        bank=None,
-        shifts=None,
-    ):
-        """Evaluate power chisq (and optional auto-chisq and SG chisq) through
-        SignalConsistencyChain.
-
-        Returns (chisq_vals, chisq_dof_vals, auto_vals).
-        """
-        snrs_arr = np.asarray(snrs)
-        snr_amp = np.abs(snrs_arr)
-        num_trigs = len(snr_amp)
-        num_b = int(self.num_bins) if self.num_bins is not None else 64
-        auto_on = autochisq is not None and getattr(autochisq, "do", False)
-
-        cthresh = self.snr_threshold or 0.0
-        above = snr_amp >= cthresh
-        self.last_kept = np.ones(num_trigs, dtype=bool)
-        if not np.any(above):
-            chisq_vals = np.full(num_trigs, 2 * num_b - 2, dtype=float32)
-            chisq_dof_vals = np.full(num_trigs, 2 * num_b - 2, dtype=np.int32)
-            auto_vals = (
-                np.full(num_trigs, autochisq.dof, dtype=float32) if auto_on else None
-            )
-            if sg_chisq is not None and getattr(sg_chisq, "do", False):
-                self.last_sg_vals = np.ones(num_trigs, dtype=float32)
-            return chisq_vals, chisq_dof_vals, auto_vals
-
-        if hasattr(filters_f, "prefetch"):
-            filters_f.prefetch(np.asarray(ids_local)[above])
-
-        max_rchi = getattr(
-            args,
-            "autochi_max_rchisq",
-            getattr(args, "autochisq_max_rchisq", 5.0),
-        )
-        custom_steps = getattr(args, "signal_consistency_chain", None)
-        chain = self.chain(
-            autochisq=autochisq if auto_on else None,
-            max_rchi=max_rchi,
-            sg_chisq=sg_chisq,
-            steps=custom_steps,
-        )
-        inputs = RatioBlockInputs(
-            self,
-            ids_local,
-            t_idxs,
-            snrs_arr,
-            fine_indices,
-            stilde,
-            ref_snr,
-            filters_f,
-            coarse_idx,
-            bank=bank,
-            shifts=shifts,
-        )
-        try:
-            kept, vals = chain.values(
-                inputs.snrs,
-                inputs.phys_t,
-                inputs.template_id,
-                inputs.template,
-                inputs.correlation,
-                stilde=stilde,
-            )
-        finally:
-            self.ref_f_cache.clear()
-
-        self.last_kept = kept
-        chisq_vals = vals["chisq"].astype(float32, copy=False)
-        chisq_dof_vals = vals["chisq_dof"].astype(np.int32, copy=False)
-        auto_vals = vals["cont_chisq"].astype(float32, copy=False) if auto_on else None
-        if sg_chisq is not None and getattr(sg_chisq, "do", False):
-            self.last_sg_vals = vals.get(
-                "sg_chisq", np.ones(num_trigs, dtype=float32)
-            ).astype(float32, copy=False)
-        return chisq_vals, chisq_dof_vals, auto_vals
-
-
-class RatioAutoChisq(SingleDetAutoChisq):
-    """pycbc's auto-chisq on the SNR series the ratio filter reconstructs.
-
-    Options, statistic and degrees of freedom are SingleDetAutoChisq's; only its
-    two inputs are built differently, from the block spectra the power chisq
-    uses. Over an N-sample block of the middle series with FFT D, the template's
-    SNR is IFFT(filters_f * D), and its autocorrelation is the IFFT of
-    its whitened power |coarse_w * conj(filters_f)|^2. Each trigger gets a block
-    centred on it, so its lags stay inside the block's valid samples.
-    """
-
-    def __init__(self, power_chisq, args):
-        if getattr(args, "autochi_stride", 0) > 0 and getattr(
-            args, "autochi_reverse_template", False
-        ):
-            raise ValueError(
-                "--autochi-reverse-template is not supported by pycbc_inspiral_fir"
-            )
-        super().__init__(
-            args.autochi_stride,
-            args.autochi_number_points,
-            onesided=args.autochi_onesided,
-            twophase=args.autochi_two_phase,
-            take_maximum_value=args.autochi_max_valued,
-            maximal_value_dof=args.autochi_max_valued_dof,
-        )
-        if self.do and not power_chisq.do:
-            raise ValueError(
-                "auto-chisq is computed with the power chisq: it needs --chisq-bins"
-            )
-        self.power_chisq = power_chisq
-        self.autocors = {}
-        self.elapsed = 0.0
-
-    @staticmethod
-    def insert_option_group(parser):
-        SingleDetAutoChisq.insert_option_group(parser)
-        parser.add_argument(
-            "--autochi-max-rchisq",
-            "--autochisq-max-rchisq",
-            type=float,
-            default=5.0,
-            metavar="RCHISQ",
-            help="Skip the auto-chisq when a trigger's reduced power chisq "
-            "(chisq / dof) is above RCHISQ; skipped triggers keep the "
-            "default auto-chisq (dof, reduced value 1).",
-        )
-
-    def clear(self):
-        self.autocors.clear()
-
-    def autocorrelation(self, stilde, coarse_idx, local_id, filters_f, band):
-        N = len(filters_f[local_id])
-        psd_key, coarse_w = self.power_chisq.coarse_weight(stilde, coarse_idx, N)
-        key = (psd_key, coarse_idx, local_id)
-        if key not in self.autocors:
-            power = np.zeros(N)
-            power[band] = (
-                np.abs(coarse_w[band] * np.conj(filters_f[local_id][band])) ** 2
-            )
-            autocor = np.fft.ifft(power)
-            reach = self.stride * self.num_points
-            lags = np.r_[0 : reach + 1, N - reach : N]
-            self.autocors[key] = autocor[lags] / autocor[0]
-        return self.autocors[key]
-
-    def value(self, stilde, coarse_idx, ref_snr, filters_f, local_id, t):
-        """Auto-chisq of one trigger, or None if its lags would leave the series."""
-        t0 = time.perf_counter()
-        reach = self.stride * self.num_points
-        N = len(filters_f[local_id])
-        start = min(max(int(t) - N // 2, 0), len(ref_snr) - N)
-        valid_start, valid_stop = filters_f.valid[local_id]
-        if t - reach - start < valid_start or t + reach - start >= valid_stop:
-            return None
-        ref_f = self.power_chisq.ref_spectrum(stilde, coarse_idx, ref_snr, start, N)
-        if ref_f is None:
-            return None
-        df = self.power_chisq.sample_rate / N
-        band = slice(
-            int(self.power_chisq.flow / df),
-            min(int(self.power_chisq.f_final / df), N // 2),
-        )
-        corr = np.zeros(N, dtype=np.complex128)
-        corr[band] = filters_f[local_id][band] * ref_f[band]
-        snr = np.fft.ifft(corr)[t - start - reach : t - start + reach + 1]
-        _, achisq = autochisq_from_precomputed(
-            snr,
-            snr,
-            self.autocorrelation(stilde, coarse_idx, local_id, filters_f, band),
-            [reach],
-            stride=self.stride,
-            num_points=self.num_points,
-            oneside=self.one_sided,
-            twophase=self.two_phase,
-            maxvalued=self.take_maximum_value,
-        )
-        self.elapsed += time.perf_counter() - t0
-        return float(achisq[0])
-
-    def evaluate_trigger(self, batch, j):
-        """Hook called by _AutoStage in SignalConsistencyChain."""
-        # Retrieve underlying RatioBlockInputs from bound method batch.template
-        inputs = getattr(batch.template, "__self__", None)
-        if inputs is None:
-            return None
-        local_id = int(inputs.ids_local[j])
-        t_idx = int(inputs.t_idxs[j])
-        return self.value(
-            inputs.stilde,
-            inputs.coarse_idx,
-            inputs.ref_snr,
-            inputs.filters_f,
-            local_id,
-            t_idx,
-        )

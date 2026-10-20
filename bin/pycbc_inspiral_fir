@@ -7,11 +7,11 @@ using the Ratio Matched Filter method.
 import argparse
 import collections
 import logging
-import multiprocessing as mp
 import os
 import re
 import sys
 import time
+import types
 
 import h5py
 import numpy as np
@@ -25,31 +25,9 @@ import pycbc.scheme
 import pycbc.strain
 import pycbc.types.optparse
 import pycbc.vetoes
-from pycbc.events import ranking
 from pycbc.filter.matched_filter_ratio import (
-    _SHARED_WORKER_CONTEXT,
-    ChisqFilters,
-    DynamicSNRRenormFactor,
-    IfoTriggerData,
-    RatioAutoChisq,
-    RatioPowerChisq,
-    TopTemplateSearch,
     analyzed_samples,
-    asym_half_span,
-    chisq_middle_spectra,
-    compute_followup_bin_budget,
-    decimation_factor,
-    injection_group_windows,
-    injection_guard_samples,
-    leaf_bank_options,
-    mf_search_block_input,
-    process_and_record_triggers,
-    process_top_template_task,
-    sample_asym_bins,
-    secondary_asym_keep,
-    segment_windows,
-    select_primary_asym_candidates,
-    validate_dynamic_snr_options,
+    run_hierarchical_search,
 )
 from pycbc.types import complex64, float32
 from pycbc.vetoes.chain import SignalConsistencyChain
@@ -67,7 +45,8 @@ def drop_unfindable_injections(segments, inj_filter_rejector, instruments):
     signal and the PSD of the segment(s) it falls in. An injection whose best
     value over all detectors is below the threshold loses its analysis window
     in every detector; a segment left with no injection window is then not
-    searched at all. The injection stays in the data."""
+    searched at all. The injection stays in the data.
+    """
     rejs = {ifo: (inj_filter_rejector or {}).get(ifo) for ifo in instruments}
     thr = {
         r.optimal_snr_threshold
@@ -82,8 +61,6 @@ def drop_unfindable_injections(segments, inj_filter_rejector, instruments):
             "the same for every detector"
         )
     thr = thr.pop()
-    # Keyed by row in the injection file: each detector's analyze_injections
-    # rows index its own injected subset, mapped through its rejector.
     snr = collections.defaultdict(dict)  # file row -> {ifo: optimal SNR}
     for ifo in instruments:
         rej = rejs.get(ifo)
@@ -130,8 +107,80 @@ def drop_unfindable_injections(segments, inj_filter_rejector, instruments):
     )
 
 
+def configure_injection_rejection(
+    bank, gwstrain, inj_filter_rejector, instruments, flow, injection_window
+):
+    """Thin the template bank and build per-window chirp-time rejection metadata."""
+    rejs = [
+        inj_filter_rejector[ifo]
+        for ifo in instruments
+        if (inj_filter_rejector or {}).get(ifo) is not None
+        and getattr(inj_filter_rejector[ifo], "enabled", False)
+    ]
+    if not rejs:
+        return None
+
+    tables = [
+        r.injection_params.table
+        for r in rejs
+        if getattr(getattr(r, "injection_params", None), "table", None) is not None
+        and len(r.injection_params.table) > 0
+    ]
+    if tables:
+        combined_table = (
+            np.concatenate(tables).view(type(tables[0]))
+            if len(tables) > 1
+            else tables[0]
+        )
+        combined_rej = types.SimpleNamespace(
+            enabled=True,
+            chirp_time_window=max(
+                (
+                    r.chirp_time_window
+                    for r in rejs
+                    if r.chirp_time_window is not None
+                ),
+                default=None,
+            ),
+            f_lower=min(
+                (r.f_lower for r in rejs if getattr(r, "f_lower", None) is not None),
+                default=flow,
+            ),
+            injection_params=types.SimpleNamespace(table=combined_table),
+        )
+        bank.template_thinning(combined_rej)
+
+    chirp_rejs = [r for r in rejs if r.chirp_time_window is not None]
+    if not chirp_rejs or injection_window is None:
+        return None
+
+    from pycbc.pnutils import mass1_mass2_to_tau0_tau3
+
+    fref = chirp_rejs[0].f_lower or flow
+
+    def tau0(tbl):
+        return np.asarray(mass1_mass2_to_tau0_tau3(tbl["mass1"], tbl["mass2"], fref)[0])
+
+    inj_reject = {
+        "window": max(float(r.chirp_time_window) for r in chirp_rejs),
+        "tau0_fine": tau0(bank.table),
+        "tau0_inj": {
+            ifo: tau0(gwstrain[ifo].injections.table)
+            for ifo in instruments
+            if hasattr(gwstrain[ifo], "injections")
+        },
+    }
+    logging.info(
+        "Injection rejection per injection window, chirp-time window %.2f s, "
+        "f_lower %.1f Hz",
+        inj_reject["window"],
+        fref,
+    )
+    return inj_reject
+
+
 # -----------------------------------------------------------------------------
-# 3. Data & Setup Helpers
+# Data & Setup Helpers
 # -----------------------------------------------------------------------------
 
 
@@ -154,15 +203,17 @@ def get_ifo_opts(opt, ifo):
         val = getattr(opt_ifo, attr, None)
         if isinstance(val, dict):
             setattr(opt_ifo, attr, val.get(ifo, None))
+    opt_ifo.psdvar_segment = None
     return opt_ifo
 
 
 def fix_frame_files_args(raw_argv=None):
+    """Auto-prefix unprefixed --frame-files arguments with IFO: when unambiguous."""
     if raw_argv is None:
         raw_argv = sys.argv[1:]
     channel_ifos = []
     for i, a in enumerate(raw_argv):
-        if a == "--channel-name" and i + 1 < len(raw_argv):
+        if a == "--channel-name":
             for part in raw_argv[i + 1 :]:
                 if part.startswith("--"):
                     break
@@ -172,34 +223,21 @@ def fix_frame_files_args(raw_argv=None):
     new_argv = []
     in_frame_files = False
     for a in raw_argv:
-        if a == "--frame-files":
-            in_frame_files = True
-            new_argv.append(a)
-        elif in_frame_files:
-            if a.startswith("--"):
-                in_frame_files = False
-                new_argv.append(a)
-            elif ":" in a:
-                new_argv.append(a)
-            else:
-                base = os.path.basename(a)
-                m = re.match(r"^[A-Z]-([A-Z0-9]{2})_", base)
-                if m:
-                    new_argv.append(f"{m.group(1)}:{a}")
-                elif len(channel_ifos) == 1:
-                    new_argv.append(f"{channel_ifos[0]}:{a}")
-                else:
-                    new_argv.append(a)
-        else:
-            new_argv.append(a)
+        if a.startswith("--"):
+            in_frame_files = a == "--frame-files"
+        elif in_frame_files and ":" not in a:
+            m = re.match(r"^[A-Z]-([A-Z0-9]{2})_", os.path.basename(a))
+            if m:
+                a = f"{m.group(1)}:{a}"
+            elif len(channel_ifos) == 1:
+                a = f"{channel_ifos[0]}:{a}"
+        new_argv.append(a)
     return new_argv
 
 
 def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
     """Generate, condition, and segment strain data for all instruments."""
     gating_info = {}
-    gwstrain_start_time = {}
-    psd_var = {}
     segments = {}
     gwstrain = {}
     sample_rate = None
@@ -216,9 +254,9 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
             dyn_range_fac=pycbc.DYN_RANGE_FAC,
         )
         gating_info[ifo] = getattr(ifo_strain, "gating_info", None)
-        gwstrain_start_time[ifo] = float(ifo_strain.start_time)
-
-        raw_strain_for_psd = ifo_strain.copy() if args.overwhiten_strain else ifo_strain
+        raw_strain_for_psd = (
+            ifo_strain.copy() if args.overwhiten_strain else ifo_strain
+        )
 
         if args.subtract_lines:
             logging.info("Applying coherent line subtraction for %s...", ifo)
@@ -227,7 +265,9 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
             orig_injs = getattr(ifo_strain, "injections", None)
             orig_gating = getattr(ifo_strain, "gating_info", None)
             f_low_sub = max(25.0, args.overwhiten_f_low)
-            ifo_strain, sub_lines = subtract_coherent_lines(ifo_strain, f_low=f_low_sub)
+            ifo_strain, sub_lines = subtract_coherent_lines(
+                ifo_strain, f_low=f_low_sub
+            )
             ifo_strain = ifo_strain.astype(np.float32)
             if orig_injs is not None:
                 ifo_strain.injections = orig_injs
@@ -242,20 +282,17 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
 
             orig_injs = getattr(ifo_strain, "injections", None)
             orig_gating = getattr(ifo_strain, "gating_info", None)
-            f_low_ow = args.overwhiten_f_low
-            max_dur_ow = args.overwhiten_max_filter_duration
-            inpaint_ow = getattr(args, "inpaint_edges", False)
-            ow_psd_model = getattr(single_det_opt, "overwhiten_psd_model", None)
-            if ow_psd_model is None:
-                ow_psd_model = getattr(
-                    single_det_opt, "psd_estimation_method", None
-                ) or getattr(single_det_opt, "psd_estimation", "welch")
+            ow_psd_model = (
+                getattr(single_det_opt, "overwhiten_psd_model", None)
+                or getattr(single_det_opt, "psd_estimation_method", None)
+                or getattr(single_det_opt, "psd_estimation", "welch")
+            )
             ifo_strain, _, _ = overwhiten_strain(
                 ifo_strain,
-                f_low=f_low_ow,
-                max_filter_duration=max_dur_ow,
+                f_low=args.overwhiten_f_low,
+                max_filter_duration=args.overwhiten_max_filter_duration,
                 f_high=args.high_frequency_cutoff,
-                inpaint_edges=inpaint_ow,
+                inpaint_edges=getattr(args, "inpaint_edges", False),
                 psd_model_type=ow_psd_model,
             )
             ifo_strain = ifo_strain.astype(np.float32)
@@ -283,21 +320,6 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
             )
             assert flen == ifo_segments.freq_len, f"Freq len mismatch for {ifo}"
             assert delta_f == ifo_segments.delta_f, f"Delta f mismatch for {ifo}"
-
-        if args.psdvar_segment is not None:
-            logging.info("Calculating PSD variation for %s", ifo)
-            ifo_opts = get_ifo_opts(args, ifo)
-            psd_var[ifo] = pycbc.psd.calc_filt_psd_variation(
-                raw_strain_for_psd,
-                ifo_opts.psdvar_segment,
-                ifo_opts.psdvar_short_segment,
-                ifo_opts.psdvar_long_segment,
-                ifo_opts.psdvar_psd_duration,
-                ifo_opts.psdvar_psd_stride,
-                ifo_opts.psd_estimation,
-                ifo_opts.psdvar_low_freq,
-                ifo_opts.psdvar_high_freq,
-            )
 
         fd_segs = ifo_segments.fourier_segments()
         pycbc.psd.associate_psds_to_segments(
@@ -332,98 +354,7 @@ def setup_strain_and_segments(args, instruments, inj_filter_rejector, flow):
         del ifo_segments
         logging.info("Finished strain setup for %s", ifo)
 
-    return (
-        segments,
-        gwstrain,
-        gating_info,
-        gwstrain_start_time,
-        psd_var,
-        sample_rate,
-        flen,
-        delta_f,
-    )
-
-
-def prepare_segment_geometry(
-    args, instruments, segments, gwstrain_start_time, num_segs, sample_rate
-):
-    """Precompute segment GPS bounds, sample rates, and detector overlap validity."""
-    ifo_sample_rates = {}
-    ifo_gps_starts = {}
-    ifo_gps_cli_starts = {}
-    seg_starts = {}
-
-    for ifo in instruments:
-        sr = (
-            args.sample_rate[ifo]
-            if isinstance(args.sample_rate, dict)
-            else args.sample_rate
-        )
-        ifo_sample_rates[ifo] = float(sr or sample_rate or 2048.0)
-        ifo_gps_starts[ifo] = gwstrain_start_time[ifo]
-        cli_start = (
-            args.gps_start_time[ifo]
-            if isinstance(args.gps_start_time, dict)
-            else args.gps_start_time
-        )
-        ifo_gps_cli_starts[ifo] = cli_start
-        for s_num, st in enumerate(segments[ifo]):
-            seg_starts[(ifo, s_num)] = (
-                getattr(st, "seg_slice", slice(0)).start
-                if getattr(st, "seg_slice", None) is not None
-                else 0
-            )
-
-    # Follow-up needs a second detector with overlapping data in the segment;
-    # otherwise a segment's primaries are recorded directly.
-    can_asym_by_seg = {}
-    if len(instruments) > 1:
-        for s_num in range(num_segs):
-            active_ifos = [ifo for ifo in instruments if s_num < len(segments[ifo])]
-            if len(active_ifos) <= 1:
-                can_asym_by_seg[s_num] = False
-                continue
-            seg_gps = {}
-            for ifo in active_ifos:
-                st = segments[ifo][s_num]
-                sr = ifo_sample_rates[ifo]
-                t0 = ifo_gps_starts[ifo]
-                s_start = seg_starts[(ifo, s_num)]
-                a_start = (
-                    st.analyze.start if getattr(st, "analyze", None) is not None else 0
-                )
-                a_stop = (
-                    st.analyze.stop
-                    if getattr(st, "analyze", None) is not None
-                    else len(st)
-                )
-                seg_gps[ifo] = (
-                    t0 + (s_start + a_start) / sr,
-                    t0 + (s_start + a_stop) / sr,
-                )
-
-            can_asym = True
-            for i_idx in range(len(active_ifos)):
-                for j_idx in range(i_idx + 1, len(active_ifos)):
-                    ifo_1, ifo_2 = active_ifos[i_idx], active_ifos[j_idx]
-                    if max(seg_gps[ifo_1][0], seg_gps[ifo_2][0]) >= min(
-                        seg_gps[ifo_1][1], seg_gps[ifo_2][1]
-                    ):
-                        can_asym = False
-                        break
-                if not can_asym:
-                    break
-            can_asym_by_seg[s_num] = can_asym
-    else:
-        can_asym_by_seg = collections.defaultdict(lambda: False)
-
-    return (
-        can_asym_by_seg,
-        ifo_sample_rates,
-        ifo_gps_starts,
-        ifo_gps_cli_starts,
-        seg_starts,
-    )
+    return segments, gwstrain, gating_info, sample_rate, flen, delta_f
 
 
 def init_event_managers(args, instruments, gating_info):
@@ -438,7 +369,6 @@ def init_event_managers(args, instruments, gating_info):
         "bank_chisq_dof": int,
         "cont_chisq": float32,
         "sg_chisq": float32,
-        "psd_var_val": float32,
     }
     names = sorted(out_types.keys())
     event_mgr = {}
@@ -456,7 +386,7 @@ def init_event_managers(args, instruments, gating_info):
 
 
 # -----------------------------------------------------------------------------
-# 4. Trigger Ingestion & Output Finalization
+# Trigger Ingestion & Output Finalization
 # -----------------------------------------------------------------------------
 
 
@@ -467,11 +397,10 @@ def ingest_ifo_triggers(
     ifo_strain,
     bank,
     args,
-    psd_var_ifo,
     cluster_window,
     has_asym_followup_ifo,
 ):
-    """Collate, sort, normalize, and ingest all triggers for a detector into EventManager."""
+    """Collate, sort, normalize, and ingest detector triggers into EventManager."""
     if has_asym_followup_ifo:
         ifo_mgr.non_threshold_time = float(args.asym_num_bins * args.asym_bin_width)
         logging.info(
@@ -508,48 +437,30 @@ def ingest_ifo_triggers(
     end_indices = np.append(start_indices[1:], n_candidates)
 
     sigmasq_rescale = bank.sigma_rescale(data["template_id"]) ** 2.0
-
-    # data['snr'] is already the true SNR: the bank's taps are pre-scaled
     data["sigmasq"] = (data["sigmasq"] * sigmasq_rescale).astype(float32)
 
     if "sg_chisq" not in data:
         data["sg_chisq"] = np.zeros(n_candidates, dtype=np.float32)
 
     ifo_opts = get_ifo_opts(args, ifo)
-    use_psd_var = args.psdvar_short_segment is not None
-    if use_psd_var:
-        gps_start = ifo_opts.gps_start_time
-        data["psd_var_val"] = pycbc.psd.find_trigger_value(
-            psd_var_ifo, data["time_index"], gps_start, ifo_opts.sample_rate
-        )
-        ingest_cols = [
-            "time_index",
-            "snr",
-            "sigmasq",
-            "chisq",
-            "chisq_dof",
-            "sg_chisq",
-            "psd_var_val",
-        ]
-    else:
-        ingest_cols = ["time_index", "snr", "sigmasq", "chisq", "chisq_dof", "sg_chisq"]
-    if args.autochi_stride > 0:
-        ingest_cols.append("cont_chisq")  # EventManager writes cont_chisq_dof
+    ingest_cols = ["time_index", "snr", "sigmasq", "chisq", "chisq_dof", "sg_chisq"]
+    if args.autochi_stride > 0 and "cont_chisq" in data:
+        ingest_cols.append("cont_chisq")
 
-    trig_data = IfoTriggerData.from_dict(data)
     logging.info(
         "[%s] Ingesting triggers for %d templates into EventManager...",
         ifo,
         len(unique_gids),
     )
+    is_asym_col = data["is_asym"]
     for t_idx, (gid, s_idx, e_idx) in enumerate(
         zip(unique_gids, start_indices, end_indices)
     ):
         ifo_mgr.new_template(tmplt=bank.table[int(gid)])
-        tmpl_is_asym = trig_data.is_asym[s_idx:e_idx]
+        tmpl_is_asym = is_asym_col[s_idx:e_idx]
         if not np.any(tmpl_is_asym):
             ifo_mgr.add_template_events(
-                ingest_cols, [trig_data[col][s_idx:e_idx] for col in ingest_cols]
+                ingest_cols, [data[col][s_idx:e_idx] for col in ingest_cols]
             )
             if cluster_window > 0:
                 ifo_mgr.cluster_template_events("time_index", "snr", cluster_window)
@@ -561,7 +472,7 @@ def ingest_ifo_triggers(
                 if np.any(mask):
                     sub = s_idx + np.flatnonzero(mask)
                     ifo_mgr.add_template_events(
-                        ingest_cols, [trig_data[col][sub] for col in ingest_cols]
+                        ingest_cols, [data[col][sub] for col in ingest_cols]
                     )
                     if do_cluster:
                         ifo_mgr.cluster_template_events(
@@ -580,10 +491,8 @@ def ingest_ifo_triggers(
     logging.info("[%s] Ingestion completed in %.2f s", ifo, ingest_total)
 
 
-def log_performance_summary(
-    run_time, tsetup, instruments, segments, bank, output_path, cores=1
-):
-    """Log formatted timing breakdown and write timing JSON output."""
+def log_performance_summary(run_time, instruments, segments, bank, cores=1):
+    """Log formatted timing breakdown."""
     total_analyzed_det_sec = sum(
         sum(
             analyzed_samples(segments[ifo][s]) * segments[ifo][s].delta_t
@@ -596,7 +505,8 @@ def log_performance_summary(
     cores = max(1, int(cores))
     core_throughput = overall_throughput / cores
     logging.info(
-        "Overall search throughput: %.0f template-s/s (%.2f M templates/s, %.2f M template-s/core-s on %d cores) over %.2f s run time",
+        "Overall search throughput: %.0f template-s/s (%.2f M templates/s, "
+        "%.2f M template-s/core-s on %d cores) over %.2f s run time",
         overall_throughput,
         overall_throughput / 1e6,
         core_throughput / 1e6,
@@ -631,24 +541,9 @@ def log_performance_summary(
     logging.info(f"{'Total Run Time':<35} {run_time:>12.3f} {100.0:>9.2f}%")
     logging.info("=" * 70)
 
-    try:
-        import json
-
-        timing_dict = {cat_name: cat_time for cat_name, cat_time in categories}
-        timing_dict["Total Run Time"] = run_time
-        timing_dict["Overall Throughput"] = overall_throughput
-        timing_dict["Core Throughput"] = core_throughput
-        timing_dict["Cores"] = cores
-        timing_path = output_path + ".timing.json"
-        with open(timing_path, "w") as tf:
-            json.dump(timing_dict, tf, indent=2)
-        logging.info("Saved timing breakdown to %s", timing_path)
-    except Exception as e:
-        logging.warning("Failed to save timing JSON: %s", e)
-
 
 # -----------------------------------------------------------------------------
-# 5. CLI Arguments & Main Entry Point
+# CLI Arguments & Main Entry Point
 # -----------------------------------------------------------------------------
 
 
@@ -666,16 +561,11 @@ def get_args():
 
     # Multi-detector & Asymmetric Windowing Options
     asym_group = parser.add_argument_group("Asymmetric Windowing Options")
-    # Asymmetric follow-up is always on; the flag is accepted so existing
-    # command lines and workflow configurations keep working.
-    asym_group.add_argument(
-        "--asym-windowing", action="store_true", help=argparse.SUPPRESS
-    )
     asym_group.add_argument(
         "--asym-snr-threshold",
         type=float,
         default=6.0,
-        help="SNR threshold in primary detector to trigger asymmetric windowing in other detectors.",
+        help="SNR threshold in primary detector (and trigger generation threshold).",
     )
     asym_group.add_argument(
         "--asym-secondary-snr-threshold",
@@ -695,45 +585,51 @@ def get_args():
         "--asym-max-followup-bins",
         type=int,
         default=2,
-        help="Maximum number of loudest followup bins to keep per primary candidate trigger "
-        "(default: 2, set 0 to keep all passing bins). In dynamic mode, serves as the upper cap.",
+        help="Maximum number of loudest followup bins to keep per primary candidate "
+        "trigger (default: 2, set 0 to keep all passing bins). In dynamic mode, "
+        "serves as the upper cap.",
     )
     asym_group.add_argument(
         "--asym-dynamic-followup-bins",
         action="store_true",
-        help="Scale followup bin budget dynamically based on the statistical difficulty "
-        "of recovering the secondary signal given primary SNR.",
+        help="Scale followup bin budget dynamically based on the statistical "
+        "difficulty of recovering the secondary signal given primary SNR.",
     )
     asym_group.add_argument(
         "--asym-min-followup-bins",
         type=int,
         default=5,
-        help="Minimum number of followup bins for marginal primary triggers in dynamic mode (default: 5).",
+        help="Minimum number of followup bins for marginal primary triggers in "
+        "dynamic mode (default: 5).",
     )
     asym_group.add_argument(
         "--asym-followup-bin-scale",
         type=float,
         default=1.2,
-        help="Overall scale factor applied to the analytic bin budget in dynamic mode (default: 1.2).",
+        help="Overall scale factor applied to the analytic bin budget in dynamic "
+        "mode (default: 1.2).",
     )
     asym_group.add_argument(
         "--asym-followup-target-net-snr",
         type=float,
         default=8.5,
-        help="Target minimum network SNR for a viable candidate in dynamic mode (default: 8.5).",
+        help="Target minimum network SNR for a viable candidate in dynamic mode "
+        "(default: 8.5).",
     )
     asym_group.add_argument(
         "--asym-followup-sec-snr-floor",
         type=float,
         default=3.0,
-        help="Practical secondary matched filter SNR floor in dynamic mode (default: 3.0).",
+        help="Practical secondary matched filter SNR floor in dynamic mode "
+        "(default: 3.0).",
     )
     asym_group.add_argument(
         "--asym-max-primary-per-group-sec",
         type=int,
         default=1,
-        help="Maximum number of primary triggers per 1-second interval within each fine "
-        "template group to instigate secondary followup windowing (default: 1, set 0 to disable).",
+        help="Maximum number of primary triggers per 1-second interval within each "
+        "fine template group to instigate secondary followup windowing "
+        "(default: 1, set 0 to disable).",
     )
     asym_group.add_argument(
         "--asym-bin-width",
@@ -759,8 +655,9 @@ def get_args():
         "--asym-primary-max-rchisq",
         type=float,
         default=5.0,
-        help="Maximum reduced chi-squared for primary candidate triggers to be followed up "
-        "in secondary detectors within asymmetric windows (default: 5.0, set 0 to disable).",
+        help="Maximum reduced chi-squared for primary candidate triggers to be "
+        "followed up in secondary detectors within asymmetric windows "
+        "(default: 5.0, set 0 to disable).",
     )
 
     # Analysis Options
@@ -769,17 +666,11 @@ def get_args():
         "--cores",
         type=int,
         default=1,
-        help="Number of CPU cores to use for multiprocessing over top templates (default: 1).",
+        help="Number of CPU cores to use for multiprocessing over top templates "
+        "(default: 1).",
     )
     parser.add_argument(
         "--bank-file", type=str, required=True, help="Path to the HDF5 Ratio Bank file."
-    )
-    parser.add_argument(
-        "--snr-threshold",
-        type=float,
-        default=None,
-        help="Ignored: the primary threshold is --asym-snr-threshold. "
-        "Accepted for compatibility with existing configurations.",
     )
     parser.add_argument(
         "--newsnr-threshold",
@@ -791,18 +682,6 @@ def get_args():
         "--low-frequency-cutoff",
         type=float,
         help="The low frequency cutoff to use for filtering (Hz)",
-    )
-    parser.add_argument(
-        "--enable-compressed-waveforms",
-        action="store_true",
-        default=True,
-        help="Enable use of compressed top waveforms if present in the bank (default: True).",
-    )
-    parser.add_argument(
-        "--disable-compressed-waveforms",
-        action="store_false",
-        dest="enable_compressed_waveforms",
-        help="Disable use of compressed waveforms and regenerate waveforms on the fly.",
     )
 
     # Ratio Specific Options
@@ -836,7 +715,8 @@ def get_args():
         type=float,
         default=0,
         metavar="HZ",
-        help="Width of the band the first stage filters, in Hz. 0 uses the design table's choice.",
+        help="Width of the band the first stage filters, in Hz. "
+        "0 uses the design table's choice.",
     )
     group.add_argument(
         "--ratio-filter-first-stage-snr",
@@ -849,25 +729,29 @@ def get_args():
         "--dynamic-snr-window",
         type=float,
         default=8.0,
-        help="Rolling window duration in seconds for dynamic SNR renormalization (default: 8.0).",
+        help="Rolling window duration in seconds for dynamic SNR renormalization "
+        "(default: 8.0).",
     )
     group.add_argument(
         "--dynamic-snr-hollow",
         type=float,
         default=0.5,
-        help="Hollow exclusion half-width in seconds for dynamic SNR renormalization (default: 0.5).",
+        help="Hollow exclusion half-width in seconds for dynamic SNR renormalization "
+        "(default: 0.5).",
     )
     group.add_argument(
         "--dynamic-snr-variance-floor",
         type=float,
         default=1.0,
-        help="Variance floor for dynamic SNR renormalization (default: 1.0; set < 1.0 for two-sided boost).",
+        help="Variance floor for dynamic SNR renormalization "
+        "(default: 1.0; set < 1.0 for two-sided boost).",
     )
     group.add_argument(
         "--dynamic-snr-max-boost",
         type=float,
         default=None,
-        help="Maximum SNR boost factor safety ceiling for dynamic SNR renormalization (default: None).",
+        help="Maximum SNR boost factor safety ceiling for dynamic SNR renormalization "
+        "(default: None).",
     )
     group.add_argument(
         "--disable-dynamic-snr-renorm",
@@ -887,13 +771,15 @@ def get_args():
         "--overwhiten-f-low",
         type=float,
         default=18.0,
-        help="Low-frequency cutoff in Hz for continuous overwhitening filter (default: 18.0).",
+        help="Low-frequency cutoff in Hz for continuous overwhitening filter "
+        "(default: 18.0).",
     )
     ow_group.add_argument(
         "--overwhiten-max-filter-duration",
         type=float,
         default=4.0,
-        help="Maximum filter duration in seconds for overwhitening filter (default: 4.0).",
+        help="Maximum filter duration in seconds for overwhitening filter "
+        "(default: 4.0).",
     )
     ow_group.add_argument(
         "--overwhiten-psd-model",
@@ -907,7 +793,8 @@ def get_args():
             "line_continuum",
             "multitaper",
         ],
-        help="PSD estimation method for overwhitening: 'welch', 'trimmed-welch', 'line-continuum', or 'multitaper' (default: None, inherits --psd-estimation).",
+        help="PSD estimation method for overwhitening: 'welch', 'trimmed-welch', "
+        "'line-continuum', or 'multitaper' (default: None, inherits --psd-estimation).",
     )
     ow_group.add_argument(
         "--subtract-lines",
@@ -929,7 +816,8 @@ def get_args():
         "--chisq-delta",
         type=float,
         default=0,
-        help="SNR-dependent term added to the chisq dof before applying --chisq-threshold.",
+        help="SNR-dependent term added to the chisq dof before applying "
+        "--chisq-threshold.",
     )
     parser.add_argument(
         "--chisq-block-length",
@@ -939,15 +827,6 @@ def get_args():
         "computed on, centred on each trigger. Sets the chisq's frequency "
         "resolution; it must hold the longest ratio filter plus the "
         "auto-chisq lags, and is independent of the filter's own blocking.",
-    )
-    parser.add_argument(
-        "--autochi-max-rchisq",
-        "--autochisq-max-rchisq",
-        type=float,
-        default=5.0,
-        help="Maximum reduced power chisq for which auto-chisq is evaluated "
-        "(default: 5.0). Triggers with reduced power chisq exceeding this "
-        "threshold bypass auto-chisq.",
     )
 
     # Clustering & Event Handling
@@ -963,20 +842,6 @@ def get_args():
         type=int,
         metavar="NUM TEMPLATES",
         help="After NUM TEMPLATES perform event consolidation.",
-    )
-
-    # Waveform parameters
-    pycbc.waveform.bank.add_approximant_arg(parser)
-    parser.add_argument(
-        "--order",
-        type=int,
-        default=-1,
-        help="The integer half-PN order at which to generate approximant.",
-    )
-    parser.add_argument(
-        "--taper-template",
-        choices=["start", "end", "startend"],
-        help="For time-domain approximants, taper template.",
     )
     parser.add_argument(
         "--keep-loudest-log-chirp-window",
@@ -1007,12 +872,6 @@ def get_args():
 def main():
     parser, args = get_args()
     pycbc.init_logging(args.verbose)
-
-    validate_dynamic_snr_options(
-        args.dynamic_snr_variance_floor,
-        args.dynamic_snr_max_boost,
-        disable=args.disable_dynamic_snr_renorm,
-    )
 
     if isinstance(args.channel_name, dict) and len(args.channel_name) > 0:
         instruments = sorted(list(args.channel_name.keys()))
@@ -1053,22 +912,9 @@ def main():
                 args.high_frequency_cutoff,
             )
 
-        # With --injection-window, keep each segment once with its full analysis
-        # range and the injection windows attached (StrainSegments otherwise
-        # duplicates the segment per window and narrows analyze to it, which
-        # reruns the top and middle stages per window and clips the asym
-        # follow-up). Only the primary search is restricted to the windows.
-        args.merge_injection_windows = True
-        (
-            segments,
-            gwstrain,
-            gating_info,
-            gwstrain_start_time,
-            psd_var,
-            sample_rate,
-            flen,
-            delta_f,
-        ) = setup_strain_and_segments(args, instruments, inj_filter_rejector, flow)
+        segments, gwstrain, gating_info, sample_rate, flen, delta_f = (
+            setup_strain_and_segments(args, instruments, inj_filter_rejector, flow)
+        )
         drop_unfindable_injections(segments, inj_filter_rejector, instruments)
 
         logging.info("Initializing Ratio Filter Bank...")
@@ -1077,63 +923,32 @@ def main():
             filter_length=flen,
             delta_f=delta_f,
             dtype=np.complex64,
-            enable_compressed_waveforms=args.enable_compressed_waveforms,
         )
-        active_rejectors = [
-            inj_filter_rejector[ifo]
-            for ifo in instruments
-            if inj_filter_rejector.get(ifo) is not None
-            and getattr(inj_filter_rejector[ifo], "enabled", False)
-        ]
-        if active_rejectors:
-            if len(active_rejectors) == 1:
-                bank.template_thinning(active_rejectors[0])
-            else:
-                tables = []
-                for rej in active_rejectors:
-                    if (
-                        hasattr(rej, "injection_params")
-                        and rej.injection_params is not None
-                    ):
-                        if (
-                            hasattr(rej.injection_params, "table")
-                            and rej.injection_params.table is not None
-                            and len(rej.injection_params.table) > 0
-                        ):
-                            tables.append(rej.injection_params.table)
-                if tables:
-                    import types
+        inj_reject = configure_injection_rejection(
+            bank,
+            gwstrain,
+            inj_filter_rejector,
+            instruments,
+            flow,
+            args.injection_window,
+        )
 
-                    combined_table = (
-                        np.concatenate(tables).view(type(tables[0]))
-                        if len(tables) > 1
-                        else tables[0]
-                    )
-                    combined_inj_params = types.SimpleNamespace(table=combined_table)
-                    combined_rej = types.SimpleNamespace(
-                        enabled=True,
-                        chirp_time_window=max(
-                            getattr(r, "chirp_time_window", 1.0)
-                            for r in active_rejectors
-                        ),
-                        f_lower=min(
-                            getattr(r, "f_lower", flow) for r in active_rejectors
-                        ),
-                        injection_params=combined_inj_params,
-                    )
-                    bank.template_thinning(combined_rej)
-
-        primary_snr_threshold = args.asym_snr_threshold
-        logging.info("Primary SNR threshold: %.2f", primary_snr_threshold)
-
+        logging.info("Primary SNR threshold: %.2f", args.asym_snr_threshold)
         sg_chisq = SingleDetSGChisq.from_cli(args, bank, str(args.chisq_bins))
         event_mgr = init_event_managers(args, instruments, gating_info)
         cluster_window = (
             int(args.cluster_window * sample_rate) if args.cluster_window else 0
         )
 
-        if all(len(segments[ifo]) == 0 for ifo in instruments):
-            logging.info("No segments to analyze. Exiting.")
+        if all(len(segments[ifo]) == 0 for ifo in instruments) or (
+            len(bank.coarse_indices) == 0
+        ):
+            msg = (
+                "No segments to analyze. Exiting."
+                if all(len(segments[ifo]) == 0 for ifo in instruments)
+                else "No coarse templates in analysis bank. Exiting."
+            )
+            logging.info(msg)
             if os.path.exists(args.output):
                 os.remove(args.output)
             for ifo in instruments:
@@ -1141,245 +956,23 @@ def main():
                 event_mgr[ifo].write_events(args.output)
             logging.info("Finished.")
             return
-
-        if len(bank.coarse_indices) == 0:
-            logging.info("No coarse templates in analysis bank. Exiting.")
-            if os.path.exists(args.output):
-                os.remove(args.output)
-            for ifo in instruments:
-                event_mgr[ifo].finalize_template_events()
-                event_mgr[ifo].write_events(args.output)
-            logging.info("Finished.")
-            return
-
-        triggers = {ifo: collections.defaultdict(list) for ifo in instruments}
-        has_asym_followup = dict.fromkeys(instruments, 0)
-        num_segs = max(len(segments[ifo]) for ifo in instruments)
-
-        (
-            can_asym_by_seg,
-            ifo_sample_rates,
-            ifo_gps_starts,
-            ifo_gps_cli_starts,
-            seg_starts,
-        ) = prepare_segment_geometry(
-            args, instruments, segments, gwstrain_start_time, num_segs, sample_rate
-        )
-
-        # Ensure asym_num_bins is identical between full search and injection jobs
-        # to eliminate trials-factor and recovery bias
-        effective_asym_num_bins = args.asym_num_bins
 
         tsetup = time.time() - tstart
         TIMERS["data_setup"] = tsetup
 
-        if bank.num_levels < 2:
-            raise ValueError(
-                "pycbc_inspiral_fir requires a hierarchical bank with at least 2 FIR levels."
-            )
-        # The hierarchy is real-real-complex: complex final taps (level 1), real taps above.
-        for lvl, grp in bank.level_groups.items():
-            want_complex = lvl == 1
-            for k in bank.level_keys[lvl]:
-                if (
-                    np.issubdtype(grp[k]["taps"].dtype, np.complexfloating)
-                    != want_complex
-                ):
-                    raise ValueError(
-                        "%s: level_%d group %s has %s taps; pycbc_inspiral_fir needs complex "
-                        "final (level 1) taps and real taps above (rebuild the bank with the "
-                        "current pycbc_fir_bank)"
-                        % (args.bank_file, lvl, k, grp[k]["taps"].dtype)
-                    )
-
-        max_upper_taps = int(bank.level_groups[2].attrs.get("max_taps", 0))
-        if max_upper_taps == 0:
-            max_upper_taps = max(
-                int(c)
-                for top_idx in bank.level_indices[2]
-                for c in bank.level_groups[2][str(int(top_idx))]["actual_tap_count"][:]
-            )
-        max_lower_taps = int(bank.level_groups[1].attrs.get("max_taps", 0))
-        if max_lower_taps == 0:
-            max_lower_taps = max(
-                int(c)
-                for middle_idx in bank.coarse_indices
-                for c in bank.level_groups[1][str(int(middle_idx))]["actual_tap_count"][
-                    :
-                ]
-            )
-        edge_margin = (max_upper_taps + max_lower_taps) // 2
-        for ifo in instruments:
-            for stilde in segments[ifo]:
-                if (
-                    stilde.analyze.start < edge_margin
-                    or (len(stilde) - 1) * 2 - stilde.analyze.stop < edge_margin
-                ):
-                    raise ValueError(
-                        "analysis window needs %d samples of padding for the "
-                        "composed upper and lower FIRs" % edge_margin
-                    )
-
-        coarse_keep = (
-            set(bank.coarse_indices)
-            if len(bank.coarse_indices) < len(bank.coarse_keys)
-            else None
+        triggers, has_asym_followup, search_timers = run_hierarchical_search(
+            bank,
+            segments,
+            instruments,
+            args,
+            flow,
+            delta_f,
+            sample_rate,
+            sg_chisq=sg_chisq,
+            inj_reject=inj_reject,
         )
-
-        # Chirp-time rejection per injection window: a middle group is filtered
-        # only near the injections whose chirp time lies within the rejector
-        # window of one of its fine templates, and a top template only in
-        # segments where one of its groups is. Needs --injection-window, which
-        # provides the per-injection windows of each segment.
-        inj_reject = None
-        rejs = [
-            r
-            for r in (inj_filter_rejector or {}).values()
-            if r is not None and r.enabled and r.chirp_time_window is not None
-        ]
-        if rejs and args.injection_window is not None:
-            from pycbc.pnutils import mass1_mass2_to_tau0_tau3
-
-            fref = rejs[0].f_lower
-            tau0 = lambda tbl: np.asarray(
-                mass1_mass2_to_tau0_tau3(tbl["mass1"], tbl["mass2"], fref)[0]
-            )
-            inj_reject = {
-                "window": max(float(r.chirp_time_window) for r in rejs),
-                "tau0_fine": tau0(bank.table),
-                # per detector, indexed like the rows of analyze_injections
-                "tau0_inj": {
-                    ifo: tau0(gwstrain[ifo].injections.table)
-                    for ifo in instruments
-                    if hasattr(gwstrain[ifo], "injections")
-                },
-            }
-            logging.info(
-                "Injection rejection per injection window, chirp-time window %.2f s, "
-                "f_lower %.1f Hz",
-                inj_reject["window"],
-                fref,
-            )
-
-        # Free raw time-domain strain buffers now that segments and PSDs are formed
-        for ifo in instruments:
-            if hasattr(gwstrain[ifo], "_data"):
-                gwstrain[ifo]._data = np.array([], dtype=gwstrain[ifo].dtype)
-
-        total_valid_segs = sum(len(segments[ifo]) for ifo in instruments)
-        if total_valid_segs == 0:
-            logging.info(
-                "Zero valid segments to analyze across all instruments. Skipping filtering."
-            )
-            bank_top_indices = []
-        else:
-            bank_top_indices = bank.level_indices[2]
-
-        top_templates = {
-            int(i): bank.get_coarse_template(int(i)) for i in bank_top_indices
-        }
-        upper_group_data = {}
-        for i in bank_top_indices:
-            i_int = int(i)
-            grp = bank.level_groups[2][str(i_int)]
-            upper_group_data[i_int] = {
-                "counts": grp["actual_tap_count"][:],
-                "m_all": grp["fine_bank_index"][:],
-                "taps": grp["taps"][:],
-                "sigmas": grp["sigmas"][:],
-            }
-
-        # Prepare top template tasks sorted by descending fine template count (LPT scheduling)
-        top_tasks = []
-        for top_idx in bank_top_indices:
-            top_idx = int(top_idx)
-            m_all = upper_group_data[top_idx]["m_all"]
-            if coarse_keep is not None:
-                m_all = [m for m in m_all if m in coarse_keep]
-            if len(m_all) == 0:
-                continue
-            fine_count = sum(bank.group_template_count(int(m)) for m in m_all)
-            top_tasks.append((top_idx, fine_count))
-
-        top_tasks.sort(key=lambda x: x[1], reverse=True)
-        n_top = len(top_tasks)
-        sorted_top_tasks = [
-            (item[0], rank, n_top, item[1]) for rank, item in enumerate(top_tasks)
-        ]
-
-        _SHARED_WORKER_CONTEXT.clear()
-        _SHARED_WORKER_CONTEXT.update(
-            {
-                "bank": bank,
-                "top_templates": top_templates,
-                "upper_group_data": upper_group_data,
-                "instruments": instruments,
-                "segments": segments,
-                "num_segs": num_segs,
-                "can_asym_by_seg": can_asym_by_seg,
-                "ifo_sample_rates": ifo_sample_rates,
-                "ifo_gps_starts": ifo_gps_starts,
-                "ifo_gps_cli_starts": ifo_gps_cli_starts,
-                "seg_starts": seg_starts,
-                "args": args,
-                "primary_snr_threshold": primary_snr_threshold,
-                "delta_f": delta_f,
-                "sample_rate": sample_rate,
-                "flow": flow,
-                "effective_asym_num_bins": effective_asym_num_bins,
-                "coarse_keep": coarse_keep,
-                "inj_reject": inj_reject,
-                "sg_chisq": sg_chisq,
-            }
-        )
-
-        total_cores = max(1, int(args.cores or 1))
-        n_workers = min(total_cores, n_top) if n_top > 0 else 1
-
-        if n_workers > 1:
-            logging.info(
-                "Parallelizing %d top templates across %d cores using fork multiprocessing...",
-                n_top,
-                n_workers,
-            )
-            bank.close_filehandler()
-            ctx = mp.get_context("fork")
-            with ctx.Pool(processes=n_workers) as pool:
-                for (
-                    top_idx,
-                    worker_trigs,
-                    worker_asym,
-                    worker_timers,
-                ) in pool.imap_unordered(process_top_template_task, sorted_top_tasks):
-                    for ifo in instruments:
-                        for col, arr in worker_trigs[ifo].items():
-                            if len(arr) > 0:
-                                triggers[ifo][col].append(arr)
-                        has_asym_followup[ifo] += worker_asym[ifo]
-                    for k, v in worker_timers.items():
-                        TIMERS[k] += v
-        else:
-            logging.info("Filtering %d top templates serially (1 core)...", n_top)
-            for task_args in sorted_top_tasks:
-                top_idx, worker_trigs, worker_asym, worker_timers = (
-                    process_top_template_task(task_args)
-                )
-                for ifo in instruments:
-                    for col, arr in worker_trigs[ifo].items():
-                        if len(arr) > 0:
-                            triggers[ifo][col].append(arr)
-                    has_asym_followup[ifo] += worker_asym[ifo]
-                for k, v in worker_timers.items():
-                    TIMERS[k] += v
-
-        _SHARED_WORKER_CONTEXT.clear()
-
-        if bank.num_levels >= 2:
-            logging.info(
-                "Upper synthesis time: direct-reference %.3f s, FIR %.3f s",
-                TIMERS["upper_ref"],
-                TIMERS["upper_fir"],
-            )
+        for k, v in search_timers.items():
+            TIMERS[k] += v
 
         # Ingest triggers into EventManager for all instruments
         for ifo in instruments:
@@ -1390,7 +983,6 @@ def main():
                 gwstrain[ifo],
                 bank,
                 args,
-                psd_var.get(ifo),
                 cluster_window,
                 has_asym_followup[ifo],
             )
@@ -1421,7 +1013,7 @@ def main():
     TIMERS["event_finalize"] += time.time() - t_fin
 
     log_performance_summary(
-        run_time, tsetup, instruments, segments, bank, args.output, cores=total_cores
+        run_time, instruments, segments, bank, cores=total_cores
     )
     logging.info("Finished.")
 

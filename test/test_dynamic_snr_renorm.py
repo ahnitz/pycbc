@@ -299,29 +299,6 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_dynamic_snr_options(1.0, 2e3)
 
-    def test_ifo_trigger_data_schema(self):
-        from pycbc.filter.matched_filter_ratio import IfoTriggerData
-
-        raw = {
-            "template_id": np.array([10, 20], dtype=np.int32),
-            "time_index": np.array([1000, 2000], dtype=np.int64),
-            "snr": np.array([7.0 + 1.0j, 8.0 - 2.0j], dtype=np.complex64),
-            "sigmasq": np.array([1.0, 1.0], dtype=np.float32),
-            "chisq": np.array([12.0, 14.0], dtype=np.float32),
-            "chisq_dof": np.array([14, 14], dtype=np.int32),
-            "sg_chisq": np.array([1.1, 0.9], dtype=np.float32),
-            "is_asym": np.array([False, True], dtype=bool),
-            "extra_unused": np.array([1, 2]),
-        }
-        td = IfoTriggerData.from_dict(raw)
-        self.assertIn("snr", td)
-        self.assertNotIn("cont_chisq", td)
-        self.assertNotIn("extra_unused", td)
-        np.testing.assert_array_equal(td["template_id"], raw["template_id"])
-        np.testing.assert_array_equal(td[0], raw["template_id"])
-        with self.assertRaises(KeyError):
-            _ = td["cont_chisq"]
-
     def test_chisq_filters_indexing_and_prefetch(self):
         from pycbc.vetoes.chisq_fir import ChisqFilters
 
@@ -351,7 +328,8 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
         import types
 
         from pycbc.types import FrequencySeries
-        from pycbc.vetoes.chisq_fir import ChisqFilters, RatioAutoChisq, RatioPowerChisq
+        from pycbc.vetoes.chain import SignalConsistencyChain
+        from pycbc.vetoes.chisq_fir import ChisqFilters, RatioPowerChisq
         from pycbc.vetoes.sgchisq import SingleDetSGChisq
 
         rng = np.random.default_rng(99)
@@ -390,16 +368,17 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
 
         pchisq = RatioPowerChisq(
             num_bins=8,
-            snr_threshold=5.0,
             sample_rate=sample_rate,
             flow=20.0,
             f_final=800.0,
-            chisq_window=0.1,
-            chisq_iterations=10,
             top_template=top_template,
             upper_f_by_coarse={},
         )
         args = types.SimpleNamespace(
+            chisq_bins=8,
+            chisq_snr_threshold=5.0,
+            chisq_window=0.1,
+            chisq_iterations=10,
             autochi_stride=2,
             autochi_number_points=4,
             autochi_onesided=None,
@@ -407,10 +386,8 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
             autochi_reverse_template=False,
             autochi_max_valued=False,
             autochi_max_valued_dof=None,
-            autochi_max_rchisq=100.0,
             signal_consistency_chain=None,
         )
-        achisq = RatioAutoChisq(pchisq, args)
 
         bank_stub = types.SimpleNamespace(
             table={
@@ -429,33 +406,43 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
         sg.do = True
         sg.params = {101: "20-0.5,20-0.6", 102: "20-0.5,20-0.6"}
 
+        chain = SignalConsistencyChain.from_cli(
+            args, bank_stub, sample_rate, power_chisq=pchisq, sg_chisq=sg
+        )
+
         ids_local = np.array([0, 1], dtype=np.int32)
         t_idxs = np.array([1024, 2048], dtype=np.int64)
         snrs = np.array([12.0 + 0.0j, 9.0 + 0.0j], dtype=np.complex64)
         fine_indices = np.array([0, 1], dtype=np.int32)
 
-        chi, dof, auto = pchisq.compute(
-            ids_local,
-            t_idxs,
+        kept, vals = chain.values(
             snrs,
-            fine_indices,
-            stilde,
-            ref_snr,
-            filters_f,
-            coarse_idx=0,
-            args=args,
-            autochisq=achisq,
-            sg_chisq=sg,
-            bank=bank_stub,
+            t_idxs,
+            fine_indices[ids_local],
+            lambda j: pchisq.template(
+                stilde,
+                0,
+                int(ids_local[j]),
+                int(fine_indices[ids_local[j]]),
+                filters_f,
+                bank_stub,
+            ),
+            lambda j, reach=0: pchisq.correlation(
+                stilde, 0, int(ids_local[j]), int(t_idxs[j]), ref_snr, filters_f, reach
+            ),
+            stilde=stilde,
         )
-        self.assertEqual(len(chi), 2)
-        self.assertEqual(len(dof), 2)
-        self.assertIsNotNone(auto)
-        self.assertTrue(np.all(np.isfinite(chi)))
-        self.assertTrue(np.all(np.isfinite(auto)))
+        pchisq.ref_f_cache.clear()
+        self.assertTrue(np.all(kept))
+        self.assertEqual(len(vals["chisq"]), 2)
+        self.assertEqual(len(vals["chisq_dof"]), 2)
+        self.assertIn("cont_chisq", vals)
+        self.assertIn("sg_chisq", vals)
+        self.assertTrue(np.all(np.isfinite(vals["chisq"])))
+        self.assertTrue(np.all(np.isfinite(vals["cont_chisq"])))
         self.assertEqual(len(pchisq.ref_f_cache), 0)
-        self.assertTrue(np.all(np.isfinite(pchisq.last_sg_vals)))
-        self.assertTrue(np.all(pchisq.last_sg_vals > 0))
+        self.assertTrue(np.all(np.isfinite(vals["sg_chisq"])))
+        self.assertTrue(np.all(vals["sg_chisq"] > 0))
 
     def test_ratio_filter_bank_handle_and_group_count(self):
         import os

@@ -146,8 +146,6 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         bins = getattr(template, "bins", None)
         if bins is None:
             bins = self.cached_chisq_bins(template, psd)
-        elif isinstance(bins, tuple):
-            bins = bins[0]
         fstep = bins[-2] - bins[-3]
         return float((bins[-2] + fstep) * template.delta_f)
 

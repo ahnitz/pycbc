@@ -1483,7 +1483,6 @@ class StrainSegments:
         injection_window=None,
         allow_zero_padding=False,
         inpaint_edges=False,
-        merge_injection_windows=False,
     ):
         """
         Determine how to chop up the strain data into smaller segments
@@ -1664,19 +1663,12 @@ class StrainSegments:
                         else:
                             merged_windows.append(cur)
 
-                    if merge_injection_windows:
-                        segment_slices_red.append(seg)
-                        analyze_slices_red.append(slice(start, stop))
-                        analyze_windows_red.append(
-                            [(int(a), int(b)) for a, b in merged_windows]
-                        )
-                        analyze_injections_red.append(per_injection)
-                        continue
-                    for w_start, w_stop in merged_windows:
-                        segment_slices_red.append(seg)
-                        analyze_slices_red.append(slice(w_start, w_stop))
-                        analyze_windows_red.append(None)
-                        analyze_injections_red.append(None)
+                    segment_slices_red.append(seg)
+                    analyze_slices_red.append(slice(start, stop))
+                    analyze_windows_red.append(
+                        [(int(a), int(b)) for a, b in merged_windows]
+                    )
+                    analyze_injections_red.append(per_injection)
                     continue
 
             if start < stop:
@@ -1723,10 +1715,6 @@ class StrainSegments:
         """
         if not self._fourier_segments:
             self._fourier_segments = []
-            cached_freq_segs = {}
-            from collections import Counter
-
-            slice_counts = Counter((s.start, s.stop) for s in self.segment_slices)
             windows = getattr(self, "analyze_windows", None) or [None] * len(
                 self.segment_slices
             )
@@ -1736,58 +1724,49 @@ class StrainSegments:
             for seg_slice, ana, wins, injs in zip(
                 self.segment_slices, self.analyze_slices, windows, injections
             ):
-                key = (seg_slice.start, seg_slice.stop)
-                if key in cached_freq_segs:
-                    freq_seg = cached_freq_segs[key].copy()
-                else:
-                    if seg_slice.start >= 0 and seg_slice.stop <= len(self.strain):
-                        base_seg = make_frequency_series(self.strain[seg_slice])
-                    # Assume that we cannot have a case where we both zero-pad on
-                    # both sides
-                    elif seg_slice.start < 0:
-                        strain_chunk = self.strain[: seg_slice.stop]
-                        strain_chunk.prepend_zeros(-seg_slice.start)
-                        if self.inpaint_edges and not getattr(
-                            self.strain, "_is_overwhitened", False
-                        ):
-                            from pycbc.strain.gate import gate_and_paint
+                if seg_slice.start >= 0 and seg_slice.stop <= len(self.strain):
+                    freq_seg = make_frequency_series(self.strain[seg_slice])
+                # Assume that we cannot have a case where we both zero-pad on
+                # both sides
+                elif seg_slice.start < 0:
+                    strain_chunk = self.strain[: seg_slice.stop]
+                    strain_chunk.prepend_zeros(-seg_slice.start)
+                    if self.inpaint_edges and not getattr(
+                        self.strain, "_is_overwhitened", False
+                    ):
+                        from pycbc.strain.gate import gate_and_paint
 
-                            invpsd = self._get_inpaint_invpsd()
-                            gate_and_paint(
-                                strain_chunk,
-                                0,
-                                -seg_slice.start,
-                                invpsd,
-                                copy=False,
-                                method="toeplitz",
-                                ridge=1e-3,
-                            )
-                        base_seg = make_frequency_series(strain_chunk)
-                    elif seg_slice.stop > len(self.strain):
-                        orig_len = len(self.strain) - seg_slice.start
-                        strain_chunk = self.strain[seg_slice.start :]
-                        strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
-                        if self.inpaint_edges and not getattr(
-                            self.strain, "_is_overwhitened", False
-                        ):
-                            from pycbc.strain.gate import gate_and_paint
+                        invpsd = self._get_inpaint_invpsd()
+                        gate_and_paint(
+                            strain_chunk,
+                            0,
+                            -seg_slice.start,
+                            invpsd,
+                            copy=False,
+                            method="toeplitz",
+                            ridge=1e-3,
+                        )
+                    freq_seg = make_frequency_series(strain_chunk)
+                elif seg_slice.stop > len(self.strain):
+                    orig_len = len(self.strain) - seg_slice.start
+                    strain_chunk = self.strain[seg_slice.start :]
+                    strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
+                    if self.inpaint_edges and not getattr(
+                        self.strain, "_is_overwhitened", False
+                    ):
+                        from pycbc.strain.gate import gate_and_paint
 
-                            invpsd = self._get_inpaint_invpsd()
-                            gate_and_paint(
-                                strain_chunk,
-                                orig_len,
-                                len(strain_chunk),
-                                invpsd,
-                                copy=False,
-                                method="toeplitz",
-                                ridge=1e-3,
-                            )
-                        base_seg = make_frequency_series(strain_chunk)
-                    if slice_counts[key] > 1:
-                        cached_freq_segs[key] = base_seg
-                        freq_seg = base_seg.copy()
-                    else:
-                        freq_seg = base_seg
+                        invpsd = self._get_inpaint_invpsd()
+                        gate_and_paint(
+                            strain_chunk,
+                            orig_len,
+                            len(strain_chunk),
+                            invpsd,
+                            copy=False,
+                            method="toeplitz",
+                            ridge=1e-3,
+                        )
+                    freq_seg = make_frequency_series(strain_chunk)
                 freq_seg.analyze = ana
                 freq_seg.analyze_windows = wins
                 freq_seg.analyze_injections = injs
@@ -1814,7 +1793,6 @@ class StrainSegments:
             injection_window=opt.injection_window,
             allow_zero_padding=opt.allow_zero_padding,
             inpaint_edges=getattr(opt, "inpaint_edges", False),
-            merge_injection_windows=getattr(opt, "merge_injection_windows", False),
         )
 
     @classmethod
@@ -1903,7 +1881,6 @@ class StrainSegments:
             injection_window=getattr(opt, "injection_window", None),
             allow_zero_padding=opt.allow_zero_padding,
             inpaint_edges=getattr(opt, "inpaint_edges", False),
-            merge_injection_windows=getattr(opt, "merge_injection_windows", False),
         )
 
     @classmethod
