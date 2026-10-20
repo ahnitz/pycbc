@@ -143,9 +143,11 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         of the second-to-last bin. The last bin edge is not used, as it need
         not be where the waveform ends.
         """
-        bins = self.cached_chisq_bins(template, psd)
+        bins = getattr(template, "bins", None)
+        if bins is None:
+            bins = self.cached_chisq_bins(template, psd)
         fstep = bins[-2] - bins[-3]
-        return (bins[-2] + fstep) * template.delta_f
+        return float((bins[-2] + fstep) * template.delta_f)
 
     def values_at(
         self, stilde, psd, template, template_psd, times, whitened=True, snrs=None
