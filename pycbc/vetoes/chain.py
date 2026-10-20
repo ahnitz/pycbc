@@ -163,6 +163,8 @@ class _AutoStage(_Stage):
     def evaluate(self, batch, j):
         est = self.estimator
         corr, index = batch.correlation(j, est.stride * est.num_points)
+        if corr is None:
+            return None
         corr = np.asarray(corr)
         sn = np.fft.ifft(corr) * len(corr)
         _, achisq = autochisq_from_precomputed(
@@ -187,10 +189,16 @@ class _AutoStage(_Stage):
         """
         tid = batch.template_id[j]
         if tid not in batch.autocorrelations:
-            power = np.abs(np.asarray(batch.template(j))) ** 2
-            power[len(power) // 2 + 1 :] = 0
-            autocor = np.fft.ifft(power)
-            batch.autocorrelations[tid] = autocor / autocor[0]
+            tmplt = batch.template(j)
+            autocor = getattr(tmplt, "autocorrelation", None)
+            if autocor is None:
+                power = np.abs(np.asarray(tmplt)) ** 2
+                power[len(power) // 2 + 1 :] = 0
+                autocor = np.fft.ifft(power)
+                autocor = autocor / autocor[0]
+                if hasattr(tmplt, "__dict__"):
+                    tmplt.autocorrelation = autocor
+            batch.autocorrelations[tid] = autocor
         return batch.autocorrelations[tid]
 
 
@@ -212,7 +220,7 @@ class _SGStage(_Stage):
             template,
             _unit_psd(template),
             np.array([seconds]),
-            whitened=False,
+            whitened=getattr(stilde, "_is_whitened", False),
         )
         return {"sg_chisq": val[0]}
 
@@ -277,6 +285,7 @@ class SignalConsistencyChain:
         self.window = window
         self.max_iterations = max_iterations
         self.defaults = defaults or {}
+        self.stage_times = {"power": 0.0, "auto": 0.0, "sg": 0.0}
 
         available = {"snr"} | set(input_columns)
         self.steps = []
@@ -397,7 +406,7 @@ class SignalConsistencyChain:
                 alive[failed] = False
                 if step[3] == "remove":
                     keep[failed] = False
-                logger.info(
+                logger.debug(
                     "%s: %d of %d triggers %s",
                     step[4],
                     len(failed),
@@ -434,6 +443,8 @@ class SignalConsistencyChain:
         return func(stat, value)
 
     def _run_stage(self, stage, batch, vals, alive):
+        if not np.any(alive):
+            return
         start = time.perf_counter()
         priority = np.abs(batch.snr)
         times = batch.time_index
@@ -463,11 +474,13 @@ class SignalConsistencyChain:
             computed += 1
         # Later stages only test triggers this one gave a value to
         alive &= assigned
-        logger.info(
+        elapsed = time.perf_counter() - start
+        self.stage_times[stage.name] = self.stage_times.get(stage.name, 0.0) + elapsed
+        logger.debug(
             "%s chisq: %d evaluations in %.3f s",
             stage.name,
             computed,
-            time.perf_counter() - start,
+            elapsed,
         )
 
     @staticmethod
@@ -519,7 +532,9 @@ class SignalConsistencyChain:
         SingleDetSGChisq.insert_option_group(parser)
 
     @classmethod
-    def from_cli(cls, args, bank, sample_rate):
+    def from_cli(
+        cls, args, bank, sample_rate, power_chisq=None, sg_chisq=None
+    ):
         """
         Create the chain from the options added by insert_option_group.
 
@@ -533,15 +548,27 @@ class SignalConsistencyChain:
         sample_rate : float
             The sample rate of the SNR time series, to convert
             --chisq-window to samples.
+        power_chisq : SingleDetPowerChisq, optional
+            Custom power-chisq estimator (defaults to SingleDetPowerChisq).
+        sg_chisq : SingleDetSGChisq, optional
+            Pre-built sine-Gaussian chisq estimator.
 
         """
         if args.autochi_reverse_template:
             raise ValueError("The chain does not support --autochi-reverse-template")  # noqa: TRY003
         # The tests' SNR thresholds are steps of the chain, not of the
         # estimators
-        power = SingleDetPowerChisq(args.chisq_bins)
+        power = (
+            SingleDetPowerChisq(args.chisq_bins)
+            if power_chisq is None
+            else power_chisq
+        )
         auto = SingleDetAutoChisq.from_cli(args)
-        sg = SingleDetSGChisq.from_cli(args, bank, args.chisq_bins)
+        sg = (
+            SingleDetSGChisq.from_cli(args, bank, str(args.chisq_bins))
+            if sg_chisq is None
+            else sg_chisq
+        )
         extra = ["psd_var_val"] if getattr(args, "psdvar_segment", None) else []
         steps = args.signal_consistency_chain
         if steps is None:
