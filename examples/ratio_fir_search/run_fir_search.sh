@@ -11,8 +11,8 @@ set -e
 export OMP_NUM_THREADS=1
 
 pycbc_inspiral_fir \
-    --fir-length 4096 \
-    --batch-size 64 \
+    --ratio-filter-engine ${ENGINE:-matchedfilter-hierarchical} \
+    --output ${OUT:-fir.hdf} \
     --pad-data 8 \
     --strain-high-pass 15 \
     --sample-rate 2048 \
@@ -26,15 +26,8 @@ pycbc_inspiral_fir \
     --psd-segment-stride 8 \
     --psd-inverse-length 16 \
     --psd-num-segments 63 \
-    --psdvar-segment 8 \
-    --psdvar-short-segment 0.25 \
-    --psdvar-long-segment 512 \
-    --psdvar-psd-duration 8 \
-    --psdvar-psd-stride 4 \
-    --psdvar-low-freq 20 \
-    --psdvar-high-freq 480 \
     --low-frequency-cutoff 20 \
-    --snr-threshold 5.0 \
+    --asym-snr-threshold ${SNR:-5.0} \
     --cluster-window 1 \
     --chisq-snr-threshold 6 \
     --chisq-bins 64 \
@@ -45,7 +38,6 @@ pycbc_inspiral_fir \
     --gps-start-time 1000000000 \
     --gps-end-time 1000005000 \
     --injection-filter-rejector-chirp-time-window 20000 \
-    --output fir.hdf \
     --newsnr-threshold 0 \
     --bank-file fir_full_bank.hdf \
     --fake-strain-seed 0 \
@@ -58,4 +50,4 @@ pycbc_inspiral_fir \
     --autogating-cluster 0.5 \
     --autogating-width 0.25 \
     --autogating-taper 0.25 \
-    --autogating-pad 16
+    --autogating-pad 16 "$@"

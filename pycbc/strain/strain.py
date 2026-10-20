@@ -1528,19 +1528,24 @@ class StrainSegments:
         # Remove segments that are outside trig start and end
         segment_slices_red = []
         analyze_slices_red = []
+        analyze_windows_red = []
+        analyze_injections_red = []
         trig_start_idx = (trigger_start - int(strain.start_time)) * strain.sample_rate
         trig_end_idx = (trigger_end - int(strain.start_time)) * strain.sample_rate
 
-        if filter_inj_only and hasattr(strain, "injections"):
+        filter_injections = (
+            filter_inj_only or injection_window is not None
+        ) and hasattr(strain, "injections")
+        if filter_injections:
             end_times = strain.injections.end_times()
-            end_times = [
-                time
-                for time in end_times
+            inj_rows = [
+                row
+                for row, time in enumerate(end_times)
                 if float(time) < trigger_end and float(time) > trigger_start
             ]
             inj_idx = [
-                (float(time) - float(strain.start_time)) * strain.sample_rate
-                for time in end_times
+                (float(end_times[row]) - float(strain.start_time)) * strain.sample_rate
+                for row in inj_rows
             ]
 
         for seg, ana in zip(self.segment_slices, self.analyze_slices):
@@ -1557,24 +1562,67 @@ class StrainSegments:
             if trig_end_idx < cum_end:
                 stop -= cum_end - trig_end_idx
 
-            if filter_inj_only and hasattr(strain, "injections"):
+            if filter_injections:
                 analyze_this = False
-                inj_window = strain.sample_rate * 8
-                for inj_id in inj_idx:
-                    if inj_id < (cum_end + inj_window) and inj_id > (
-                        cum_start - inj_window
-                    ):
+                inj_pad = int(
+                    (injection_window if injection_window is not None else 8)
+                    * strain.sample_rate
+                )
+                matching_injs = []
+                matching_rows = []
+                for inj_row, inj_id in zip(inj_rows, inj_idx):
+                    if (cum_start - inj_pad) < inj_id < (cum_end + inj_pad):
                         analyze_this = True
+                        matching_injs.append(inj_id)
+                        matching_rows.append(inj_row)
 
                 if not analyze_this:
+                    continue
+
+                if injection_window is not None and matching_injs:
+                    win_points = int(injection_window * strain.sample_rate)
+                    windows = []
+                    per_injection = []
+                    for inj_row, inj_id in zip(matching_rows, matching_injs):
+                        inj_pos = int(inj_id - seg.start)
+                        w_start = max(start, inj_pos - win_points)
+                        w_stop = min(stop, inj_pos + win_points)
+                        if w_start < w_stop:
+                            windows.append([w_start, w_stop])
+                            per_injection.append(
+                                (int(w_start), int(w_stop), int(inj_row))
+                            )
+
+                    if not windows:
+                        continue
+
+                    windows.sort(key=lambda x: x[0])
+                    merged_windows = [windows[0]]
+                    for cur in windows[1:]:
+                        prev = merged_windows[-1]
+                        if cur[0] <= prev[1]:
+                            prev[1] = max(prev[1], cur[1])
+                        else:
+                            merged_windows.append(cur)
+
+                    segment_slices_red.append(seg)
+                    analyze_slices_red.append(slice(start, stop))
+                    analyze_windows_red.append(
+                        [(int(a), int(b)) for a, b in merged_windows]
+                    )
+                    analyze_injections_red.append(per_injection)
                     continue
 
             if start < stop:
                 segment_slices_red.append(seg)
                 analyze_slices_red.append(slice(start, stop))
+                analyze_windows_red.append(None)
+                analyze_injections_red.append(None)
 
         self.segment_slices = segment_slices_red
         self.analyze_slices = analyze_slices_red
+        self.analyze_windows = analyze_windows_red
+        self.analyze_injections = analyze_injections_red
 
     def fourier_segments(self):
         """
@@ -1587,7 +1635,12 @@ class StrainSegments:
         """
         if not self._fourier_segments:
             self._fourier_segments = []
-            for seg_slice, ana in zip(self.segment_slices, self.analyze_slices):
+            for seg_slice, ana, wins, injs in zip(
+                self.segment_slices,
+                self.analyze_slices,
+                self.analyze_windows,
+                self.analyze_injections,
+            ):
                 if seg_slice.start >= 0 and seg_slice.stop <= len(self.strain):
                     freq_seg = make_frequency_series(self.strain[seg_slice])
                 # Assume that we cannot have a case where we both zero-pad on
@@ -1601,6 +1654,8 @@ class StrainSegments:
                     strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
                     freq_seg = make_frequency_series(strain_chunk)
                 freq_seg.analyze = ana
+                freq_seg.analyze_windows = wins
+                freq_seg.analyze_injections = injs
                 freq_seg.cumulative_index = seg_slice.start + ana.start
                 freq_seg.seg_slice = seg_slice
                 self._fourier_segments.append(freq_seg)
@@ -1702,6 +1757,7 @@ class StrainSegments:
             trigger_start=opt.trig_start_time[ifo],
             trigger_end=opt.trig_end_time[ifo],
             filter_inj_only=opt.filter_inj_only,
+            injection_window=getattr(opt, "injection_window", None),
             allow_zero_padding=opt.allow_zero_padding,
         )
 
@@ -1778,6 +1834,13 @@ class StrainSegments:
             "--filter-inj-only",
             action="store_true",
             help="Analyze only segments that contain an injection.",
+        )
+        segment_group.add_argument(
+            "--injection-window",
+            default=None,
+            type=float,
+            metavar="WINDOW",
+            help="Window to analyze in seconds around an injection.",
         )
 
     required_opts_list = [
