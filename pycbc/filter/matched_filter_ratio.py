@@ -103,7 +103,15 @@ class MatchedFilterRatioControl:
         return filters_f, n_taps
 
     def process_segment(
-        self, stilde, psd, ref_template, filters_f, n_taps, indices, valid_slice=None
+        self,
+        stilde,
+        psd,
+        ref_template,
+        filters_f,
+        n_taps,
+        indices,
+        valid_slice=None,
+        templates=None,
     ):
         """
         Process a single data segment.
@@ -123,41 +131,50 @@ class MatchedFilterRatioControl:
         )
 
         self.ref_snr = snr.numpy() * (norm * stilde.delta_t)
+        local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
+            self.ref_snr, filters_f, n_taps, valid_slice
+        )
         # What fine_template and fine_correlation need for this batch
-        self._batch = (stilde, psd, ref_template, filters_f, n_taps)
+        self._batch = (
+            stilde,
+            psd,
+            ref_template,
+            filters_f,
+            n_taps,
+            templates,
+            local_idxs,
+            t_idxs,
+            tstarts,
+        )
         self._fine_templates = {}
         self._fine_correlations = {}
         self._ref_blocks = {}
         self._ref_weight = None
-
-        local_idxs, t_idxs, snr_vals, tstarts = self._execute_blocked_kernel(
-            self.ref_snr, filters_f, n_taps, valid_slice
-        )
 
         if len(local_idxs) > 0:
             global_ids = indices[local_idxs]
             return global_ids, t_idxs, snr_vals, tstarts, h_norm
         return [], [], [], tstarts, h_norm
 
-    def fine_template(self, i, params):
+    def fine_template(self, j):
         """
-        Return fine template i of the last process_segment batch, divided
-        by the square root of the PSD (whitened), on the frequency grid of
-        the engine's blocks.
+        Return the whitened fine template for trigger j of the last
+        process_segment batch, on the frequency grid of the engine's blocks.
 
         The fine templates are never generated: each is reconstructed as
         its ratio filter times the reference template.
 
         Parameters
         ----------
-        i : int
-            The index of the template's ratio filter in the batch.
-        params : object
-            The template's parameters, set as its params attribute.
+        j : int
+            The trigger index in the batch.
 
         """
+        stilde, psd, ref_template, filters_f, _, templates, local_idxs, _, _ = (
+            self._batch
+        )
+        i = int(local_idxs[j])
         if i not in self._fine_templates:
-            stilde, psd, ref_template, filters_f, _ = self._batch
             n = self.fir_fft_len
             delta_f = self.engine_sr / n
             if self._ref_weight is None:
@@ -171,34 +188,28 @@ class MatchedFilterRatioControl:
                 filters_f[i] * self._ref_weight, delta_f=delta_f, dtype=stilde.dtype
             )
             tmplt[:] = abs(tmplt) / self.engine_sr
-            tmplt.params = params
+            tmplt.params = templates[i]
             tmplt.f_lower = ref_template.f_lower
             self._fine_templates[i] = tmplt
         return self._fine_templates[i]
 
-    def fine_correlation(self, i, t, tstart, reach=0):
+    def fine_correlation(self, j, reach=0):
         """
-        Return the frequency-domain correlation of fine template i of the
-        last process_segment batch with the data, over a block around time
-        t: the ratio filter times the FFT of a block of the reference SNR
-        series.
+        Return the frequency-domain correlation for trigger j of the last
+        process_segment batch with the data, over a block around the trigger:
+        the ratio filter times the FFT of a block of the reference SNR series.
 
-        The block is the one starting at tstart, in which the trigger was
-        found, unless a sample within reach of t lies where that block's
-        output is not exact: within half the ratio filter's length of the
-        block's edges, where the filter wraps around the block. A block
-        centred on t is then used.
+        The block is the one in which the trigger was found, unless a sample
+        within reach of the trigger lies within half the ratio filter's length
+        of the block's edges, where the filter wraps around the block. A block
+        centred on the trigger is then used.
 
         Parameters
         ----------
-        i : int
-            The index of the template's ratio filter in the batch.
-        t : int
-            The sample of the trigger in the segment.
-        tstart : int
-            The first sample of the block the trigger was found in.
+        j : int
+            The trigger index in the batch.
         reach : int, optional
-            The number of samples either side of t that must be exact.
+            The number of samples either side of the trigger that must be exact.
 
         Returns
         -------
@@ -209,9 +220,11 @@ class MatchedFilterRatioControl:
             The sample of the block at which the trigger is.
 
         """
-        _, _, _, filters_f, n_taps = self._batch
+        _, _, _, filters_f, n_taps, _, local_idxs, t_idxs, tstarts = self._batch
+        i = int(local_idxs[j])
+        t = int(t_idxs[j])
+        tstart = int(tstarts[j])
         n = self.fir_fft_len
-        t, tstart = int(t), int(tstart)
         half = int(n_taps[i]) // 2
         if t - reach - tstart < half or t + reach - tstart >= n - half:
             tstart = min(max(t - n // 2, 0), len(self.ref_snr) - n)

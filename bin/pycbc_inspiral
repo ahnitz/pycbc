@@ -136,7 +136,6 @@ parser.add_argument(
     default=0,
     help="Length of clustering window in seconds. Set to 0 to disable clustering.",
 )
-parser.add_argument("--bank-veto-bank-file", type=str, help="FIXME: ADD")
 parser.add_argument("--chisq-threshold", type=float, default=0, help="FIXME: ADD")
 parser.add_argument("--chisq-delta", type=float, default=0, help="FIXME: ADD")
 parser.add_argument(
@@ -260,6 +259,7 @@ fft.insert_fft_option_group(parser)
 pycbc.opt.insert_optimization_option_group(parser)
 pycbc.inject.insert_injfilterrejector_option_group(parser)
 vetoes.SingleDetPowerChisq.insert_option_group(parser)
+vetoes.SingleDetBankVeto.insert_option_group(parser)
 vetoes.SingleDetAutoChisq.insert_option_group(parser)
 SingleDetSGChisq.insert_option_group(parser)
 opt = parser.parse_args()
@@ -516,14 +516,8 @@ with ctx:
         cluster_function=opt.cluster_function,
     )
 
-    bank_chisq = vetoes.SingleDetBankVeto(
-        opt.bank_veto_bank_file,
-        flen,
-        delta_f,
-        flow,
-        complex64,
-        phase_order=opt.order,
-        approximant=opt.approximant,
+    bank_chisq = vetoes.SingleDetBankVeto.from_cli(
+        opt, flen=flen, delta_f=delta_f, f_low=flow, cdtype=complex64
     )
 
     power_chisq = vetoes.SingleDetPowerChisq.from_cli(opt)

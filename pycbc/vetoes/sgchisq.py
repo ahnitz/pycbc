@@ -21,6 +21,9 @@ class SingleDetSGChisq(SingleDetPowerChisq):
     running the sine-Gaussian chisq
     """
 
+    name = "sg"
+    columns = {"sg_chisq": numpy.float32}
+    default_values = {"sg_chisq": 1}
     returns = {"sg_chisq": numpy.float32}
 
     def __init__(self, bank, num_bins=0, snr_threshold=None, chisq_locations=None):
@@ -43,10 +46,10 @@ class SingleDetSGChisq(SingleDetPowerChisq):
             which templates to apply this set of sine-Gaussians to.
 
         """
-        if snr_threshold is not None and chisq_locations is not None:
+        self.snr_threshold = snr_threshold
+        if chisq_locations is not None:
             self.do = True
             self.num_bins = num_bins
-            self.snr_threshold = snr_threshold
             self.params = {}
             for descr in chisq_locations:
                 region, values = descr.split(":")
@@ -77,33 +80,73 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         )
 
     @classmethod
-    def from_cli(cls, args, bank, chisq_bins):
+    def from_cli(cls, args, bank=None, chisq_bins=None):
+        if chisq_bins is None:
+            chisq_bins = str(args.chisq_bins)
         return cls(bank, chisq_bins, args.sgchisq_snr_threshold, args.sgchisq_locations)
 
+    def default_steps(self):
+        steps = []
+        if self.snr_threshold is not None:
+            steps.append(f"newsnr:{float(self.snr_threshold)!r}:lower_inc:skip")
+        steps.append(self.name)
+        return steps
+
+    def evaluate(self, batch, j):
+        stilde = batch.stilde
+        template = batch.template(j)
+        val = self.values(
+            stilde,
+            template,
+            stilde.psd,
+            numpy.array([batch.snr[j]]),
+            1,
+            indices=numpy.array([batch.time_index[j]]),
+            template_whitened=True,
+            whitened=getattr(stilde, "_is_whitened", False),
+        )
+        return {"sg_chisq": val[0]}
+
     def values(
-        self, stilde, template, psd, snrv, snr_norm, bchisq, bchisq_dof, indices
+        self,
+        stilde,
+        template,
+        psd,
+        snrv,
+        snr_norm,
+        bchisq=None,
+        bchisq_dof=None,
+        indices=None,
+        template_whitened=False,
+        whitened=True,
     ):
         """
         Calculate sine-Gaussian chisq
 
         Parameters
         ----------
-        stilde: pycbc.types.Frequencyseries
-            The overwhitened strain
-        template: pycbc.types.Frequencyseries
+        stilde: pycbc.types.FrequencySeries
+            The data, divided by its PSD (overwhitened) unless whitened is
+            False
+        template: pycbc.types.FrequencySeries
             The waveform template being analyzed
-        psd: pycbc.types.Frequencyseries
+        psd: pycbc.types.FrequencySeries
             The power spectral density of the data
         snrv: numpy.ndarray
             The peak unnormalized complex SNR values
         snr_norm: float
             The normalization factor for the snr
-        bchisq: numpy.ndarray
+        bchisq: numpy.ndarray, optional
             The Bruce Allen power chisq values for these triggers
-        bchisq_dof: numpy.ndarray
+        bchisq_dof: numpy.ndarray, optional
             The degrees of freedom of the Bruce chisq
-        indics: numpy.ndarray
+        indices: numpy.ndarray, optional
             The indices of the snr peaks.
+        template_whitened: bool, optional
+            Whether template is already divided by sqrt(psd).
+        whitened: bool, optional
+            Whether stilde is already divided by the PSD. If not, only the
+            frequencies the tiles read are divided by it.
 
         Returns
         -------
@@ -115,83 +158,26 @@ class SingleDetSGChisq(SingleDetPowerChisq):
             return None
 
         chisq = numpy.ones(len(snrv))
-        if template.params.template_hash not in self.params:
-            return chisq
-
-        # Skip triggers whose newsnr is too low
-        snr = abs(numpy.array(snrv) * snr_norm)
-        rchisq = numpy.array(bchisq) / numpy.array(bchisq_dof)
-        nsnr = ranking.newsnr(snr, rchisq)
-        above = nsnr >= self.snr_threshold
-        if not above.any():
-            return chisq
-
-        num_samples = (len(template) - 1) * 2
-        dt = 1.0 / (num_samples * template.delta_f)
-        times = float(template.epoch) + dt * numpy.array(indices)[above]
-        chisq[above] = self.values_at(stilde, psd, template, psd, times)
-        return chisq
-
-    def peak_frequency(self, template, psd):
-        """
-        Estimate the frequency up to which the template has power, from
-        which the sine-Gaussian tiles are offset.
-
-        The power per frequency is assumed constant over the last two chisq
-        bins, so the estimate is the second-to-last bin edge plus the width
-        of the second-to-last bin. The last bin edge is not used, as it need
-        not be where the waveform ends.
-        """
-        bins = self.cached_chisq_bins(template, psd)
-        fstep = bins[-2] - bins[-3]
-        return (bins[-2] + fstep) * template.delta_f
-
-    def values_at(self, stilde, psd, template, template_psd, times, whitened=True):
-        """
-        Calculate the sine-Gaussian chisq of a template at the given
-        times.
-
-        Unlike values, the template need not be on the data's frequency
-        grid: it is only used to place the tiles, from its peak frequency
-        and low frequency cutoff.
-
-        Parameters
-        ----------
-        stilde: pycbc.types.FrequencySeries
-            The data, divided by its PSD (overwhitened) unless whitened is
-            False
-        psd: pycbc.types.FrequencySeries
-            The power spectral density of the data
-        template: pycbc.types.FrequencySeries
-            The template, on any frequency grid, with its f_lower and params
-            attributes; params.template_hash selects the tiles to use (see
-            chisq_locations).
-        template_psd: pycbc.types.FrequencySeries
-            The PSD on the template's frequency grid, used to find the
-            template's peak frequency (see peak_frequency).
-        times: numpy.ndarray
-            The times of the triggers, in seconds from the start of stilde
-        whitened: bool, optional
-            Whether stilde is already divided by the PSD. If not, only the
-            frequencies the tiles read are divided by it.
-
-        Returns
-        -------
-        chisq: numpy.ndarray
-            The sine-Gaussian chisq at each time. It is 1 if the template has
-            no tiles, or if a tile would reach within 10% of the Nyquist
-            frequency.
-
-        """
-        chisq = numpy.ones(len(times))
         template_hash = template.params.template_hash
         if template_hash not in self.params:
             return chisq
+
+        if bchisq is not None and self.snr_threshold is not None:
+            # Skip if newsnr too low
+            snr = abs(numpy.array(snrv) * snr_norm)
+            rchisq = numpy.array(bchisq) / numpy.array(bchisq_dof)
+            nsnr = ranking.newsnr(snr, rchisq)
+            above = numpy.flatnonzero(nsnr >= self.snr_threshold)
+            if not len(above):
+                return chisq
+        else:
+            above = range(len(snrv))
+
         tiles = self._cached_tiles(
             stilde,
             psd,
             template_hash,
-            self.peak_frequency(template, template_psd),
+            self.peak_frequency(template, None if template_whitened else psd),
             template.f_lower,
         )
         if tiles is None:
@@ -206,7 +192,11 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         if not whitened:
             band /= psd.numpy()[klo:khi]
         band = FrequencySeries(band, delta_f=stilde.delta_f)
-        for i, time in enumerate(times):
+
+        num_samples = (len(stilde) - 1) * 2
+        dt = 1.0 / (num_samples * stilde.delta_f)
+        for i in above:
+            time = float(template.epoch) + dt * indices[i]
             # Shift the data so the trigger time is at 0. The band starts at
             # frequency klo * delta_f, so the shift of the band's first
             # sample is applied separately
@@ -222,6 +212,20 @@ class SingleDetSGChisq(SingleDetPowerChisq):
                 chisq[i] += abs(gsnr) ** 2.0
             chisq[i] /= 2 * len(tiles)
         return chisq
+
+    def peak_frequency(self, template, psd=None):
+        """
+        Estimate the frequency up to which the template has power, from
+        which the sine-Gaussian tiles are offset.
+
+        The power per frequency is assumed constant over the last two chisq
+        bins, so the estimate is the second-to-last bin edge plus the width
+        of the second-to-last bin. The last bin edge is not used, as it need
+        not be where the waveform ends.
+        """
+        bins = self.cached_chisq_bins(template, psd)
+        fstep = bins[-2] - bins[-3]
+        return float((bins[-2] + fstep) * template.delta_f)
 
     def _cached_tiles(self, stilde, psd, template_hash, fpeak, f_lower):
         """
