@@ -411,6 +411,8 @@ def main():
             channel = opts.channel_name[det]
         if not channel:
             channel = f"{det}:GWOSC-4KHZ_R1_STRAIN"
+        elif not channel.startswith(f"{det}:"):
+            channel = f"{det}:{channel}"
 
         files = []
         if getattr(opts, "frame_files", None) and det in opts.frame_files:
@@ -533,16 +535,8 @@ def main():
                 inj_table["optimal_mf_snr_" + det][idx] = 0.0
                 continue
 
-            # 1. Read detector noise around injection
-            data = frame_readers[det].get_data(ideal_start_time, int(seg_len))
-            if data is None:
-                inj_table["optimal_snr_" + det][idx] = 0.0
-                inj_table["optimal_mf_snr_" + det][idx] = 0.0
-                continue
-
-            start_time = int(data.start_time)
-
-            # 2. Generate template waveform in zero noise (scaled by DYN_RANGE_FAC)
+            # 1. Generate template waveform in zero noise (scaled by DYN_RANGE_FAC)
+            start_time = ideal_start_time
             wave_ts = TimeSeries(
                 zeros(tlen, dtype=float32), delta_t=delta_t, epoch=start_time
             )
@@ -554,7 +548,7 @@ def main():
             )
             wave_fd = make_frequency_series(wave_ts)
 
-            # Deterministic optimal SNR
+            # Deterministic optimal SNR (requires only waveform and PSD)
             sig = sigma(
                 wave_fd,
                 psd=psd,
@@ -562,6 +556,31 @@ def main():
                 high_frequency_cutoff=f_high,
             )
             inj_table["optimal_snr_" + det][idx] = float(sig)
+
+            # 2. Read detector noise around injection for optimal matched filter SNR
+            data = None
+            if det in frame_readers:
+                data = frame_readers[det].get_data(ideal_start_time, int(seg_len))
+
+            if data is None or sig <= 0:
+                inj_table["optimal_mf_snr_" + det][idx] = 0.0
+                continue
+
+            # Ensure template matches data epoch if data slice starts slightly differently
+            if wave_ts.start_time != data.start_time:
+                start_time = int(data.start_time)
+                wave_ts = TimeSeries(
+                    zeros(tlen, dtype=float32), delta_t=delta_t, epoch=start_time
+                )
+                injections.apply(
+                    wave_ts,
+                    det,
+                    distance_scale=1.0 / pycbc.DYN_RANGE_FAC,
+                    simulation_ids=[sim_id],
+                )
+                wave_fd = make_frequency_series(wave_ts)
+            else:
+                start_time = int(data.start_time)
 
             # 3. Add injection to real detector data
             data_with_inj = data + wave_ts

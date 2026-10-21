@@ -123,8 +123,35 @@ for ifo in args.single_detector_triggers:
     insp_data_seglists[ifo].coalesce()
     insp_analysed_seglists[ifo].coalesce()
 
-num_events = int(
-    workflow.cp.get_opt_tags("workflow-minifollowups", "num-events", args.tags or [])
+tags = args.tags or []
+num_events = (
+    int(workflow.cp.get_opt_tags("workflow-minifollowups", "num-events", tags))
+    if workflow.cp.has_option_tags("workflow-minifollowups", "num-events", tags)
+    else 10
+)
+
+# Support continuing until a FAR / IFAR threshold with min/max bounds
+ifar_threshold = None
+if workflow.cp.has_option_tags("workflow-minifollowups", "ifar-threshold", tags):
+    ifar_threshold = float(
+        workflow.cp.get_opt_tags("workflow-minifollowups", "ifar-threshold", tags)
+    )
+elif workflow.cp.has_option_tags("workflow-minifollowups", "far-threshold", tags):
+    far_val = float(
+        workflow.cp.get_opt_tags("workflow-minifollowups", "far-threshold", tags)
+    )
+    if far_val > 0:
+        ifar_threshold = 1.0 / far_val
+
+min_events = (
+    int(workflow.cp.get_opt_tags("workflow-minifollowups", "min-events", tags))
+    if workflow.cp.has_option_tags("workflow-minifollowups", "min-events", tags)
+    else (num_events if ifar_threshold is None else 5)
+)
+max_events = (
+    int(workflow.cp.get_opt_tags("workflow-minifollowups", "max-events", tags))
+    if workflow.cp.has_option_tags("workflow-minifollowups", "max-events", tags)
+    else max(num_events, 50)
 )
 f = HFile(args.statmap_file, "r")
 file_val = args.analysis_category
@@ -142,7 +169,7 @@ if args.sort_variable not in f[file_val]:
 # In case we are doing background minifollowup with repeated events,
 # we must include the ordering / template / trigger / time info for
 # _many_ more events to make sure we get enough
-events_to_read = num_events * 100
+events_to_read = max(num_events, max_events) * 100
 
 # We've asked for more events than there are!
 num_events = min(num_events, len(stat))
@@ -164,6 +191,11 @@ for ifo in ifo_list:
     times[ifo] = f_cat[ifo]["time"][:][event_idx]
     tids[ifo] = f_cat[ifo]["trigger_id"][:][event_idx]
 bank_ids = f_cat["template_id"][:][event_idx]
+ifars = None
+if "ifar_exc" in f_cat:
+    ifars = f_cat["ifar_exc"][:][event_idx]
+elif "ifar" in f_cat:
+    ifars = f_cat["ifar"][:][event_idx]
 f.close()
 
 bank_data = HFile(args.bank_file, "r")
@@ -173,8 +205,17 @@ event_times = {}
 skipped_data = []
 event_count = 0
 curr_idx = -1
-while event_count < num_events and curr_idx < (events_to_read - 1):
+while curr_idx < (events_to_read - 1):
     curr_idx += 1
+    # Check stopping conditions
+    if event_count >= min_events:
+        if ifar_threshold is not None and ifars is not None:
+            if ifars[curr_idx] < ifar_threshold:
+                break
+        elif event_count >= num_events:
+            break
+    if event_count >= max_events:
+        break
     files = wf.FileList([])
     duplicate = False
 

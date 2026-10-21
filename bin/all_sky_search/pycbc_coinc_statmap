@@ -100,6 +100,14 @@ parser.add_argument(
     '(little-dogs-out) background. [default="none"]',
 )
 parser.add_argument(
+    "--hierarchical-removal-threshold-ifar",
+    type=float,
+    default=None,
+    help="IFAR threshold (in years) above which foreground triggers continue "
+    "to be hierarchically removed. Default is background_time (only remove "
+    "triggers louder than the loudest background).",
+)
+parser.add_argument(
     "--additional-event-times",
     type=float,
     nargs="+",
@@ -476,10 +484,15 @@ else:
 # while loop comparison doesnt fail straight away
 ifar_foreground = numpy.append(ifar_foreground, 0)
 
-while numpy.any(ifar_foreground >= background_time):
+if args.hierarchical_removal_threshold_ifar is not None:
+    h_threshold = conv.year_to_sec(args.hierarchical_removal_threshold_ifar)
+else:
+    h_threshold = background_time
+
+while numpy.any(ifar_foreground >= h_threshold):
     # If the user wants to stop doing hierarchical removals after a set
     # number of iterations then break when that happens.
-    if h_iterations == args.max_hierarchical_removal:
+    if args.max_hierarchical_removal >= 0 and h_iterations >= args.max_hierarchical_removal:
         break
 
     # Write foreground trigger info before hierarchical removals for
