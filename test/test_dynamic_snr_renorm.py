@@ -386,6 +386,8 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
             autochi_reverse_template=False,
             autochi_max_valued=False,
             autochi_max_valued_dof=None,
+            sgchisq_snr_threshold=0,
+            sgchisq_locations=None,
             signal_consistency_chain=None,
         )
 
@@ -443,6 +445,57 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
         self.assertEqual(len(pchisq.ref_f_cache), 0)
         self.assertTrue(np.all(np.isfinite(vals["sg_chisq"])))
         self.assertTrue(np.all(vals["sg_chisq"] > 0))
+
+    def test_chain_defaults_and_subthreshold_chisq(self):
+        import types
+
+        from pycbc.events import ranking
+        from pycbc.vetoes.chain import SignalConsistencyChain
+        from pycbc.vetoes.chisq_fir import RatioPowerChisq
+
+        pchisq = RatioPowerChisq(num_bins=64, sample_rate=2048.0)
+        args = types.SimpleNamespace(
+            chisq_bins=64,
+            chisq_snr_threshold=5.25,
+            chisq_window=1.0,
+            chisq_iterations=1,
+            autochi_stride=0,
+            autochi_number_points=0,
+            autochi_onesided=None,
+            autochi_two_phase=False,
+            autochi_reverse_template=False,
+            autochi_max_valued=False,
+            autochi_max_valued_dof=None,
+            sgchisq_snr_threshold=0,
+            sgchisq_locations=None,
+            signal_consistency_chain=None,
+        )
+        bank_stub = types.SimpleNamespace(table={})
+        chain = SignalConsistencyChain.from_cli(
+            args,
+            bank_stub,
+            2048.0,
+            power_chisq=pchisq,
+            defaults={"chisq": 126, "chisq_dof": 126, "sg_chisq": 1.0},
+        )
+        # Sub-threshold trigger (SNR = 4.2 < 5.25) should receive nominal rchisq = 1.0
+        kept, vals = chain.values(
+            np.array([4.2 + 0.0j], dtype=np.complex64),
+            np.array([1024], dtype=np.int64),
+            np.array([0], dtype=np.int32),
+            lambda j: None,
+            lambda j, reach=0: (None, None),
+        )
+        self.assertTrue(np.all(kept))
+        self.assertEqual(vals["chisq"][0], 126.0)
+        self.assertEqual(vals["chisq_dof"][0], 126)
+        # Verify EventManager conversion (dof / 2 + 1) -> get_newsnr yields rchisq = 1.0
+        em_trigs = {
+            "snr": np.array([4.2], dtype=np.float32),
+            "chisq": vals["chisq"].astype(np.float32),
+            "chisq_dof": (vals["chisq_dof"] / 2 + 1).astype(np.int32),
+        }
+        np.testing.assert_allclose(ranking.get_newsnr(em_trigs), [4.2], rtol=1e-6)
 
     def test_ratio_filter_bank_handle_and_group_count(self):
         import os

@@ -805,7 +805,6 @@ def get_args():
 
     # Signal Consistency (Power, Auto, SG Chisq & Chain) Options
     SignalConsistencyChain.insert_option_group(parser)
-    parser.set_defaults(chisq_iterations=100)
     parser.add_argument(
         "--chisq-threshold",
         type=float,

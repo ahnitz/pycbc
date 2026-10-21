@@ -534,7 +534,13 @@ class SignalConsistencyChain:
 
     @classmethod
     def from_cli(
-        cls, args, bank, sample_rate, power_chisq=None, sg_chisq=None
+        cls,
+        args,
+        bank,
+        sample_rate,
+        power_chisq=None,
+        sg_chisq=None,
+        defaults=None,
     ):
         """
         Create the chain from the options added by insert_option_group.
@@ -553,6 +559,8 @@ class SignalConsistencyChain:
             Custom power-chisq estimator (defaults to SingleDetPowerChisq).
         sg_chisq : SingleDetSGChisq, optional
             Pre-built sine-Gaussian chisq estimator.
+        defaults : dict, optional
+            Default values for columns of uncomputed triggers.
 
         """
         if args.autochi_reverse_template:
@@ -590,4 +598,5 @@ class SignalConsistencyChain:
             window=int(args.chisq_window * sample_rate),
             max_iterations=args.chisq_iterations,
             input_columns=extra,
+            defaults=defaults,
         )

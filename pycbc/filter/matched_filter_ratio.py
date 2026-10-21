@@ -557,12 +557,23 @@ class TopTemplateSearch:
             top_template=top_template,
             upper_f_by_coarse=upper_f_by_coarse,
         )
+        num_b = (
+            int(self.power_chisq.num_bins)
+            if self.power_chisq.num_bins is not None
+            else 64
+        )
+        chain_defaults = {
+            "chisq": 2 * num_b - 2,
+            "chisq_dof": 2 * num_b - 2,
+            "sg_chisq": 1.0,
+        }
         self.chain = SignalConsistencyChain.from_cli(
             args,
             bank,
             sample_rate,
             power_chisq=self.power_chisq,
             sg_chisq=self.sg_chisq,
+            defaults=chain_defaults,
         )
 
         self.group_tau = {}
@@ -705,6 +716,30 @@ class TopTemplateSearch:
                 t_idxs = t_idxs[keep]
                 snrs_eval = snrs_eval[keep]
 
+        cap = self.args.asym_max_primary_per_group_sec
+        if (
+            len(ids_local) > 0
+            and not is_asym
+            and cap is not None
+            and cap > 0
+            and len(ids_local) > cap
+        ):
+            t0_seg = float(stilde.start_time)
+            dt_seg = float(stilde.delta_t)
+            sec_bins = np.floor(t0_seg + t_idxs * dt_seg).astype(np.int64)
+            throttled = []
+            for s in np.unique(sec_bins):
+                s_cands = np.flatnonzero(sec_bins == s)
+                if len(s_cands) <= cap:
+                    throttled.extend(s_cands)
+                else:
+                    order = np.argsort(-np.abs(snrs_eval[s_cands]), kind="stable")
+                    throttled.extend(s_cands[order[:cap]])
+            keep_cap = np.array(sorted(throttled), dtype=np.int64)
+            ids_local = ids_local[keep_cap]
+            t_idxs = t_idxs[keep_cap]
+            snrs_eval = snrs_eval[keep_cap]
+
         n_trig = len(ids_local)
         if n_trig == 0:
             return (
@@ -778,12 +813,12 @@ class TopTemplateSearch:
         chi = (
             vals["chisq"].astype(float32, copy=False)
             if "chisq" in vals
-            else np.zeros(n_trig, dtype=float32)
+            else np.full(n_trig, self.chain.defaults["chisq"], dtype=float32)
         )
         chi_dof = (
             vals["chisq_dof"].astype(np.int32, copy=False)
             if "chisq_dof" in vals
-            else np.full(n_trig, -100, dtype=np.int32)
+            else np.full(n_trig, self.chain.defaults["chisq_dof"], dtype=np.int32)
         )
         sg_vals = (
             vals["sg_chisq"].astype(float32, copy=False)
