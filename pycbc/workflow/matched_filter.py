@@ -413,6 +413,10 @@ def setup_matchedfltr_dax_generated_multi(
         if cp.has_option("inspiral", "segment-end-pad"):
             end_pad = int(cp.get("inspiral", "segment-end-pad"))
 
+        allow_zero_padding = cp.has_option("inspiral", "allow-zero-padding")
+        bound_start_pad = 0 if allow_zero_padding else start_pad
+        bound_end_pad = 0 if allow_zero_padding else end_pad
+
         job_instances = {}
 
         def get_job_instance(active_ifos):
@@ -430,14 +434,14 @@ def setup_matchedfltr_dax_generated_multi(
 
         for curr_seg, active_ifos in seg_active_map:
             seg_len = abs(curr_seg)
-            throwaway = start_pad + end_pad + 2 * pad_data
+            throwaway = bound_start_pad + bound_end_pad + 2 * pad_data
             if min_analysis_length and seg_len < min_analysis_length:
                 continue
             if seg_len <= throwaway:
                 continue
 
-            ana_start = curr_seg[0] + start_pad + pad_data
-            ana_end = curr_seg[1] - end_pad - pad_data
+            ana_start = curr_seg[0] + bound_start_pad + pad_data
+            ana_end = curr_seg[1] - bound_end_pad - pad_data
             ana_len = ana_end - ana_start
 
             num_jobs = max(1, int(round(ana_len / float(target_duration))))
