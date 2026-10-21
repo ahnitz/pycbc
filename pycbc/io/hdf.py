@@ -1056,6 +1056,22 @@ class SingleDetTriggers:
         return self.get_column("chisq") / (self.get_column("chisq_dof") * 2 - 2)
 
     @property
+    def auto_rchisq(self):
+        if "cont_chisq" in self.trigs and "cont_chisq_dof" in self.trigs:
+            return self.get_column("cont_chisq") / np.maximum(
+                1.0, self.get_column("cont_chisq_dof")
+            )
+        elif "auto_chisq" in self.trigs and "auto_chisq_dof" in self.trigs:
+            return self.get_column("auto_chisq") / np.maximum(
+                1.0, self.get_column("auto_chisq_dof")
+            )
+        elif "cont_chisq" in self.trigs:
+            return self.get_column("cont_chisq")
+        elif "auto_chisq" in self.trigs:
+            return self.get_column("auto_chisq")
+        return None
+
+    @property
     def psd_var_val(self):
         return self.get_column("psd_var_val")
 
@@ -1074,6 +1090,12 @@ class SingleDetTriggers:
     @property
     def newsnr_sgveto_offset125(self):
         return ranking.newsnr_sgveto_offset125(self.snr, self.rchisq, self.sgchisq)
+
+    @property
+    def newsnr_sgveto_autochisq(self):
+        return ranking.newsnr_sgveto_autochisq(
+            self.snr, self.rchisq, self.sgchisq, self.auto_rchisq
+        )
 
     @property
     def newsnr_sgveto_psdvar(self):

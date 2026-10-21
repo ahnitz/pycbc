@@ -64,7 +64,7 @@ class ProfileShortcuts:
         self.add_profile("condor", "request_cpus", number)
 
     def set_universe(self, universe):
-        if universe == "standard":
+        if universe in ["standard", "local"]:
             self.add_profile("pegasus", "gridstart", "none")
 
         self.add_profile("condor", "universe", universe)
@@ -122,6 +122,8 @@ class Executable(ProfileShortcuts):
             err_msg = "Need code changes to be able to add profiles "
             err_msg += "after transformations are created."
             raise ValueError(err_msg)
+        if namespace == "condor" and key == "universe" and value in ["standard", "local"]:
+            self.profiles.setdefault(("pegasus", "gridstart"), "none")
         self.profiles[(namespace, key)] = value
 
 
@@ -313,6 +315,10 @@ class Node(ProfileShortcuts):
     # functions to describe properties of this node
     def add_profile(self, namespace, key, value):
         """Add profile information to this node at the DAX level"""
+        if namespace == "condor" and key == "universe" and value in ["standard", "local"]:
+            self._dax_node.add_profiles(
+                dax.Namespace("pegasus"), key="gridstart", value="none"
+            )
         self._dax_node.add_profiles(dax.Namespace(namespace), key=key, value=value)
 
     def _finalize(self):

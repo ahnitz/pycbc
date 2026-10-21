@@ -77,6 +77,14 @@ def _dataset(h5file, channel):
         return h5file[_DATASETS[name]]
     if f"strain/{name}" in h5file:
         return h5file[f"strain/{name}"]
+    if "meta/StrainChannel" in h5file:
+        sc = h5file["meta/StrainChannel"][()]
+        sc_str = sc.decode("utf-8") if isinstance(sc, bytes) else str(sc)
+        if channel == sc_str or name == sc_str or channel.split(":")[-1] == sc_str.split(":")[-1]:
+            if "strain/Strain" in h5file:
+                return h5file["strain/Strain"]
+    if "strain/Strain" in h5file and (name.upper() in ("STRAIN", "GDS-CALIB_STRAIN_CLEAN_AR") or "STRAIN" in name.upper()):
+        return h5file["strain/Strain"]
     known = ", ".join(f"{ifo}:{n}" for n in _DATASETS)
     raise ValueError(  # noqa: TRY003
         f"Channel {channel} is not in {h5file.filename}; "
