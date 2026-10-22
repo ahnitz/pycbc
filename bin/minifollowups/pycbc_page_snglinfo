@@ -18,6 +18,7 @@
 """Make tables describing a sngl event"""
 
 import argparse
+import logging
 import sys
 
 import matplotlib
@@ -125,7 +126,21 @@ sngl_file = hdf.SingleDetTriggers(
     premask=mask,
 )
 
-rank_method = pystat.get_statistic_from_opts(args, [args.instrument])
+try:
+    rank_method = pystat.get_statistic_from_opts(args, [args.instrument])
+except RuntimeError as exc:
+    if "fit_coeffs" in str(exc):
+        logging.warning(
+            "Fit coeffs not found in stat files (%s), falling back to single_ranking_only",
+            exc,
+        )
+        args.ranking_statistic = "single_ranking_only"
+        args.statistic_files = None
+        args.statistic_features = []
+        args.statistic_keywords = []
+        rank_method = pystat.get_statistic_from_opts(args, [args.instrument])
+    else:
+        raise
 
 if args.trigger_id is not None:
     # Mask already applied
