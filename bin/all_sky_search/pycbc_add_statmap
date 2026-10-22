@@ -99,8 +99,8 @@ parser.add_argument(
     "hierarchical removal. [default=1s]",
 )
 parser.add_argument(
-    "--hierarchical-removal-threshold-ifar",
     "--hierarchical-removal-ifar-thresh",
+    "--hierarchical-removal-threshold-ifar",
     "--hierarchical-removal-ifar-threshold",
     dest="hierarchical_removal_ifar_thresh",
     type=float,

@@ -69,9 +69,9 @@ parser.add_argument(
 )
 significance.insert_significance_option_group(parser)
 parser.add_argument(
+    "--hierarchical-removal-ifar-thresh",
     "--hierarchical-removal-ifar-threshold",
     "--hierarchical-removal-threshold-ifar",
-    "--hierarchical-removal-ifar-thresh",
     dest="hierarchical_removal_ifar_threshold",
     type=float,
     default=0.5,

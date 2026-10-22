@@ -103,10 +103,10 @@ parser.add_argument(
     '(little-dogs-out) background. [default="none"]',
 )
 parser.add_argument(
-    "--hierarchical-removal-threshold-ifar",
     "--hierarchical-removal-ifar-thresh",
+    "--hierarchical-removal-threshold-ifar",
     "--hierarchical-removal-ifar-threshold",
-    dest="hierarchical_removal_threshold_ifar",
+    dest="hierarchical_removal_ifar_thresh",
     type=float,
     default=None,
     help="IFAR threshold (in years) above which foreground triggers continue "
@@ -490,11 +490,11 @@ else:
 # while loop comparison doesnt fail straight away
 ifar_foreground = numpy.append(ifar_foreground, 0)
 
-if args.hierarchical_removal_threshold_ifar is not None:
-    thresh_yr = args.hierarchical_removal_threshold_ifar
+if args.hierarchical_removal_ifar_thresh is not None:
+    thresh_yr = args.hierarchical_removal_ifar_thresh
 else:
     thresh_yr = conv.sec_to_year(coinc_time)
-h_threshold = conv.year_to_sec(thresh_yr)
+h_threshold = thresh_yr / conv.sec_to_year(1.0)
 
 # Write foreground & background trigger info before hierarchical removals (level h0)
 for k in all_trigs.data:
@@ -525,7 +525,7 @@ while True:
     obs_count = numpy.sum(ifar_foreground >= h_threshold)
     excess_sigma = (obs_count - expected_count) / numpy.sqrt(max(expected_count, 1e-6))
     loudest_ifar = ifar_foreground.max() if len(ifar_foreground) else 0.0
-    stop_thresh_sec = conv.year_to_sec(max(thresh_yr, t_fg_yr))
+    stop_thresh_sec = max(thresh_yr, t_fg_yr) / conv.sec_to_year(1.0)
 
     if not (loudest_ifar > stop_thresh_sec or (excess_sigma > 2.0 and obs_count > 0)):
         logging.info(
