@@ -40,6 +40,9 @@ class fw:
     def __getitem__(self, *args):
         return self.f.__getitem__(*args)
 
+    def __contains__(self, name):
+        return name in self.f
+
 
 parser = argparse.ArgumentParser()
 # General required options
@@ -68,6 +71,7 @@ significance.insert_significance_option_group(parser)
 parser.add_argument(
     "--hierarchical-removal-ifar-threshold",
     "--hierarchical-removal-threshold-ifar",
+    "--hierarchical-removal-ifar-thresh",
     dest="hierarchical_removal_ifar_threshold",
     type=float,
     default=0.5,

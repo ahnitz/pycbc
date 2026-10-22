@@ -2306,6 +2306,7 @@ __all__ = [
     "secondary_mass",
     "secondary_spin",
     "secondary_xi",
+    "sec_to_year",
     "snr_from_loglr",
     "spin1x_from_xi1_phi_a_phi_s",
     "spin1y_from_xi1_phi_a_phi_s",
@@ -2323,4 +2324,5 @@ __all__ = [
     "taulmn_from_other_lmn",
     "xi1_from_spin1x_spin1y",
     "xi2_from_mass1_mass2_spin2x_spin2y",
+    "year_to_sec",
 ]

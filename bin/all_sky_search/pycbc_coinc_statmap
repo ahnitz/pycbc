@@ -43,6 +43,9 @@ class fw:
     def __getitem__(self, *args):
         return self.f.__getitem__(*args)
 
+    def __contains__(self, name):
+        return name in self.f
+
 
 parser = argparse.ArgumentParser()
 # General required options
@@ -101,6 +104,9 @@ parser.add_argument(
 )
 parser.add_argument(
     "--hierarchical-removal-threshold-ifar",
+    "--hierarchical-removal-ifar-thresh",
+    "--hierarchical-removal-ifar-threshold",
+    dest="hierarchical_removal_threshold_ifar",
     type=float,
     default=None,
     help="IFAR threshold (in years) above which foreground triggers continue "
