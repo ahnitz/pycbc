@@ -972,7 +972,7 @@ while True:
                     significance_dict,
                     combo=key,
                 )
-                sep_fg_data[key].data["ifar_exc"] = conv.sec_to_year(1.0 / fg_far_exc)
+                sep_fg_data[key].data["ifar_exc"] = 1.0 / fg_far_exc
                 sep_fg_data[key].data["fap_exc"] = 1 - np.exp(-fg_t_y * fg_far_exc)
 
         far_exc = {}
