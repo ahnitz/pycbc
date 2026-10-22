@@ -112,6 +112,11 @@ def sec_to_year(sec):
     return sec / YRJUL_SI
 
 
+def year_to_sec(yr):
+    """Converts number of years to number of seconds"""
+    return yr * YRJUL_SI
+
+
 def hypertriangle(*params, bounds=(0, 1)):
     """
     Apply a hypertriangle map to a series of input parameter values.

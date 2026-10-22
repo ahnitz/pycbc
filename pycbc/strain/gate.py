@@ -183,7 +183,7 @@ def gate_and_paint(
     invpsd,
     copy=True,
     method="toeplitz",
-    ridge=1e-10,
+    ridge=1e-8,
     pad_duration=16.0,
 ):
     """Gates and in-paints data using a hole-filling solver.
@@ -207,7 +207,7 @@ def gate_and_paint(
         'cholesky' uses a regularized Cholesky factorization (O(K^3)).
     ridge : float, optional
         Diagonal Tikhonov regularization parameter relative to the diagonal
-        element of the inverse covariance operator. Default is 1e-3.
+        element of the inverse covariance operator. Default is 1e-8.
     pad_duration : float, optional
         Padding duration in seconds on each side of the gate for local
         convolution inpainting. Default is 16.0 seconds. If None or if data
@@ -261,10 +261,14 @@ def gate_and_paint(
         filt_neg = tdfilter[-M:]  # lags -M to -1
         filt_pos = tdfilter[: M + 1]  # lags 0 to M
         kernel = np.concatenate([filt_neg, filt_pos])
-        rhs = signal.fftconvolve(data_chunk, kernel[::-1], mode="valid")
+        rhs = signal.fftconvolve(
+            data_chunk.astype(np.float64),
+            kernel[::-1].astype(np.float64),
+            mode="valid",
+        )
     else:
         owhgated_data = (data.to_frequencyseries() * invpsd).to_timeseries()
-        rhs = owhgated_data[lindex:rindex].numpy()
+        rhs = owhgated_data[lindex:rindex].numpy().astype(np.float64)
 
     raw_col = tdfilter[:K].numpy() if hasattr(tdfilter[:K], "numpy") else tdfilter[:K]
     if method == "cholesky":
@@ -287,7 +291,7 @@ def gate_and_paint(
     return data
 
 
-def invert_covariance(invpsd, lindex, rindex, ridge=1e-10):
+def invert_covariance(invpsd, lindex, rindex, ridge=1e-8):
     """Calculate the uninverted covariance matrix with optional regularization.
 
     Parameters
@@ -299,7 +303,7 @@ def invert_covariance(invpsd, lindex, rindex, ridge=1e-10):
     rindex : int
         The end index of the gate.
     ridge : float, optional
-        Regularization ridge parameter. Default is 1e-10.
+        Regularization ridge parameter. Default is 1e-8.
 
     Returns
     -------
@@ -309,17 +313,17 @@ def invert_covariance(invpsd, lindex, rindex, ridge=1e-10):
     """
     K = rindex - lindex
     tdfilter = _get_tdfilter(invpsd)
-    diag = tdfilter[0]
+    diag = float(tdfilter[0])
     col = tdfilter[:K].numpy() if hasattr(tdfilter[:K], "numpy") else tdfilter[:K]
-    mat = linalg.toeplitz(col / diag)
+    mat = linalg.toeplitz((col / diag).astype(np.float64))
     if ridge > 0:
-        mat += ridge * np.eye(K)
+        mat += ridge * np.eye(K, dtype=np.float64)
     invmat = linalg.inv(mat) / diag
     return invmat
 
 
 def gate_and_paint_matmul(
-    data, lindex, rindex, invpsd, invmat=None, ridge=1e-10, copy=True, pad_duration=16.0
+    data, lindex, rindex, invpsd, invmat=None, ridge=1e-8, copy=True, pad_duration=16.0
 ):
     """Gates and in-paints data using explicit matrix multiplication.
 
@@ -336,7 +340,7 @@ def gate_and_paint_matmul(
     invmat : array, optional
         The uninverted covariance matrix. If None, calculate on function call.
     ridge : float, optional
-        Regularization ridge parameter if invmat is calculated. Default is 1e-10.
+        Regularization ridge parameter if invmat is calculated. Default is 1e-8.
     copy : bool, optional
         Copy the data before applying the gate. Otherwise, the gate will
         be applied in-place. Default is True.
@@ -390,16 +394,20 @@ def gate_and_paint_matmul(
         filt_neg = tdfilter[-M:]
         filt_pos = tdfilter[: M + 1]
         kernel = np.concatenate([filt_neg, filt_pos])
-        rhs = signal.fftconvolve(data_chunk, kernel[::-1], mode="valid")
+        rhs = signal.fftconvolve(
+            data_chunk.astype(np.float64),
+            kernel[::-1].astype(np.float64),
+            mode="valid",
+        )
     else:
         owhgated_data = (data.to_frequencyseries() * invpsd).to_timeseries()
-        rhs = owhgated_data[lindex:rindex].numpy()
+        rhs = owhgated_data[lindex:rindex].numpy().astype(np.float64)
 
     # invert the matrix if not provided
     if invmat is None:
         invmat = invert_covariance(invpsd, lindex, rindex, ridge=ridge)
 
     # remove the projection into the null space
-    proj = invmat @ rhs
-    data[lindex:rindex] -= proj
+    proj = invmat.astype(np.float64) @ rhs
+    data[lindex:rindex] -= proj.astype(data.dtype)
     return data
