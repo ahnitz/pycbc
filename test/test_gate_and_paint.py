@@ -173,6 +173,59 @@ class TestGateAndPaint(unittest.TestCase):
         )
         self.assertTrue(np.all(np.isfinite(cleaned.numpy())))
 
+    def test_auto_switch_toeplitz_wide_gate(self):
+        """Test that wide gates with K > 2048 samples automatically switch
+        from cholesky to toeplitz solver.
+        """
+        # 1.5 seconds at 2048 Hz is K = 3072 > 2048
+        lindex = int(3.25 * self.sample_rate)
+        rindex = int(4.75 * self.sample_rate)
+        self.assertGreater(rindex - lindex, 2048)
+
+        cleaned_cho = gate_and_paint(
+            self.ts_glitch,
+            lindex,
+            rindex,
+            self.invpsd,
+            copy=True,
+            method="cholesky",
+            ridge=1e-10,
+        )
+        cleaned_toep = gate_and_paint(
+            self.ts_glitch,
+            lindex,
+            rindex,
+            self.invpsd,
+            copy=True,
+            method="toeplitz",
+            ridge=1e-10,
+        )
+
+        self.assertTrue(np.all(np.isfinite(cleaned_cho.numpy())))
+        diff = np.max(np.abs(cleaned_cho.numpy() - cleaned_toep.numpy()))
+        self.assertLess(diff, 1e-6)
+
+        # Check overwhitened data inside the wide gate
+        owh_clean = (cleaned_cho.to_frequencyseries() * self.invpsd).to_timeseries()
+        owh_inside = owh_clean[lindex:rindex].numpy()
+        diag = (self.invpsd.astype("complex").to_timeseries() * self.invpsd.delta_t)[0]
+        self.assertLess(np.max(np.abs(owh_inside)) / diag, 1e-3)
+
+    def test_default_method_is_toeplitz(self):
+        """Test that calling gate_and_paint without method defaults to toeplitz."""
+        lindex = int(3.95 * self.sample_rate)
+        rindex = int(4.05 * self.sample_rate)
+
+        cleaned_default = gate_and_paint(
+            self.ts_glitch, lindex, rindex, self.invpsd, copy=True
+        )
+        cleaned_toep = gate_and_paint(
+            self.ts_glitch, lindex, rindex, self.invpsd, copy=True, method="toeplitz"
+        )
+        diff = np.max(np.abs(cleaned_default.numpy() - cleaned_toep.numpy()))
+        self.assertEqual(diff, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

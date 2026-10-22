@@ -15,10 +15,13 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 """Functions for applying gates to data."""
 
+import logging
 import numpy as np
 from scipy import linalg
 
 from . import strain
+
+logger = logging.getLogger("pycbc.strain.gate")
 
 
 def _gates_from_cli(opts, gate_opt):
@@ -204,7 +207,7 @@ def gate_and_paint(
     method : {'toeplitz', 'cholesky'}, optional
         Algorithm used to solve the linear system for the inpainting projection.
         'toeplitz' (default) uses regularized scipy.linalg.solve_toeplitz (Levinson recursion, O(K^2)).
-        'cholesky' uses a regularized Cholesky factorization (O(K^3)).
+        'cholesky' uses a regularized Cholesky factorization (O(K^3); automatically switches to 'toeplitz' when gate length K > 2048).
     ridge : float, optional
         Diagonal Tikhonov regularization parameter relative to the diagonal
         element of the inverse covariance operator. Default is 1e-8.
@@ -270,7 +273,18 @@ def gate_and_paint(
         owhgated_data = (data.to_frequencyseries() * invpsd).to_timeseries()
         rhs = owhgated_data[lindex:rindex].numpy().astype(np.float64)
 
+    if method is None:
+        method = "toeplitz"
+
     raw_col = tdfilter[:K].numpy() if hasattr(tdfilter[:K], "numpy") else tdfilter[:K]
+    if method == "cholesky" and K > 2048:
+        logger.info(
+            "Gate length K=%d > 2048 samples; automatically switching to toeplitz solver "
+            "(Levinson-Durbin O(K^2)) instead of dense Cholesky O(K^3).",
+            K,
+        )
+        method = "toeplitz"
+
     if method == "cholesky":
         col = raw_col.astype(np.float64) / diag
         T = linalg.toeplitz(col)
