@@ -82,28 +82,29 @@ def newsnr_sgveto_autochisq(
     triggers outside the envelope are smoothly downweighted by their combined
     normalized distance D = sqrt(z_pow^2 + z_auto^2 + z_sg^2)."""
     nsnr = numpy.array(snr, ndmin=1, dtype=numpy.float64)
-    s2 = numpy.minimum(nsnr**2, 5000.0)
+    s2_pa = numpy.minimum(nsnr**2, 300.0)
+    s2_sg = numpy.minimum(nsnr**2, 5000.0)
 
     d2 = numpy.zeros_like(nsnr)
 
     if brchisq is not None:
         rpow = numpy.abs(numpy.array(brchisq, ndmin=1, dtype=numpy.float64))
-        tau_p = 1.50 + 0.0018 * s2
-        sig_p = 0.45 + 0.0008 * s2
+        tau_p = 1.50 + 0.0018 * s2_pa
+        sig_p = 0.45 + 0.0008 * s2_pa
         zp = numpy.maximum(0.0, (rpow - tau_p) / sig_p)
         d2 += zp**2
 
     if autochisq is not None:
         rauto = numpy.abs(numpy.array(autochisq, ndmin=1, dtype=numpy.float64))
-        tau_a = 1.85 + 0.0028 * s2
-        sig_a = 0.65 + 0.0012 * s2
+        tau_a = 1.85 + 0.0028 * s2_pa
+        sig_a = 0.65 + 0.0012 * s2_pa
         za = numpy.maximum(0.0, (rauto - tau_a) / sig_a)
         d2 += za**2
 
     if sgchisq is not None:
         rsg = numpy.abs(numpy.array(sgchisq, ndmin=1, dtype=numpy.float64))
-        tau_s = 3.20 + c_sg * s2
-        sig_s = 1.20 + 0.0035 * s2
+        tau_s = 3.20 + c_sg * s2_sg
+        sig_s = 1.20 + 0.0035 * s2_sg
         zs = numpy.maximum(0.0, (rsg - tau_s) / sig_s)
         d2 += zs**2
 
