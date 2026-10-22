@@ -75,6 +75,36 @@ parser.add_argument(
     choices=["ascending", "descending"],
     help="Which direction to use when sorting on --sort-variable. Default=descending",
 )
+parser.add_argument(
+    "--num-events",
+    type=int,
+    default=None,
+    help="Number of events to follow up (overrides [workflow-minifollowups] num-events)",
+)
+parser.add_argument(
+    "--ifar-threshold",
+    type=float,
+    default=None,
+    help="IFAR threshold (years) to continue following up events down to",
+)
+parser.add_argument(
+    "--far-threshold",
+    type=float,
+    default=None,
+    help="FAR threshold (yr^-1) to continue following up events down to",
+)
+parser.add_argument(
+    "--min-events",
+    type=int,
+    default=None,
+    help="Minimum number of events to follow up when using --ifar-threshold",
+)
+parser.add_argument(
+    "--max-events",
+    type=int,
+    default=None,
+    help="Maximum number of events to follow up when using --ifar-threshold",
+)
 
 wf.add_workflow_command_line_group(parser)
 wf.add_workflow_settings_cli(parser, include_subdax_opts=True)
@@ -124,35 +154,51 @@ for ifo in args.single_detector_triggers:
     insp_analysed_seglists[ifo].coalesce()
 
 tags = args.tags or []
-num_events = (
-    int(workflow.cp.get_opt_tags("workflow-minifollowups", "num-events", tags))
-    if workflow.cp.has_option_tags("workflow-minifollowups", "num-events", tags)
-    else 10
-)
+if args.num_events is not None:
+    num_events = args.num_events
+elif workflow.cp.has_option_tags("workflow-minifollowups", "num-events", tags):
+    num_events = int(
+        workflow.cp.get_opt_tags("workflow-minifollowups", "num-events", tags)
+    )
+else:
+    num_events = 10
 
 # Support continuing until a FAR / IFAR threshold with min/max bounds
-ifar_threshold = None
-if workflow.cp.has_option_tags("workflow-minifollowups", "ifar-threshold", tags):
+ifar_threshold = args.ifar_threshold
+if ifar_threshold is None and args.far_threshold is not None and args.far_threshold > 0:
+    ifar_threshold = 1.0 / args.far_threshold
+if ifar_threshold is None and workflow.cp.has_option_tags(
+    "workflow-minifollowups", "ifar-threshold", tags
+):
     ifar_threshold = float(
         workflow.cp.get_opt_tags("workflow-minifollowups", "ifar-threshold", tags)
     )
-elif workflow.cp.has_option_tags("workflow-minifollowups", "far-threshold", tags):
+elif ifar_threshold is None and workflow.cp.has_option_tags(
+    "workflow-minifollowups", "far-threshold", tags
+):
     far_val = float(
         workflow.cp.get_opt_tags("workflow-minifollowups", "far-threshold", tags)
     )
     if far_val > 0:
         ifar_threshold = 1.0 / far_val
 
-min_events = (
-    int(workflow.cp.get_opt_tags("workflow-minifollowups", "min-events", tags))
-    if workflow.cp.has_option_tags("workflow-minifollowups", "min-events", tags)
-    else (num_events if ifar_threshold is None else 5)
-)
-max_events = (
-    int(workflow.cp.get_opt_tags("workflow-minifollowups", "max-events", tags))
-    if workflow.cp.has_option_tags("workflow-minifollowups", "max-events", tags)
-    else max(num_events, 50)
-)
+if args.min_events is not None:
+    min_events = args.min_events
+elif workflow.cp.has_option_tags("workflow-minifollowups", "min-events", tags):
+    min_events = int(
+        workflow.cp.get_opt_tags("workflow-minifollowups", "min-events", tags)
+    )
+else:
+    min_events = num_events if ifar_threshold is None else 5
+
+if args.max_events is not None:
+    max_events = args.max_events
+elif workflow.cp.has_option_tags("workflow-minifollowups", "max-events", tags):
+    max_events = int(
+        workflow.cp.get_opt_tags("workflow-minifollowups", "max-events", tags)
+    )
+else:
+    max_events = max(num_events, 50)
 f = HFile(args.statmap_file, "r")
 file_val = args.analysis_category
 stat = f[f"{file_val}/stat"][:]
@@ -268,18 +314,16 @@ while curr_idx < (events_to_read - 1):
 
     bank_id = int(bank_ids[curr_idx])
 
-    layouts += (
-        mini.make_coinc_info(
-            workflow,
-            single_triggers,
-            tmpltbank_file,
-            coinc_file,
-            args.output_dir,
-            n_loudest=curr_idx,
-            sort_order=args.sort_order,
-            sort_var=args.sort_variable,
-            tags=args.tags + [str(event_count)],
-        ),
+    cinfo = mini.make_coinc_info(
+        workflow,
+        single_triggers,
+        tmpltbank_file,
+        coinc_file,
+        args.output_dir,
+        n_loudest=curr_idx,
+        sort_order=args.sort_order,
+        sort_var=args.sort_variable,
+        tags=args.tags + [str(event_count)],
     )
     files += mini.make_trigger_timeseries(
         workflow,
@@ -341,7 +385,18 @@ while curr_idx < (events_to_read - 1):
                 f"Trigger time {time} is not valid in {ifo}, skipping singles plots"
             )
 
-    layouts += list(layout.grouper(files, 2))
+    event_layouts = [tuple(cinfo)] + list(layout.grouper(files, 2))
+    layouts += event_layouts
+    ifar_val = ifars[curr_idx] if (ifars is not None and curr_idx < len(ifars)) else 0.0
+    stat_val = stat[curr_idx]
+    layout.two_column_layout(
+        args.output_dir,
+        event_layouts,
+        unique=f"_{event_count:03d}",
+        collapse="true",
+        title=f"Event #{event_count} | IFAR_exc={ifar_val:.3g} yr | Stat={stat_val:.2f} | GPS={mtime:.2f}",
+    )
 
 workflow.save()
-layout.two_column_layout(args.output_dir, layouts)
+if event_count == 0:
+    layout.two_column_layout(args.output_dir, layouts)

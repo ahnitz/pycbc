@@ -62,6 +62,70 @@
                 if (active) $('#accordion .in').collapse('hide');
             });
 
+            // Keyboard (ArrowDown/j, ArrowUp/k) and wheel event flipper navigation for well accordions
+            var lastWheelFlip = 0;
+            $(document).on('keydown', function (e) {
+                if ($('.fancybox-opened').length || $('input, textarea, select').is(':focus')) return;
+                if (e.ctrlKey || e.altKey || e.metaKey) return;
+
+                var wellCollapses = $('.panel-collapse[id$="well"]');
+                if (wellCollapses.length <= 1) return;
+
+                var openWell = wellCollapses.filter('.in');
+                var currIndex = openWell.length ? wellCollapses.index(openWell) : -1;
+
+                if (e.key === 'ArrowDown' || e.key === 'ArrowRight' || e.key === 'j' || e.key === 'J') {
+                    var nextIndex = currIndex + 1;
+                    if (nextIndex < wellCollapses.length) {
+                        e.preventDefault();
+                        if (currIndex >= 0) wellCollapses.eq(currIndex).collapse('hide');
+                        wellCollapses.eq(nextIndex).collapse('show');
+                        wellCollapses.eq(nextIndex).closest('.panel')[0].scrollIntoView({behavior: 'smooth', block: 'nearest'});
+                    }
+                } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft' || e.key === 'k' || e.key === 'K') {
+                    if (currIndex > 0) {
+                        e.preventDefault();
+                        wellCollapses.eq(currIndex).collapse('hide');
+                        wellCollapses.eq(currIndex - 1).collapse('show');
+                        wellCollapses.eq(currIndex - 1).closest('.panel')[0].scrollIntoView({behavior: 'smooth', block: 'nearest'});
+                    }
+                }
+            });
+
+            $(document).on('mousewheel DOMMouseScroll', function (e) {
+                if ($('.fancybox-opened').length || $('input, textarea, select').is(':focus')) return;
+                if (!$(e.target).closest('#accordion1').length) return;
+
+                var now = new Date().getTime();
+                if (now - lastWheelFlip < 300) return;
+
+                var wellCollapses = $('.panel-collapse[id$="well"]');
+                if (wellCollapses.length <= 1) return;
+
+                var openWell = wellCollapses.filter('.in');
+                var currIndex = openWell.length ? wellCollapses.index(openWell) : -1;
+                var delta = e.originalEvent.wheelDelta || -e.originalEvent.detail;
+
+                if (delta < 0) {
+                    var nextIndex = currIndex + 1;
+                    if (nextIndex < wellCollapses.length) {
+                        e.preventDefault();
+                        lastWheelFlip = now;
+                        if (currIndex >= 0) wellCollapses.eq(currIndex).collapse('hide');
+                        wellCollapses.eq(nextIndex).collapse('show');
+                        wellCollapses.eq(nextIndex).closest('.panel')[0].scrollIntoView({behavior: 'smooth', block: 'nearest'});
+                    }
+                } else if (delta > 0) {
+                    if (currIndex > 0) {
+                        e.preventDefault();
+                        lastWheelFlip = now;
+                        wellCollapses.eq(currIndex).collapse('hide');
+                        wellCollapses.eq(currIndex - 1).collapse('show');
+                        wellCollapses.eq(currIndex - 1).closest('.panel')[0].scrollIntoView({behavior: 'smooth', block: 'nearest'});
+                    }
+                }
+            });
+
         });
     </script>
 
@@ -172,6 +236,7 @@
                 {% endfor %}
                 
                 <!-- include well if it exists and check meta-data if well renders any files inside it -->
+                <div class="panel-group" id="accordion1">
                 {% for wellname in wellnames %}
                     {% set well_path = plots_dir + dir.path + '/' + wellname.filename() %}
                     {% set _ = well_filenames.append(wellname.filename()) %}
@@ -186,27 +251,26 @@
                         {% if not cp.check_option(wellname.filename(), 'collapse') %}
                             {{ setup_template_render(well_path, None) }}     
                         {% else %}
-                            <div class="panel-group" id="accordion1">
-                                <div class="panel panel-default">
-                                    <div class="panel-heading">
-                                        <h4 class="panel-title" data-toggle="collapse" data-target="#collapse{{loop.index}}well">
-                                            {% if cp.check_option(wellname.filename(), 'title') %}
-                                                W{{loop.index}}. {{cp.get(wellname.filename(), 'title')}}
-                                            {% else %}
-                                                W{{loop.index}}. {{wellname.filename()}}
-                                            {% endif %}
-                                        </h4>
-                                    </div>
-                                    <div id="collapse{{loop.index}}well" class="panel-collapse collapse">
-                                        <div class="panel-body">
-                                            {{setup_template_render(well_path, None) }}     
-                                        </div>
+                            <div class="panel panel-default">
+                                <div class="panel-heading">
+                                    <h4 class="panel-title" data-toggle="collapse" data-parent="#accordion1" data-target="#collapse{{loop.index}}well">
+                                        {% if cp.check_option(wellname.filename(), 'title') %}
+                                            {{cp.get(wellname.filename(), 'title')}}
+                                        {% else %}
+                                            W{{loop.index}}. {{wellname.filename()}}
+                                        {% endif %}
+                                    </h4>
+                                </div>
+                                <div id="collapse{{loop.index}}well" class="panel-collapse collapse">
+                                    <div class="panel-body">
+                                        {{setup_template_render(well_path, None) }}     
                                     </div>
                                 </div>
                             </div>
                         {% endif %}                               
                     {% endif %}
                 {% endfor %}
+                </div>
 
                 <hr class="row-divider">
 

@@ -446,6 +446,14 @@ def _stage_frame_files_for_node(workflow, curr_exe, node, ifo, data_seg):
                 node.add_input_list_opt("--frame-files", needed)
 
 
+class MinifollowupPlotExecutable(PlotExecutable):
+    """Class for minifollowup plotting executables with Pegasus horizontal
+    job clustering enabled by default (clusters.size = 20).
+    """
+
+    group_jobs = "20"
+
+
 class SingleTemplateExecutable(PlotExecutable):
     """Class to be used for to create workflow.Executable instances for the
     pycbc_single_template executable. Basically inherits directly from
@@ -453,6 +461,7 @@ class SingleTemplateExecutable(PlotExecutable):
     """
 
     time_dependent_options = ["--channel-name", "--frame-type"]
+    group_jobs = "20"
 
 
 class SingleTimeFreqExecutable(PlotExecutable):
@@ -462,6 +471,7 @@ class SingleTimeFreqExecutable(PlotExecutable):
     """
 
     time_dependent_options = ["--channel-name", "--frame-type"]
+    group_jobs = "20"
 
 
 class PlotQScanExecutable(PlotExecutable):
@@ -471,6 +481,7 @@ class PlotQScanExecutable(PlotExecutable):
     """
 
     time_dependent_options = ["--channel-name", "--frame-type"]
+    group_jobs = "20"
 
 
 def get_single_template_params(curr_idx, times, bank_data, bank_id, fsdt, tids):
@@ -804,7 +815,7 @@ def make_single_template_plots(
             )
             hdf_files += data
             # Make the plot for this trigger and detector
-            node = PlotExecutable(
+            node = MinifollowupPlotExecutable(
                 workflow.cp, name, ifos=[ifo], out_dir=out_dir, tags=[tag] + tags
             ).create_node()
             node.add_input_opt("--single-template-file", data[0])
@@ -845,7 +856,7 @@ def make_plot_waveform_plot(
     secs = excludestr(secs, workflow.ifo_combinations)
     files = FileList([])
     for tag in secs:
-        node = PlotExecutable(
+        node = MinifollowupPlotExecutable(
             workflow.cp, "plot_waveform", ifos=ifos, out_dir=out_dir, tags=[tag] + tags
         ).create_node()
         node.add_opt("--mass1", "%.6f" % params["mass1"])
@@ -874,7 +885,7 @@ def make_inj_info(workflow, injection_file, injection_index, num, out_dir, tags=
     makedir(out_dir)
     name = "page_injinfo"
     files = FileList([])
-    node = PlotExecutable(
+    node = MinifollowupPlotExecutable(
         workflow.cp, name, ifos=workflow.ifos, out_dir=out_dir, tags=tags
     ).create_node()
     node.add_input_opt("--injection-file", injection_file)
@@ -904,7 +915,7 @@ def make_coinc_info(
     makedir(out_dir)
     name = "page_coincinfo"
     files = FileList([])
-    node = PlotExecutable(
+    node = MinifollowupPlotExecutable(
         workflow.cp, name, ifos=workflow.ifos, out_dir=out_dir, tags=tags
     ).create_node()
     unique_singles = []
@@ -950,7 +961,7 @@ def make_sngl_ifo(
     makedir(out_dir)
     name = "page_snglinfo"
     files = FileList([])
-    node = PlotExecutable(
+    node = MinifollowupPlotExecutable(
         workflow.cp, name, ifos=[ifo], out_dir=out_dir, tags=tags
     ).create_node()
     node.add_input_opt("--single-trigger-file", sngl_file)
@@ -989,7 +1000,7 @@ def make_trigger_timeseries(
     secs = excludestr(secs, workflow.ifo_combinations)
     files = FileList([])
     for tag in secs:
-        node = PlotExecutable(
+        node = MinifollowupPlotExecutable(
             workflow.cp, name, ifos=workflow.ifos, out_dir=out_dir, tags=[tag] + tags
         ).create_node()
         node.add_multiifo_input_list_opt("--single-trigger-files", singles)
@@ -1381,7 +1392,7 @@ def make_upload_files(
     workflow += bayestar_node
 
     logging.info("Setting up skymap plot generation")
-    skymap_plot_exe = PlotExecutable(
+    skymap_plot_exe = MinifollowupPlotExecutable(
         workflow.cp, "skymap_plot", ifos=workflow.ifos, out_dir=out_dir, tags=tags
     )
 

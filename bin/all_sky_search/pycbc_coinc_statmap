@@ -485,35 +485,50 @@ else:
 ifar_foreground = numpy.append(ifar_foreground, 0)
 
 if args.hierarchical_removal_threshold_ifar is not None:
-    h_threshold = conv.year_to_sec(args.hierarchical_removal_threshold_ifar)
+    thresh_yr = args.hierarchical_removal_threshold_ifar
 else:
-    h_threshold = background_time
+    thresh_yr = conv.sec_to_year(coinc_time)
+h_threshold = conv.year_to_sec(thresh_yr)
 
-while numpy.any(ifar_foreground >= h_threshold):
+# Write foreground & background trigger info before hierarchical removals (level h0)
+for k in all_trigs.data:
+    f["background_h0/" + k] = all_trigs.data[k][back_locs]
+f["background_h0/ifar"] = conv.sec_to_year(1.0 / bg_far)
+f["foreground_h0/stat"] = fore_stat
+f["foreground_h0/ifar"] = conv.sec_to_year(ifar)
+f["foreground_h0/fap"] = fap
+f["foreground_h0/template_id"] = all_trigs.data["template_id"][fore_locs]
+for ifo in args.ifos:
+    trig_id = all_trigs.data["%s/trigger_id" % ifo][fore_locs]
+    trig_time = all_trigs.data["%s/time" % ifo][fore_locs]
+    f["foreground_h0/%s/time" % ifo] = trig_time
+    f["foreground_h0/%s/trigger_id" % ifo] = trig_id
+
+while True:
     # If the user wants to stop doing hierarchical removals after a set
     # number of iterations then break when that happens.
     if args.max_hierarchical_removal >= 0 and h_iterations >= args.max_hierarchical_removal:
+        logging.info("Reached maximum hierarchical removals of %d", args.max_hierarchical_removal)
         break
 
-    # Write foreground trigger info before hierarchical removals for
-    # downstream codes.
-    if h_iterations == 0:
-        f["background_h%s/stat" % h_iterations] = back_stat
-        f["background_h%s/ifar" % h_iterations] = conv.sec_to_year(1.0 / bg_far)
-        f["background_h%s/timeslide_id" % h_iterations] = all_trigs.data[
-            "timeslide_id"
-        ][back_locs]
-        f["foreground_h%s/stat" % h_iterations] = fore_stat
-        f["foreground_h%s/ifar" % h_iterations] = conv.sec_to_year(ifar)
-        f["foreground_h%s/fap" % h_iterations] = fap
-        f["foreground_h%s/template_id" % h_iterations] = all_trigs.data["template_id"][
-            fore_locs
-        ]
-        for ifo in args.ifos:
-            trig_id = all_trigs.data["%s/trigger_id" % ifo][fore_locs]
-            trig_time = all_trigs.data["%s/time" % ifo][fore_locs]
-            f["foreground_h%s/%s/time" % (h_iterations, ifo)] = trig_time
-            f["foreground_h%s/%s/trigger_id" % (h_iterations, ifo)] = trig_id
+    # Dynamic stopping against exclusive background:
+    # Continue removing as long as the loudest remaining event has IFAR_exc > T_fg
+    # OR the Poisson tail count of remaining foreground events exceeds expectation by > 2 sigma.
+    t_fg_yr = conv.sec_to_year(coinc_time)
+    expected_count = t_fg_yr / thresh_yr if thresh_yr > 0 else 0.0
+    obs_count = numpy.sum(ifar_foreground >= h_threshold)
+    excess_sigma = (obs_count - expected_count) / numpy.sqrt(max(expected_count, 1e-6))
+    loudest_ifar = ifar_foreground.max() if len(ifar_foreground) else 0.0
+    stop_thresh_sec = conv.year_to_sec(max(thresh_yr, t_fg_yr))
+
+    if not (loudest_ifar > stop_thresh_sec or (excess_sigma > 2.0 and obs_count > 0)):
+        logging.info(
+            "Remaining foreground is consistent with background: "
+            "loudest IFAR=%.3g yr, Poisson excess=%.2f sigma (obs=%d, exp=%.2f). "
+            "Stopping hierarchical removal.",
+            conv.sec_to_year(loudest_ifar), excess_sigma, obs_count, expected_count
+        )
+        break
 
     # Add the iteration number of hierarchical removals done.
     h_iterations += 1
@@ -533,6 +548,8 @@ while numpy.any(ifar_foreground >= h_threshold):
     # hierarchically remove.
     f["foreground/ifar"][orig_fore_idx] = conv.sec_to_year(ifar[max_stat_idx])
     f["foreground/fap"][orig_fore_idx] = fap[max_stat_idx]
+    if args.hierarchical_removal_against == "exclusive" and "foreground/ifar_exc" in f:
+        f["foreground/ifar_exc"][orig_fore_idx] = conv.sec_to_year(ifar_foreground[max_stat_idx])
 
     logging.info(
         "Removing foreground trigger that is louder than the inclusive background."
@@ -571,9 +588,7 @@ while numpy.any(ifar_foreground >= h_threshold):
     back_locs = all_trigs.timeslide_id != 0
 
     logging.info("Dumping foreground triggers")
-    logging.info("Dumping background triggers (inclusive of zerolag)")
-    for k in all_trigs.data:
-        f["background_h%s/" % h_iterations + k] = all_trigs.data[k][back_locs]
+    # Omit dumping intermediate background_h1..h{h_iterations - 1} full-array copies to avoid STATMAP file bloat
 
     maxtime = all_trigs.attrs["%s_foreground_time" % f.attrs["pivot"]]
     for ifo in ifos:
@@ -630,7 +645,6 @@ while numpy.any(ifar_foreground >= h_threshold):
     # ifar_foreground has been updated and the code can continue.
 
     logging.info("Calculating ifar/fap values")
-    f["background_h%s/ifar" % h_iterations] = conv.sec_to_year(1.0 / bg_far)
     f.attrs["background_time_h%s" % h_iterations] = background_time
     f.attrs["foreground_time_h%s" % h_iterations] = coinc_time
 
@@ -650,6 +664,8 @@ while numpy.any(ifar_foreground >= h_threshold):
             orig_fore_idx = numpy.where(orig_fore_stat == fore_stat[i])[0][0]
             f["foreground/ifar"][orig_fore_idx] = conv.sec_to_year(ifar[i])
             f["foreground/fap"][orig_fore_idx] = fap[i]
+            if args.hierarchical_removal_against == "exclusive" and "foreground/ifar_exc" in f:
+                f["foreground/ifar_exc"][orig_fore_idx] = conv.sec_to_year(ifar_foreground[i])
 
         # Save trigger ids for foreground triggers for downstream plotting code.
         # These don't change with the iterations but should be written at every
@@ -671,6 +687,13 @@ while numpy.any(ifar_foreground >= h_threshold):
         for ifo in args.ifos:
             f["foreground_h%s/%s/time" % (h_iterations, ifo)] = numpy.array([])
             f["foreground_h%s/%s/trigger_id" % (h_iterations, ifo)] = numpy.array([])
+
+# Write final background triggers once if hierarchical removals were performed
+if h_iterations > 0:
+    logging.info("Dumping final background triggers for iteration %s", h_iterations)
+    for k in all_trigs.data:
+        f["background_h%s/" % h_iterations + k] = all_trigs.data[k][back_locs]
+    f["background_h%s/ifar" % h_iterations] = conv.sec_to_year(1.0 / bg_far)
 
 # Write to file how many hierarchical removals were implemented.
 f.attrs["hierarchical_removal_iterations"] = h_iterations

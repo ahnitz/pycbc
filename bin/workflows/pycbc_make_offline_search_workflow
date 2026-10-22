@@ -702,7 +702,19 @@ for ifo in workflow.ifos:
             continue
         sec_name = f"workflow-sngl_minifollowups-{subsec}"
         dir_str = workflow.cp.get(sec_name, "section-header")
-        currdir = rdir[f"single_triggers/{curr_ifo}_{dir_str}"]
+        stat_inputs = (
+            None
+            if (
+                subsec in ["raw", "raw_unfitted"]
+                or workflow.cp.has_option(sec_name, "omit-statistic-files")
+                or (
+                    workflow.cp.has_option(sec_name, "use-statistic-files")
+                    and workflow.cp.get(sec_name, "use-statistic-files").lower()
+                    in ["false", "no", "0"]
+                )
+            )
+            else wf.FileList(statfiles)
+        )
         wf.setup_single_det_minifollowups(
             workflow,
             insp_file,
@@ -712,7 +724,7 @@ for ifo in workflow.ifos:
             trig_generated_name,
             "daxes",
             currdir,
-            statfiles=wf.FileList(statfiles),
+            statfiles=stat_inputs,
             fg_file=censored_veto,
             fg_name="closed_box",
             tags=insp_file.tags + [subsec],

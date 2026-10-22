@@ -56,6 +56,39 @@ class PlotExecutable(Executable):
 
     current_retention_level = Executable.FINAL_RESULT
 
+    def __init__(
+        self, cp, name, ifos=None, out_dir=None, tags=None, **kwargs
+    ):
+        super().__init__(
+            cp, name, ifos=ifos, out_dir=out_dir, tags=tags, **kwargs
+        )
+        if not hasattr(self, "group_jobs"):
+            tags = tags or []
+            secs = [
+                "workflow-minifollowups",
+                "workflow-sngl_minifollowups",
+                "workflow-injection_minifollowups",
+            ]
+            opts = [
+                "batch-size", "group-jobs", "clusters-size", "cluster-size"
+            ]
+            for sec in secs:
+                for opt in opts:
+                    if cp.has_option_tags(sec, opt, tags):
+                        self.group_jobs = cp.get_opt_tags(sec, opt, tags)
+                        self.add_profile(
+                            "pegasus", "clusters.size", str(self.group_jobs)
+                        )
+                        break
+                    elif cp.has_option(sec, opt):
+                        self.group_jobs = cp.get(sec, opt)
+                        self.add_profile(
+                            "pegasus", "clusters.size", str(self.group_jobs)
+                        )
+                        break
+                if hasattr(self, "group_jobs"):
+                    break
+
     # plots and final results should get the highest priority
     # on the job queue
     def create_node(self, **kwargs):

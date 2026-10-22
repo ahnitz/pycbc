@@ -73,15 +73,16 @@ def newsnr_sgveto_autochisq(
     autochisq,
     q=6.0,
     n=1.0,
+    c_sg=0.012,
     **kwargs,
 ):
     """Multi-metric signal-consistency distance from the BBH injection envelope
     in (snr, reduced_power_chisq, reduced_auto_chisq, sg_chisq) space.
-    Signals inside the 95% injection envelope experience zero downweighting (D=0);
+    Signals inside the 95% injection envelope experience zero downweighting;
     triggers outside the envelope are smoothly downweighted by their combined
     normalized distance D = sqrt(z_pow^2 + z_auto^2 + z_sg^2)."""
     nsnr = numpy.array(snr, ndmin=1, dtype=numpy.float64)
-    s2 = numpy.minimum(nsnr**2, 300.0)
+    s2 = numpy.minimum(nsnr**2, 5000.0)
 
     d2 = numpy.zeros_like(nsnr)
 
@@ -101,7 +102,7 @@ def newsnr_sgveto_autochisq(
 
     if sgchisq is not None:
         rsg = numpy.abs(numpy.array(sgchisq, ndmin=1, dtype=numpy.float64))
-        tau_s = 3.20 + 0.0080 * s2
+        tau_s = 1.50 + c_sg * s2
         sig_s = 1.20 + 0.0035 * s2
         zs = numpy.maximum(0.0, (rsg - tau_s) / sig_s)
         d2 += zs**2
@@ -410,10 +411,14 @@ def get_newsnr_sgveto_autochisq(
     n_trad=2.0,
     n_sg=2.0,
     n_auto=2.0,
+    c_sg=0.012,
     q=6.0,
     **kwargs,
 ):
-    """Calculate newsnr re-weighted by traditional chisq, sine-gaussian chisq, and auto-correlation chisq"""
+    """Calculate newsnr re-weighted by traditional chisq, sine-gaussian chisq,
+    and auto-correlation chisq"""
+    if "sngl_ranking_c_sg" in kwargs:
+        c_sg = float(kwargs.pop("sngl_ranking_c_sg"))
     dof = 2.0 * trigs["chisq_dof"][:] - 2.0
     rchisq = trigs["chisq"][:] / dof
     try:
@@ -453,6 +458,7 @@ def get_newsnr_sgveto_autochisq(
         n_trad=n_trad,
         n_sg=n_sg,
         n_auto=n_auto,
+        c_sg=c_sg,
         q=q,
         **kwargs,
     )
