@@ -190,7 +190,7 @@ def timeslide_durations(start1, start2, end1, end2, timeslide_offsets):
     return numpy.array(durations)
 
 
-def time_coincidence(t1, t2, window, slide_step=0):
+def time_coincidence(t1, t2, window, slide_step=0, max_slide=None):
     """
     Find coincidences by time window
 
@@ -205,6 +205,9 @@ def time_coincidence(t1, t2, window, slide_step=0):
     slide_step : float (default 0)
         If calculating background coincidences, the interval between background
         slides, arbitrary units (usually s)
+    max_slide : int (optional, default None)
+        If given, restrict background coincidences to |slide| <= max_slide using
+        bounded time-window search instead of full-run modulo folding.
 
     Returns
     -------
@@ -216,6 +219,33 @@ def time_coincidence(t1, t2, window, slide_step=0):
         Array of slide ids
 
     """
+    if slide_step and max_slide is not None:
+        sort1 = t1.argsort()
+        sort2 = t2.argsort()
+        t1_s = t1[sort1]
+        t2_s = t2[sort2]
+        max_w = max_slide * slide_step + window
+        left = t2_s.searchsorted(t1_s - max_w)
+        right = t2_s.searchsorted(t1_s + max_w)
+        lenidx = timecoincidence_findidxlen(left, right, len(left))
+        if lenidx == 0:
+            return (
+                numpy.zeros(0, dtype=numpy.uint32),
+                numpy.zeros(0, dtype=numpy.uint32),
+                numpy.zeros(0, dtype=numpy.int32),
+            )
+        idx1 = numpy.zeros(lenidx, dtype=numpy.uint32)
+        idx2 = numpy.zeros(lenidx, dtype=numpy.uint32)
+        timecoincidence_constructidxs(
+            idx1, idx2, sort1, sort2, left, right, len(left), len(sort2)
+        )
+        slide = numpy.zeros(lenidx, dtype=numpy.int32)
+        timecoincidence_getslideint(slide, t1, t2, idx1, idx2, slide_step)
+        valid = (numpy.abs((t1[idx1] - t2[idx2]) - slide * slide_step) < window) & (
+            numpy.abs(slide) <= max_slide
+        )
+        return idx1[valid], idx2[valid], slide[valid]
+
     if slide_step:
         length1 = len(t1)
         length2 = len(t2)
@@ -256,7 +286,9 @@ def time_coincidence(t1, t2, window, slide_step=0):
     return idx1, idx2, slide
 
 
-def time_multi_coincidence(times, slide_step=0, slop=0.003, pivot="H1", fixed="L1"):
+def time_multi_coincidence(
+    times, slide_step=0, slop=0.003, pivot="H1", fixed="L1", max_slide=None
+):
     """
     Find multi detector coincidences.
 
@@ -274,6 +306,8 @@ def time_multi_coincidence(times, slide_step=0, slop=0.003, pivot="H1", fixed="L
         The other ifo used in first stage coincidence, subsequently used as a
         time reference for additional ifos. All other ifos are not time shifted
         relative to this ifo
+    max_slide: int (optional, default None)
+        If given, restrict background coincidences to |slide| <= max_slide.
 
     Returns
     -------
@@ -294,7 +328,11 @@ def time_multi_coincidence(times, slide_step=0, slop=0.003, pivot="H1", fixed="L
 
     # Find coincs between the 'pivot' and 'fixed' detectors as in 2-ifo case
     pivot_id, fix_id, slide = time_coincidence(
-        times[pivot], times[fixed], win(pivot, fixed), slide_step=slide_step
+        times[pivot],
+        times[fixed],
+        win(pivot, fixed),
+        slide_step=slide_step,
+        max_slide=max_slide,
     )
 
     # Additional detectors do not slide independently of the 'fixed' one

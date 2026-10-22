@@ -71,40 +71,49 @@ def newsnr_sgveto_autochisq(
     brchisq,
     sgchisq,
     autochisq,
-    chisq_thresh=1.50,
-    sg_thresh=4.0,
-    auto_thresh=4.0,
-    n_trad=2.0,
-    n_sg=2.0,
-    n_auto=2.0,
     q=6.0,
+    n=1.0,
     **kwargs,
 ):
-    """Combined NewSNR with traditional chi2 offset, sine-Gaussian chi2 offset,
-    and auto-correlation chi2 offset with smooth power-law downweighting."""
-    nsnr = numpy.array(
-        newsnr(snr, brchisq, chisq_thresh=chisq_thresh, q=q, n=n_trad, **kwargs),
-        ndmin=1,
-    )
+    """Multi-metric signal-consistency distance from the BBH injection envelope
+    in (snr, reduced_power_chisq, reduced_auto_chisq, sg_chisq) space.
+    Signals inside the 95% injection envelope experience zero downweighting (D=0);
+    triggers outside the envelope are smoothly downweighted by their combined
+    normalized distance D = sqrt(z_pow^2 + z_auto^2 + z_sg^2)."""
+    nsnr = numpy.array(snr, ndmin=1, dtype=numpy.float64)
+    s2 = numpy.minimum(nsnr**2, 300.0)
 
-    if sg_thresh is not None and sgchisq is not None:
-        sgchisq = numpy.array(sgchisq, ndmin=1)
-        t_sg = numpy.where(sgchisq > sg_thresh)[0]
-        if len(t_sg):
-            scaled_sg = sgchisq[t_sg] / sg_thresh
-            nsnr[t_sg] *= (0.5 * (1.0 + scaled_sg ** (q / n_sg))) ** (-1.0 / q)
+    d2 = numpy.zeros_like(nsnr)
 
-    if auto_thresh is not None and autochisq is not None:
-        autochisq = numpy.array(autochisq, ndmin=1)
-        t_auto = numpy.where(autochisq > auto_thresh)[0]
-        if len(t_auto):
-            scaled_auto = autochisq[t_auto] / auto_thresh
-            nsnr[t_auto] *= (0.5 * (1.0 + scaled_auto ** (q / n_auto))) ** (-1.0 / q)
+    if brchisq is not None:
+        rpow = numpy.abs(numpy.array(brchisq, ndmin=1, dtype=numpy.float64))
+        tau_p = 1.50 + 0.0018 * s2
+        sig_p = 0.45 + 0.0008 * s2
+        zp = numpy.maximum(0.0, (rpow - tau_p) / sig_p)
+        d2 += zp**2
+
+    if autochisq is not None:
+        rauto = numpy.abs(numpy.array(autochisq, ndmin=1, dtype=numpy.float64))
+        tau_a = 1.85 + 0.0028 * s2
+        sig_a = 0.65 + 0.0012 * s2
+        za = numpy.maximum(0.0, (rauto - tau_a) / sig_a)
+        d2 += za**2
+
+    if sgchisq is not None:
+        rsg = numpy.abs(numpy.array(sgchisq, ndmin=1, dtype=numpy.float64))
+        tau_s = 3.20 + 0.0080 * s2
+        sig_s = 1.20 + 0.0035 * s2
+        zs = numpy.maximum(0.0, (rsg - tau_s) / sig_s)
+        d2 += zs**2
+
+    dist = numpy.sqrt(d2)
+    ind = numpy.where(dist > 0.0)[0]
+    if len(ind):
+        nsnr[ind] *= (0.5 * (1.0 + (1.0 + dist[ind]) ** (q / n))) ** (-1.0 / q)
 
     if hasattr(snr, "__len__"):
         return nsnr
-    else:
-        return nsnr[0]
+    return nsnr[0]
 
 
 

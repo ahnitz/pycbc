@@ -195,6 +195,9 @@ if args.ranking_statistic in ["quadsum", "single_ranking_only"]:
     stat_name = sngl_stat_name
     stat_name_long = sngl_stat_name
 else:
+    sngl_val = rank_method.get_sngl_ranking(sngl_file.trig_dict())
+    headers.append(sngl_stat_name)
+    data[0].append("%5.2f" % sngl_val[0])
     # Name would be too long - just call it ranking statistic
     stat_name = "Ranking Statistic"
     stat_name_long = " with ".join([args.ranking_statistic, args.sngl_ranking])

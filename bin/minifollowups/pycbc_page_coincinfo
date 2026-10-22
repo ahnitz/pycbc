@@ -294,7 +294,10 @@ for ifo in files:
     data[-1].append("%5.2f" % mchirp)
     data[-1].append("%5.2f" % bank["spin1z"][tid])
     data[-1].append("%5.2f" % bank["spin2z"][tid])
-    data[-1].append("%5.2f" % d["template_duration"][i])
+    tdur = d["template_duration"][i]
+    if tdur == 0 and "template_duration" in bank:
+        tdur = bank["template_duration"][tid]
+    data[-1].append("%5.2f" % tdur)
     headers.append("m<sub>1</sub>")
     headers.append("m<sub>2</sub>")
     headers.append("M<sub>c</sub>")

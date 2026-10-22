@@ -55,7 +55,7 @@ parser.add_argument("--veto-file", help="LIGOLW file containing veto segments")
 parser.add_argument("--f-low", type=float, default=20, help="Low-frequency cutoff")
 parser.add_argument(
     "--rank",
-    choices=["snr", "newsnr"],
+    choices=list(pycbc.events.ranking.sngls_ranking_function_dict.keys()),
     default="newsnr",
     help="Ranking statistic for sorting triggers",
 )
@@ -161,6 +161,15 @@ if len(indices) > 0:
         if type(rank) in [np.float32, np.float64]:
             rank = np.array([rank])
         del rchisq
+    else:
+        data_mask = np.zeros(trigs["snr"].size, dtype=bool)
+        data_mask[indices] = True
+        sngl_trigs = pycbc.io.SingleDetTriggers(
+            opts.trig_file, opts.detector, premask=data_mask
+        )
+        rank = np.atleast_1d(
+            pycbc.events.ranking.get_sngls_ranking_from_trigs(sngl_trigs, opts.rank)
+        )
     del snr, chisq, chisq_dof
 
     sorter = np.argsort(rank)[::-1][: opts.num_loudest]

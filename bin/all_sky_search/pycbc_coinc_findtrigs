@@ -524,6 +524,11 @@ def process_template(tnum):
                 args.coinc_threshold,
                 args.pivot_ifo,
                 args.fixed_ifo,
+                max_slide=(
+                    max_slide // int(total_factors[-1])
+                    if max_slide is not None
+                    else None
+                ),
             )
             slide *= total_factors[-1]
 
@@ -591,6 +596,11 @@ def process_template(tnum):
                     args.coinc_threshold,
                     args.pivot_ifo,
                     args.fixed_ifo,
+                    max_slide=(
+                        max_slide // int(total_factors[kidx - 1])
+                        if max_slide is not None
+                        else None
+                    ),
                 )
                 set_slide *= total_factors[kidx - 1]
 

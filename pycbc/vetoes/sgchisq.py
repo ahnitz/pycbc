@@ -351,13 +351,13 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         # near Nyquist due to resample filtering
         fstop = len(stilde) * stilde.delta_f * 0.9
         delta_f = stilde.delta_f
-        kmin = int(f_lower / psd.delta_f)
+        kmin_base = int(f_lower / psd.delta_f)
         tiles = []
         for descr in values.split(","):
             q, offset = descr.split("-")
             q, offset = float(q), float(offset)
             fcen = fpeak + offset
-            flow = max(kmin * delta_f, fcen - qwindow)
+            flow = max(kmin_base * delta_f, fcen - qwindow)
             fhigh = fcen + qwindow
             if fhigh > fstop:
                 return None

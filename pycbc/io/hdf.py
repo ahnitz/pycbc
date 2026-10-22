@@ -1037,7 +1037,10 @@ class SingleDetTriggers:
 
     @property
     def template_duration(self):
-        return self.get_column("template_duration")
+        td = self.get_column("template_duration")
+        if self.bank is not None and "template_duration" in self.bank and np.all(td == 0):
+            return self.bank["template_duration"][:][self.template_id]
+        return td
 
     @property
     def snr(self):
