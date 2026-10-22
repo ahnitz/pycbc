@@ -67,6 +67,8 @@ parser.add_argument(
 significance.insert_significance_option_group(parser)
 parser.add_argument(
     "--hierarchical-removal-ifar-threshold",
+    "--hierarchical-removal-threshold-ifar",
+    dest="hierarchical_removal_ifar_threshold",
     type=float,
     default=0.5,
     help="Threshold to hierarchically remove foreground "
