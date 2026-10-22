@@ -101,6 +101,7 @@ parser.add_argument(
 parser.add_argument(
     "--hierarchical-removal-threshold-ifar",
     "--hierarchical-removal-ifar-thresh",
+    "--hierarchical-removal-ifar-threshold",
     dest="hierarchical_removal_ifar_thresh",
     type=float,
     default=100.0,
