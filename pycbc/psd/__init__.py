@@ -988,6 +988,21 @@ def generate_segment_psds(
             epoch + p1 / sample_rate,
         )
 
+    valid_psds = [
+        (idx, p)
+        for idx, (_, _, p) in enumerate(psds_and_times)
+        if p is not None
+        and not (numpy.isinf(p.numpy())).all()
+        and not (p.numpy() == 0).all()
+    ]
+    if valid_psds and len(valid_psds) < len(psds_and_times):
+        for i, (p_start, p_stop, p) in enumerate(psds_and_times):
+            if p is None or (numpy.isinf(p.numpy())).all() or (p.numpy() == 0).all():
+                nearest_idx, nearest_psd = min(
+                    valid_psds, key=lambda item: abs(item[0] - i)
+                )
+                psds_and_times[i] = (p_start, p_stop, nearest_psd)
+
     return psds_and_times
 
 
