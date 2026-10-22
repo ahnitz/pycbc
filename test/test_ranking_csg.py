@@ -11,13 +11,13 @@ class TestRankingCsg(unittest.TestCase):
     def test_newsnr_sgveto_default_csg(self):
         # High SNR test vector (GW241011-like, SNR ~ 33.87)
         # s2 = min(33.87^2, 5000) = 1147.1769
-        # tau_s = 1.50 + 0.012 * 1147.1769 = 15.2661
+        # tau_s = 3.20 + 0.012 * 1147.1769 = 16.9661
         snr = numpy.array([33.87])
         rchisq = numpy.array([1.0])
         autochisq = numpy.array([1.0])
 
         # sgchisq within tau_s should not downweight
-        sgchisq_in = numpy.array([15.0])
+        sgchisq_in = numpy.array([16.0])
         res_in = ranking.newsnr_sgveto_autochisq(
             snr, rchisq, sgchisq=sgchisq_in, autochisq=autochisq
         )
@@ -31,17 +31,30 @@ class TestRankingCsg(unittest.TestCase):
         self.assertLess(res_out[0], 33.87)
         self.assertGreater(res_out[0], 0.0)
 
+    def test_moderate_snr_intercept_protection(self):
+        # Moderate SNR trigger (e.g. GW240512-like, SNR ~ 8.13, sg_chisq ~ 3.0)
+        # With base intercept 3.20: tau_s = 3.20 + 0.012 * 8.13^2 = 3.99 > 3.0 -> zero downweighting!
+        # With intercept 1.50: tau_s was 1.50 + 0.012 * 66.1 = 2.29 < 3.0 -> was heavily downweighted!
+        snr = numpy.array([8.13])
+        rchisq = numpy.array([1.0])
+        autochisq = numpy.array([1.0])
+        sgchisq = numpy.array([3.0])
+        res = ranking.newsnr_sgveto_autochisq(
+            snr, rchisq, sgchisq=sgchisq, autochisq=autochisq
+        )
+        self.assertAlmostEqual(res[0], 8.13, places=4)
+
     def test_newsnr_sgveto_custom_csg(self):
         snr = numpy.array([20.0])
         rchisq = numpy.array([1.0])
         autochisq = numpy.array([1.0])
-        sgchisq = numpy.array([8.0])
+        sgchisq = numpy.array([10.0])
 
-        # With c_sg=0.012: tau_s = 1.50 + 0.012 * 400 = 6.30 -> downweighted
+        # With c_sg=0.012: tau_s = 3.20 + 0.012 * 400 = 8.00 -> downweighted
         res_c012 = ranking.newsnr_sgveto_autochisq(
             snr, rchisq, sgchisq=sgchisq, autochisq=autochisq, c_sg=0.012
         )
-        # With c_sg=0.020: tau_s = 1.50 + 0.020 * 400 = 9.50 -> inside
+        # With c_sg=0.020: tau_s = 3.20 + 0.020 * 400 = 11.20 -> inside
         res_c020 = ranking.newsnr_sgveto_autochisq(
             snr, rchisq, sgchisq=sgchisq, autochisq=autochisq, c_sg=0.020
         )
@@ -53,9 +66,9 @@ class TestRankingCsg(unittest.TestCase):
         snr = numpy.array([100.0])
         rchisq = numpy.array([1.0])
         autochisq = numpy.array([1.0])
-        # At s2 = 5000, tau_s = 1.50 + 0.012 * 5000 = 61.5
+        # At s2 = 5000, tau_s = 3.20 + 0.012 * 5000 = 63.2
         # sig_s = 1.20 + 0.0035 * 5000 = 18.7
-        sgchisq = numpy.array([61.0])
+        sgchisq = numpy.array([62.0])
         res = ranking.newsnr_sgveto_autochisq(
             snr, rchisq, sgchisq=sgchisq, autochisq=autochisq
         )

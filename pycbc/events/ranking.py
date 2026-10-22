@@ -102,7 +102,7 @@ def newsnr_sgveto_autochisq(
 
     if sgchisq is not None:
         rsg = numpy.abs(numpy.array(sgchisq, ndmin=1, dtype=numpy.float64))
-        tau_s = 1.50 + c_sg * s2
+        tau_s = 3.20 + c_sg * s2
         sig_s = 1.20 + 0.0035 * s2
         zs = numpy.maximum(0.0, (rsg - tau_s) / sig_s)
         d2 += zs**2

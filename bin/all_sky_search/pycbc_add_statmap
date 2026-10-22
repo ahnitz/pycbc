@@ -959,12 +959,11 @@ while True:
     if args.hierarchical_removal_against == "exclusive":
         for key in all_ifo_combos:
             if key in sep_bg_exc_data:
-                bg_t_exc_y = conv.sec_to_year(bg_time_ct_exc[key])
                 _, fg_far_exc, _ = significance.get_far(
                     sep_bg_exc_data[key].data["stat"],
                     sep_fg_data[key].data["stat"],
                     sep_bg_exc_data[key].data["decimation_factor"],
-                    bg_t_exc_y,
+                    bg_time_ct_exc[key],
                     **significance_dict[key],
                 )
                 fg_far_exc = significance.apply_far_limit(
@@ -972,8 +971,16 @@ while True:
                     significance_dict,
                     combo=key,
                 )
-                sep_fg_data[key].data["ifar_exc"] = 1.0 / fg_far_exc
-                sep_fg_data[key].data["fap_exc"] = 1 - np.exp(-fg_t_y * fg_far_exc)
+                sep_fg_data[key].data["ifar_exc"] = conv.sec_to_year(1.0 / fg_far_exc)
+                fg_time_ct_exc_val = (
+                    f[key].attrs.get("foreground_time_exc", fg_time_ct[key])
+                    if key in f
+                    else fg_time_ct[key]
+                )
+                sep_fg_data[key].data["fap_exc"] = 1 - np.exp(
+                    -conv.sec_to_year(fg_time_ct_exc_val)
+                    / sep_fg_data[key].data["ifar_exc"]
+                )
 
         far_exc = {}
         for key in all_ifo_combos:
