@@ -702,6 +702,7 @@ for ifo in workflow.ifos:
             continue
         sec_name = f"workflow-sngl_minifollowups-{subsec}"
         dir_str = workflow.cp.get(sec_name, "section-header")
+        currdir = rdir[f"single_triggers/{curr_ifo}_{dir_str}"]
         stat_inputs = (
             None
             if (
