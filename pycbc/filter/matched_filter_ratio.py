@@ -1227,3 +1227,162 @@ def run_hierarchical_search(
         timers["upper_fir"],
     )
     return triggers, has_asym_followup, timers
+
+
+_REF_IFFT_PLANS = {}
+_TD_CORR_BANK_CACHE = {}
+_TD_CORR_BUF_CACHE = {}
+
+
+def make_reference_series(
+    stilde,
+    psd,
+    ref_template,
+    high_frequency_cutoff=None,
+    tap_sample_rate=2048,
+    data_sample_rate=2048,
+):
+    """Return the top filter's real output series (float32) and its template sigmasq."""
+    from pycbc.fft import IFFT
+    from pycbc.filter.matchedfilter import correlate, get_cutoff_indices
+    from pycbc.types import Array, zeros
+
+    h_norm = ref_template.sigmasq(psd)
+    N = (len(stilde) - 1) * 2
+    kmin, kmax = get_cutoff_indices(
+        ref_template.f_lower, high_frequency_cutoff, stilde.delta_f, N
+    )
+    if kmax > N // 2:
+        raise ValueError("the real reference series needs the upper cutoff below Nyquist")
+
+    cached = _REF_IFFT_PLANS.get(N)
+    if cached is None:
+        qt = zeros(N // 2 + 1, dtype=complex64)
+        q = zeros(N, dtype=float32)
+        cached = _REF_IFFT_PLANS[N] = (IFFT(qt, q), qt, q)
+    plan, qt_raw, q = cached
+    qt = Array(qt_raw, copy=False)
+    qt[:kmin] = 0
+    qt[kmax:] = 0
+    correlate(ref_template[kmin:kmax], stilde[kmin:kmax], qt[kmin:kmax])
+    plan.execute()
+
+    decim = decimation_factor(tap_sample_rate, data_sample_rate)
+    norm = (4.0 * stilde.delta_f) / np.sqrt(h_norm)
+    scale = 0.5 * (norm * stilde.delta_t) / decim
+    out = np.empty(len(q), dtype=np.float32)
+    np.multiply(q.numpy(), scale, out=out, casting="same_kind")
+    return out, h_norm
+
+
+def _get_td_corr_bank(comp_tap, tap_sample_rate=None, data_sample_rate=None):
+    """Return a cached single-template ``matchedfilter.TimeDomainFilterBank`` in ``'corr'`` mode."""
+    sr_tap = int(tap_sample_rate) if tap_sample_rate is not None else 2048
+    sr_dat = int(data_sample_rate) if data_sample_rate is not None else sr_tap
+    key = (id(comp_tap), sr_tap, sr_dat)
+    td_bank = _TD_CORR_BANK_CACHE.get(key)
+    if td_bank is None:
+        taps_2d = np.ascontiguousarray(comp_tap, dtype=np.complex64)[None, :]
+        counts_1d = np.array([len(comp_tap)], dtype=np.int32)
+        td_bank = _mf.TimeDomainFilterBank(
+            taps_2d,
+            tap_counts=counts_1d,
+            tap_sample_rate=sr_tap,
+            data_sample_rate=sr_dat,
+            engine="corr",
+        )
+        if len(_TD_CORR_BANK_CACHE) >= 32768:
+            _TD_CORR_BANK_CACHE.clear()
+        _TD_CORR_BANK_CACHE[key] = td_bank
+    return td_bank
+
+
+def _get_td_corr_buf(n_samples):
+    """Return a reusable ``(1, n_samples)`` complex64 output buffer for ``correlate_series``."""
+    n_samples = int(n_samples)
+    buf = _TD_CORR_BUF_CACHE.get(n_samples)
+    if buf is None:
+        buf = np.empty((1, n_samples), dtype=np.complex64)
+        _TD_CORR_BUF_CACHE[n_samples] = buf
+    return buf
+
+
+def reconstruct_fir_snr_span(
+    ref_series,
+    comp_tap,
+    shift,
+    phys_span_start,
+    phys_span_stop,
+    renorm_factor=None,
+    tap_sample_rate=None,
+    data_sample_rate=None,
+    td_bank=None,
+    template_index=0,
+):
+    """Reconstruct a continuous complex SNR span from a reference SNR series and composed FIR taps.
+
+    Uses ``matchedfilter.TimeDomainFilterBank(..., engine='corr').correlate_series`` when
+    ``ref_series`` is a real ``float32`` reference series and ``phys_span_stop - phys_span_start``
+    is larger than a few samples, falling back to direct dot-product/correlation for 1-sample
+    point evaluations or complex reference series.
+    """
+    c_comp = len(comp_tap) // 2
+    is_complex_ref = np.iscomplexobj(ref_series)
+    eff_shift = -int(shift) if is_complex_ref else int(shift)
+    phys_span_start = int(phys_span_start)
+    phys_span_stop = int(phys_span_stop)
+    span_len = phys_span_stop - phys_span_start
+    if span_len <= 0:
+        return np.empty(0, dtype=np.complex64)
+
+    raw_start = phys_span_start + eff_shift
+    raw_stop = phys_span_stop + eff_shift
+    s0 = raw_start - c_comp
+    s1 = raw_stop + len(comp_tap) - 1 - c_comp
+    if s0 < 0 or s1 > len(ref_series):
+        return None
+
+    if span_len == 1:
+        seg_slice = ref_series[s0:s1]
+        tap_corr = np.conj(comp_tap) if is_complex_ref else comp_tap
+        val = np.dot(seg_slice, np.conj(tap_corr))
+        z_raw = np.array([val], dtype=np.complex64)
+    elif (not is_complex_ref) and (_mf is not None) and (span_len >= 64):
+        if td_bank is None:
+            td_bank = _get_td_corr_bank(comp_tap, tap_sample_rate, data_sample_rate)
+            template_index = 0
+        buf = _get_td_corr_buf(len(ref_series))
+        ref_f32 = (
+            ref_series
+            if (ref_series.dtype == np.float32 and ref_series.flags.c_contiguous)
+            else np.ascontiguousarray(ref_series, dtype=np.float32)
+        )
+        td_bank.correlate_series(
+            ref_f32,
+            windows=[(raw_start, raw_stop)],
+            template_index=int(template_index),
+            out=buf,
+        )
+        z_raw = buf[0, raw_start:raw_stop].copy()
+    else:
+        from scipy.signal import correlate as sp_correlate, fftconvolve
+
+        seg_slice = ref_series[s0:s1]
+        tap_corr = np.conj(comp_tap) if is_complex_ref else comp_tap
+        if len(tap_corr) <= 256 or (s1 - s0) <= 2048:
+            z_raw = sp_correlate(
+                seg_slice, tap_corr, mode="valid", method="direct"
+            ).astype(np.complex64)
+        else:
+            z_raw = fftconvolve(
+                seg_slice, np.conj(tap_corr[::-1]), mode="valid"
+            ).astype(np.complex64)
+
+    if renorm_factor is not None:
+        if span_len == 1:
+            z_raw = z_raw * renorm_factor[phys_span_start]
+        else:
+            z_raw = z_raw * renorm_factor[
+                np.arange(phys_span_start, phys_span_stop, dtype=np.int64)
+            ]
+    return z_raw

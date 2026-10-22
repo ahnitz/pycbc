@@ -132,6 +132,51 @@ class PyCBCFindCoincExecutable(Executable):
         return node
 
 
+class PyCBCFollowupMargLogLRExecutable(Executable):
+    """Find coinc triggers and evaluate coherent snippet marginal logLR using an FIR Ratio Bank"""
+
+    current_retention_level = Executable.ALL_TRIGGERS
+
+    def create_node(
+        self,
+        trig_files,
+        bank_file,
+        stat_files,
+        veto_file,
+        veto_name,
+        template_str,
+        pivot_ifo,
+        fixed_ifo,
+        frame_files=None,
+        inj_file=None,
+        tags=None,
+    ):
+        if tags is None:
+            tags = []
+        segs = trig_files.get_times_covered_by_files()
+        seg = segments.segment(segs[0][0], segs[-1][1])
+        node = Node(self)
+        node.add_input_opt("--bank-file", bank_file)
+        node.add_input_list_opt("--trigger-files", trig_files)
+        if frame_files is not None and len(frame_files) > 0:
+            node.add_multiifo_input_list_opt("--frame-files", frame_files)
+        if inj_file is not None:
+            if isinstance(inj_file, list) and len(inj_file) == 1:
+                node.add_input_opt("--injection-file", inj_file[0])
+            elif isinstance(inj_file, list):
+                node.add_input_list_opt("--injection-file", inj_file)
+            else:
+                node.add_input_opt("--injection-file", inj_file)
+        if veto_file is not None:
+            node.add_input_opt("--veto-files", veto_file)
+            node.add_opt("--segment-name", veto_name)
+        node.add_opt("--pivot-ifo", pivot_ifo)
+        node.add_opt("--fixed-ifo", fixed_ifo)
+        node.add_opt("--template-fraction-range", template_str)
+        node.new_output_file_opt(seg, ".hdf", "--output-file", tags=tags)
+        return node
+
+
 class PyCBCFindSnglsExecutable(Executable):
     """Calculate single-detector ranking statistic for triggers"""
 
@@ -549,6 +594,18 @@ def setup_sngls_statmap_inj(
     return stat_node.output_files[0]
 
 
+def _get_coinc_exe_class(workflow, tags=None):
+    """Return the appropriate coincidence Executable subclass for ``[executables] coinc``."""
+    tags = [] if tags is None else tags
+    try:
+        coinc_exe_path = workflow.cp.get_opt_tags("executables", "coinc", tags)
+    except Exception:
+        coinc_exe_path = workflow.cp.get("executables", "coinc")
+    if os.path.basename(coinc_exe_path) == "pycbc_followup_marg_loglr":
+        return PyCBCFollowupMargLogLRExecutable
+    return PyCBCFindCoincExecutable
+
+
 def setup_interval_coinc_inj(
     workflow,
     hdfbank,
@@ -583,7 +640,8 @@ def setup_interval_coinc_inj(
 
     injinj_files = FileList(list(dict.fromkeys(ifiles.values())))
 
-    findcoinc_exe = PyCBCFindCoincExecutable(
+    coinc_cls = _get_coinc_exe_class(workflow, tags=tags + ["injinj"])
+    findcoinc_exe = coinc_cls(
         workflow.cp,
         "coinc",
         ifos=ifiles.keys(),
@@ -643,7 +701,8 @@ def setup_interval_coinc(
         ifos, _ = trig_files.categorize_by_attr("ifo")
     except (ValueError, AttributeError, TypeError):
         ifos = sorted(list({ifo for f in trig_files for ifo in f.ifo_list}))
-    findcoinc_exe = PyCBCFindCoincExecutable(
+    coinc_cls = _get_coinc_exe_class(workflow, tags=tags)
+    findcoinc_exe = coinc_cls(
         workflow.cp, "coinc", ifos=ifos, tags=tags, out_dir=out_dir
     )
 

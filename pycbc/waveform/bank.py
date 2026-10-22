@@ -102,7 +102,10 @@ def sigma_cached(self, psd):
                 self.sigma_view = self[self.sslice].squared_norm() * 4.0 * self.delta_f
 
             if not hasattr(psd, "invsqrt"):
-                psd.invsqrt = 1.0 / psd
+                inv = np.zeros(len(psd), dtype=psd.dtype)
+                p_np = psd.numpy()
+                np.divide(1.0, p_np, out=inv, where=p_np > 0)
+                psd.invsqrt = pycbc.types.Array(inv, copy=False)
 
             self._sigmasq[key] = self.sigma_view.inner(psd.invsqrt[self.sslice])
     return self._sigmasq[key]
@@ -1196,7 +1199,7 @@ class FilterBankSkyMax(TemplateBank):
         hplus.end_frequency = f_end
         hcross.end_frequency = f_end
         hplus.end_idx = int(hplus.end_frequency / hplus.delta_f)
-        hcross.end_idx = int(hplus.end_frequency / hplus.delta_f)
+        hcross.end_idx = int(hcross.end_frequency / hcross.delta_f)
         hplus.params = self.table[index]
         hcross.params = self.table[index]
         hplus.approximant = approximant
@@ -1285,6 +1288,9 @@ class RatioFilterBank(FilterBank):
             if len(fine_indices) > 0:
                 sigmas = c_group["sigmas"][:]
                 self.sigma_sigma_rescale[fine_indices] = sigmas[:, 1] / sigmas[:, 0]
+
+        self._hierarchy_cache = None
+        self._group_td_bank_cache = {}
 
     def close_filehandler(self):
         """Close the underlying HDF5 file handle so forked worker processes can
@@ -1488,6 +1494,132 @@ class RatioFilterBank(FilterBank):
                 shifts[sort_idx],
             )
         return taps[sort_idx], actual_tap_counts[sort_idx], fine_indices[sort_idx]
+
+    def build_hierarchy_maps(self):
+        """Build fast lookup tables mapping ``fine_gid -> top_id`` and parent chains."""
+        self._ensure_open()
+        if self._hierarchy_cache is not None:
+            return self._hierarchy_cache["fine_to_top"], self._hierarchy_cache
+
+        n_lvls = self.num_levels
+        child_to_parent = {lvl: {} for lvl in range(1, n_lvls + 1)}
+        for lvl in range(1, n_lvls + 1):
+            l_grp = self.level_groups[lvl]
+            for p_str in self.level_keys[lvl]:
+                p_id = int(p_str)
+                g = l_grp[p_str]
+                c_idxs = g["fine_bank_index"][:]
+                counts = g["actual_tap_count"][:]
+                taps_2d = g["taps"][:]
+                shifts = g["sample_shift"][:]
+                sigs = g["sigmas"][:]
+                for j, cid in enumerate(c_idxs):
+                    t_1d = taps_2d[j, : int(counts[j])]
+                    sr_sq = float((sigs[j, 2] / max(sigs[j, 0], 1e-30)) ** 2)
+                    child_to_parent[lvl][int(cid)] = (
+                        p_id,
+                        t_1d,
+                        int(shifts[j]),
+                        sr_sq,
+                    )
+
+        fine_to_top = {}
+        for fg in child_to_parent[1].keys():
+            cur = fg
+            for lvl in range(1, n_lvls + 1):
+                cur = child_to_parent[lvl][cur][0]
+            fine_to_top[fg] = cur
+
+        self._hierarchy_cache = {
+            "n_lvls": n_lvls,
+            "child_to_parent": child_to_parent,
+            "fine_to_top": fine_to_top,
+            "composed": {},
+        }
+        return fine_to_top, self._hierarchy_cache
+
+    def get_composed_template_fir(self, fine_index):
+        """Return the composed top-to-fine FIR filter
+        ``(comp_tap, total_shift, tot_sig_scale_sq, top_id)`` for ``fine_index``.
+        """
+        _, cache_obj = self.build_hierarchy_maps()
+        fine_index = int(fine_index)
+        if fine_index in cache_obj["composed"]:
+            return cache_obj["composed"][fine_index]
+
+        c2p = cache_obj["child_to_parent"]
+        cur = fine_index
+        taps_chain = []
+        total_shift = 0
+        tot_sig_scale_sq = 1.0
+        for lvl in range(1, cache_obj["n_lvls"] + 1):
+            p_id, t_1d, sh, sr_sq = c2p[lvl][cur]
+            taps_chain.append(t_1d)
+            total_shift += sh
+            tot_sig_scale_sq *= sr_sq
+            cur = p_id
+        top_id = cur
+
+        comp_tap = taps_chain[-1].astype(np.complex64)
+        for t_lower in reversed(taps_chain[:-1]):
+            comp_tap = np.convolve(comp_tap, t_lower).astype(np.complex64)
+
+        res = (comp_tap, int(total_shift), float(tot_sig_scale_sq), int(top_id))
+        cache_obj["composed"][fine_index] = res
+        return res
+
+    def get_group_corr_bank(
+        self, top_id, fine_indices, tap_sample_rate=None, data_sample_rate=None
+    ):
+        """Return a batched ``matchedfilter.TimeDomainFilterBank(..., engine='corr')``
+        and per-template metadata for the requested ``fine_indices`` under ``top_id``.
+        """
+        from pycbc.filter.matched_filter_ratio import _mf
+
+        top_id = int(top_id)
+        unique_gids = tuple(sorted({int(g) for g in fine_indices}))
+        sr_tap = (
+            int(tap_sample_rate)
+            if tap_sample_rate is not None
+            else int(self.sample_rate)
+        )
+        sr_dat = int(data_sample_rate) if data_sample_rate is not None else sr_tap
+        key = (top_id, unique_gids, sr_tap, sr_dat)
+        if key in self._group_td_bank_cache:
+            return self._group_td_bank_cache[key]
+
+        taps_list = []
+        counts_list = []
+        gid_meta = {}
+        for slot, gid in enumerate(unique_gids):
+            comp_tap, sh, sc_sq, _ = self.get_composed_template_fir(gid)
+            taps_list.append(comp_tap)
+            counts_list.append(len(comp_tap))
+            gid_meta[gid] = (slot, comp_tap, int(sh), float(sc_sq))
+
+        max_nt = max(counts_list) if counts_list else 1
+        taps_2d = np.zeros((len(unique_gids), max_nt), dtype=np.complex64)
+        for slot, t in enumerate(taps_list):
+            taps_2d[slot, : len(t)] = t
+        counts_1d = np.asarray(counts_list, dtype=np.int32)
+
+        td_bank = (
+            _mf.TimeDomainFilterBank(
+                taps_2d,
+                tap_counts=counts_1d,
+                tap_sample_rate=sr_tap,
+                data_sample_rate=sr_dat,
+                engine="corr",
+            )
+            if (_mf is not None and len(unique_gids) > 0)
+            else None
+        )
+        res = (td_bank, gid_meta)
+        if len(self._group_td_bank_cache) >= 4096:
+            self._group_td_bank_cache.clear()
+        self._group_td_bank_cache[key] = res
+        return res
+
 
 
 __all__ = (

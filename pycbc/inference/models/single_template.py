@@ -24,6 +24,7 @@ from pycbc import filter as pyfilter
 from pycbc.detector import Detector
 from pycbc.waveform import get_fd_waveform
 
+from .base import BaseModel
 from .gaussian_noise import BaseGaussianNoise
 from .tools import DistMarg
 
@@ -72,11 +73,35 @@ class SingleTemplate(DistMarg, BaseGaussianNoise):
         low_frequency_cutoff,
         sample_rate=32768,
         marginalize_phase=True,
+        sh=None,
+        hh=None,
+        snr=None,
         **kwargs,
     ):
         variable_params, kwargs = self.setup_marginalization(
             variable_params, marginalize_phase=marginalize_phase, **kwargs
         )
+
+        if sh is not None and hh is not None:
+            self._data = {ifo: sh[ifo] for ifo in sh}
+            self.sh = dict(sh)
+            self.hh = dict(hh)
+            self.snr = (
+                dict(snr)
+                if snr is not None
+                else {ifo: sh[ifo] / (self.hh[ifo] ** 0.5) for ifo in sh}
+            )
+            self.det = {ifo: Detector(ifo) for ifo in sh}
+            self.waveform = None
+            self.htfs = {}
+            self.dts = {}
+            BaseModel.__init__(self, variable_params, **kwargs)
+            self.setup_peak_lock(
+                snrs=self.snr, sample_rate=float(sample_rate), **kwargs
+            )
+            self.draw_ifos(self.snr, **kwargs)
+            return
+
         super().__init__(variable_params, data, low_frequency_cutoff, **kwargs)
 
         sample_rate = float(sample_rate)
@@ -223,19 +248,28 @@ class SingleTemplate(DistMarg, BaseGaussianNoise):
         pol_phase = numpy.exp(-2.0j * p["polarization"])
 
         self.snr_draw(snrs=self.snr)
+        p = self.current_params
 
         for ifo in self.sh:
-            dt = self.det[ifo].time_delay_from_earth_center(p["ra"], p["dec"], p["tc"])
+            if self.precalc_antenna_factors:
+                fp, fc, dt = self.get_precalc_antenna_factors(ifo)
+            else:
+                dt = self.det[ifo].time_delay_from_earth_center(
+                    p["ra"], p["dec"], p["tc"]
+                )
+                fp, fc = self.det[ifo].antenna_pattern(
+                    p["ra"], p["dec"], 0, p["tc"]
+                )
             self.dts[ifo] = p["tc"] + dt
-
-            fp, fc = self.det[ifo].antenna_pattern(p["ra"], p["dec"], 0, p["tc"])
             f = (fp + 1.0j * fc) * pol_phase
 
             # Note, this includes complex conjugation already
             # as our stored inner products were hp* x data
             htf = (f.real * ip + 1.0j * f.imag * ic) / p["distance"] * phase
             self.htfs[ifo] = htf
-            sh = self.sh[ifo].at_time(self.dts[ifo], interpolate="quadratic")
+            sh = self.sh[ifo].at_time(
+                self.dts[ifo], interpolate="quadratic", extrapolate=0.0j
+            )
             sh_total += sh * htf
             hh_total += self.hh[ifo] * abs(htf) ** 2.0
 

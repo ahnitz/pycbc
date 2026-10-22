@@ -459,6 +459,7 @@ class DistMarg:
         ikey = "".join(ifos)
 
         vsamples = size if size is not None else self.vsamples
+        self.precalc_antenna_factors = False
 
         # No good SNR peaks, go with prior draw
         if len(ifos) == 0:
@@ -832,7 +833,11 @@ class DistMarg:
 
 
 def setup_distance_marg_interpolant(
-    dist_marg, phase=False, snr_range=(1, 50), density=(1000, 1000)
+    dist_marg,
+    phase=False,
+    snr_range=(1, 50),
+    density=(1000, 1000),
+    bounds_check=False,
 ):
     """
     Create the interpolant for distance marginalization
@@ -855,7 +860,7 @@ def setup_distance_marg_interpolant(
         inner product sh/hh.
 
     """
-    dist_rescale, _ = dist_marg
+    dist_rescale, dist_weights = dist_marg
     logging.info("Interpolator valid for SNRs in %s", snr_range)
     logging.info("Interpolator using grid %s", density)
     # approximate maximum shr and hhr values, assuming the true SNR is
@@ -871,14 +876,18 @@ def setup_distance_marg_interpolant(
 
     shr = numpy.geomspace(shr_min, shr_max, density[0])
     hhr = numpy.geomspace(hhr_min, hhr_max, density[1])
-    lvals = numpy.zeros((len(shr), len(hhr)))
     logging.info("Setup up likelihood interpolator")
-    for i, sh in enumerate(tqdm.tqdm(shr)):
-        for j, hh in enumerate(hhr):
-            lvals[i, j] = marginalize_likelihood(
-                sh, hh, distance=dist_marg, phase=phase
-            )
-    interp = RectBivariateSpline(shr, hhr, lvals)
+    logw = numpy.log(numpy.maximum(dist_weights, 1e-300))[None, :]
+    h_grid = hhr[:, None] * (dist_rescale[None, :] ** 2.0)
+    lvals = numpy.empty((len(shr), len(hhr)))
+    for i, sh in enumerate(shr):
+        s_grid = sh * dist_rescale[None, :]
+        if phase:
+            s_grid = numpy.log(i0e(s_grid)) + s_grid
+        lvals[i] = logsumexp(s_grid - 0.5 * h_grid + logw, axis=-1)
+    interp = RectBivariateSpline(
+        numpy.log(shr), numpy.log(hhr), lvals, kx=1, ky=1
+    )
 
     # said once, the first time it happens
     warned = [False]
@@ -893,10 +902,10 @@ def setup_distance_marg_interpolant(
             snr_range,
         )
 
-    def interp_wrapper(x, y, bounds_check=True):
+    def interp_wrapper(x, y, bounds_check=bounds_check):
         k = None
         if bounds_check:
-            if isinstance(x, float):
+            if isinstance(x, float) or numpy.isscalar(x):
                 if x > shr_max or x < shr_min or y > hhr_max or y < hhr_min:
                     if not warned[0]:
                         warn_out_of_range()
@@ -908,7 +917,9 @@ def setup_distance_marg_interpolant(
                 if not warned[0] and k.any():
                     warn_out_of_range()
 
-        v = interp(x, y, grid=False)
+        x_c = numpy.clip(x, shr_min, shr_max)
+        y_c = numpy.clip(y, hhr_min, hhr_max)
+        v = interp(numpy.log(x_c), numpy.log(y_c), grid=False)
         if k is not None:
             v[k] = -numpy.inf
         return v
