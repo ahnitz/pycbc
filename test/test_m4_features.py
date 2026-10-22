@@ -36,31 +36,32 @@ class TestMilestone4Features(unittest.TestCase):
         self.assertAlmostEqual(newsnr_clean, 33.87, delta=0.01)
 
         # With minor residual dist = 0.15 (e.g. from elevated power or sg chisq):
-        # s2 = 1147.18, tau_s = 15.266, sig_s = 5.215
-        # sg_chisq = tau_s + 0.15 * sig_s = 16.048
+        # s2 = 1147.18, tau_s = 3.20 + 0.012 * 1147.18 = 16.966, sig_s = 8.483
+        # sg_chisq = tau_s + 0.15 * sig_s = 18.239
+        sg_chisq_dist = 16.966 + 0.15 * 8.483
         newsnr_dist015 = newsnr_sgveto_autochisq(
             snr,
             chisq,
-            16.048,
+            sg_chisq_dist,
             autochisq,
             c_sg=0.012,
         )
-        self.assertAlmostEqual(newsnr_dist015, 31.14, delta=0.05)
+        self.assertAlmostEqual(newsnr_dist015, 29.37, delta=0.05)
 
         # Using ranking function
         trigs = {
             "chisq": np.array([chisq]),
             "chisq_dof": np.array([1.5]),
             "snr": np.array([snr]),
-            "sg_chisq": np.array([16.048]),
+            "sg_chisq": np.array([sg_chisq_dist]),
             "auto_chisq": np.array([autochisq]),
             "auto_chisq_dof": np.array([1.0]),
         }
         getter_newsnr = get_newsnr_sgveto_autochisq(trigs, c_sg=0.012)[0]
-        self.assertAlmostEqual(getter_newsnr, 31.14, delta=0.05)
+        self.assertAlmostEqual(getter_newsnr, 29.37, delta=0.05)
 
     def test_ranking_low_snr_glitch_rejection(self):
-        """Verify low-SNR glitch with sg_chisq=6.0 is suppressed to 2.48."""
+        """Verify low-SNR glitch with sg_chisq=6.0 is suppressed to 3.70 with tau_s=3.97."""
         snr = 8.0
         chisq = 1.0
         autochisq = 1.0
@@ -73,7 +74,7 @@ class TestMilestone4Features(unittest.TestCase):
             autochisq,
             c_sg=0.012,
         )
-        self.assertAlmostEqual(newsnr, 2.48, delta=0.05)
+        self.assertAlmostEqual(newsnr, 3.70, delta=0.05)
 
     def test_ranking_s2_saturation_limit(self):
         """Verify s2 saturation limit extends up to 5000.0."""
@@ -139,7 +140,7 @@ class TestMilestone4Features(unittest.TestCase):
         import subprocess
         import sys
 
-        # 1. pycbc_calculate_psd accepts --psd-delta-f and --native-psd-resolution
+        # 1. pycbc_calculate_psd accepts --psd-delta-f, --native-welch-resolution, etc.
         res = subprocess.run(
             [sys.executable, "bin/all_sky_search/pycbc_calculate_psd", "--help"],
             capture_output=True,
@@ -148,6 +149,81 @@ class TestMilestone4Features(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertIn("--psd-delta-f", res.stdout)
         self.assertIn("--native-psd-resolution", res.stdout)
+        self.assertIn("--native-welch-resolution", res.stdout)
+        self.assertIn("--no-native-welch-resolution", res.stdout)
+        self.assertIn("--interpolated-resolution", res.stdout)
+
+    def test_calculate_psd_default_welch_resolution(self):
+        """Verify pycbc_calculate_psd parser defaults native_welch_resolution to True."""
+        import subprocess
+        import sys
+
+        script_template = """
+import sys
+from unittest.mock import patch
+import runpy
+
+sys.argv = [
+    'pycbc_calculate_psd',
+    '--low-frequency-cutoff', '20',
+    '--channel-name', 'H1:STRAIN',
+    '--analysis-segment-file', 'dummy.xml',
+    '--output-file', 'dummy.hdf'{extra_arg}
+]
+with patch('pycbc.init_logging'), \\
+     patch('pycbc.psd.verify_psd_options'), \\
+     patch('pycbc.strain.StrainSegments.verify_segment_options'), \\
+     patch('pycbc.events.select_segments_by_definer', return_value=[]), \\
+     patch('pycbc.io.HFile'):
+    mod = runpy.run_path(
+        'bin/all_sky_search/pycbc_calculate_psd', run_name='__main__'
+    )
+print('DEFAULT_RES:', mod['args'].native_welch_resolution)
+"""
+        # Default run
+        res = subprocess.run(
+            [sys.executable, "-c", script_template.format(extra_arg="")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            res.returncode, 0, msg=f"Subprocess failed:\n{res.stderr}"
+        )
+        self.assertIn("DEFAULT_RES: True", res.stdout)
+
+        # --no-native-welch-resolution
+        res_no = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script_template.format(
+                    extra_arg=", '--no-native-welch-resolution'"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            res_no.returncode, 0, msg=f"Subprocess failed:\n{res_no.stderr}"
+        )
+        self.assertIn("DEFAULT_RES: False", res_no.stdout)
+
+        # --interpolated-resolution
+        res_interp = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script_template.format(
+                    extra_arg=", '--interpolated-resolution'"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            res_interp.returncode, 0, msg=f"Subprocess failed:\n{res_interp.stderr}"
+        )
+        self.assertIn("DEFAULT_RES: False", res_interp.stdout)
 
         # 2. pycbc_add_statmap accepts --hierarchical-removal-threshold-ifar
         res = subprocess.run(

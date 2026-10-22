@@ -43,14 +43,25 @@ parser.add_argument(
     type=float,
     default=None,
     help="Target frequency resolution for output PSDs in Hz (e.g. 0.0625 for 1/16 Hz). "
-    "If not specified and --native-welch-resolution is set, defaults to 1.0 / psd_segment_length.",
+    "If not specified and native Welch resolution is active (the default), "
+    "defaults to 1.0 / psd_segment_length.",
 )
 parser.add_argument(
     "--native-welch-resolution",
     "--native-psd-resolution",
     dest="native_welch_resolution",
     action="store_true",
-    help="Store PSDs at native Welch estimation resolution (1.0 / psd_segment_length).",
+    default=True,
+    help="Store PSDs at native Welch estimation resolution (1.0 / psd_segment_length). "
+    "Enabled by default to keep PSD file sizes compact.",
+)
+parser.add_argument(
+    "--no-native-welch-resolution",
+    "--interpolated-resolution",
+    dest="native_welch_resolution",
+    action="store_false",
+    help="Disable native Welch resolution and store PSDs at "
+    "interpolated full segment resolution (legacy behavior).",
 )
 
 pycbc.psd.insert_psd_option_group(parser, output=False)
