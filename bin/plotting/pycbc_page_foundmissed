@@ -398,24 +398,6 @@ else:
     plot.ylim(ymin=1, ymax=ymax)
 
 if args.axis_type in per_ifo_snr_keys and args.distance_type in per_ifo_snr_keys:
-    ax.axvline(
-        4.5,
-        color="#555555",
-        linestyle=":",
-        linewidth=0.9,
-        alpha=0.75,
-        label="SNR = 4.5 (2nd threshold)",
-    )
-    ax.axhline(4.5, color="#555555", linestyle=":", linewidth=0.9, alpha=0.75)
-    ax.axvline(
-        6.0,
-        color="#222222",
-        linestyle="-.",
-        linewidth=0.9,
-        alpha=0.75,
-        label="SNR = 6.0 (1st threshold)",
-    )
-    ax.axhline(6.0, color="#222222", linestyle="-.", linewidth=0.9, alpha=0.75)
     if args.log_x or args.log_distance:
         ax.plot(
             [],
@@ -428,8 +410,7 @@ if args.axis_type in per_ifo_snr_keys and args.distance_type in per_ifo_snr_keys
         )
         caption += (
             " Single-detector injections where one IFO was offline (SNR = 0) are mapped "
-            "to 0.7 (gray dashed line). Dotted lines show SNR = 4.5 (secondary followup "
-            "threshold) and dash-dotted lines show SNR = 6.0 (primary trigger threshold)."
+            "to 0.7 (gray dashed line)."
         )
     ax.legend(loc="lower left", fontsize=7, framealpha=0.85)
 
