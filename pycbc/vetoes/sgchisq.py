@@ -119,9 +119,18 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         indices=None,
         template_whitened=False,
         whitened=True,
+        project=True,
     ):
         """
-        Calculate sine-Gaussian chisq
+        Calculate sine-Gaussian chisq.
+
+        A signal that matches the template also contributes to any tile that
+        overlaps the template, by an amount that grows with the square of
+        its SNR, so a loud signal could fail the test. When project is True,
+        that contribution, the trigger's SNR times the normalized overlap
+        <tile|template>, is subtracted from each tile's SNR, and each tile's
+        squared SNR is divided by 1 - |<tile|template>|^2 to keep the
+        chisq's mean at 1 in noise.
 
         Parameters
         ----------
@@ -147,6 +156,8 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         whitened: bool, optional
             Whether stilde is already divided by the PSD. If not, only the
             frequencies the tiles read are divided by it.
+        project: bool, optional
+            Whether to remove the template's expected response from each tile.
 
         Returns
         -------
@@ -162,23 +173,26 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         if template_hash not in self.params:
             return chisq
 
+        snrs = numpy.array(snrv) * snr_norm
         if bchisq is not None and self.snr_threshold is not None:
             # Skip if newsnr too low
-            snr = abs(numpy.array(snrv) * snr_norm)
             rchisq = numpy.array(bchisq) / numpy.array(bchisq_dof)
-            nsnr = ranking.newsnr(snr, rchisq)
+            nsnr = ranking.newsnr(abs(snrs), rchisq)
             above = numpy.flatnonzero(nsnr >= self.snr_threshold)
             if not len(above):
                 return chisq
         else:
             above = range(len(snrv))
 
+        template_psd = None if template_whitened else psd
         tiles = self._cached_tiles(
             stilde,
             psd,
             template_hash,
-            self.peak_frequency(template, None if template_whitened else psd),
+            self.peak_frequency(template, template_psd),
             template.f_lower,
+            template if project else None,
+            template_psd,
         )
         if tiles is None:
             return chisq
@@ -204,12 +218,16 @@ class SingleDetSGChisq(SingleDetPowerChisq):
                 2j * numpy.pi * klo * stilde.delta_f * time
             )
             chisq[i] = 0
-            for gtem, kmin, kmax, gsigma in tiles:
+            for gtem, kmin, kmax, gsigma, overlap in tiles:
                 gsnr = (
                     gtem.numpy()[kmin:kmax] * shifted[kmin - klo : kmax - klo]
                 ).sum()
                 gsnr *= 4.0 * gtem.delta_f / gsigma
-                chisq[i] += abs(gsnr) ** 2.0
+                if project:
+                    gsnr -= snrs[i] * overlap
+                    chisq[i] += abs(gsnr) ** 2 / (1 - abs(overlap) ** 2)
+                else:
+                    chisq[i] += abs(gsnr) ** 2
             chisq[i] /= 2 * len(tiles)
         return chisq
 
@@ -227,14 +245,77 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         fstep = bins[-2] - bins[-3]
         return float((bins[-2] + fstep) * template.delta_f)
 
-    def _cached_tiles(self, stilde, psd, template_hash, fpeak, f_lower):
+    @staticmethod
+    def _overlaps(tiles, template, template_psd, psd):
+        """
+        Return the normalized overlap of each tile with the template,
+        <tile|template> / (|tile| |template|).
+
+        The overlap is computed on the template's frequency grid. The
+        template is whitened by template_psd (unless already whitened), and
+        the tile by the data's PSD at the same frequencies.
+        """
+        df = template.delta_f
+        # Only positive frequencies below the data's Nyquist frequency
+        npos = min(len(template), int(len(psd) * psd.delta_f / df))
+        if template_psd is None:
+            h = numpy.asarray(template)[:npos]
+        else:
+            tpsd = numpy.asarray(template_psd)[:npos]
+            h = numpy.zeros(npos, dtype=complex)
+            good = tpsd > 0
+            h[good] = numpy.asarray(template)[:npos][good] / numpy.sqrt(tpsd[good])
+        hnorm = numpy.sqrt(4 * df * numpy.sum(abs(h) ** 2))
+
+        def on_template_grid(series, k):
+            """
+            Return series, given on the data's frequency grid, at the
+            template's frequency samples k.
+            """
+            ratio = df / series.delta_f
+            if abs(ratio - round(ratio)) < 1e-9:
+                return numpy.asarray(series)[(k * round(ratio))]
+            data_f = numpy.arange(len(series)) * series.delta_f
+            return numpy.interp(k * df, data_f, numpy.asarray(series))
+
+        out = []
+        for gtem, kmin, kmax, _ in tiles:
+            fmin, fmax = kmin * gtem.delta_f, kmax * gtem.delta_f
+            k = numpy.arange(
+                int(numpy.ceil(fmin / df)), min(int(numpy.ceil(fmax / df)), npos)
+            )
+            g = on_template_grid(gtem, k) / numpy.sqrt(on_template_grid(psd, k))
+            gnorm = numpy.sqrt(4 * df * numpy.sum(abs(g) ** 2))
+            if gnorm == 0 or hnorm == 0:
+                out.append(0.0)
+                continue
+            out.append(4 * df * numpy.sum(g * h[k]) / (gnorm * hnorm))
+        return out
+
+    def _cached_tiles(
+        self,
+        stilde,
+        psd,
+        template_hash,
+        fpeak,
+        f_lower,
+        template=None,
+        template_psd=None,
+    ):
         """
         Return the result of _tiles, cached for the 16 templates used
         most recently. Triggers are often evaluated one at a time, in an
         order that moves between templates.
         """
         cache = self.__dict__.setdefault("_tile_cache", OrderedDict())
-        key = (template_hash, fpeak, f_lower, len(stilde), stilde.delta_f)
+        key = (
+            template_hash,
+            fpeak,
+            f_lower,
+            len(stilde),
+            stilde.delta_f,
+            template is not None,
+        )
         entry = cache.get(key)
         # The psd is held by the entry, so it cannot be another one reusing
         # its id
@@ -242,6 +323,12 @@ class SingleDetSGChisq(SingleDetPowerChisq):
             cache.move_to_end(key)
             return entry[1]
         tiles = self._tiles(stilde, psd, self.params[template_hash], fpeak, f_lower)
+        if tiles is not None:
+            if template is not None:
+                overlaps = self._overlaps(tiles, template, template_psd, psd)
+            else:
+                overlaps = [0.0] * len(tiles)
+            tiles = [(*t, o) for t, o in zip(tiles, overlaps, strict=True)]
         cache[key] = (psd, tiles)
         if len(cache) > 16:
             cache.popitem(last=False)
