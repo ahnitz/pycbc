@@ -65,6 +65,7 @@ def get_stat(args, trigs, threshold):
         # read and format chunk of data so it can be read by key
         # as the stat classes expect.
         chunk = {k: trigs[k][s:e] for k in trigs if len(trigs[k]) == size}
+        chunk["_full_trigs"] = trigs
         trigger_keep_bool = np.zeros(e - s, dtype=bool)
 
         if len(trigger_cut_dict) > 0:
@@ -202,7 +203,59 @@ statsmod.insert_statistic_option_group(
     parser, default_ranking_statistic="single_ranking_only"
 )
 cuts.insert_cuts_option_group(parser)
+parser.add_argument(
+    "--sngl-ranking-hollow-knee",
+    type=float,
+    default=None,
+    help="Knee parameter for hollow-annulus non-stationarity ranking term. Default None (disabled / 0.0).",
+)
+parser.add_argument(
+    "--sngl-ranking-hollow-scale",
+    type=float,
+    default=None,
+    help="Scale parameter for hollow-annulus non-stationarity ranking term. Default None (2.5).",
+)
+parser.add_argument(
+    "--sngl-ranking-hollow-inner",
+    type=float,
+    default=None,
+    help="Inner window in seconds for hollow-annulus non-stationarity ranking term. Default None (0.25).",
+)
+parser.add_argument(
+    "--sngl-ranking-hollow-outer",
+    type=float,
+    default=None,
+    help="Outer window in seconds for hollow-annulus non-stationarity ranking term. Default None (12.0).",
+)
+parser.add_argument(
+    "--sngl-ranking-hollow-min-snr",
+    type=float,
+    default=None,
+    help="Minimum SNR for triggers to contribute to hollow annulus. Default None (6.0).",
+)
+parser.add_argument(
+    "--sngl-ranking-hollow-max-rchisq",
+    type=float,
+    default=None,
+    help="Maximum reduced chi-squared for triggers to contribute to hollow annulus. Default None (2.5).",
+)
 args = parser.parse_args()
+
+hollow_cli_opts = {
+    "sngl_ranking_hollow_knee": args.sngl_ranking_hollow_knee,
+    "sngl_ranking_hollow_scale": args.sngl_ranking_hollow_scale,
+    "sngl_ranking_hollow_inner": args.sngl_ranking_hollow_inner,
+    "sngl_ranking_hollow_outer": args.sngl_ranking_hollow_outer,
+    "sngl_ranking_hollow_min_snr": args.sngl_ranking_hollow_min_snr,
+    "sngl_ranking_hollow_max_rchisq": args.sngl_ranking_hollow_max_rchisq,
+}
+if args.statistic_keywords is None:
+    args.statistic_keywords = []
+for opt_name, opt_val in hollow_cli_opts.items():
+    if opt_val is not None:
+        kw_prefix = f"{opt_name}:"
+        if not any(kw.startswith(kw_prefix) for kw in args.statistic_keywords):
+            args.statistic_keywords.append(f"{opt_name}:{opt_val}")
 
 init_logging(args.verbose)
 

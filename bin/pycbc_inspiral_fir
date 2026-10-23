@@ -634,6 +634,14 @@ def get_args():
         help="Number of bins in the asymmetric window (default 100).",
     )
     asym_group.add_argument(
+        "--asym-followup-cluster-bins",
+        type=int,
+        default=0,
+        help="Local-maximum separation in bins across secondary followup bins "
+        "to prevent multi-bin secondary glitches from consuming the bin budget "
+        "(default: 0 = disabled).",
+    )
+    asym_group.add_argument(
         "--asym-primary-newsnr-threshold",
         type=float,
         default=None,

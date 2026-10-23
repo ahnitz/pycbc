@@ -74,13 +74,16 @@ def newsnr_sgveto_autochisq(
     q=6.0,
     n=1.0,
     c_sg=0.012,
+    hollow=None,
+    hollow_knee=0.0,
+    hollow_scale=2.5,
     **kwargs,
 ):
     """Multi-metric signal-consistency distance from the BBH injection envelope
-    in (snr, reduced_power_chisq, reduced_auto_chisq, sg_chisq) space.
+    in (snr, reduced_power_chisq, reduced_auto_chisq, sg_chisq, hollow) space.
     Signals inside the 95% injection envelope experience zero downweighting;
     triggers outside the envelope are smoothly downweighted by their combined
-    normalized distance D = sqrt(z_pow^2 + z_auto^2 + z_sg^2)."""
+    normalized distance D = sqrt(z_pow^2 + z_auto^2 + z_sg^2 + z_hollow^2)."""
     nsnr = numpy.array(snr, ndmin=1, dtype=numpy.float64)
     s2_pa = numpy.minimum(nsnr**2, 300.0)
     s2_sg = numpy.minimum(nsnr**2, 5000.0)
@@ -107,6 +110,11 @@ def newsnr_sgveto_autochisq(
         sig_s = 1.20 + 0.0035 * s2_sg
         zs = numpy.maximum(0.0, (rsg - tau_s) / sig_s)
         d2 += zs**2
+
+    if hollow is not None and hollow_knee > 0.0:
+        rhollow = numpy.abs(numpy.array(hollow, ndmin=1, dtype=numpy.float64))
+        zh = numpy.maximum(0.0, (rhollow - hollow_knee) / hollow_scale)
+        d2 += zh**2
 
     dist = numpy.sqrt(d2)
     ind = numpy.where(dist > 0.0)[0]
@@ -404,6 +412,100 @@ def get_newsnr_sgveto_psdvar_scaled_threshold(trigs, **kwargs):
     return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
 
 
+def _extract_clean_hollow_times(
+    trigs,
+    min_snr=6.0,
+    max_rchisq=2.5,
+):
+    """Extract and 0.1s-cluster clean triggers from trigs or its underlying dataset."""
+    source = None
+    if isinstance(trigs, dict) and "_full_trigs" in trigs:
+        source = trigs["_full_trigs"]
+    elif hasattr(trigs, "trigs") and hasattr(trigs.trigs, "__getitem__"):
+        # SingleDetTriggers
+        source = trigs.trigs
+    elif (
+        hasattr(trigs, "file")
+        and hasattr(trigs, "ifo")
+        and hasattr(trigs.file, "__getitem__")
+        and trigs.ifo in trigs.file
+    ):
+        # ReadByTemplate
+        source = trigs.file[trigs.ifo]
+    elif hasattr(trigs, "__getitem__") and "snr" in trigs and "chisq" in trigs:
+        # HDF5 Group or trigger dict
+        source = trigs
+
+    if source is None:
+        return None
+
+    cache_key = ("_hollow_times", float(min_snr), float(max_rchisq))
+    if hasattr(source, "_hollow_cache") and cache_key in source._hollow_cache:
+        return source._hollow_cache[cache_key]
+
+    try:
+        all_snr = source["snr"][:]
+        all_chisq = source["chisq"][:]
+        all_dof = 2.0 * source["chisq_dof"][:] - 2.0
+        all_rchisq = all_chisq / numpy.maximum(1.0, all_dof)
+        clean = (all_snr >= min_snr) & (all_rchisq <= max_rchisq)
+
+        if "end_time" in source:
+            clean_times = numpy.array(source["end_time"][:][clean], dtype=numpy.float64)
+            if "end_time_ns" in source:
+                clean_times += (
+                    numpy.array(source["end_time_ns"][:][clean], dtype=numpy.float64)
+                    * 1e-9
+                )
+        elif "time" in source:
+            clean_times = numpy.array(source["time"][:][clean], dtype=numpy.float64)
+        else:
+            return None
+
+        if len(clean_times) == 0:
+            clustered = numpy.empty(0, dtype=numpy.float64)
+        else:
+            bin_idx = numpy.floor(clean_times / 0.1).astype(numpy.int64)
+            unique_bins = numpy.unique(bin_idx)
+            clustered = unique_bins * 0.1 + 0.05
+
+        try:
+            if not hasattr(source, "_hollow_cache"):
+                source._hollow_cache = {}
+            source._hollow_cache[cache_key] = clustered
+        except (AttributeError, TypeError):
+            pass
+
+        return clustered
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def compute_hollow_counts(
+    t,
+    clustered_clean_times,
+    inner=0.25,
+    outer=12.0,
+):
+    """Compute count of clustered clean triggers in hollow annulus [inner, outer]."""
+    if clustered_clean_times is None or len(clustered_clean_times) == 0:
+        return numpy.zeros_like(t, dtype=numpy.float64)
+
+    t_arr = numpy.array(t, ndmin=1, dtype=numpy.float64)
+    left_start = numpy.searchsorted(clustered_clean_times, t_arr - outer, side="left")
+    left_end = numpy.searchsorted(clustered_clean_times, t_arr - inner, side="right")
+    count_left = left_end - left_start
+
+    right_start = numpy.searchsorted(clustered_clean_times, t_arr + inner, side="left")
+    right_end = numpy.searchsorted(clustered_clean_times, t_arr + outer, side="right")
+    count_right = right_end - right_start
+
+    H = (count_left + count_right).astype(numpy.float64)
+    if hasattr(t, "__len__"):
+        return H
+    return H[0]
+
+
 def get_newsnr_sgveto_autochisq(
     trigs,
     chisq_thresh=1.50,
@@ -417,10 +519,10 @@ def get_newsnr_sgveto_autochisq(
     **kwargs,
 ):
     """Calculate newsnr re-weighted by traditional chisq, sine-gaussian chisq,
-    and auto-correlation chisq"""
+    auto-correlation chisq, and hollow-annulus non-stationarity"""
     if "sngl_ranking_c_sg" in kwargs:
         c_sg = float(kwargs.pop("sngl_ranking_c_sg"))
-    dof = 2.0 * trigs["chisq_dof"][:] - 2.0
+    dof = numpy.maximum(1.0, 2.0 * trigs["chisq_dof"][:] - 2.0)
     rchisq = trigs["chisq"][:] / dof
     try:
         sgchisq = trigs["sg_chisq"][:]
@@ -448,6 +550,54 @@ def get_newsnr_sgveto_autochisq(
             except (KeyError, ValueError):
                 autochisq = None
 
+    # Parse hollow-annulus non-stationarity parameters
+    hollow_knee = float(
+        kwargs.pop("sngl_ranking_hollow_knee", kwargs.pop("hollow_knee", 0.0))
+    )
+    hollow_scale = float(
+        kwargs.pop("sngl_ranking_hollow_scale", kwargs.pop("hollow_scale", 2.5))
+    )
+    hollow_inner = float(
+        kwargs.pop("sngl_ranking_hollow_inner", kwargs.pop("hollow_inner", 0.25))
+    )
+    hollow_outer = float(
+        kwargs.pop("sngl_ranking_hollow_outer", kwargs.pop("hollow_outer", 12.0))
+    )
+    hollow_min_snr = float(
+        kwargs.pop("sngl_ranking_hollow_min_snr", kwargs.pop("hollow_min_snr", 6.0))
+    )
+    hollow_max_rchisq = float(
+        kwargs.pop(
+            "sngl_ranking_hollow_max_rchisq", kwargs.pop("hollow_max_rchisq", 2.5)
+        )
+    )
+
+    hollow_counts = None
+    if hollow_knee > 0.0:
+        t = None
+        if "end_time" in trigs:
+            t = numpy.array(trigs["end_time"][:], dtype=numpy.float64)
+            if "end_time_ns" in trigs:
+                t += (
+                    numpy.array(trigs["end_time_ns"][:], dtype=numpy.float64)
+                    * 1e-9
+                )
+        elif "time" in trigs:
+            t = numpy.array(trigs["time"][:], dtype=numpy.float64)
+
+        if t is not None:
+            clustered = _extract_clean_hollow_times(
+                trigs,
+                min_snr=hollow_min_snr,
+                max_rchisq=hollow_max_rchisq,
+            )
+            hollow_counts = compute_hollow_counts(
+                t,
+                clustered,
+                inner=hollow_inner,
+                outer=hollow_outer,
+            )
+
     nsnr = newsnr_sgveto_autochisq(
         trigs["snr"][:],
         rchisq,
@@ -461,6 +611,9 @@ def get_newsnr_sgveto_autochisq(
         n_auto=n_auto,
         c_sg=c_sg,
         q=q,
+        hollow=hollow_counts,
+        hollow_knee=hollow_knee,
+        hollow_scale=hollow_scale,
         **kwargs,
     )
     return numpy.array(nsnr, ndmin=1, dtype=numpy.float32)
@@ -488,7 +641,11 @@ reqd_datasets["new_snr"] = reqd_datasets["newsnr"]
 reqd_datasets["newsnr_offset125"] = reqd_datasets["newsnr"]
 reqd_datasets["newsnr_sgveto"] = reqd_datasets["newsnr"] + ["sg_chisq"]
 reqd_datasets["newsnr_sgveto_offset125"] = reqd_datasets["newsnr_sgveto"]
-reqd_datasets["newsnr_sgveto_autochisq"] = reqd_datasets["newsnr_sgveto"] + ["cont_chisq", "cont_chisq_dof"]
+reqd_datasets["newsnr_sgveto_autochisq"] = reqd_datasets["newsnr_sgveto"] + [
+    "cont_chisq",
+    "cont_chisq_dof",
+    "end_time",
+]
 reqd_datasets["newsnr_sgveto_psdvar"] = reqd_datasets["newsnr_sgveto"] + ["psd_var_val"]
 reqd_datasets["newsnr_sgveto_psdvar_threshold"] = reqd_datasets["newsnr_sgveto_psdvar"]
 reqd_datasets["newsnr_sgveto_psdvar_scaled"] = reqd_datasets["newsnr_sgveto_psdvar"]

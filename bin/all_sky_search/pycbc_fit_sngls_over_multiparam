@@ -280,6 +280,13 @@ parser.add_argument(
     action="store_true",
     help="If given, will output the input file fits to fit_by_template group.",
 )
+parser.add_argument(
+    "--max-fit-coeff",
+    type=float,
+    default=None,
+    help="Upper cap to apply to fit coefficient (alpha) values. "
+    "If provided, caps raw and smoothed fit_coeff values. Default None.",
+)
 args = parser.parse_args()
 
 if args.smoothing_keywords:
@@ -363,7 +370,12 @@ for filename in args.template_fit_file:
         tid = numpy.concatenate((tid, fits["template_id"][:]))
         nabove = numpy.concatenate((nabove, fits["count_above_thresh"][:]))
         ntotal = numpy.concatenate((ntotal, fits["count_in_template"][:]))
-        alpha = numpy.concatenate((alpha, fits["fit_coeff"][:]))
+        raw_alpha = fits["fit_coeff"][:]
+        if args.max_fit_coeff is not None:
+            raw_alpha = numpy.where(
+                raw_alpha > 0, numpy.minimum(raw_alpha, args.max_fit_coeff), raw_alpha
+            )
+        alpha = numpy.concatenate((alpha, raw_alpha))
         try:
             median_sigma = numpy.concatenate((median_sigma, fits["median_sigma"][:]))
         except KeyError:
@@ -427,6 +439,10 @@ if args.output_fits_by_template:
         # a warning and panic
         alpha = nabove / invalphan
     alpha[nabove == 0] = -100
+    if args.max_fit_coeff is not None:
+        alpha = numpy.where(
+            alpha > 0, numpy.minimum(alpha, args.max_fit_coeff), alpha
+        )
     fbt_dict["fit_coeff"] = alpha
 
 n_required = (
@@ -561,6 +577,9 @@ else:
         smoothed_vals[i, :] = smooth(
             nabove, invalphan, ntotal, d, args.smoothing_method, **kwarg_dict
         )
+
+if args.max_fit_coeff is not None:
+    smoothed_vals[:, 1] = numpy.minimum(smoothed_vals[:, 1], args.max_fit_coeff)
 
 logging.info("Writing output")
 outfile = HFile(args.output, "w")

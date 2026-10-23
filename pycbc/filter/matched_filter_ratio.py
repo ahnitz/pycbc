@@ -336,6 +336,7 @@ def secondary_asym_keep(
     secondary_snr_threshold=None,
     network_snr_threshold=None,
     max_followup_bins=0,
+    cluster_bins=0,
 ):
     """Positions of the secondary triggers (SNRs asym_snrs) kept."""
     if len(asym_snrs) == 0:
@@ -357,7 +358,24 @@ def secondary_asym_keep(
     else:
         passing_indices = np.arange(len(asym_snrs))
 
-    if (
+    if len(passing_indices) == 0:
+        return np.empty(0, dtype=np.int64)
+
+    if cluster_bins is not None and cluster_bins > 0:
+        order = np.argsort(-rho_sec[passing_indices], kind="stable")
+        sorted_candidates = passing_indices[order]
+        accepted = []
+        for c in sorted_candidates:
+            if not any(abs(c - a) <= cluster_bins for a in accepted):
+                accepted.append(c)
+                if (
+                    max_followup_bins is not None
+                    and max_followup_bins > 0
+                    and len(accepted) >= max_followup_bins
+                ):
+                    break
+        passing_indices = np.sort(accepted)
+    elif (
         max_followup_bins is not None
         and max_followup_bins > 0
         and len(passing_indices) > max_followup_bins
@@ -913,6 +931,7 @@ class TopTemplateSearch:
                         secondary_snr_threshold=args.asym_secondary_snr_threshold,
                         network_snr_threshold=args.asym_network_snr_threshold,
                         max_followup_bins=max_bins,
+                        cluster_bins=getattr(args, "asym_followup_cluster_bins", 0),
                     )
                     self._record(
                         ctx,

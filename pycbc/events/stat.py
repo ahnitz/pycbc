@@ -939,6 +939,11 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         # Modifier to get a sensible value of the fit slope below threshold
         self.alphabelow = float(self.kwargs.get("alpha_below_thresh", numpy.inf))
+        val_cap = self.kwargs.get("cap_alpha_below", False)
+        if isinstance(val_cap, str):
+            self.cap_alpha_below = val_cap.lower() in ["true", "1", "yes", "t"]
+        else:
+            self.cap_alpha_below = bool(val_cap)
 
         # This will be used to keep track of the template number being used
         self.curr_tnum = None
@@ -1403,11 +1408,19 @@ class ExpFitStatistic(PhaseTDStatistic):
             # Above the threshold we use the usual fit coefficient (alphai)
             # below threshold use specified alphabelow
             bt = sngl_stat < thresh
-            lognoiselbt = (
-                -self.alphabelow * (sngl_stat - thresh)
-                + numpy.log(self.alphabelow)
-                + numpy.log(ratei)
-            )
+            if getattr(self, "cap_alpha_below", False):
+                ab_eff = numpy.minimum(alphai, self.alphabelow)
+                lognoiselbt = (
+                    -ab_eff * (sngl_stat - thresh)
+                    + numpy.log(alphai)
+                    + numpy.log(ratei)
+                )
+            else:
+                lognoiselbt = (
+                    -self.alphabelow * (sngl_stat - thresh)
+                    + numpy.log(self.alphabelow)
+                    + numpy.log(ratei)
+                )
             lognoisel[bt] = lognoiselbt[bt]
 
         return numpy.array(lognoisel, ndmin=1, dtype=numpy.float32)
@@ -1965,6 +1978,11 @@ class ExpFitCombinedSNR(ExpFitStatistic):
 
         # Modifier to get a sensible value of the fit slope below threshold
         self.alphabelow = float(self.kwargs.get("alpha_below_thresh", numpy.inf))
+        val_cap = self.kwargs.get("cap_alpha_below", False)
+        if isinstance(val_cap, str):
+            self.cap_alpha_below = val_cap.lower() in ["true", "1", "yes", "t"]
+        else:
+            self.cap_alpha_below = bool(val_cap)
 
     def single(self, trigs):
         """
