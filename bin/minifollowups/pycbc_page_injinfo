@@ -191,11 +191,45 @@ tag = ""
 if args.n_nearest is not None:
     tag = ":%s" % (args.n_nearest + 1)
 
+summary_parts = []
+if "net_mf_snr" in derived:
+    ifos_str = ", ".join(
+        f"{ifo}={numpy.nan_to_num(f['injections'][f'optimal_mf_snr_{ifo}'][iidx], nan=0.0):.2f}"
+        for ifo in f.attrs["ifos"].split(" ")
+        if f"optimal_mf_snr_{ifo}" in f["injections"]
+    )
+    summary_parts.append(f"MF_SNR={derived['net_mf_snr']:.2f} ({ifos_str})")
+elif "net_opt_snr" in derived:
+    ifos_str = ", ".join(
+        f"{ifo}={numpy.nan_to_num(f['injections'][f'optimal_snr_{ifo}'][iidx], nan=0.0):.2f}"
+        for ifo in f.attrs["ifos"].split(" ")
+        if f"optimal_snr_{ifo}" in f["injections"]
+    )
+    summary_parts.append(f"Opt_SNR={derived['net_opt_snr']:.2f} ({ifos_str})")
+
+if "found_after_vetoes" in f and "injection_index" in f["found_after_vetoes"]:
+    found_idxes = f["found_after_vetoes/injection_index"][:]
+    matches = numpy.where(found_idxes == iidx)[0]
+    if len(matches) > 0:
+        f_pos = matches[0]
+        stat_val = f["found_after_vetoes/stat"][f_pos]
+        ifar_val = (
+            f["found_after_vetoes/ifar_exc"][f_pos]
+            if "ifar_exc" in f["found_after_vetoes"]
+            else f["found_after_vetoes/ifar"][f_pos]
+        )
+        summary_parts.append(f"Found: stat={stat_val:.2f}, IFAR={ifar_val:.3g} yr")
+    else:
+        summary_parts.append("MISSED")
+
+summary_parts.append(f"Mc={derived['mchirp']:.1f} Msun | GPS={f['injections']['tc'][iidx]:.2f}")
+title_str = "Parameters of missed injection" + tag + " | " + " | ".join(summary_parts)
+
 pycbc.results.save_fig_with_metadata(
     html,
     args.output_file,
     {},
     cmd=" ".join(sys.argv),
-    title="Parameters of missed injection" + tag,
+    title=title_str,
     caption="Parameters of this injection",
 )

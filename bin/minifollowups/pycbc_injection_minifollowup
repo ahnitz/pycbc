@@ -197,6 +197,35 @@ parser.add_argument(
     "decisive SNR is smaller than this value.",
 )
 parser.add_argument(
+    "--minimum-decisive-snr",
+    "--min-decisive-snr",
+    dest="minimum_decisive_snr",
+    type=float,
+    default=None,
+    help="If given, only follow up injections where the decisive (2nd largest) "
+    "optimal/MF SNR is >= this value (e.g. > 0 to require at least 2 detectors "
+    "online, or >= 4.0 to require both detectors above a secondary SNR threshold).",
+)
+parser.add_argument(
+    "--max-ifar",
+    type=float,
+    default=None,
+    help="If given, only follow up found injections with IFAR < this value (years).",
+)
+parser.add_argument(
+    "--snr-type",
+    choices=["optimal", "optimal_mf"],
+    default=None,
+    help="Type of injected SNR to use for network/decisive SNR filtering and sorting "
+    "('optimal' or 'optimal_mf').",
+)
+parser.add_argument(
+    "--num-events",
+    type=int,
+    default=None,
+    help="Maximum number of injections to follow up (overrides [workflow-injection_minifollowups] num-events).",
+)
+parser.add_argument(
     "--nearby-triggers-window",
     type=float,
     default=0.05,
@@ -227,10 +256,20 @@ parser.add_argument(
 )
 parser.add_argument(
     "--sort-variable",
+    "--sort-by",
+    dest="sort_variable",
     default=None,
-    choices=["optimal_snr", "ifar", "stat"],
-    help="Variable to sort injections by. If 'ifar', sorts ascending (worst IFAR first). "
-    "If 'stat', sorts ascending (worst ranking statistic first).",
+    choices=[
+        "optimal_snr",
+        "optimal_mf_snr",
+        "network_snr",
+        "decisive_snr",
+        "ifar",
+        "stat",
+    ],
+    help="Variable to sort injections by. If 'ifar' or 'stat', sorts ascending "
+    "(worst IFAR/stat first). If 'network_snr'/'optimal_snr'/'optimal_mf_snr', "
+    "sorts descending by network SNR. If 'decisive_snr', sorts descending by decisive SNR.",
 )
 parser.add_argument(
     "--min-network-snr",
@@ -288,22 +327,38 @@ for ifo in args.single_detector_triggers:
 f = HFile(args.injection_file, "r")
 inj_def = f["injections"]
 
-# Calculate network optimal SNR for all injections
-prefix = (
-    "optimal_mf_snr_"
-    if getattr(args, "distance_type", None) and "mf" in args.distance_type
-    else "optimal_snr_"
+# Calculate network and decisive optimal/MF SNR for all injections
+use_mf = (
+    args.snr_type == "optimal_mf"
+    or (
+        args.snr_type is None
+        and getattr(args, "distance_type", None)
+        and "mf" in args.distance_type
+    )
+    or getattr(args, "sort_variable", None) == "optimal_mf_snr"
 )
-optimal_snrs = [inj_def[dsn][:] for dsn in inj_def.keys() if dsn.startswith(prefix)]
+prefix = "optimal_mf_snr_" if use_mf else "optimal_snr_"
+optimal_snrs = [
+    numpy.nan_to_num(inj_def[dsn][:], nan=0.0)
+    for dsn in inj_def.keys()
+    if dsn.startswith(prefix)
+]
 if not optimal_snrs and prefix != "optimal_snr_":
     optimal_snrs = [
-        inj_def[dsn][:] for dsn in inj_def.keys() if dsn.startswith("optimal_snr_")
+        numpy.nan_to_num(inj_def[dsn][:], nan=0.0)
+        for dsn in inj_def.keys()
+        if dsn.startswith("optimal_snr_")
     ]
 if optimal_snrs:
     optimal_snrs = numpy.vstack(optimal_snrs)
     net_opt_snr_all = numpy.sqrt((optimal_snrs**2).sum(axis=0))
+    if optimal_snrs.shape[0] >= 2:
+        dec_opt_snr_all = numpy.sort(optimal_snrs, axis=0)[-2]
+    else:
+        dec_opt_snr_all = optimal_snrs[0]
 else:
     net_opt_snr_all = numpy.zeros(len(inj_def["tc"]))
+    dec_opt_snr_all = numpy.zeros(len(inj_def["tc"]))
 
 # Select injections by category
 if args.injection_category == "found":
@@ -331,6 +386,30 @@ if args.min_network_snr is not None and len(inj_candidates) > 0:
     valid_snr = net_opt_snr_all[inj_candidates] >= args.min_network_snr
     inj_candidates = inj_candidates[valid_snr]
 
+# Filter by minimum / maximum decisive SNR if requested
+if args.minimum_decisive_snr is not None and len(inj_candidates) > 0:
+    valid_dec = dec_opt_snr_all[inj_candidates] >= args.minimum_decisive_snr
+    inj_candidates = inj_candidates[valid_dec]
+if args.maximum_decisive_snr is not None and len(inj_candidates) > 0:
+    valid_dec = dec_opt_snr_all[inj_candidates] <= args.maximum_decisive_snr
+    inj_candidates = inj_candidates[valid_dec]
+
+# Filter found injections by max IFAR if requested
+max_ifar_val = (
+    args.max_ifar
+    if args.max_ifar is not None
+    else (args.ifar_threshold if args.injection_category == "found" else None)
+)
+if max_ifar_val is not None and len(inj_candidates) > 0 and "found_after_vetoes" in f:
+    found_idx_arr = f["found_after_vetoes/injection_index"][:]
+    try:
+        all_ifars = f["found_after_vetoes/ifar_exc"][:]
+    except KeyError:
+        all_ifars = f["found_after_vetoes/ifar"][:]
+    ifar_map = dict(zip(found_idx_arr, all_ifars))
+    cand_ifars = numpy.array([ifar_map.get(idx, 0.0) for idx in inj_candidates])
+    inj_candidates = inj_candidates[cand_ifars < max_ifar_val]
+
 # Sort the injections
 if args.sort_variable in ["ifar", "stat"]:
     if len(inj_candidates) > 0:
@@ -352,19 +431,32 @@ if args.sort_variable in ["ifar", "stat"]:
         cand_snrs = net_opt_snr_all[inj_candidates]
         sort_order = numpy.lexsort((-cand_snrs, cand_vals))
         inj_candidates = inj_candidates[sort_order]
+elif args.sort_variable in ["network_snr", "optimal_snr", "optimal_mf_snr"]:
+    if len(inj_candidates) > 0:
+        cand_snrs = net_opt_snr_all[inj_candidates]
+        inj_candidates = inj_candidates[ numpy.argsort(-cand_snrs, kind="mergesort") ]
+elif args.sort_variable == "decisive_snr":
+    if len(inj_candidates) > 0:
+        cand_dec = dec_opt_snr_all[inj_candidates]
+        cand_snrs = net_opt_snr_all[inj_candidates]
+        sort_order = numpy.lexsort((-cand_snrs, -cand_dec))
+        inj_candidates = inj_candidates[sort_order]
 else:
     if args.distance_type is None:
-        args.distance_type = "comb_optimal_snr"
+        args.distance_type = "comb_optimal_mf_snr" if use_mf else "comb_optimal_snr"
     inj_candidates = sort_injections(args, inj_def, inj_candidates)
 
 missed = inj_candidates
 
 # figure out how many injections to follow up
-num_events = int(
-    workflow.cp.get_opt_tags(
-        "workflow-injection_minifollowups", "num-events", args.tags or []
+if args.num_events is not None:
+    num_events = int(args.num_events)
+else:
+    num_events = int(
+        workflow.cp.get_opt_tags(
+            "workflow-injection_minifollowups", "num-events", args.tags or []
+        )
     )
-)
 num_events = min(num_events, len(missed))
 
 # Get the trigger SNRs and times for the injections being followed up
