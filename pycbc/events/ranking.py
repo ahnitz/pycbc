@@ -412,6 +412,9 @@ def get_newsnr_sgveto_psdvar_scaled_threshold(trigs, **kwargs):
     return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
 
 
+_HOLLOW_TIMES_CACHE = {}
+
+
 def _extract_clean_hollow_times(
     trigs,
     min_snr=6.0,
@@ -419,11 +422,45 @@ def _extract_clean_hollow_times(
 ):
     """Extract and 0.1s-cluster clean triggers from trigs or its underlying dataset."""
     source = None
+    file_obj = None
+    ifo = None
+
     if isinstance(trigs, dict) and "_full_trigs" in trigs:
-        source = trigs["_full_trigs"]
+        full_source = trigs["_full_trigs"]
+        if hasattr(full_source, "trigs") and hasattr(full_source.trigs, "__getitem__"):
+            source = full_source.trigs
+            file_obj = getattr(full_source, "file", trigs.get("file"))
+            ifo = getattr(full_source, "ifo", trigs.get("ifo"))
+        elif (
+            hasattr(full_source, "file")
+            and hasattr(full_source, "ifo")
+            and hasattr(full_source.file, "__getitem__")
+            and full_source.ifo in full_source.file
+        ):
+            source = full_source.file[full_source.ifo]
+            file_obj = full_source.file
+            ifo = full_source.ifo
+        elif (
+            hasattr(full_source, "__getitem__")
+            and "snr" in full_source
+            and "chisq" in full_source
+        ):
+            source = full_source
+            file_obj = getattr(full_source, "file", trigs.get("file"))
+            ifo = getattr(full_source, "ifo", trigs.get("ifo"))
+        if file_obj is None and "file" in trigs:
+            file_obj = trigs["file"]
+        if ifo is None and "ifo" in trigs:
+            ifo = trigs["ifo"]
+    elif hasattr(trigs, "_full_trigs") and trigs._full_trigs is not None:
+        source = trigs._full_trigs
+        file_obj = getattr(trigs, "file", getattr(source, "file", None))
+        ifo = getattr(trigs, "ifo", getattr(source, "ifo", None))
     elif hasattr(trigs, "trigs") and hasattr(trigs.trigs, "__getitem__"):
         # SingleDetTriggers
         source = trigs.trigs
+        file_obj = getattr(trigs, "file", None)
+        ifo = getattr(trigs, "ifo", None)
     elif (
         hasattr(trigs, "file")
         and hasattr(trigs, "ifo")
@@ -432,14 +469,52 @@ def _extract_clean_hollow_times(
     ):
         # ReadByTemplate
         source = trigs.file[trigs.ifo]
+        file_obj = trigs.file
+        ifo = trigs.ifo
+    elif (
+        isinstance(trigs, dict)
+        and "file" in trigs
+        and "ifo" in trigs
+        and hasattr(trigs["file"], "__getitem__")
+        and trigs["ifo"] in trigs["file"]
+    ):
+        source = trigs["file"][trigs["ifo"]]
+        file_obj = trigs["file"]
+        ifo = trigs["ifo"]
     elif hasattr(trigs, "__getitem__") and "snr" in trigs and "chisq" in trigs:
         # HDF5 Group or trigger dict
         source = trigs
+        file_obj = (
+            getattr(trigs, "file", None)
+            if not isinstance(trigs, dict)
+            else trigs.get("file", None)
+        )
+        ifo = (
+            getattr(trigs, "ifo", None)
+            if not isinstance(trigs, dict)
+            else trigs.get("ifo", None)
+        )
 
     if source is None:
         return None
 
-    cache_key = ("_hollow_times", float(min_snr), float(max_rchisq))
+    cache_key = (
+        str(ifo) if ifo is not None else "",
+        float(min_snr),
+        float(max_rchisq),
+    )
+
+    if (
+        file_obj is not None
+        and hasattr(file_obj, "_hollow_cache")
+        and cache_key in file_obj._hollow_cache
+    ):
+        return file_obj._hollow_cache[cache_key]
+
+    cache_id = id(file_obj) if file_obj is not None else id(source)
+    if (cache_id, cache_key) in _HOLLOW_TIMES_CACHE:
+        return _HOLLOW_TIMES_CACHE[(cache_id, cache_key)]
+
     if hasattr(source, "_hollow_cache") and cache_key in source._hollow_cache:
         return source._hollow_cache[cache_key]
 
@@ -469,12 +544,23 @@ def _extract_clean_hollow_times(
             unique_bins = numpy.unique(bin_idx)
             clustered = unique_bins * 0.1 + 0.05
 
+        if file_obj is not None:
+            try:
+                if (
+                    not hasattr(file_obj, "_hollow_cache")
+                    or file_obj._hollow_cache is None
+                ):
+                    file_obj._hollow_cache = {}
+                file_obj._hollow_cache[cache_key] = clustered
+            except (AttributeError, TypeError):
+                pass
         try:
-            if not hasattr(source, "_hollow_cache"):
+            if not hasattr(source, "_hollow_cache") or source._hollow_cache is None:
                 source._hollow_cache = {}
             source._hollow_cache[cache_key] = clustered
         except (AttributeError, TypeError):
             pass
+        _HOLLOW_TIMES_CACHE[(cache_id, cache_key)] = clustered
 
         return clustered
     except (KeyError, ValueError, TypeError):

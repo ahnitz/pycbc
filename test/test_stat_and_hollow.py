@@ -231,6 +231,64 @@ class TestHollowAnnulusRanking(unittest.TestCase):
         res_zero_knee = ranking.get_newsnr_sgveto_autochisq(trigs, sngl_ranking_hollow_knee=0.0)
         self.assertEqual(res_default[0], res_zero_knee[0])
 
+    def test_full_trigs_in_dict(self):
+        """When _full_trigs is attached, hollow term uses full dataset."""
+        # Single candidate trigger at t = 100.0, alone in template
+        trig_subset = {
+            "snr": np.array([8.0]),
+            "chisq": np.array([28.0]),
+            "chisq_dof": np.array([15.0]),
+            "cont_chisq": np.array([1.0]),
+            "cont_chisq_dof": np.array([1.0]),
+            "sg_chisq": np.array([1.0]),
+            "end_time": np.array([100.0]),
+        }
+        # Without _full_trigs, candidate sees only itself -> 0 hollow triggers
+        res_isolated = ranking.get_newsnr_sgveto_autochisq(
+            trig_subset,
+            sngl_ranking_hollow_knee=4.5,
+            sngl_ranking_hollow_scale=2.5,
+        )
+
+        # Full detector trigger table with 10 clean glitches in hollow annulus [90s, 110s]
+        full_times = np.array([91.0, 92.0, 93.0, 94.0, 95.0, 105.0, 106.0, 107.0, 108.0, 109.0])
+        full_table = {
+            "snr": np.array([8.0] * len(full_times)),
+            "chisq": np.array([28.0] * len(full_times)),
+            "chisq_dof": np.array([15.0] * len(full_times)),
+            "end_time": full_times,
+        }
+        trig_subset["_full_trigs"] = full_table
+
+        # With _full_trigs attached, candidate detects hollow counts and is downweighted
+        res_full = ranking.get_newsnr_sgveto_autochisq(
+            trig_subset,
+            sngl_ranking_hollow_knee=4.5,
+            sngl_ranking_hollow_scale=2.5,
+        )
+        self.assertLess(res_full[0], res_isolated[0])
+
+    def test_clean_times_caching(self):
+        """Verify _extract_clean_hollow_times caches clustered array."""
+        class MockFile:
+            pass
+
+        mock_f = MockFile()
+        full_table = {
+            "snr": np.array([8.0, 8.0, 8.0]),
+            "chisq": np.array([28.0, 28.0, 28.0]),
+            "chisq_dof": np.array([15.0, 15.0, 15.0]),
+            "end_time": np.array([100.0, 101.0, 102.0]),
+            "file": mock_f,
+            "ifo": "H1",
+        }
+        c1 = ranking._extract_clean_hollow_times(full_table)
+        self.assertTrue(hasattr(mock_f, "_hollow_cache"))
+        c2 = ranking._extract_clean_hollow_times(full_table)
+        # Should return identical cached array
+        self.assertIs(c1, c2)
+
+
 
 class TestAsymFollowupClusterBins(unittest.TestCase):
     """Test --asym-followup-cluster-bins local-maximum greedy separation."""

@@ -745,6 +745,7 @@ class SingleDetTriggers:
             logger.info("%i triggers remain after vetoes", self.mask_size)
 
         self.file = self.trigs_f
+        self._full_trigs = self.trigs
         self.veto_files = [veto_file] if veto_file else []
         self.segment_name = [segment_name] if segment_name else []
 
@@ -788,6 +789,7 @@ class SingleDetTriggers:
         mtrigs["veto_files"] = getattr(self, "veto_files", [])
         mtrigs["segment_name"] = getattr(self, "segment_name", [])
         mtrigs["gating_veto_windows"] = getattr(self, "gating_veto_windows", {})
+        mtrigs["_full_trigs"] = self
         return mtrigs
 
     @classmethod
@@ -1595,6 +1597,7 @@ class ReadByTemplate:
         self.filename = filename
         self.file = HFile(filename, "r")
         self.ifo = ifo if ifo is not None else tuple(self.file.keys())[0]
+        self._full_trigs = self.file[self.ifo]
         self.valid = None
         self.bank = HFile(bank, "r") if bank else {}
         self.segment_name = segment_name
@@ -1617,7 +1620,7 @@ class ReadByTemplate:
                 vfile, ifo=self.ifo, segment_name=name
             )
             self.segs = (self.segs - veto_segs).coalesce()
-        if self.ifo in gating_veto_windows:
+        if self.ifo in self.gating_veto_windows:
             gating_veto = gating_veto_windows[self.ifo].split(",")
             gveto_before = float(gating_veto[0])
             gveto_after = float(gating_veto[1])
