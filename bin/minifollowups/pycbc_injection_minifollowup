@@ -479,7 +479,7 @@ elif workflow.cp.has_option_tags(
         )
     )
 else:
-    max_strain_events = min(num_events, 10)
+    max_strain_events = num_events
 
 # Get the trigger SNRs and times for the injections being followed up
 missed_inj_times = numpy.sort(inj_def["tc"][:][missed[:num_events]])
