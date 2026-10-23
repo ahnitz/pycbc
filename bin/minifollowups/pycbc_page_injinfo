@@ -207,10 +207,12 @@ elif "net_opt_snr" in derived:
     )
     summary_parts.append(f"Opt_SNR={derived['net_opt_snr']:.2f} ({ifos_str})")
 
+is_found_inj = False
 if "found_after_vetoes" in f and "injection_index" in f["found_after_vetoes"]:
     found_idxes = f["found_after_vetoes/injection_index"][:]
     matches = numpy.where(found_idxes == iidx)[0]
     if len(matches) > 0:
+        is_found_inj = True
         f_pos = matches[0]
         stat_val = f["found_after_vetoes/stat"][f_pos]
         ifar_val = (
@@ -223,7 +225,8 @@ if "found_after_vetoes" in f and "injection_index" in f["found_after_vetoes"]:
         summary_parts.append("MISSED")
 
 summary_parts.append(f"Mc={derived['mchirp']:.1f} Msun | GPS={f['injections']['tc'][iidx]:.2f}")
-title_str = "Parameters of missed injection" + tag + " | " + " | ".join(summary_parts)
+inj_label = "Parameters of found injection" if is_found_inj else "Parameters of missed injection"
+title_str = inj_label + tag + " | " + " | ".join(summary_parts)
 
 pycbc.results.save_fig_with_metadata(
     html,

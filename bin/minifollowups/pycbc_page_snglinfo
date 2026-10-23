@@ -29,7 +29,7 @@ matplotlib.use("Agg")
 import pycbc.events
 import pycbc.pnutils
 import pycbc.results
-from pycbc import add_common_pycbc_options, init_logging
+from pycbc import add_common_pycbc_options, conversions, init_logging
 from pycbc.events import stat as pystat
 from pycbc.io import hdf
 from pycbc.results import followup
@@ -243,17 +243,22 @@ except:
     pass
 
 # Template parameters
+chieff_val = conversions.chi_eff(
+    sngl_file.mass1[0], sngl_file.mass2[0], sngl_file.spin1z[0], sngl_file.spin2z[0]
+)
 data[0].append("%5.2f" % sngl_file.mass1[0])
 data[0].append("%5.2f" % sngl_file.mass2[0])
 data[0].append("%5.2f" % sngl_file.mchirp[0])
 data[0].append("%5.2f" % sngl_file.spin1z[0])
 data[0].append("%5.2f" % sngl_file.spin2z[0])
+data[0].append("%5.2f" % chieff_val)
 data[0].append("%5.2f" % sngl_file.template_duration[0])
 headers.append("m<sub>1</sub>")
 headers.append("m<sub>2</sub>")
 headers.append("M<sub>c</sub>")
 headers.append("s<sub>1z</sub>")
 headers.append("s<sub>2z</sub>")
+headers.append("&chi;<sub>eff</sub>")
 headers.append("Duration")
 # display eccentricity and relative anomaly if they exist
 try:
@@ -292,15 +297,31 @@ html = pycbc.results.dq.redirect_javascript + str(
 ###############################################################################
 
 # Set up default titles and the captions for the file
-if args.n_loudest:
-    title = "Parameters of single-detector event ranked %s" % (args.n_loudest + 1)
+if args.n_loudest is not None:
+    base_title = "Parameters of single-detector event ranked %s" % (args.n_loudest + 1)
     caption = (
         "Parameters of the single-detector event ranked number %s by %s. The figures below show the mini-followup data for this event."
         % (args.n_loudest + 1, stat_name_long)
     )
 else:
-    title = "Parameters of single-detector event"
+    base_title = "Parameters of single-detector event"
     caption = "Parameters of the single-detector event. The figures below show the mini-followup data for this event."
+
+if args.ranking_statistic in ["quadsum", "single_ranking_only"]:
+    stat_summary = f"{args.instrument} {stat_name}={stat[0]:.2f} (SNR={sngl_file.snr[0]:.2f})"
+else:
+    stat_summary = (
+        f"{args.instrument} Stat={stat[0]:.2f} | "
+        f"{sngl_stat_name}={sngl_val[0]:.2f} (SNR={sngl_file.snr[0]:.2f})"
+    )
+
+title = (
+    f"{base_title} | {stat_summary} | "
+    f"rchisq={sngl_file.rchisq[0]:.2f} | "
+    f"m1={sngl_file.mass1[0]:.1f}, m2={sngl_file.mass2[0]:.1f} "
+    f"(Mc={sngl_file.mchirp[0]:.1f}, chi_eff={chieff_val:+.2f}, dur={sngl_file.template_duration[0]:.2f}s) | "
+    f"GPS={time:.3f}"
+)
 
 pycbc.results.save_fig_with_metadata(
     html,

@@ -226,6 +226,13 @@ parser.add_argument(
     help="Maximum number of injections to follow up (overrides [workflow-injection_minifollowups] num-events).",
 )
 parser.add_argument(
+    "--max-strain-followup-events",
+    type=int,
+    default=None,
+    help="Maximum number of top events to run raw-strain single_template/qscan "
+    "jobs for (all num-events still get page_injinfo/coincinfo/snglinfo and plot_trigger_timeseries).",
+)
+parser.add_argument(
     "--nearby-triggers-window",
     type=float,
     default=0.05,
@@ -459,6 +466,21 @@ else:
     )
 num_events = min(num_events, len(missed))
 
+if args.max_strain_followup_events is not None:
+    max_strain_events = int(args.max_strain_followup_events)
+elif workflow.cp.has_option_tags(
+    "workflow-injection_minifollowups", "max-strain-followup-events", args.tags or []
+):
+    max_strain_events = int(
+        workflow.cp.get_opt_tags(
+            "workflow-injection_minifollowups",
+            "max-strain-followup-events",
+            args.tags or [],
+        )
+    )
+else:
+    max_strain_events = min(num_events, 10)
+
 # Get the trigger SNRs and times for the injections being followed up
 missed_inj_times = numpy.sort(inj_def["tc"][:][missed[:num_events]])
 
@@ -510,6 +532,7 @@ for ifo in args.single_detector_triggers:
 # loop over sorted missed injections to be followed up
 found_inj_idxes = f["found_after_vetoes/injection_index"][:]
 for num_event in range(num_events):
+    event_layouts = []
     files = wf.FileList([])
 
     injection_index = missed[num_event]
@@ -535,7 +558,7 @@ for num_event in range(num_events):
     all_times = [inj_params[ifo + "_end_time"] for ifo in args.single_detector_triggers]
     inj_params["mean_time"] = coinc.mean_if_greater_than_zero(all_times)[0]
 
-    layouts += [
+    event_layouts += [
         (
             mini.make_inj_info(
                 workflow,
@@ -547,9 +570,15 @@ for num_event in range(num_events):
             )[0],
         )
     ]
+    ifo_tids_list = []
     if injection_index in found_inj_idxes:
         trig_id = numpy.where(found_inj_idxes == injection_index)[0][0]
-        layouts += [
+        for ifo in args.single_detector_triggers:
+            if ifo in f["found_after_vetoes"] and "trigger_id" in f["found_after_vetoes"][ifo]:
+                tid_val = int(f["found_after_vetoes"][ifo]["trigger_id"][trig_id])
+                if tid_val >= 0:
+                    ifo_tids_list.append(f"{ifo}:{tid_val}")
+        event_layouts += [
             (
                 mini.make_coinc_info(
                     workflow,
@@ -589,154 +618,184 @@ for num_event in range(num_events):
             title=f"Parameters of loudest SNR nearby trigger in {ifo}",
             tags=args.tags + [str(num_event)],
         )[0]
-        layouts += [(sngl_info,)]
+        event_layouts += [(sngl_info,)]
 
     files += mini.make_trigger_timeseries(
         workflow,
         single_triggers,
         ifo_times,
         args.output_dir,
+        special_tids=" ".join(ifo_tids_list) if ifo_tids_list else None,
         tags=args.tags + [str(num_event)],
     )
 
-    for ifo in args.single_detector_triggers:
-        sngl = single_triggers_by_ifo[ifo]
-        checkedtime = time
-        if inj_params[ifo + "_end_time"] == -1.0:
-            checkedtime = inj_params["mean_time"]
-        for seg in insp_analysed_seglists[ifo]:
-            if checkedtime in seg:
-                files += mini.make_singles_timefreq(
-                    workflow,
-                    sngl,
-                    tmpltbank_file,
+    if num_event < max_strain_events:
+        for ifo in args.single_detector_triggers:
+            sngl = single_triggers_by_ifo[ifo]
+            checkedtime = time
+            if inj_params[ifo + "_end_time"] == -1.0:
+                checkedtime = inj_params["mean_time"]
+            for seg in insp_analysed_seglists[ifo]:
+                if checkedtime in seg:
+                    files += mini.make_singles_timefreq(
+                        workflow,
+                        sngl,
+                        tmpltbank_file,
+                        checkedtime,
+                        args.output_dir,
+                        data_segments=insp_data_seglists[ifo],
+                        tags=args.tags + [str(num_event)],
+                        ifo=ifo,
+                    )
+                    files += mini.make_qscan_plot(
+                        workflow,
+                        ifo,
+                        checkedtime,
+                        args.output_dir,
+                        data_segments=insp_data_seglists[ifo],
+                        injection_file=injection_xml_file,
+                        tags=args.tags + [str(num_event)],
+                    )
+                    break
+            else:
+                logging.info(
+                    "Trigger time %s is not valid in %s, skipping singles plots",
                     checkedtime,
-                    args.output_dir,
-                    data_segments=insp_data_seglists[ifo],
-                    tags=args.tags + [str(num_event)],
-                    ifo=ifo,
-                )
-                files += mini.make_qscan_plot(
-                    workflow,
                     ifo,
-                    checkedtime,
-                    args.output_dir,
-                    data_segments=insp_data_seglists[ifo],
-                    injection_file=injection_xml_file,
-                    tags=args.tags + [str(num_event)],
                 )
-                break
-        else:
-            logging.info(
-                "Trigger time %s is not valid in %s, skipping singles plots",
-                checkedtime,
-                ifo,
-            )
 
-    _, norm_plot = mini.make_single_template_plots(
-        workflow,
-        insp_segs,
-        args.inspiral_data_read_name,
-        args.inspiral_data_analyzed_name,
-        inj_params,
-        args.output_dir,
-        inj_file=injection_xml_file,
-        tags=args.tags + ["INJ_PARAMS", str(num_event)],
-        params_str="injection parameters as template, "
-        "here the injection is made as normal",
-        use_exact_inj_params=True,
-    )
-    files += norm_plot
-
-    _, inv_plot = mini.make_single_template_plots(
-        workflow,
-        insp_segs,
-        args.inspiral_data_read_name,
-        args.inspiral_data_analyzed_name,
-        inj_params,
-        args.output_dir,
-        inj_file=injection_xml_file,
-        tags=args.tags + ["INJ_PARAMS_INVERTED", str(num_event)],
-        params_str="injection parameters as template, "
-        "here the injection is made inverted",
-        use_exact_inj_params=True,
-    )
-    files += inv_plot
-
-    _, noinj_plot = mini.make_single_template_plots(
-        workflow,
-        insp_segs,
-        args.inspiral_data_read_name,
-        args.inspiral_data_analyzed_name,
-        inj_params,
-        args.output_dir,
-        inj_file=injection_xml_file,
-        tags=args.tags + ["INJ_PARAMS_NOINJ", str(num_event)],
-        params_str="injection parameters, here no injection was actually performed",
-        use_exact_inj_params=True,
-    )
-    files += noinj_plot
-
-    for curr_ifo in args.single_detector_triggers:
-        # Finding loudest template in this detector near to the injection:
-        # First, find triggers close to the missed injection
-        single_fname = args.single_detector_triggers[curr_ifo]
-        idx, _ = HFile(single_fname).select(
-            lambda t: abs(t - inj_params["tc"]) < args.inj_window,
-            f"{curr_ifo}/end_time",
-            return_data=False,
-        )
-
-        if len(idx) == 0:
-            # No events in the injection window for this detector
-            continue
-
-        hd_sngl = SingleDetTriggers(
-            single_fname, curr_ifo, bank_file=args.bank_file, premask=idx
-        )
-        # Next, find the loudest within this set of triggers
-        # Use SNR here or NewSNR, or other??
-        loudest_idx = hd_sngl.snr.argmax()
-        hd_sngl.apply_mask([loudest_idx])
-
-        # What are the parameters of this trigger?
-        curr_params = copy.deepcopy(inj_params)
-        curr_params["mass1"] = hd_sngl.mass1[0]
-        curr_params["mass2"] = hd_sngl.mass2[0]
-        curr_params["spin1z"] = hd_sngl.spin1z[0]
-        curr_params["spin2z"] = hd_sngl.spin2z[0]
-        curr_params["f_lower"] = hd_sngl.f_lower[0]
-        # don't require precessing template info if not present
-        try:
-            curr_params["spin1x"] = hd_sngl.spin1x[0]
-            curr_params["spin2x"] = hd_sngl.spin2x[0]
-            curr_params["spin1y"] = hd_sngl.spin1y[0]
-            curr_params["spin2y"] = hd_sngl.spin2y[0]
-            curr_params["inclination"] = hd_sngl.inclination[0]
-        except KeyError:
-            pass
-        try:
-            # Only present for precessing search
-            curr_params["u_vals"] = hd_sngl.u_vals[0]
-        except:
-            pass
-
-        curr_tags = ["TMPLT_PARAMS_%s" % (curr_ifo,)]
-        curr_tags += [str(num_event)]
-        _, loudest_plot = mini.make_single_template_plots(
+        _, norm_plot = mini.make_single_template_plots(
             workflow,
             insp_segs,
             args.inspiral_data_read_name,
             args.inspiral_data_analyzed_name,
-            curr_params,
+            inj_params,
             args.output_dir,
             inj_file=injection_xml_file,
-            tags=args.tags + curr_tags,
-            params_str="loudest template in %s" % curr_ifo,
+            tags=args.tags + ["INJ_PARAMS", str(num_event)],
+            params_str="injection parameters as template, "
+            "here the injection is made as normal",
+            use_exact_inj_params=True,
         )
-        files += loudest_plot
+        files += norm_plot
 
-    layouts += list(layout.grouper(files, 2))
+        _, inv_plot = mini.make_single_template_plots(
+            workflow,
+            insp_segs,
+            args.inspiral_data_read_name,
+            args.inspiral_data_analyzed_name,
+            inj_params,
+            args.output_dir,
+            inj_file=injection_xml_file,
+            tags=args.tags + ["INJ_PARAMS_INVERTED", str(num_event)],
+            params_str="injection parameters as template, "
+            "here the injection is made inverted",
+            use_exact_inj_params=True,
+        )
+        files += inv_plot
+
+        _, noinj_plot = mini.make_single_template_plots(
+            workflow,
+            insp_segs,
+            args.inspiral_data_read_name,
+            args.inspiral_data_analyzed_name,
+            inj_params,
+            args.output_dir,
+            inj_file=injection_xml_file,
+            tags=args.tags + ["INJ_PARAMS_NOINJ", str(num_event)],
+            params_str="injection parameters, here no injection was actually performed",
+            use_exact_inj_params=True,
+        )
+        files += noinj_plot
+
+        for curr_ifo in args.single_detector_triggers:
+            # Finding loudest template in this detector near to the injection:
+            # First, find triggers close to the missed injection
+            single_fname = args.single_detector_triggers[curr_ifo]
+            idx, _ = HFile(single_fname).select(
+                lambda t: abs(t - inj_params["tc"]) < args.inj_window,
+                f"{curr_ifo}/end_time",
+                return_data=False,
+            )
+
+            if len(idx) == 0:
+                # No events in the injection window for this detector
+                continue
+
+            hd_sngl = SingleDetTriggers(
+                single_fname, curr_ifo, bank_file=args.bank_file, premask=idx
+            )
+            # Next, find the loudest within this set of triggers
+            # Use SNR here or NewSNR, or other??
+            loudest_idx = hd_sngl.snr.argmax()
+            hd_sngl.apply_mask([loudest_idx])
+
+            # What are the parameters of this trigger?
+            curr_params = copy.deepcopy(inj_params)
+            curr_params["mass1"] = hd_sngl.mass1[0]
+            curr_params["mass2"] = hd_sngl.mass2[0]
+            curr_params["spin1z"] = hd_sngl.spin1z[0]
+            curr_params["spin2z"] = hd_sngl.spin2z[0]
+            curr_params["f_lower"] = hd_sngl.f_lower[0]
+            # don't require precessing template info if not present
+            try:
+                curr_params["spin1x"] = hd_sngl.spin1x[0]
+                curr_params["spin2x"] = hd_sngl.spin2x[0]
+                curr_params["spin1y"] = hd_sngl.spin1y[0]
+                curr_params["spin2y"] = hd_sngl.spin2y[0]
+                curr_params["inclination"] = hd_sngl.inclination[0]
+            except KeyError:
+                pass
+            try:
+                # Only present for precessing search
+                curr_params["u_vals"] = hd_sngl.u_vals[0]
+            except:
+                pass
+
+            curr_tags = ["TMPLT_PARAMS_%s" % (curr_ifo,)]
+            curr_tags += [str(num_event)]
+            _, loudest_plot = mini.make_single_template_plots(
+                workflow,
+                insp_segs,
+                args.inspiral_data_read_name,
+                args.inspiral_data_analyzed_name,
+                curr_params,
+                args.output_dir,
+                inj_file=injection_xml_file,
+                tags=args.tags + curr_tags,
+                params_str="loudest template in %s" % curr_ifo,
+            )
+            files += loudest_plot
+
+    event_layouts += list(layout.grouper(files, 2))
+    layouts += event_layouts
+
+    net_snr_val = float(net_opt_snr_all[injection_index])
+    dec_snr_val = float(dec_opt_snr_all[injection_index])
+    snr_lbl = "MF_SNR" if use_mf else "Opt_SNR"
+    if injection_index in found_inj_idxes:
+        f_idx = numpy.where(found_inj_idxes == injection_index)[0][0]
+        st_v = float(f["found_after_vetoes/stat"][f_idx])
+        ifar_v = float(
+            f["found_after_vetoes/ifar_exc"][f_idx]
+            if "ifar_exc" in f["found_after_vetoes"]
+            else f["found_after_vetoes/ifar"][f_idx]
+        )
+        status_str = f"Found: stat={st_v:.2f}, IFAR={ifar_v:.3g} yr"
+    else:
+        status_str = "MISSED"
+    ev_title = (
+        f"Event #{num_event + 1} | {snr_lbl}={net_snr_val:.2f} (dec={dec_snr_val:.2f}) | "
+        f"{status_str} | m1={inj_params['mass1']:.1f}, m2={inj_params['mass2']:.1f} | GPS={time:.2f}"
+    )
+    layout.two_column_layout(
+        args.output_dir,
+        event_layouts,
+        unique=f"_{num_event + 1:03d}",
+        collapse="true",
+        title=ev_title,
+    )
 
 workflow.save()
-layout.two_column_layout(args.output_dir, layouts)
+if num_events == 0:
+    layout.two_column_layout(args.output_dir, layouts)
