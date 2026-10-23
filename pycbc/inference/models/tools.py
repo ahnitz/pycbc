@@ -317,9 +317,10 @@ class DistMarg:
         self._current_params.update(self.marginalize_vector_params)
         self.sample_idx = self.premarg["sample_idx"][choice]
 
-        # Update the importance weights for each vector sample
-        logw = self.marginalize_vector_weights + logw[choice]
-        self.marginalize_vector_weights = logw - logsumexp(logw)
+        # Update the importance weights for each vector sample. They are
+        # not renormalized to sum to one: that would make the integral over
+        # the marginalized parameter an average over it instead.
+        self.marginalize_vector_weights = self.marginalize_vector_weights + logw[choice]
         return self.marginalize_vector_params
 
     def snr_draw(self, wfs=None, snrs=None, size=None):
