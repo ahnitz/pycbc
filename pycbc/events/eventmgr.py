@@ -425,7 +425,7 @@ class EventManager:
 
     def consolidate_events(self, opt, gwstrain=None):
         logger.info("We currently have %d triggers", len(self.events))
-        if opt.chisq_threshold and opt.chisq_bins:
+        if getattr(opt, "chisq_threshold", None) and opt.chisq_bins:
             logger.info("Removing triggers with poor chisq")
             self.chisq_threshold(opt.chisq_threshold, opt.chisq_bins, opt.chisq_delta)
             logger.info("%d remaining triggers", len(self.events))
@@ -511,8 +511,9 @@ class EventManager:
                 # Not precessing
                 f["coa_phase"] = numpy.angle(self.events["snr"])
             f["chisq"] = self.events["chisq"]
-            f["bank_chisq"] = self.events["bank_chisq"]
-            f["bank_chisq_dof"] = self.events["bank_chisq_dof"]
+            if "bank_chisq" in self.events.dtype.names:
+                f["bank_chisq"] = self.events["bank_chisq"]
+                f["bank_chisq_dof"] = self.events["bank_chisq_dof"]
             f["cont_chisq"] = self.events["cont_chisq"]
             f["end_time"] = (
                 self.events["time_index"] / float(self.opt.sample_rate)

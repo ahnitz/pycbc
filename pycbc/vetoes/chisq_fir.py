@@ -157,6 +157,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
         f_final=800.0,
         top_template=None,
         upper_f_by_coarse=None,
+        bank=None,
     ):
         super().__init__(num_bins=num_bins)
         if self.do and self.num_bins is not None:
@@ -168,6 +169,8 @@ class RatioPowerChisq(SingleDetPowerChisq):
         self.upper_f_by_coarse = (
             upper_f_by_coarse if upper_f_by_coarse is not None else {}
         )
+        self.bank = bank
+        self._batch = None
 
         self.template_cache = {}
         self.psd_cache = {}
@@ -179,10 +182,26 @@ class RatioPowerChisq(SingleDetPowerChisq):
         self.psd_cache.clear()
         self.coarse_w_cache.clear()
         self.ref_f_cache.clear()
+        self._batch = None
 
     def begin_group(self):
         """Release the block spectra of the previous (segment, middle group) pass."""
         self.ref_f_cache.clear()
+
+    def set_batch(
+        self, stilde, coarse_idx, ids_local, gids, t_idxs, ref_snr, filters_f
+    ):
+        """Bind the current trigger batch for template(j) and correlation(j, reach)."""
+        self.ref_f_cache.clear()
+        self._batch = (
+            stilde,
+            coarse_idx,
+            ids_local,
+            gids,
+            t_idxs,
+            ref_snr,
+            filters_f,
+        )
 
     def coarse_weight(self, stilde, coarse_idx, block_len):
         """(psd key, whitened top x upper spectrum of a middle group) on a block's
@@ -241,10 +260,17 @@ class RatioPowerChisq(SingleDetPowerChisq):
             self.ref_f_cache[cache_key] = spec
         return self.ref_f_cache[cache_key]
 
-    def template(self, stilde, coarse_idx, local_id, gid, filters_f, bank=None):
-        """Return the whitened fine template on the block grid with its power-chisq
-        bins and SG-chisq metadata attached, cached per (psd, coarse_idx, local_id).
+    def template(self, j):
+        """Return the whitened fine template for batch trigger j on the block grid
+        with its power-chisq bins and SG-chisq metadata attached, cached per
+        (psd, coarse_idx, local_id).
         """
+        stilde, coarse_idx, ids_local, gids, _t_idxs, _ref_snr, filters_f = (
+            self._batch
+        )
+        local_id = int(ids_local[j])
+        gid = int(gids[j])
+        bank = self.bank
         block_len = filters_f.block_length
         df = self.sample_rate / block_len
         n_half = block_len // 2 + 1
@@ -296,12 +322,15 @@ class RatioPowerChisq(SingleDetPowerChisq):
             self.template_cache[key] = tmplt
         return self.template_cache[key]
 
-    def correlation(
-        self, stilde, coarse_idx, local_id, t_idx, ref_snr, filters_f, reach=0
-    ):
-        """Return (corr, index_in_block) for trigger at sample t_idx on the chisq
-        block centred on t_idx, or (None, None) if reach exceeds the valid FIR lags.
+    def correlation(self, j, reach=0):
+        """Return (corr, index_in_block) for batch trigger j on the chisq block
+        centred on t_idx, or (None, None) if reach exceeds the valid FIR lags.
         """
+        stilde, coarse_idx, ids_local, _gids, t_idxs, ref_snr, filters_f = (
+            self._batch
+        )
+        local_id = int(ids_local[j])
+        t_idx = int(t_idxs[j])
         block_len = filters_f.block_length
         tstart = min(max(t_idx - block_len // 2, 0), len(ref_snr) - block_len)
         if reach > 0 and hasattr(filters_f, "valid"):

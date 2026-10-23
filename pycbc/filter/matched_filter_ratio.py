@@ -377,13 +377,25 @@ class TopTemplateSearch:
             ),
             top_template=top_template,
             upper_f_by_coarse=upper_f_by_coarse,
+            bank=bank,
         )
+        num_b = (
+            int(self.power_chisq.num_bins)
+            if self.power_chisq.num_bins is not None
+            else 64
+        )
+        chain_defaults = {
+            "chisq": 2 * num_b - 2,
+            "chisq_dof": 2 * num_b - 2,
+            "sg_chisq": 1.0,
+        }
         self.chain = SignalConsistencyChain.from_cli(
             args,
             bank,
             sample_rate,
             power_chisq=self.power_chisq,
             sg_chisq=self.sg_chisq,
+            defaults=chain_defaults,
         )
 
         self.group_tau = {}
@@ -486,6 +498,30 @@ class TopTemplateSearch:
                 t_idxs = t_idxs[keep]
                 snrs = snrs[keep]
 
+        cap = self.args.asym_max_primary_per_group_sec
+        if (
+            len(ids_local) > 0
+            and not is_asym
+            and cap is not None
+            and cap > 0
+            and len(ids_local) > cap
+        ):
+            t0_seg = float(stilde.start_time)
+            dt_seg = float(stilde.delta_t)
+            sec_bins = np.floor(t0_seg + t_idxs * dt_seg).astype(np.int64)
+            throttled = []
+            for s in np.unique(sec_bins):
+                s_cands = np.flatnonzero(sec_bins == s)
+                if len(s_cands) <= cap:
+                    throttled.extend(s_cands)
+                else:
+                    order = np.argsort(-np.abs(snrs[s_cands]), kind="stable")
+                    throttled.extend(s_cands[order[:cap]])
+            keep_cap = np.array(sorted(throttled), dtype=np.int64)
+            ids_local = ids_local[keep_cap]
+            t_idxs = t_idxs[keep_cap]
+            snrs = snrs[keep_cap]
+
         n_trig = len(ids_local)
         if n_trig == 0:
             return (
@@ -511,28 +547,17 @@ class TopTemplateSearch:
         local_shifts = shifts[ids_local] if shifts is not None else 0
         phys_t = t_idxs - local_shifts
         gids = fine_indices[ids_local]
-        ref_snr = ctx.series(ifo)
-        try:
-            kept, vals = self.chain.values(
-                snrs,
-                phys_t,
-                gids,
-                lambda j: self.power_chisq.template(
-                    stilde, cid, int(ids_local[j]), int(gids[j]), filters_f, self.bank
-                ),
-                lambda j, reach=0: self.power_chisq.correlation(
-                    stilde,
-                    cid,
-                    int(ids_local[j]),
-                    int(t_idxs[j]),
-                    ref_snr,
-                    filters_f,
-                    reach,
-                ),
-                stilde=stilde,
-            )
-        finally:
-            self.power_chisq.ref_f_cache.clear()
+        self.power_chisq.set_batch(
+            stilde, cid, ids_local, gids, t_idxs, ctx.series(ifo), filters_f
+        )
+        kept, vals = self.chain.values(
+            snrs,
+            phys_t,
+            gids,
+            self.power_chisq.template,
+            self.power_chisq.correlation,
+            stilde=stilde,
+        )
 
         if not np.all(kept):
             ids_local = ids_local[kept]
@@ -556,37 +581,18 @@ class TopTemplateSearch:
             if getattr(stilde, "analyze", None) is not None
             else 0
         )
-        chi = (
-            vals["chisq"].astype(float32, copy=False)
-            if "chisq" in vals
-            else np.zeros(n_trig, dtype=float32)
-        )
-        chi_dof = (
-            vals["chisq_dof"].astype(np.int32, copy=False)
-            if "chisq_dof" in vals
-            else np.full(n_trig, -100, dtype=np.int32)
-        )
-        sg_vals = (
-            vals["sg_chisq"].astype(float32, copy=False)
-            if "sg_chisq" in vals
-            else np.ones(n_trig, dtype=float32)
-        )
         h_norm = self.norm(ifo, ctx.chunk) * self.sigmasq_ratio[cid]
         batch = {
             "template_id": gids,
             "time_index": (phys_t + time_offset).astype(np.int64),
             "snr": snrs.astype(complex64),
             "sigmasq": np.full(n_trig, h_norm, dtype=np.float32),
-            "chisq": chi,
-            "chisq_dof": chi_dof,
-            "sg_chisq": sg_vals,
             "is_asym": np.full(n_trig, is_asym, dtype=bool),
+            **vals,
         }
-        if "cont_chisq" in vals:
-            batch["cont_chisq"] = vals["cont_chisq"].astype(float32, copy=False)
         for col, arr in batch.items():
             self.triggers[ifo][col].append(arr)
-        return ids_local, t_idxs, snrs, chi, chi_dof
+        return ids_local, t_idxs, snrs, vals["chisq"], vals["chisq_dof"]
 
     def follow_up(self, ctx, primaries):
         """Follow up each detector's recorded primaries that pass the NewSNR,
