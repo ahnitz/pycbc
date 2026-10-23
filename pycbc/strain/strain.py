@@ -84,32 +84,15 @@ def detect_loud_glitches(
     corrupt_time=4.0,
     high_freq_cutoff=None,
     output_intermediates=False,
-    bandlimited_freq=(20.0, 150.0),
-    min_quiet_duration=0.10,
-    quiet_threshold=None,
-    pad_duration=0.20,
-    min_separation=0.20,
-    min_half_width=None,
-    taper_duration=0.25,
-    return_gate_intervals=False,
 ):
     """
     Automatic identification of loud transients for gating purposes.
 
     This function first estimates the PSD of the input time series using the
     FindChirp Welch method. Then it whitens the time series using that
-    estimate across both the full bandwidth and an optional band-limited
-    frequency range (e.g. [20, 150] Hz) to prevent mid-frequency glitches from
-    being diluted below detection threshold. It computes the magnitude of the
-    whitened series, thresholds it and applies FindChirp clustering over time.
-    For each detected transient, the gate boundaries are dynamically expanded
-    left and right until the whitened residual remains below `quiet_threshold`
-    (default max(10.0, 0.25 * threshold)) for at least `min_quiet_duration`
-    (default 0.10s) continuously, plus a symmetric padding duration (default 0.20s).
-    Per-glitch expansion is capped at `max_half_width = max(width, 2.0)` (<=2.0s
-    half-width), and merged gates are capped at `max_merged_half_width = 4.0`
-    (<=4.0s half-width / 8.0s total). Overlapping or closely separated gates
-    (<= `min_separation`, default 0.20s) are merged.
+    estimate. Finally, it computes the magnitude of the whitened series,
+    thresholds it and applies the FindChirp clustering over time to the
+    surviving samples.
 
     Parameters
     ----------
@@ -137,37 +120,11 @@ def detect_loud_glitches(
         frequency is used.
     output_intermediates : {bool, False}
         Save intermediate time series for debugging.
-    bandlimited_freq : {tuple, (20.0, 150.0)}
-        Frequency bounds (f_low, f_high) in Hz for secondary band-limited
-        whitened transient detection. If None, only full-band whitening is used.
-    min_quiet_duration : {float, 0.10}
-        Minimum duration in seconds that the whitened residual must remain
-        below quiet_threshold to mark the boundary of a transient.
-    quiet_threshold : {float, None}
-        Threshold in units of whitened sigma for determining quiet boundaries.
-        Default is None, which sets quiet_threshold = max(10.0, 0.25 * threshold).
-        Threshold in units of whitened sigma for determining quiet boundaries.
-    pad_duration : {float, 0.20}
-        Extra padding in seconds added to both sides of each dynamically
-        expanded gate (typically 0.15 to 0.25 seconds).
-    min_separation : {float, 0.20}
-        Minimum separation in seconds between gates. Gates separated by less
-        than or equal to this duration are merged.
-    min_half_width : {float, None}
-        Minimum half-width of each gate in seconds. If provided, gates will not
-        shrink below this half-width.
-    taper_duration : {float, 0.25}
-        Duration of the taper window in seconds associated with the gates.
-    return_gate_intervals : {bool, False}
-        If True, return a list of [center_time, half_width, taper_duration].
-        If False, return a list of central glitch times for backward
-        compatibility.
 
     Returns
     -------
     list :
-        List of glitch central times (float) or list of
-        [center_time, half_width, taper_duration] if return_gate_intervals is True.
+        List of glitch central times (float).
     """
     if high_freq_cutoff:
         strain = resample_to_delta_t(strain, 0.5 / high_freq_cutoff, method="ldas")
@@ -199,10 +156,6 @@ def detect_loud_glitches(
     strain_pad[pad_start:pad_end] = strain[:]
 
     # estimate the PSD
-    trunc_flow = low_freq_cutoff
-    if bandlimited_freq is not None:
-        trunc_flow = min(trunc_flow, bandlimited_freq[0])
-
     psd = pycbc.psd.welch(
         strain[corrupt_length : (len(strain) - corrupt_length)],
         seg_len=int(psd_duration * strain.sample_rate),
@@ -214,152 +167,49 @@ def detect_loud_glitches(
     psd = pycbc.psd.inverse_spectrum_truncation(
         psd,
         int(psd_duration * strain.sample_rate),
-        low_frequency_cutoff=trunc_flow,
+        low_frequency_cutoff=low_freq_cutoff,
         high_frequency_cutoff=high_freq_cutoff,
         trunc_method="hann",
     )
+    kmin = int(low_freq_cutoff / psd.delta_f)
+    psd[0:kmin] = numpy.inf
+    if high_freq_cutoff:
+        kmax = int(high_freq_cutoff / psd.delta_f)
+        psd[kmax:] = numpy.inf
 
+    # whiten
     strain_tilde = strain_pad.to_frequencyseries()
 
-    # Full-band whitening
-    psd_full = psd.copy()
-    kmin_full = int(low_freq_cutoff / psd.delta_f)
-    psd_full[0:kmin_full] = numpy.inf
     if high_freq_cutoff:
-        kmax_full = int(high_freq_cutoff / psd.delta_f)
-        psd_full[kmax_full:] = numpy.inf
-        norm_full = high_freq_cutoff - low_freq_cutoff
+        norm = high_freq_cutoff - low_freq_cutoff
     else:
-        norm_full = strain.sample_rate / 2.0 - low_freq_cutoff
+        norm = strain.sample_rate / 2.0 - low_freq_cutoff
+    strain_tilde *= (psd * norm) ** (-0.5)
 
-    strain_tilde_full = strain_tilde * ((psd_full * norm_full) ** (-0.5))
-    strain_pad_full = strain_tilde_full.to_timeseries()
-    mag_full = abs(strain_pad_full[pad_start:pad_end]).numpy()
-    mag_full[0:corrupt_length] = 0
-    mag_full[-1 : -corrupt_length - 1 : -1] = 0
-
-    # Secondary band-limited whitening (e.g. [20, 150] Hz) to avoid mid-frequency dilution
-    if bandlimited_freq is not None:
-        f_low_b, f_high_b = bandlimited_freq
-        f_low_b = max(f_low_b, trunc_flow)
-        f_high_b = min(f_high_b, strain.sample_rate / 2.0)
-        if high_freq_cutoff:
-            f_high_b = min(f_high_b, high_freq_cutoff)
-
-        if f_high_b > f_low_b:
-            psd_band = psd.copy()
-            kmin_band = int(f_low_b / psd.delta_f)
-            kmax_band = int(f_high_b / psd.delta_f)
-            psd_band[0:kmin_band] = numpy.inf
-            psd_band[kmax_band:] = numpy.inf
-            norm_band = f_high_b - f_low_b
-
-            strain_tilde_band = strain_tilde * ((psd_band * norm_band) ** (-0.5))
-            strain_pad_band = strain_tilde_band.to_timeseries()
-            mag_band = abs(strain_pad_band[pad_start:pad_end]).numpy()
-            mag_band[0:corrupt_length] = 0
-            mag_band[-1 : -corrupt_length - 1 : -1] = 0
-
-            mag_comb = numpy.maximum(mag_full, mag_band)
-        else:
-            mag_comb = mag_full
-    else:
-        mag_comb = mag_full
+    strain_pad = strain_tilde.to_timeseries()
 
     if output_intermediates:
-        strain_pad_full[pad_start:pad_end].save_to_wav("strain_whitened.wav")
-        numpy.save("strain_whitened_mag.npy", mag_comb)
+        strain_pad[pad_start:pad_end].save_to_wav("strain_whitened.wav")
+
+    mag = abs(strain_pad[pad_start:pad_end])
+
+    if output_intermediates:
+        mag.save("strain_whitened_mag.npy")
+
+    mag = mag.numpy()
+
+    # remove strain corrupted by filters at the ends
+    mag[0:corrupt_length] = 0
+    mag[-1 : -corrupt_length - 1 : -1] = 0
 
     # find peaks and their times
-    indices = numpy.where(mag_comb > threshold)[0]
-    if len(indices) == 0:
-        return []
-
+    indices = numpy.where(mag > threshold)[0]
     cluster_idx = pycbc.events.findchirp_cluster_over_window(
-        indices, numpy.array(mag_comb[indices]), int(cluster_window * strain.sample_rate)
+        indices, numpy.array(mag[indices]), int(cluster_window * strain.sample_rate)
     )
-    peak_indices = indices[cluster_idx]
+    times = [idx * strain.delta_t + strain.start_time for idx in indices[cluster_idx]]
 
-    # Dynamic gate width expansion
-    if quiet_threshold is None:
-        quiet_threshold = max(10.0, 0.25 * threshold)
-
-    n_data = len(mag_comb)
-    fs = float(strain.sample_rate)
-    n_quiet = int(numpy.ceil(min_quiet_duration * fs))
-    n_pad = int(numpy.round(pad_duration * fs))
-
-    raw_gates = []
-    for p in peak_indices:
-        # Search leftward from peak until mag_comb < quiet_threshold for >= n_quiet samples
-        quiet_count = 0
-        left_edge = 0
-        for i in range(p, -1, -1):
-            if mag_comb[i] < quiet_threshold:
-                quiet_count += 1
-                if quiet_count >= n_quiet:
-                    left_edge = i + n_quiet
-                    break
-            else:
-                quiet_count = 0
-
-        # Search rightward from peak until mag_comb < quiet_threshold for >= n_quiet samples
-        quiet_count = 0
-        right_edge = n_data - 1
-        for i in range(p, n_data):
-            if mag_comb[i] < quiet_threshold:
-                quiet_count += 1
-                if quiet_count >= n_quiet:
-                    right_edge = i - n_quiet
-                    break
-            else:
-                quiet_count = 0
-
-        # Apply pad_duration to each side
-        start_idx = max(0, left_edge - n_pad)
-        end_idx = min(n_data - 1, right_edge + n_pad)
-
-        t_start = float(strain.start_time + start_idx * strain.delta_t)
-        t_end = float(strain.start_time + end_idx * strain.delta_t)
-
-        center = (t_start + t_end) / 2.0
-        half_w = (t_end - t_start) / 2.0
-        base_w = min_half_width if min_half_width is not None else 0.0
-        if base_w > 0:
-            half_w = max(half_w, base_w)
-        max_half_width = max(base_w, 2.0)
-        half_w = min(half_w, max_half_width)
-        t_start = center - half_w
-        t_end = center + half_w
-
-        raw_gates.append([t_start, t_end])
-
-    # Merge overlapping or closely spaced gates up to max_merged_half_width = 4.0s
-    max_merged_half_width = 4.0
-    raw_gates.sort(key=lambda g: g[0])
-    merged_intervals = []
-    for g_start, g_end in raw_gates:
-        if not merged_intervals:
-            merged_intervals.append([g_start, g_end])
-        else:
-            prev_start, prev_end = merged_intervals[-1]
-            cand_end = max(prev_end, g_end)
-            if (g_start - prev_end <= min_separation) and (
-                (cand_end - prev_start) / 2.0 <= max_merged_half_width
-            ):
-                merged_intervals[-1][1] = cand_end
-            else:
-                merged_intervals.append([g_start, g_end])
-
-    gate_params = []
-    for g_start, g_end in merged_intervals:
-        center_t = (g_start + g_end) / 2.0
-        half_w = min((g_end - g_start) / 2.0, max_merged_half_width)
-        gate_params.append([center_t, half_w, taper_duration])
-
-    if return_gate_intervals:
-        return gate_params
-    return [gp[0] for gp in gate_params]
+    return times
 
 
 def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None):
@@ -616,18 +466,19 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
         paint_r = getattr(opt, "paint_ridge", 0.001)
         gating_info["auto"] = []
         for _ in range(opt.autogating_max_iterations):
-            gate_params = detect_loud_glitches(
+            gtimes = detect_loud_glitches(
                 strain,
                 threshold=opt.autogating_threshold,
                 cluster_window=opt.autogating_cluster,
                 low_freq_cutoff=opt.strain_high_pass,
                 corrupt_time=opt.pad_data + opt.autogating_pad,
-                min_half_width=opt.autogating_width,
-                taper_duration=opt.autogating_taper,
-                return_gate_intervals=True,
             )
-            if not gate_params:
+            if not gtimes:
                 break
+            gwidths = numpy.repeat(opt.autogating_width, len(gtimes))
+            gate_params = [
+                [gt, gw, opt.autogating_taper] for gt, gw in zip(gtimes, gwidths)
+            ]
             invpsd = (
                 _get_gating_invpsd(gate_params)
                 if opt.gating_method == "paint"
@@ -647,7 +498,7 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
                 )
             logger.info(
                 "Autogating at %s",
-                ", ".join(["%.3f (w=%.3f)" % (gp[0], gp[1]) for gp in gate_params]),
+                ", ".join(["%.3f" % gt for gt in gtimes]),
             )
 
     # Note: redundant post-inpaint second highpass removed to preserve
@@ -2898,7 +2749,7 @@ class StrainBuffer(pycbc.frame.DataBuffer):
         if self.autogating_threshold is not None:
             autogating_duration_length = self.autogating_duration * self.sample_rate
             autogating_start_sample = int(len(self.strain) - autogating_duration_length)
-            gate_params = detect_loud_glitches(
+            glitch_times = detect_loud_glitches(
                 self.strain[autogating_start_sample : -self.corruption],
                 psd_duration=self.autogating_psd_segment_length,
                 psd_stride=self.autogating_psd_stride,
@@ -2906,17 +2757,17 @@ class StrainBuffer(pycbc.frame.DataBuffer):
                 cluster_window=self.autogating_cluster,
                 low_freq_cutoff=self.highpass_frequency,
                 corrupt_time=self.autogating_pad,
-                min_half_width=self.autogating_width,
-                taper_duration=self.autogating_taper,
-                return_gate_intervals=True,
             )
-            if len(gate_params) > 0:
+            if len(glitch_times) > 0:
                 logger.info(
                     "Autogating %s at %s",
                     self.detector,
-                    ", ".join(["%.3f (w=%.3f)" % (gp[0], gp[1]) for gp in gate_params]),
+                    ", ".join(["%.3f" % gt for gt in glitch_times]),
                 )
-                self.gate_params = gate_params
+                self.gate_params = [
+                    (gt, self.autogating_width, self.autogating_taper)
+                    for gt in glitch_times
+                ]
                 self.strain = gate_data(self.strain, self.gate_params)
 
         if self.psd is None and self.wait_duration <= 0:

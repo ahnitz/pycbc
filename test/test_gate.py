@@ -54,60 +54,34 @@ class TestGateAndInpaint(unittest.TestCase):
         )
         self.invpsd = 1.0 / self.psd
 
-    def test_quiet_threshold_scaling(self):
-        """Verify detect_loud_glitches sets quiet_threshold = max(10.0, 0.25 * threshold)."""
-        # Test default quiet threshold formula at various thresholds
-        self.assertEqual(max(10.0, 0.25 * 50.0), 12.5)
-        self.assertEqual(max(10.0, 0.25 * 30.0), 10.0)
-        self.assertEqual(max(10.0, 0.25 * 80.0), 20.0)
-
-        # Create strain with a glitch core (60 Hz) and ringing tail between 4.0 and 8.0 sigma
+    def test_detect_loud_glitches_gwastro_master(self):
+        """Verify detect_loud_glitches aligns with gwastro/master fixed-width behavior."""
+        # Create strain with a glitch at t = 32.0s
         t = self.ts.sample_times.numpy() - 32.0
         env_core = np.exp(-((t / 0.05) ** 2))
         glitch_core = 50.0 * env_core * np.sin(2 * np.pi * 60.0 * t)
-        env_tail = np.exp(-((t / 1.5) ** 2))
-        ringing = 6.0 * env_tail * np.sin(2 * np.pi * 60.0 * t)
         ts_glitch = self.ts + pycbc.types.TimeSeries(
-            glitch_core + ringing, delta_t=self.delta_t, epoch=0
+            glitch_core, delta_t=self.delta_t, epoch=0
         )
 
-        # With default quiet_threshold (= 12.5 for threshold=50), it does not walk along
-        # the 6 sigma ringing tail
-        gates_default = detect_loud_glitches(
+        glitch_times = detect_loud_glitches(
             ts_glitch,
             threshold=50.0,
             low_freq_cutoff=20.0,
-            min_half_width=0.25,
-            pad_duration=0.20,
-            return_gate_intervals=True,
         )
-        self.assertGreaterEqual(len(gates_default), 1)
-        _, half_w_default, _ = gates_default[0]
-        # Should stay tight around the core (well below 2.0s half-width)
-        self.assertLess(half_w_default, 1.5)
+        self.assertGreaterEqual(len(glitch_times), 1)
+        # Verify it returns float timestamps centered near 32.0s
+        for gt in glitch_times:
+            self.assertIsInstance(float(gt), float)
+            self.assertAlmostEqual(float(gt), 32.0, delta=0.5)
 
-    def test_half_width_caps_per_peak_and_merged(self):
-        """Verify detect_loud_glitches caps per-peak half-width at max(width, 2.0)
-        and merged gates at max_merged_half_width = 4.0 under 2x noise drift."""
-        t = self.ts.sample_times.numpy() - 32.0
-        # Simulate a wide, persistent disturbance over a multi-second window
-        wide_burst = 50.0 * np.exp(-((t / 5.0) ** 2)) * np.sin(2 * np.pi * 50.0 * t)
-        ts_wide = self.ts + pycbc.types.TimeSeries(
-            wide_burst, delta_t=self.delta_t, epoch=0
-        )
-
-        gates = detect_loud_glitches(
-            ts_wide,
-            threshold=30.0,
+        # High threshold returns empty list
+        no_glitches = detect_loud_glitches(
+            ts_glitch,
+            threshold=500.0,
             low_freq_cutoff=20.0,
-            min_half_width=0.25,
-            pad_duration=0.20,
-            return_gate_intervals=True,
         )
-        self.assertGreaterEqual(len(gates), 1)
-        for _, half_w, _ in gates:
-            # Under extreme disturbance, no merged gate can ever exceed 4.0s half-width
-            self.assertLessEqual(half_w, 4.0)
+        self.assertEqual(len(no_glitches), 0)
 
     def test_gate_and_paint_wide_gate_k_greater_than_65536(self):
         """Verify gate_and_paint with K > 65536 (e.g. K = 70000)."""
