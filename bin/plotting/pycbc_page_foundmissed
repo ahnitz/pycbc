@@ -29,13 +29,28 @@ labels = {
     "comb_optimal_snr": "Combined Optimal SNR",
     "decisive_optimal_snr": "Decisive Optimal SNR",
     "max_optimal_snr": "Maximum Optimal SNR",
+    "optimal_snr_H1": "H1 Optimal SNR",
+    "optimal_snr_L1": "L1 Optimal SNR",
+    "optimal_snr_V1": "V1 Optimal SNR",
     "comb_optimal_mf_snr": "Combined Optimal Matched-Filter SNR",
     "decisive_optimal_mf_snr": "Decisive Optimal Matched-Filter SNR",
     "max_optimal_mf_snr": "Maximum Optimal Matched-Filter SNR",
+    "optimal_mf_snr_H1": "H1 Optimal Matched-Filter SNR",
+    "optimal_mf_snr_L1": "L1 Optimal Matched-Filter SNR",
+    "optimal_mf_snr_V1": "V1 Optimal Matched-Filter SNR",
     "redshift": "Redshift",
     "time": "Time (s)",
     "effective_spin": "Effective Inspiral Spin",
 }
+
+per_ifo_snr_keys = (
+    "optimal_snr_H1",
+    "optimal_snr_L1",
+    "optimal_snr_V1",
+    "optimal_mf_snr_H1",
+    "optimal_mf_snr_L1",
+    "optimal_mf_snr_V1",
+)
 
 parser = argparse.ArgumentParser(description=__doc__)
 pycbc.add_common_pycbc_options(parser)
@@ -45,7 +60,14 @@ parser.add_argument(
 parser.add_argument(
     "--axis-type",
     default="mchirp",
-    choices=["mchirp", "effective_spin", "time", "mtotal", "mass_ratio"],
+    choices=[
+        "mchirp",
+        "effective_spin",
+        "time",
+        "mtotal",
+        "mass_ratio",
+        *per_ifo_snr_keys,
+    ],
 )
 parser.add_argument("--log-x", action="store_true", default=False)
 parser.add_argument(
@@ -183,6 +205,12 @@ dvals["chirp_distance"] = pycbc.pnutils.chirp_distance(dist, vals["mchirp"])
 if args.distance_type == "redshift":
     dvals["redshift"] = f["injections/redshift"][:]
 
+for k in per_ifo_snr_keys:
+    if f"injections/{k}" in f:
+        arr = numpy.nan_to_num(f[f"injections/{k}"][:], nan=0.0)
+        vals[k] = arr.copy()
+        dvals[k] = arr.copy()
+
 if "snr" in args.distance_type:  # only evaluate SNRs if needed
     if "mf" in args.distance_type:
         opt_snrsq_arr = [
@@ -213,6 +241,15 @@ if "snr" in args.distance_type:  # only evaluate SNRs if needed
         dvals["max_optimal_snr"] = numpy.array(
             [numpy.sqrt(max(opt_snrsq)) for opt_snrsq in zip(*opt_snrsq_arr)]
         )
+
+if args.axis_type in per_ifo_snr_keys and args.log_x:
+    vals[args.axis_type] = numpy.where(
+        vals[args.axis_type] <= 0.7, 0.7, vals[args.axis_type]
+    )
+if args.distance_type in per_ifo_snr_keys and args.log_distance:
+    dvals[args.distance_type] = numpy.where(
+        dvals[args.distance_type] <= 0.7, 0.7, dvals[args.distance_type]
+    )
 
 fdvals = dvals[args.distance_type][found]
 mdvals = dvals[args.distance_type][missed]
@@ -327,18 +364,29 @@ plot.grid()
 if args.log_x:
     # log x axis may fail for some choices, eg effective spin
     ax.set_xscale("log")
-    tmpxvals = list(vals[args.axis_type][missed])
-    tmpxvals += list(vals[args.axis_type][found])
-    xmax = 1.4 * max(tmpxvals)
-    xmin = 0.7 * min(tmpxvals)
+    tmpxvals = [
+        v
+        for v in (list(vals[args.axis_type][missed]) + list(vals[args.axis_type][found]))
+        if v > 0
+    ]
+    xmax = 1.4 * max(tmpxvals) if tmpxvals else 100.0
+    if args.axis_type in per_ifo_snr_keys:
+        xmin = 0.6
+        ax.axvline(0.7, color="gray", linestyle="--", linewidth=0.9, alpha=0.7)
+    else:
+        xmin = 0.7 * min(tmpxvals) if tmpxvals else 0.6
     plot.xlim(xmin, xmax)
 if args.log_distance:
     ax.set_yscale("log")
+    if args.distance_type in per_ifo_snr_keys:
+        ax.axhline(0.7, color="gray", linestyle="--", linewidth=0.9, alpha=0.7)
 
-tmpyvals = list(fdvals) + list(mdvals)
-ymax = 1.2 * max(tmpyvals)
-ymin = 0.9 * min(tmpyvals)
-if args.plot_all_distance:
+tmpyvals = [v for v in (list(fdvals) + list(mdvals)) if v > 0]
+ymax = 1.2 * max(tmpyvals) if tmpyvals else 100.0
+ymin = 0.9 * min(tmpyvals) if tmpyvals else 0.6
+if args.distance_type in per_ifo_snr_keys and args.log_distance:
+    plot.ylim(ymin=0.6, ymax=ymax)
+elif args.plot_all_distance:
     # note: ymin=0 will clash with args.log_distance
     # in that case it *should* throw an error!
     plot.ylim(ymin, ymax)
@@ -348,6 +396,42 @@ elif args.distance_type == "redshift":
 else:
     # arbitrary limit of 1 distance-unit or snr-unit
     plot.ylim(ymin=1, ymax=ymax)
+
+if args.axis_type in per_ifo_snr_keys and args.distance_type in per_ifo_snr_keys:
+    ax.axvline(
+        4.5,
+        color="#555555",
+        linestyle=":",
+        linewidth=0.9,
+        alpha=0.75,
+        label="SNR = 4.5 (2nd threshold)",
+    )
+    ax.axhline(4.5, color="#555555", linestyle=":", linewidth=0.9, alpha=0.75)
+    ax.axvline(
+        6.0,
+        color="#222222",
+        linestyle="-.",
+        linewidth=0.9,
+        alpha=0.75,
+        label="SNR = 6.0 (1st threshold)",
+    )
+    ax.axhline(6.0, color="#222222", linestyle="-.", linewidth=0.9, alpha=0.75)
+    if args.log_x or args.log_distance:
+        ax.plot(
+            [],
+            [],
+            color="gray",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.7,
+            label="0 (offline, mapped to 0.7)",
+        )
+        caption += (
+            " Single-detector injections where one IFO was offline (SNR = 0) are mapped "
+            "to 0.7 (gray dashed line). Dotted lines show SNR = 4.5 (secondary followup "
+            "threshold) and dash-dotted lines show SNR = 6.0 (primary trigger threshold)."
+        )
+    ax.legend(loc="lower left", fontsize=7, framealpha=0.85)
 
 fig_kwds = {}
 if ".png" in args.output_file:
