@@ -38,6 +38,15 @@ def two_column_layout(path, cols, unique="", **kwargs):
     path = os.path.join(os.getcwd(), path, f"well{unique}.html")
     from pycbc.results.render import render_workflow_html_template
 
+    if "collapse" in kwargs:
+        cval = kwargs["collapse"]
+        if cval is False or str(cval).lower() in ("false", "0", "no", ""):
+            kwargs = dict(kwargs)
+            kwargs.pop("collapse")
+        else:
+            kwargs = dict(kwargs)
+            kwargs["collapse"] = "true"
+
     render_workflow_html_template(path, "two_column.html", cols, **kwargs)
 
 

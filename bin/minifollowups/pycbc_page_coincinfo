@@ -67,9 +67,9 @@ trig_input.add_argument(
 )
 parser.add_argument(
     "--sort-variable",
-    default="ifar",
+    default="stat",
     help="Which subgroup of --analysis-category to use for "
-    "sorting if using --n-loudest. Default=ifar",
+    "sorting if using --n-loudest. Default=stat",
 )
 parser.add_argument(
     "--sort-order",
@@ -121,7 +121,16 @@ f = HFile(args.statmap_file, "r")
 d = f[args.statmap_file_subspace_name]
 
 if args.n_loudest is not None:
-    sorting = d[args.sort_variable][:].argsort()
+    primary_sort = d[args.sort_variable][:]
+    if args.sort_variable == "stat":
+        tie_breaker = (
+            d["ifar_exc"][:]
+            if "ifar_exc" in d
+            else (d["ifar"][:] if "ifar" in d else primary_sort)
+        )
+    else:
+        tie_breaker = d["stat"][:] if "stat" in d else primary_sort
+    sorting = numpy.lexsort((tie_breaker, primary_sort))
     if args.sort_order == "descending":
         sorting = sorting[::-1]
     n = sorting[args.n_loudest]

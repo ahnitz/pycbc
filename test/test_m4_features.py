@@ -235,7 +235,7 @@ print('DEFAULT_RES:', mod['args'].native_welch_resolution)
         self.assertIn("--hierarchical-removal-threshold-ifar", res.stdout)
         self.assertIn("--hierarchical-removal-ifar-thresh", res.stdout)
 
-        # 3. pycbc_foreground_minifollowup accepts sync flags
+        # 3. pycbc_foreground_minifollowup accepts sync flags and defaults --sort-variable to stat
         res = subprocess.run(
             [sys.executable, "bin/minifollowups/pycbc_foreground_minifollowup", "--help"],
             capture_output=True,
@@ -247,6 +247,46 @@ print('DEFAULT_RES:', mod['args'].native_welch_resolution)
         self.assertIn("--far-threshold", res.stdout)
         self.assertIn("--min-events", res.stdout)
         self.assertIn("--max-events", res.stdout)
+        self.assertIn("Default=stat", res.stdout)
+
+    def test_event_flipper_and_layout_collapse(self):
+        """Verify layout.py collapse handling and orange.html Event Flipper markup."""
+        import os
+        import tempfile
+        from pycbc.results import layout, render
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dummy_file = type("DummyFile", (), {"name": "plot1.png"})()
+            layout.group_layout(
+                tmpdir,
+                [dummy_file],
+                unique="_001",
+                collapse=True,
+                title="Event #1 | Stat=141.89",
+            )
+            cp1 = render.get_embedded_config(os.path.join(tmpdir, "well_001.html"))
+            self.assertTrue(cp1.check_option("well_001.html", "collapse"))
+            self.assertEqual(cp1.get("well_001.html", "collapse"), "true")
+
+            layout.group_layout(
+                tmpdir,
+                [dummy_file],
+                unique="_002",
+                collapse=False,
+                title="Non-collapsed well",
+            )
+            cp2 = render.get_embedded_config(os.path.join(tmpdir, "well_002.html"))
+            self.assertFalse(cp2.check_option("well_002.html", "collapse"))
+
+        with open("pycbc/results/templates/orange.html", "r") as f:
+            orange_html = f.read()
+        self.assertIn("event-flipper-bar", orange_html)
+        self.assertIn("flipper-prev", orange_html)
+        self.assertIn("flipper-next", orange_html)
+        self.assertIn("flipper-select", orange_html)
+        self.assertIn("flipper-mode-toggle", orange_html)
+        self.assertIn("ArrowLeft", orange_html)
+        self.assertIn("ArrowRight", orange_html)
 
 
 if __name__ == "__main__":

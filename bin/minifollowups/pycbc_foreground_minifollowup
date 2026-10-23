@@ -21,6 +21,7 @@ import logging
 import os
 import re
 
+import numpy
 import pycbc.workflow as wf
 import pycbc.workflow.minifollowups as mini
 from pycbc import add_common_pycbc_options, init_logging
@@ -66,8 +67,8 @@ parser.add_argument(
 )
 parser.add_argument(
     "--sort-variable",
-    default="ifar",
-    help="Which subgroup of --analysis-category to use for sorting. Default=ifar",
+    default="stat",
+    help="Which subgroup of --analysis-category to use for sorting. Default=stat",
 )
 parser.add_argument(
     "--sort-order",
@@ -222,7 +223,17 @@ num_events = min(num_events, len(stat))
 events_to_read = min(events_to_read, len(stat))
 
 # Get the indices of the events we are considering in the order specified
-sorting = f[file_val + "/" + args.sort_variable][:].argsort()
+f_cat = f[file_val]
+primary_sort = f_cat[args.sort_variable][:]
+if args.sort_variable == "stat":
+    tie_breaker = (
+        f_cat["ifar_exc"][:]
+        if "ifar_exc" in f_cat
+        else (f_cat["ifar"][:] if "ifar" in f_cat else primary_sort)
+    )
+else:
+    tie_breaker = stat
+sorting = numpy.lexsort((tie_breaker, primary_sort))
 if args.sort_order == "descending":
     sorting = sorting[::-1]
 event_idx = sorting[0:events_to_read]
@@ -232,7 +243,6 @@ stat = stat[event_idx]
 times = {}
 tids = {}
 ifo_list = f.attrs["ifos"].split(" ")
-f_cat = f[file_val]
 for ifo in ifo_list:
     times[ifo] = f_cat[ifo]["time"][:][event_idx]
     tids[ifo] = f_cat[ifo]["trigger_id"][:][event_idx]
@@ -256,7 +266,7 @@ while curr_idx < (events_to_read - 1):
     # Check stopping conditions
     if event_count >= min_events:
         if ifar_threshold is not None and ifars is not None:
-            if ifars[curr_idx] < ifar_threshold:
+            if numpy.all(ifars[curr_idx:] < ifar_threshold):
                 break
         elif event_count >= num_events:
             break
@@ -394,7 +404,7 @@ while curr_idx < (events_to_read - 1):
         event_layouts,
         unique=f"_{event_count:03d}",
         collapse="true",
-        title=f"Event #{event_count} | IFAR_exc={ifar_val:.3g} yr | Stat={stat_val:.2f} | GPS={mtime:.2f}",
+        title=f"Event #{event_count} | Stat={stat_val:.2f} | IFAR_exc={ifar_val:.3g} yr | GPS={mtime:.2f}",
     )
 
 workflow.save()
