@@ -131,7 +131,8 @@ class _PowerStage(_Stage):
     name = "power"
     columns: ClassVar[dict] = {"chisq": np.float32, "chisq_dof": int}
 
-    def default(self, n):
+    @staticmethod
+    def default(n):
         return {
             "chisq": np.zeros(n, dtype=np.float32),
             "chisq_dof": np.zeros(n, dtype=int) - 100,
@@ -157,7 +158,8 @@ class _AutoStage(_Stage):
     name = "auto"
     columns: ClassVar[dict] = {"cont_chisq": np.float32}
 
-    def default(self, n):
+    @staticmethod
+    def default(n):
         return {"cont_chisq": np.zeros(n, dtype=np.float32)}
 
     def evaluate(self, batch, j):
@@ -206,7 +208,8 @@ class _SGStage(_Stage):
     name = "sg"
     columns: ClassVar[dict] = {"sg_chisq": np.float32}
 
-    def default(self, n):
+    @staticmethod
+    def default(n):
         return {"sg_chisq": np.ones(n, dtype=np.float32)}
 
     def evaluate(self, batch, j):
@@ -258,6 +261,13 @@ class SignalConsistencyChain:
         computed, in place of the test's own default.
 
     """
+
+    _ALL_STAGES = (_PowerStage, _AutoStage, _SGStage)
+    columns: ClassVar[dict] = {
+        col: dtype
+        for stage in _ALL_STAGES
+        for col, dtype in stage.columns.items()
+    }
 
     def __init__(
         self,
@@ -400,6 +410,11 @@ class SignalConsistencyChain:
         # The triggers still being tested: thresholds and tests narrow it
         alive = np.ones(n, dtype=bool)
         vals = {}
+        for stage in self._ALL_STAGES:
+            for col, arr in stage.default(n).items():
+                if col in self.defaults:
+                    arr[:] = self.defaults[col]
+                vals[col] = arr
         for step in self.steps:
             if isinstance(step, tuple):
                 idx = np.flatnonzero(alive)
@@ -415,10 +430,6 @@ class SignalConsistencyChain:
                     "removed" if step[3] == "remove" else "skipped",
                 )
             else:
-                for col, arr in step.default(n).items():
-                    if col in self.defaults:
-                        arr[:] = self.defaults[col]
-                    vals[col] = arr
                 self._run_stage(step, batch, vals, alive)
         return keep, vals
 
@@ -432,7 +443,7 @@ class SignalConsistencyChain:
         if "chisq_dof" in trigs:
             # EventManager's convention (2p - 2); ranking expects p bins
             trigs["chisq_dof"] = trigs["chisq_dof"] / 2 + 1
-        if "cont_chisq" in vals:
+        if hasattr(self, "_auto_dof"):
             trigs["cont_chisq_dof"] = np.repeat(float(self._auto_dof), len(idx))
 
         if param in ranking.sngls_ranking_function_dict:

@@ -363,12 +363,7 @@ def init_event_managers(args, instruments, gating_info):
         "time_index": int,
         "snr": complex64,
         "sigmasq": float32,
-        "chisq": float32,
-        "chisq_dof": int,
-        "bank_chisq": float32,
-        "bank_chisq_dof": int,
-        "cont_chisq": float32,
-        "sg_chisq": float32,
+        **SignalConsistencyChain.columns,
     }
     names = sorted(out_types.keys())
     event_mgr = {}
@@ -439,13 +434,8 @@ def ingest_ifo_triggers(
     sigmasq_rescale = bank.sigma_rescale(data["template_id"]) ** 2.0
     data["sigmasq"] = (data["sigmasq"] * sigmasq_rescale).astype(float32)
 
-    if "sg_chisq" not in data:
-        data["sg_chisq"] = np.zeros(n_candidates, dtype=np.float32)
-
     ifo_opts = get_ifo_opts(args, ifo)
-    ingest_cols = ["time_index", "snr", "sigmasq", "chisq", "chisq_dof", "sg_chisq"]
-    if args.autochi_stride > 0 and "cont_chisq" in data:
-        ingest_cols.append("cont_chisq")
+    ingest_cols = ["time_index", "snr", "sigmasq", *SignalConsistencyChain.columns]
 
     logging.info(
         "[%s] Ingesting triggers for %d templates into EventManager...",
@@ -805,19 +795,6 @@ def get_args():
 
     # Signal Consistency (Power, Auto, SG Chisq & Chain) Options
     SignalConsistencyChain.insert_option_group(parser)
-    parser.add_argument(
-        "--chisq-threshold",
-        type=float,
-        default=0,
-        help="Maximum reduced chisq a trigger may have; 0 disables the cut.",
-    )
-    parser.add_argument(
-        "--chisq-delta",
-        type=float,
-        default=0,
-        help="SNR-dependent term added to the chisq dof before applying "
-        "--chisq-threshold.",
-    )
     parser.add_argument(
         "--chisq-block-length",
         type=int,

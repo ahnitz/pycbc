@@ -13,7 +13,6 @@ export OMP_NUM_THREADS=1
 pycbc_inspiral_fir \
     --ratio-filter-engine ${ENGINE:-matchedfilter-hierarchical} \
     --output ${OUT:-fir.hdf} \
-    --disable-dynamic-snr-renorm \
     --pad-data 8 \
     --strain-high-pass 15 \
     --sample-rate 2048 \
@@ -32,7 +31,6 @@ pycbc_inspiral_fir \
     --cluster-window 1 \
     --chisq-snr-threshold 6 \
     --chisq-bins 64 \
-    --chisq-threshold 10.0 \
     --sgchisq-snr-threshold 6.0 \
     --sgchisq-locations "mtotal>30:20-15,20-30,20-45,20-60,20-75,20-90,20-105,20-120" \
     --channel-name L1:FAKE-STRAIN \
