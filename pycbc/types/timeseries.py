@@ -996,6 +996,16 @@ class TimeSeries(Array):
 
         # Interpolate if requested
         if delta_f or delta_t or logfsteps:
+            df = _numpy.diff(freqs)
+            if _numpy.any(df <= 0):
+                keep_f = _numpy.concatenate(([True], df > 0))
+                freqs = freqs[keep_f]
+                q_plane = q_plane[keep_f, :]
+            dt = _numpy.diff(times)
+            if _numpy.any(dt <= 0):
+                keep_t = _numpy.concatenate(([True], dt > 0))
+                times = times[keep_t]
+                q_plane = q_plane[:, keep_t]
             if return_complex:
                 interp_amp = interp2d(freqs, times, abs(q_plane), kx=1, ky=1)
                 interp_phase = interp2d(freqs, times, _numpy.angle(q_plane), kx=1, ky=1)

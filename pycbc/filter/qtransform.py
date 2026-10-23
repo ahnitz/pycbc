@@ -188,13 +188,18 @@ def _iter_frequencies(q, frange, mismatch, dur):
     fstep = fcum_mismatch / nfreq
     fstepmin = 1.0 / dur
     # for each frequency, yield a QTile
+    last_f = None
     for i in range(nfreq):
-        yield (
+        f = (
             float(minf)
             * exp(2 / (2 + q**2) ** (1 / 2.0) * (i + 0.5) * fstep)
             // fstepmin
             * fstepmin
         )
+        if last_f is not None and f <= last_f:
+            f = last_f + fstepmin
+        last_f = f
+        yield f
 
 
 def qseries(fseries, Q, f0, return_complex=False):
