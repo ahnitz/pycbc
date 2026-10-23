@@ -359,8 +359,8 @@ class TopTemplateSearch:
         self.timers["filter_prep"] += time.perf_counter() - t0
         self.top_pad = self.search.pad(self.root)
         guard_sec = float(args.cluster_window or 0.0) + float(args.chisq_window or 0.0)
-        self.guard_samples = (
-            int(np.ceil(guard_sec * float(sample_rate))) + 2 * int(self.top_pad)
+        self.guard_samples = int(np.ceil(guard_sec * float(sample_rate))) + 2 * int(
+            self.top_pad
         )
 
         self.power_chisq = RatioPowerChisq(
@@ -378,6 +378,7 @@ class TopTemplateSearch:
             top_template=top_template,
             upper_f_by_coarse=upper_f_by_coarse,
             bank=bank,
+            snr_threshold=args.chisq_snr_threshold,
         )
         num_b = (
             int(self.power_chisq.num_bins)
@@ -393,8 +394,8 @@ class TopTemplateSearch:
             args,
             bank,
             sample_rate,
-            power_chisq=self.power_chisq,
-            sg_chisq=self.sg_chisq,
+            self.power_chisq,
+            self.sg_chisq,
             defaults=chain_defaults,
         )
 
@@ -470,9 +471,7 @@ class TopTemplateSearch:
         if self.ctx["can_asym_by_seg"].get(ctx.chunk, False):
             self.follow_up(ctx, primaries)
 
-    def _record(
-        self, ctx, ifo, ids_local, t_idxs, snrs, is_asym=False, threshold=None
-    ):
+    def _record(self, ctx, ifo, ids_local, t_idxs, snrs, is_asym=False, threshold=None):
         """Filter triggers to segment analyze bounds and SNR threshold, evaluate the
         signal-consistency chain, and append surviving triggers to self.triggers[ifo].
         """
@@ -534,9 +533,7 @@ class TopTemplateSearch:
 
         if self.power_chisq.do or self.args.autochi_stride > 0:
             cthresh = (
-                (self.args.chisq_snr_threshold or 0.0)
-                if self.power_chisq.do
-                else 0.0
+                (self.args.chisq_snr_threshold or 0.0) if self.power_chisq.do else 0.0
             )
             above = np.abs(snrs) >= cthresh
             if np.any(above):
@@ -710,9 +707,7 @@ class TopTemplateSearch:
         t_seg_dur = max(now - clock["t"], 1e-6)
         ifo0 = ctx.channels[0]
         active_cids = [
-            cid
-            for cid in self.groups
-            if self.windows(cid, ctx.chunk, ifo0, 0) != []
+            cid for cid in self.groups if self.windows(cid, ctx.chunk, ifo0, 0) != []
         ]
         n_tmpl_seg = sum(len(self.groups[cid][0]) for cid in active_cids)
         stilde_ref = ctx.tags[ifo0]
@@ -807,10 +802,7 @@ def _validate_bank_and_padding(bank, segments, instruments, bank_file):
     for lvl, grp in bank.level_groups.items():
         want_complex = lvl == 1
         for k in bank.level_keys[lvl]:
-            if (
-                np.issubdtype(grp[k]["taps"].dtype, np.complexfloating)
-                != want_complex
-            ):
+            if np.issubdtype(grp[k]["taps"].dtype, np.complexfloating) != want_complex:
                 raise ValueError(
                     "%s: level_%d group %s has %s taps; pycbc_inspiral_fir "
                     "needs complex final (level 1) taps and real taps above "
@@ -864,8 +856,7 @@ def run_hierarchical_search(
     num_segs = max(len(segments[ifo]) for ifo in instruments)
     if sum(len(segments[ifo]) for ifo in instruments) == 0:
         logging.info(
-            "Zero valid segments to analyze across all instruments. "
-            "Skipping filtering."
+            "Zero valid segments to analyze across all instruments. Skipping filtering."
         )
         return triggers, has_asym_followup, timers
 

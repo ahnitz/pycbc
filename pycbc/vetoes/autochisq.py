@@ -20,6 +20,8 @@ import numpy as np
 from pycbc.filter import make_frequency_series, matched_filter_core
 from pycbc.types import Array
 
+logger = logging.getLogger(__name__)
+
 BACKEND_PREFIX = "pycbc.vetoes.autochisq_"
 
 
@@ -154,6 +156,10 @@ class SingleDetAutoChisq:
     Class that handles precomputation and memory management for efficiently
     running the auto chisq in a single detector inspiral analysis.
     """
+
+    name = "auto"
+    columns = {"cont_chisq": np.float32, "cont_chisq_dof": int}
+    default_values = {"cont_chisq": 0, "cont_chisq_dof": 0}
 
     def __init__(
         self,
@@ -294,7 +300,7 @@ class SingleDetAutoChisq:
         )
 
     @classmethod
-    def from_cli(cls, args):
+    def from_cli(cls, args, **kwargs):
         """Create the auto-chisq from the options of insert_option_group."""
         return cls(
             args.autochi_stride,
@@ -305,6 +311,20 @@ class SingleDetAutoChisq:
             take_maximum_value=args.autochi_max_valued,
             maximal_value_dof=args.autochi_max_valued_dof,
         )
+
+    def default_steps(self):
+        return [self.name]
+
+    def evaluate(self, batch, j):
+        if getattr(self, "reverse_template", False):
+            raise ValueError("The chain does not support --autochi-reverse-template")
+        corr, index = batch.correlation(j, self.stride * self.num_points)
+        if corr is None:
+            return None
+        corr = np.asarray(corr)
+        sn = np.fft.ifft(corr) * len(corr)
+        achisq, dof = self.values(sn, [index], batch.template(j), None, 1)
+        return {"cont_chisq": achisq[0], "cont_chisq_dof": dof}
 
     def values(
         self,
@@ -353,12 +373,24 @@ class SingleDetAutoChisq:
         if not (self.do and len(indices) > 0):
             return None, None
 
-        htilde = make_frequency_series(template)
-
         # Check if we need to recompute the autocorrelation
         key = (id(template), id(psd))
-        if key != self._autocor_id:
-            logging.debug("Calculating autocorrelation")
+        if psd is None and len(template) == len(sn):
+            autocor = getattr(template, "autocorrelation", None)
+            if autocor is None:
+                if key != self._autocor_id:
+                    power = np.abs(np.asarray(template)) ** 2
+                    power[len(power) // 2 + 1 :] = 0
+                    autocor = np.fft.ifft(power)
+                    self._autocor = autocor / autocor[0]
+                    self._autocor_id = key
+                autocor = self._autocor
+                if hasattr(template, "__dict__"):
+                    template.autocorrelation = autocor
+            self._autocor = autocor
+        elif key != self._autocor_id:
+            logger.debug("Calculating autocorrelation")
+            htilde = make_frequency_series(template)
 
             if not self.reverse_template:
                 Pt, _, P_norm = matched_filter_core(
@@ -388,10 +420,11 @@ class SingleDetAutoChisq:
                 self._autocor = Array(Pt, copy=True)
             self._autocor_id = key
 
-        logging.debug("...Calculating autochisquare")
+        logger.debug("...Calculating autochisquare")
         sn = sn * norm
         if self.reverse_template:
             assert stilde is not None
+            htilde = make_frequency_series(template)
             asn, _, ahnrm = matched_filter_core(
                 htilde.conj(),
                 stilde,

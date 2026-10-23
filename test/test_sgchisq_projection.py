@@ -1,4 +1,4 @@
-"""Tests of the sine-Gaussian chisq with the template's response removed."""
+"""Unit tests for SingleDetSGChisq with the template's response removed."""
 
 import unittest
 
@@ -65,16 +65,19 @@ class TestSGChisqProjection(unittest.TestCase):
             self.template, data, psd=self.psd, low_frequency_cutoff=20
         )
         index = numpy.rint(numpy.array(times) * self.sr).astype(int)
-        kw = {}
-        if project:
-            kw = dict(snrs=snr.numpy()[index] * snr_norm)
         # The data divided by the PSD, where the PSD is defined (the model
         # is zero below 15 Hz and at Nyquist)
         whitened = data.copy()
         defined = self.psd.numpy() > 0
         whitened.data[defined] /= self.psd.numpy()[defined]
-        return self.sg.values_at(
-            whitened, self.psd, self.template, self.psd, numpy.array(times), **kw
+        return self.sg.values(
+            whitened,
+            self.template,
+            self.psd,
+            snr.numpy()[index],
+            snr_norm,
+            indices=index,
+            project=project,
         )
 
     def test_template_response_is_removed(self):

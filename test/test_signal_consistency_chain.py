@@ -7,17 +7,18 @@ import numpy
 from pycbc.events import ranking
 from pycbc.types import FrequencySeries
 from pycbc.vetoes.chain import SignalConsistencyChain
+from pycbc.vetoes.chisq import SingleDetPowerChisq
+from pycbc.vetoes.sgchisq import SingleDetSGChisq
 
 
-class StubPower:
+class StubPower(SingleDetPowerChisq):
     """
     A stand-in for SingleDetPowerChisq whose chisq is 10 |SNR|, with 6
     dof (4 bins). It counts how often it is called.
     """
 
-    do = True
-
     def __init__(self):
+        super().__init__(num_bins=4)
         self.calls = 0
 
     def values(self, corr, snrv, snr_norm, psd, indices, template):
@@ -195,11 +196,14 @@ class TestChain(unittest.TestCase):
         numpy.testing.assert_array_equal(keep, [True, False])
 
     def test_later_stages_need_a_value(self):
-        class StubSG:
+        class StubSG(SingleDetSGChisq):
             do = True
             calls = 0
 
-            def values_at(self, *args, **kwargs):
+            def __init__(self):
+                pass
+
+            def values(self, *args, **kwargs):
                 self.calls += 1
                 return numpy.array([2.0])
 
@@ -286,6 +290,80 @@ class TestChain(unittest.TestCase):
         args = parser.parse_args(["--chisq-bins", "16", "--chisq-snr-threshold", "6"])
         chain = SignalConsistencyChain.from_cli(args, None, 1024.0)
         self.assertEqual(chain.description, "snr:6.0:lower:skip power")
+
+    def test_bank_chisq_matches_single_det_bank_veto(self):
+        import types
+
+        from pycbc.filter import matched_filter_core, sigma
+        from pycbc.types import FrequencySeries, TimeSeries
+        from pycbc.vetoes.bank_chisq import SingleDetBankVeto
+        from pycbc.waveform import get_fd_waveform
+
+        rng = numpy.random.default_rng(2)
+        n, sr = 8192, 1024.0
+        df = sr / n
+        hp, _ = get_fd_waveform(
+            approximant="TaylorF2", mass1=10, mass2=10, f_lower=30, delta_f=df
+        )
+        hp.resize(n // 2 + 1)
+        hp.f_lower = 30.0
+        hp.params = types.SimpleNamespace(mass1=10.0, mass2=10.0)
+
+        bank_tmplt, _ = get_fd_waveform(
+            approximant="TaylorF2", mass1=12, mass2=12, f_lower=30, delta_f=df
+        )
+        bank_tmplt.resize(n // 2 + 1)
+        bank_tmplt.f_lower = 30.0
+        bank_tmplt.params = types.SimpleNamespace(mass1=12.0, mass2=12.0)
+
+        psd = FrequencySeries(numpy.ones(n // 2 + 1), delta_f=df)
+        noise = TimeSeries(rng.normal(size=n) * (sr / 2) ** 0.5, delta_t=1 / sr)
+        signal = (
+            hp.cyclic_time_shift(2.0).to_timeseries()
+            * 20
+            / sigma(hp, psd=psd, low_frequency_cutoff=30)
+        )
+        stilde = TimeSeries(
+            noise.numpy() + signal.numpy(), delta_t=1 / sr
+        ).to_frequencyseries()
+        stilde.psd = psd
+
+        snrv, _, norm = matched_filter_core(
+            hp, stilde, psd=psd, low_frequency_cutoff=30
+        )
+        index = int(numpy.argmax(abs(snrv)))
+
+        bank_veto = SingleDetBankVeto(None)
+        bank_veto.do = True
+        bank_veto.f_low = 30.0
+        bank_veto.filters = [bank_tmplt]
+        bank_veto.dof = 2
+        bank_veto._overlaps_cache = {}
+        bank_veto._segment_snrs_cache = {}
+
+        expect, expect_dof = bank_veto.values(
+            hp,
+            psd,
+            stilde,
+            numpy.array([snrv[index]]),
+            norm,
+            numpy.array([index]),
+            whitened=False,
+        )
+
+        chain = SignalConsistencyChain(
+            bank_chisq=bank_veto, steps=["bank", "bank:50:upper:remove"]
+        )
+        keep, vals = run(
+            chain,
+            [snrv[index] * norm],
+            [index],
+            template=lambda j: hp,
+            stilde=stilde,
+        )
+        self.assertTrue(keep.all())
+        numpy.testing.assert_allclose(vals["bank_chisq"], expect, rtol=1e-5)
+        numpy.testing.assert_array_equal(vals["bank_chisq_dof"], expect_dof)
 
 
 if __name__ == "__main__":
