@@ -86,7 +86,7 @@ def detect_loud_glitches(
     output_intermediates=False,
     bandlimited_freq=(20.0, 150.0),
     min_quiet_duration=0.10,
-    quiet_threshold=3.0,
+    quiet_threshold=None,
     pad_duration=0.20,
     min_separation=0.20,
     min_half_width=None,
@@ -104,9 +104,12 @@ def detect_loud_glitches(
     whitened series, thresholds it and applies FindChirp clustering over time.
     For each detected transient, the gate boundaries are dynamically expanded
     left and right until the whitened residual remains below `quiet_threshold`
-    (default 3.0 sigma) for at least `min_quiet_duration` (default 0.10s)
-    continuously, plus a symmetric padding duration (default 0.20s). Overlapping
-    or closely separated gates (<= `min_separation`, default 0.20s) are merged.
+    (default max(10.0, 0.25 * threshold)) for at least `min_quiet_duration`
+    (default 0.10s) continuously, plus a symmetric padding duration (default 0.20s).
+    Per-glitch expansion is capped at `max_half_width = max(width, 2.0)` (<=2.0s
+    half-width), and merged gates are capped at `max_merged_half_width = 4.0`
+    (<=4.0s half-width / 8.0s total). Overlapping or closely separated gates
+    (<= `min_separation`, default 0.20s) are merged.
 
     Parameters
     ----------
@@ -140,7 +143,9 @@ def detect_loud_glitches(
     min_quiet_duration : {float, 0.10}
         Minimum duration in seconds that the whitened residual must remain
         below quiet_threshold to mark the boundary of a transient.
-    quiet_threshold : {float, 3.0}
+    quiet_threshold : {float, None}
+        Threshold in units of whitened sigma for determining quiet boundaries.
+        Default is None, which sets quiet_threshold = max(10.0, 0.25 * threshold).
         Threshold in units of whitened sigma for determining quiet boundaries.
     pad_duration : {float, 0.20}
         Extra padding in seconds added to both sides of each dynamically
@@ -276,6 +281,9 @@ def detect_loud_glitches(
     peak_indices = indices[cluster_idx]
 
     # Dynamic gate width expansion
+    if quiet_threshold is None:
+        quiet_threshold = max(10.0, 0.25 * threshold)
+
     n_data = len(mag_comb)
     fs = float(strain.sample_rate)
     n_quiet = int(numpy.ceil(min_quiet_duration * fs))
@@ -314,15 +322,20 @@ def detect_loud_glitches(
         t_start = float(strain.start_time + start_idx * strain.delta_t)
         t_end = float(strain.start_time + end_idx * strain.delta_t)
 
-        if min_half_width is not None and min_half_width > 0:
-            center = (t_start + t_end) / 2.0
-            half_w = max((t_end - t_start) / 2.0, min_half_width)
-            t_start = center - half_w
-            t_end = center + half_w
+        center = (t_start + t_end) / 2.0
+        half_w = (t_end - t_start) / 2.0
+        base_w = min_half_width if min_half_width is not None else 0.0
+        if base_w > 0:
+            half_w = max(half_w, base_w)
+        max_half_width = max(base_w, 2.0)
+        half_w = min(half_w, max_half_width)
+        t_start = center - half_w
+        t_end = center + half_w
 
         raw_gates.append([t_start, t_end])
 
-    # Merge overlapping or closely spaced gates
+    # Merge overlapping or closely spaced gates up to max_merged_half_width = 4.0s
+    max_merged_half_width = 4.0
     raw_gates.sort(key=lambda g: g[0])
     merged_intervals = []
     for g_start, g_end in raw_gates:
@@ -330,15 +343,18 @@ def detect_loud_glitches(
             merged_intervals.append([g_start, g_end])
         else:
             prev_start, prev_end = merged_intervals[-1]
-            if g_start - prev_end <= min_separation:
-                merged_intervals[-1][1] = max(prev_end, g_end)
+            cand_end = max(prev_end, g_end)
+            if (g_start - prev_end <= min_separation) and (
+                (cand_end - prev_start) / 2.0 <= max_merged_half_width
+            ):
+                merged_intervals[-1][1] = cand_end
             else:
                 merged_intervals.append([g_start, g_end])
 
     gate_params = []
     for g_start, g_end in merged_intervals:
         center_t = (g_start + g_end) / 2.0
-        half_w = (g_end - g_start) / 2.0
+        half_w = min((g_end - g_start) / 2.0, max_merged_half_width)
         gate_params.append([center_t, half_w, taper_duration])
 
     if return_gate_intervals:
@@ -573,7 +589,7 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
         if len(gate_params.shape) == 1:
             gate_params = [gate_params]
         paint_m = getattr(opt, "paint_method", "toeplitz")
-        paint_r = getattr(opt, "paint_ridge", 1e-8)
+        paint_r = getattr(opt, "paint_ridge", 0.001)
         invpsd = (
             _get_gating_invpsd(gate_params) if opt.gating_method == "paint" else None
         )
@@ -597,7 +613,7 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
 
     if opt.autogating_threshold is not None:
         paint_m = getattr(opt, "paint_method", "toeplitz")
-        paint_r = getattr(opt, "paint_ridge", 1e-8)
+        paint_r = getattr(opt, "paint_ridge", 0.001)
         gating_info["auto"] = []
         for _ in range(opt.autogating_max_iterations):
             gate_params = detect_loud_glitches(
@@ -1003,8 +1019,8 @@ def insert_strain_option_group(parser, gps_times=True):
     data_reading_group.add_argument(
         "--paint-ridge",
         type=float,
-        default=1e-8,
-        help="Diagonal regularization ridge parameter for inpainting. Default: 1e-8",
+        default=0.001,
+        help="Diagonal regularization ridge parameter for inpainting. Default: 0.001",
     )
     # Optional
     data_reading_group.add_argument(
@@ -1447,9 +1463,9 @@ def insert_strain_option_group_multi_ifo(parser, gps_times=True):
         type=float,
         nargs="+",
         action=MultiDetOptionAction,
-        default=1e-8,
+        default=0.001,
         metavar="IFO:RIDGE",
-        help="Diagonal regularization ridge parameter for inpainting. Default: 1e-8",
+        help="Diagonal regularization ridge parameter for inpainting. Default: 0.001",
     )
 
     # Optional

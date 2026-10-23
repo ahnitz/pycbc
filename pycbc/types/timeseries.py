@@ -723,7 +723,7 @@ class TimeSeries(Array):
         invpsd=None,
         paint_method="toeplitz",
         paint_invmat=None,
-        paint_ridge=1e-8,
+        paint_ridge=1e-3,
         paint_pad_duration=16.0,
         paint_subsample_shift=False,
     ):
@@ -758,7 +758,7 @@ class TimeSeries(Array):
             invpsd.
         paint_ridge: float, optional
             Diagonal ridge parameter for regularizing covariance inversion.
-            Default is 1e-8.
+            Default is 1e-3 (0.001).
         paint_pad_duration: float, optional
             Padding duration in seconds on each side of the gate for local
             convolution inpainting. Default is 16.0 seconds.

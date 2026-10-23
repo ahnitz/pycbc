@@ -116,7 +116,13 @@ class TestGateAndPaint(unittest.TestCase):
             ridge=1e-10,
         )
         cleaned_toep = gate_and_paint(
-            self.ts_glitch, lindex, rindex, self.invpsd, copy=True, method="toeplitz"
+            self.ts_glitch,
+            lindex,
+            rindex,
+            self.invpsd,
+            copy=True,
+            method="toeplitz",
+            ridge=1e-10,
         )
 
         diff = np.max(np.abs(cleaned_cho.numpy() - cleaned_toep.numpy()))

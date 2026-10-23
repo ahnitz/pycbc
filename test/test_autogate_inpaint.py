@@ -385,6 +385,40 @@ class TestAutogateInpaint(unittest.TestCase):
         max_snr = abs(snr_clean[eval_slice]).numpy().max()
         self.assertLess(max_snr, 5.5)
 
+    def test_noise_drift_hard_cap_merged_gates(self):
+        """Verify detect_loud_glitches under 2x noise drift never returns half_width > 4.0s."""
+        t = self.ts_noise.sample_times.numpy() - 16.0
+        # Persistent disturbance with 2x noise drift
+        drift_disturbance = 70.0 * np.exp(-((t / 0.8) ** 2)) * np.sin(2 * np.pi * 50.0 * t)
+        ts_drift = self.ts_noise + pycbc.types.TimeSeries(
+            drift_disturbance, delta_t=self.delta_t, epoch=0
+        )
+
+        gates = detect_loud_glitches(
+            ts_drift,
+            threshold=30.0,
+            low_freq_cutoff=20.0,
+            min_half_width=0.25,
+            pad_duration=0.20,
+            return_gate_intervals=True,
+        )
+        self.assertGreaterEqual(len(gates), 1)
+        for _, half_w, _ in gates:
+            self.assertLessEqual(half_w, 4.0)
+
+    def test_gate_and_paint_wide_gate_fallback(self):
+        """Verify gate_and_paint falls back to cosine taper for K > 32768."""
+        K = 35000  # > 32768 samples
+        lindex = 5000
+        rindex = lindex + K
+
+        cleaned = gate_and_paint(
+            self.ts_noise, lindex, rindex, self.invpsd, copy=True, fallback_taper=True
+        )
+        self.assertTrue(np.all(np.isfinite(cleaned.numpy())))
+        center_idx = (lindex + rindex) // 2
+        self.assertEqual(cleaned[center_idx], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
