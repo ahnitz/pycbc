@@ -78,7 +78,7 @@
                     }
                     if (markerCmd) {
                         if (!$('#accordion1').length) {
-                            singleWell.before('<div class="panel-group" id="accordion1"></div>');
+                            singleWell.before($('<div/>', {'class': 'panel-group', 'id': 'accordion1'}));
                         }
                         var groups = [];
                         var currGroup = null;
@@ -94,7 +94,7 @@
                             $.each(groups, function (idx, gRows) {
                                 var $firstRow = gRows[0];
                                 var titleText = $.trim($firstRow.find('.pycbc-meta[key="title"]').first().attr('value') || ('Event #' + (idx + 1)));
-                                var $panel = $('<div class="panel panel-default"></div>');
+                                var $panel = $('<div/>', {'class': 'panel panel-default'});
                                 var $heading = $('<div class="panel-heading"><h4 class="panel-title" data-toggle="collapse" data-parent="#accordion1" data-target="#collapse' + (idx + 1) + 'well"></h4></div>');
                                 $heading.find('.panel-title').text('Event #' + (idx + 1) + ' | ' + titleText);
                                 var $collapse = $('<div id="collapse' + (idx + 1) + 'well" class="panel-collapse collapse"><div class="panel-body"><div class="scaffold well"></div></div></div>');
@@ -116,7 +116,7 @@
 
                 if (!$('#event-flipper-bar').length) {
                     var flipperHtml =
-                        '<div id="event-flipper-bar" class="well well-sm" style="position: sticky; top: 0; z-index: 1000; background: #fdfdfd; border: 1px solid #d5d5d5; border-left: 4px solid #e67e22; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">' +
+                        '<' + 'div id="event-flipper-bar" class="well well-sm" style="position: sticky; top: 0; z-index: 1000; background: #fdfdfd; border: 1px solid #d5d5d5; border-left: 4px solid #e67e22; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">' +
                             '<div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;">' +
                                 '<div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">' +
                                     '<button type="button" id="flipper-prev" class="btn btn-sm btn-primary" title="Previous Event (Left Arrow)">&#8592; Prev</button>' +
