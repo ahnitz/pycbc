@@ -794,14 +794,15 @@ class TimeSeries(Array):
             offset = rindex_time - (time + window)
 
             def _apply_paint(target_data):
-                if paint_method in ("cholesky", "toeplitz"):
+                if paint_method in ("cholesky", "toeplitz", "auto"):
+                    resolved_method = "toeplitz" if paint_method == "auto" else paint_method
                     return gate_and_paint(
                         target_data,
                         lindex,
                         rindex,
                         invpsd,
                         copy=False,
-                        method=paint_method,
+                        method=resolved_method,
                         ridge=paint_ridge,
                         pad_duration=paint_pad_duration,
                     )

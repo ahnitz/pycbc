@@ -291,7 +291,7 @@ def gate_and_paint(
         owhgated_data = (data.to_frequencyseries() * invpsd).to_timeseries()
         rhs = owhgated_data[lindex:rindex].numpy().astype(np.float64)
 
-    if method is None:
+    if method in (None, "auto"):
         method = "toeplitz"
 
     raw_col = tdfilter[:K].numpy() if hasattr(tdfilter[:K], "numpy") else tdfilter[:K]

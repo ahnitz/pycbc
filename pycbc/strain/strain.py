@@ -863,9 +863,9 @@ def insert_strain_option_group(parser, gps_times=True):
     data_reading_group.add_argument(
         "--paint-method",
         type=str,
-        default="toeplitz",
-        choices=["cholesky", "toeplitz", "matmul"],
-        help="Solver method for inpainting. Default: `toeplitz`",
+        default="auto",
+        choices=["cholesky", "toeplitz", "matmul", "auto"],
+        help="Solver method for inpainting. Default: `auto` (uses `toeplitz`)",
     )
     data_reading_group.add_argument(
         "--paint-ridge",
@@ -1305,9 +1305,9 @@ def insert_strain_option_group_multi_ifo(parser, gps_times=True):
         type=str,
         nargs="+",
         action=MultiDetOptionAction,
-        default="toeplitz",
-        choices=["cholesky", "toeplitz", "matmul"],
-        help="Solver method for inpainting. Default: `toeplitz`",
+        default="auto",
+        choices=["cholesky", "toeplitz", "matmul", "auto"],
+        help="Solver method for inpainting. Default: `auto` (uses `toeplitz`)",
     )
     data_reading_group_multi.add_argument(
         "--paint-ridge",

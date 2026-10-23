@@ -138,6 +138,29 @@ class TestGateAndInpaint(unittest.TestCase):
         opts = parser.parse_args([])
         self.assertEqual(opts.paint_ridge, 0.001)
 
+    def test_paint_method_auto_cli_and_execution(self):
+        """Verify --paint-method auto parses cleanly and executes identically to toeplitz."""
+        parser = argparse.ArgumentParser()
+        insert_strain_option_group(parser)
+        opts = parser.parse_args(["--paint-method", "auto", "--channel-name", "H1:TEST"])
+        self.assertEqual(opts.paint_method, "auto")
+
+        # Test execution with method='auto' vs method='toeplitz'
+        lindex = int(31.8 * self.sample_rate)
+        rindex = int(32.2 * self.sample_rate)
+        cleaned_auto = gate_and_paint(
+            self.ts, lindex, rindex, self.invpsd, copy=True, method="auto", ridge=1e-3
+        )
+        cleaned_toeplitz = gate_and_paint(
+            self.ts, lindex, rindex, self.invpsd, copy=True, method="toeplitz", ridge=1e-3
+        )
+        np.testing.assert_allclose(cleaned_auto.numpy(), cleaned_toeplitz.numpy(), rtol=1e-7, atol=1e-7)
+
+        # Test timeseries gate_and_paint with method='auto'
+        ts_copy = self.ts.copy()
+        cleaned_ts = gate_and_paint(ts_copy, lindex, rindex, self.invpsd, method="auto")
+        self.assertTrue(np.all(np.isfinite(cleaned_ts.numpy())))
+
 
 if __name__ == "__main__":
     unittest.main()
