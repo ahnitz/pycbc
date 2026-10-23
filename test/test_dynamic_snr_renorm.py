@@ -373,6 +373,7 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
             f_final=800.0,
             top_template=top_template,
             upper_f_by_coarse={},
+            snr_threshold=5.0,
         )
         args = types.SimpleNamespace(
             chisq_bins=8,
@@ -386,8 +387,10 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
             autochi_reverse_template=False,
             autochi_max_valued=False,
             autochi_max_valued_dof=None,
-            sgchisq_snr_threshold=0,
-            sgchisq_locations=None,
+            sgchisq_snr_threshold=5.0,
+            sgchisq_locations=[],
+            bank_veto_bank_file=None,
+            bank_veto_time_freq=False,
             signal_consistency_chain=None,
         )
 
@@ -399,6 +402,7 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
                 1: {"mass1": 25.0, "mass2": 25.0, "spin1z": 0.0, "spin2z": 0.0},
             }
         )
+        pchisq.bank = bank_stub
         sg = SingleDetSGChisq(
             bank_stub,
             num_bins=8,
@@ -409,7 +413,7 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
         sg.params = {101: "20-0.5,20-0.6", 102: "20-0.5,20-0.6"}
 
         chain = SignalConsistencyChain.from_cli(
-            args, bank_stub, sample_rate, power_chisq=pchisq, sg_chisq=sg
+            args, bank_stub, sample_rate, pchisq, sg
         )
 
         ids_local = np.array([0, 1], dtype=np.int32)
@@ -417,21 +421,15 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
         snrs = np.array([12.0 + 0.0j, 9.0 + 0.0j], dtype=np.complex64)
         fine_indices = np.array([0, 1], dtype=np.int32)
 
+        pchisq.set_batch(
+            stilde, 0, ids_local, fine_indices[ids_local], t_idxs, ref_snr, filters_f
+        )
         kept, vals = chain.values(
             snrs,
             t_idxs,
             fine_indices[ids_local],
-            lambda j: pchisq.template(
-                stilde,
-                0,
-                int(ids_local[j]),
-                int(fine_indices[ids_local[j]]),
-                filters_f,
-                bank_stub,
-            ),
-            lambda j, reach=0: pchisq.correlation(
-                stilde, 0, int(ids_local[j]), int(t_idxs[j]), ref_snr, filters_f, reach
-            ),
+            pchisq.template,
+            pchisq.correlation,
             stilde=stilde,
         )
         pchisq.ref_f_cache.clear()
@@ -453,7 +451,7 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
         from pycbc.vetoes.chain import SignalConsistencyChain
         from pycbc.vetoes.chisq_fir import RatioPowerChisq
 
-        pchisq = RatioPowerChisq(num_bins=64, sample_rate=2048.0)
+        pchisq = RatioPowerChisq(num_bins=64, sample_rate=2048.0, snr_threshold=5.25)
         args = types.SimpleNamespace(
             chisq_bins=64,
             chisq_snr_threshold=5.25,
@@ -468,6 +466,8 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
             autochi_max_valued_dof=None,
             sgchisq_snr_threshold=0,
             sgchisq_locations=None,
+            bank_veto_bank_file=None,
+            bank_veto_time_freq=False,
             signal_consistency_chain=None,
         )
         bank_stub = types.SimpleNamespace(table={})
@@ -475,7 +475,7 @@ class TestFIRChisqAndSearchHelpers(unittest.TestCase):
             args,
             bank_stub,
             2048.0,
-            power_chisq=pchisq,
+            pchisq,
             defaults={"chisq": 126, "chisq_dof": 126, "sg_chisq": 1.0},
         )
         # Sub-threshold trigger (SNR = 4.2 < 5.25) should receive nominal rchisq = 1.0

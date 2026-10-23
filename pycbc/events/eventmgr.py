@@ -42,7 +42,7 @@ from pycbc.types import Array
 from . import coinc, ranking
 from .eventmgr_cython import findchirp_cluster_over_window_cython
 
-logger = logging.getLogger("pycbc.events.eventmgr")
+logger = logging.getLogger(__name__)
 
 
 @schemed("pycbc.events.threshold_")
@@ -511,9 +511,8 @@ class EventManager:
                 # Not precessing
                 f["coa_phase"] = numpy.angle(self.events["snr"])
             f["chisq"] = self.events["chisq"]
-            if "bank_chisq" in self.events.dtype.names:
-                f["bank_chisq"] = self.events["bank_chisq"]
-                f["bank_chisq_dof"] = self.events["bank_chisq_dof"]
+            f["bank_chisq"] = self.events["bank_chisq"]
+            f["bank_chisq_dof"] = self.events["bank_chisq_dof"]
             f["cont_chisq"] = self.events["cont_chisq"]
             f["end_time"] = (
                 self.events["time_index"] / float(self.opt.sample_rate)
@@ -551,15 +550,18 @@ class EventManager:
                 template_durations, dtype=numpy.float32
             )[tid]
 
-            # FIXME: Can we get this value from the autochisq instance?
-            cont_dof = self.opt.autochi_number_points
-            if self.opt.autochi_onesided is None:
-                cont_dof = cont_dof * 2
-            if self.opt.autochi_two_phase:
-                cont_dof = cont_dof * 2
-            if self.opt.autochi_max_valued_dof:
-                cont_dof = self.opt.autochi_max_valued_dof
-            f["cont_chisq_dof"] = numpy.repeat(cont_dof, len(self.events))
+            if "cont_chisq_dof" in self.events.dtype.names:
+                f["cont_chisq_dof"] = self.events["cont_chisq_dof"]
+            else:
+                # FIXME: Can we get this value from the autochisq instance?
+                cont_dof = self.opt.autochi_number_points
+                if self.opt.autochi_onesided is None:
+                    cont_dof = cont_dof * 2
+                if self.opt.autochi_two_phase:
+                    cont_dof = cont_dof * 2
+                if self.opt.autochi_max_valued_dof:
+                    cont_dof = self.opt.autochi_max_valued_dof
+                f["cont_chisq_dof"] = numpy.repeat(cont_dof, len(self.events))
 
             if "chisq_dof" in self.events.dtype.names:
                 f["chisq_dof"] = self.events["chisq_dof"] / 2 + 1
@@ -633,10 +635,6 @@ class EventManager:
                     f["gating/" + gate_type + "/pad"] = numpy.array(
                         [g[2] for g in gating_info[gate_type]]
                     )
-        if hasattr(self, "non_threshold_time") and self.non_threshold_time is not None:
-            f["search/non_threshold_time"] = numpy.array(
-                [float(self.non_threshold_time)]
-            )
 
         f.f.close()
 

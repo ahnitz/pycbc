@@ -158,8 +158,9 @@ class RatioPowerChisq(SingleDetPowerChisq):
         top_template=None,
         upper_f_by_coarse=None,
         bank=None,
+        snr_threshold=None,
     ):
-        super().__init__(num_bins=num_bins)
+        super().__init__(num_bins=num_bins, snr_threshold=snr_threshold)
         if self.do and self.num_bins is not None:
             self.num_bins = int(self.num_bins)
         self.sample_rate = float(sample_rate)
@@ -265,9 +266,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
         with its power-chisq bins and SG-chisq metadata attached, cached per
         (psd, coarse_idx, local_id).
         """
-        stilde, coarse_idx, ids_local, gids, _t_idxs, _ref_snr, filters_f = (
-            self._batch
-        )
+        stilde, coarse_idx, ids_local, gids, _t_idxs, _ref_snr, filters_f = self._batch
         local_id = int(ids_local[j])
         gid = int(gids[j])
         bank = self.bank
@@ -326,9 +325,7 @@ class RatioPowerChisq(SingleDetPowerChisq):
         """Return (corr, index_in_block) for batch trigger j on the chisq block
         centred on t_idx, or (None, None) if reach exceeds the valid FIR lags.
         """
-        stilde, coarse_idx, ids_local, _gids, t_idxs, ref_snr, filters_f = (
-            self._batch
-        )
+        stilde, coarse_idx, ids_local, _gids, t_idxs, ref_snr, filters_f = self._batch
         local_id = int(ids_local[j])
         t_idx = int(t_idxs[j])
         block_len = filters_f.block_length
