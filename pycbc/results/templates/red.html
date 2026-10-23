@@ -70,7 +70,7 @@
 
                 if (!$('#event-flipper-bar').length) {
                     var flipperHtml =
-                        '<' + 'div id="event-flipper-bar" class="well well-sm" style="position: sticky; top: 0; z-index: 1000; background: #fdfdfd; border: 1px solid #d5d5d5; border-left: 4px solid #c0392b; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">' +
+                        '<' + 'div id="event-flipper-bar" class="well well-sm" style="position: sticky; top: 0; z-index: 90; background: #fdfdfd; border: 1px solid #d5d5d5; border-left: 4px solid #c0392b; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">' +
                             '<div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;">' +
                                 '<div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">' +
                                     '<button type="button" id="flipper-prev" class="btn btn-sm btn-primary" title="Previous Event (Left Arrow)">&#8592; Prev</button>' +
@@ -87,30 +87,30 @@
                     $('#accordion1').before(flipperHtml);
                 }
 
-                var $select = $('#flipper-select').empty();
+                var selEl = $('#flipper-select').empty();
                 wellPanels.each(function (idx) {
                     var title = $.trim($(this).find('.panel-title').first().text()) || ('Event #' + (idx + 1));
                     var label = (idx + 1) + ' / ' + wellPanels.length + ': ' + title;
-                    $select.append($('<option></option>').attr('value', idx).text(label));
+                    selEl.append($('<option></option>').attr('value', idx).text(label));
                 });
 
-                function loadPanelMedia($panel) {
-                    $panel.find('img, iframe').each(function () {
-                        var $el = $(this);
-                        var dataSrc = $el.attr('data-src');
+                function loadPanelMedia(panelEl) {
+                    panelEl.find('img, iframe').each(function () {
+                        var elNode = $(this);
+                        var dataSrc = elNode.attr('data-src');
                         if (dataSrc) {
-                            $el.attr('src', dataSrc).removeAttr('data-src');
+                            elNode.attr('src', dataSrc).removeAttr('data-src');
                         }
-                        if ($el.attr('loading') === 'lazy') {
-                            $el.attr('loading', 'eager');
+                        if (elNode.attr('loading') === 'lazy') {
+                            elNode.attr('loading', 'eager');
                             this.loading = 'eager';
                         }
                     });
                 }
 
-                function preloadPanelMedia($panel) {
-                    if (!$panel || !$panel.length) return;
-                    $panel.find('img').each(function () {
+                function preloadPanelMedia(panelEl) {
+                    if (!panelEl || !panelEl.length) return;
+                    panelEl.find('img').each(function () {
                         var src = $(this).attr('data-src') || $(this).attr('src');
                         if (src) {
                             var preloadImg = new Image();
@@ -123,23 +123,23 @@
                     if (currIndex < 0) currIndex = 0;
                     if (currIndex >= wellPanels.length) currIndex = wellPanels.length - 1;
 
-                    var $active = wellPanels.eq(currIndex);
-                    loadPanelMedia($active);
+                    var activeEl = wellPanels.eq(currIndex);
+                    loadPanelMedia(activeEl);
                     if (currIndex + 1 < wellPanels.length) preloadPanelMedia(wellPanels.eq(currIndex + 1));
                     if (currIndex > 0) preloadPanelMedia(wellPanels.eq(currIndex - 1));
 
                     if (flipperMode) {
                         wellPanels.hide();
-                        $active.show();
-                        $active.find('.panel-collapse').first().addClass('in').css('height', 'auto').attr('aria-expanded', 'true');
+                        activeEl.show();
+                        activeEl.find('.panel-collapse').first().addClass('in').css('height', 'auto').attr('aria-expanded', 'true');
                         $('#flipper-mode-toggle').text('View All Stacked');
                     } else {
                         wellPanels.show();
                         wellPanels.find('.panel-collapse[id$="well"]').removeClass('in');
-                        $active.find('.panel-collapse').first().addClass('in').css('height', 'auto').attr('aria-expanded', 'true');
+                        activeEl.find('.panel-collapse').first().addClass('in').css('height', 'auto').attr('aria-expanded', 'true');
                         $('#flipper-mode-toggle').text('Flipper Mode');
-                        if (scrollIfStacked && $active[0] && $active[0].scrollIntoView) {
-                            $active[0].scrollIntoView({behavior: 'smooth', block: 'nearest'});
+                        if (scrollIfStacked && activeEl[0] && activeEl[0].scrollIntoView) {
+                            activeEl[0].scrollIntoView({behavior: 'smooth', block: 'nearest'});
                         }
                     }
 
