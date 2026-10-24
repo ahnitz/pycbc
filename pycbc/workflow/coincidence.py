@@ -32,6 +32,7 @@ import os
 
 import igwn_segments as segments
 
+from pycbc.io import HFile
 from pycbc.workflow.core import Executable, File, FileList, Node, make_analysis_dir
 
 logger = logging.getLogger("pycbc.workflow.coincidence")
@@ -150,11 +151,17 @@ class PyCBCFollowupMargLogLRExecutable(Executable):
         frame_files=None,
         inj_file=None,
         tags=None,
+        trig_start_time=None,
+        trig_end_time=None,
+        analysis_seg=None,
     ):
         if tags is None:
             tags = []
-        segs = trig_files.get_times_covered_by_files()
-        seg = segments.segment(segs[0][0], segs[-1][1])
+        if analysis_seg is not None:
+            seg = analysis_seg
+        else:
+            segs = trig_files.get_times_covered_by_files()
+            seg = segments.segment(segs[0][0], segs[-1][1])
         node = Node(self)
         node.add_input_opt("--bank-file", bank_file)
         node.add_input_list_opt("--trigger-files", trig_files)
@@ -173,6 +180,10 @@ class PyCBCFollowupMargLogLRExecutable(Executable):
         node.add_opt("--pivot-ifo", pivot_ifo)
         node.add_opt("--fixed-ifo", fixed_ifo)
         node.add_opt("--template-fraction-range", template_str)
+        if trig_start_time is not None:
+            node.add_opt("--trig-start-time", str(trig_start_time))
+        if trig_end_time is not None:
+            node.add_opt("--trig-end-time", str(trig_end_time))
         node.new_output_file_opt(seg, ".hdf", "--output-file", tags=tags)
         return node
 
@@ -606,6 +617,52 @@ def _get_coinc_exe_class(workflow, tags=None):
     return PyCBCFindCoincExecutable
 
 
+def _get_coinc_job_segments(workflow, trig_files, ifos, factor):
+    """Determine segments for per-segment coincidence jobs."""
+    job_segments = []
+    # 1. Try reading search/start_time and search/end_time from input trigger files
+    for f in trig_files:
+        fn = f.storage_path if hasattr(f, "storage_path") and f.storage_path else str(f)
+        if not os.path.exists(fn):
+            for pfn in getattr(f, "pfns", []):
+                if hasattr(pfn, "url") and os.path.exists(pfn.url.replace("file://", "")):
+                    fn = pfn.url.replace("file://", "")
+                    break
+        if os.path.exists(fn):
+            try:
+                with HFile(fn, "r") as hf:
+                    for ifo in ifos:
+                        if ifo in hf and "search/start_time" in hf[ifo]:
+                            st = hf[ifo]["search/start_time"][:]
+                            et = hf[ifo]["search/end_time"][:]
+                            for s, e in zip(st, et):
+                                job_segments.append(
+                                    (int(round(float(s))), int(round(float(e))))
+                                )
+            except Exception as exc:
+                logger.warning("Could not read segments from %s: %s", fn, exc)
+
+    if job_segments:
+        return sorted(list(set(job_segments)))
+
+    # 2. Try workflow.analyzable_segs
+    if hasattr(workflow, "analyzable_segs") and workflow.analyzable_segs:
+        all_segs = segments.segmentlist()
+        for ifo in ifos:
+            if ifo in workflow.analyzable_segs:
+                all_segs.extend(workflow.analyzable_segs[ifo])
+        all_segs.coalesce()
+        return [(int(s[0]), int(s[1])) for s in all_segs]
+
+    # 3. Fallback: divide workflow.analysis_time into factor intervals
+    t0, t1 = int(workflow.analysis_time[0]), int(workflow.analysis_time[1])
+    dt = max(1, (t1 - t0) // factor)
+    return [
+        (t0 + j * dt, t0 + (j + 1) * dt if j < factor - 1 else t1)
+        for j in range(factor)
+    ]
+
+
 def setup_interval_coinc_inj(
     workflow,
     hdfbank,
@@ -648,6 +705,39 @@ def setup_interval_coinc_inj(
         tags=tags + ["injinj"],
         out_dir=out_dir,
     )
+
+    if coinc_cls == PyCBCFollowupMargLogLRExecutable:
+        job_segments = _get_coinc_job_segments(workflow, injinj_files, ifiles.keys(), factor)
+        bg_files = []
+        for i, (t_start, t_end) in enumerate(job_segments):
+            seg_obj = segments.segment(t_start, t_end)
+            coinc_node = findcoinc_exe.create_node(
+                injinj_files,
+                hdfbank,
+                stat_files,
+                veto_file,
+                veto_name,
+                "0/1",
+                pivot_ifo,
+                fixed_ifo,
+                tags=["SEG%d" % i],
+                trig_start_time=t_start,
+                trig_end_time=t_end,
+                analysis_seg=seg_obj,
+            )
+            bg_files += coinc_node.output_files
+            workflow.add_node(coinc_node)
+
+        logger.info("...leaving coincidence for injections")
+        return setup_statmap_inj(
+            workflow,
+            ifiles.keys(),
+            bg_files,
+            background_file,
+            out_dir,
+            tags=tags + [veto_name],
+        )
+
     bg_files = []
     for i in range(factor):
         group_str = "%s/%s" % (i, factor)
@@ -714,6 +804,33 @@ def setup_interval_coinc(
             [findcoinc_exe.ifo_string] + tags,
         )
     )
+
+    if coinc_cls == PyCBCFollowupMargLogLRExecutable:
+        job_segments = _get_coinc_job_segments(workflow, trig_files, ifos, factor)
+        statmap_files = []
+        bg_files = FileList()
+        for i, (t_start, t_end) in enumerate(job_segments):
+            seg_obj = segments.segment(t_start, t_end)
+            coinc_node = findcoinc_exe.create_node(
+                trig_files,
+                hdfbank,
+                stat_files,
+                veto_file,
+                veto_name,
+                "0/1",
+                pivot_ifo,
+                fixed_ifo,
+                tags=["SEG%d" % i],
+                trig_start_time=t_start,
+                trig_end_time=t_end,
+                analysis_seg=seg_obj,
+            )
+            bg_files += coinc_node.output_files
+            workflow.add_node(coinc_node)
+
+        statmap_files = setup_statmap(workflow, ifos, bg_files, out_dir, tags=tags)
+        logger.info("...leaving coincidence ")
+        return statmap_files
 
     statmap_files = []
     bg_files = FileList()

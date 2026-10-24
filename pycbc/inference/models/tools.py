@@ -186,8 +186,7 @@ class DistMarg:
             )
             dmin, dmax = dprior.bounds["distance"]
             dist_locs = numpy.linspace(dmin, dmax, int(marginalize_distance_samples))
-            dist_weights = [dprior.pdf(distance=l) for l in dist_locs]
-            dist_weights = numpy.array(dist_weights)
+            dist_weights = numpy.asarray(dprior.pdf(distance=dist_locs))
 
         # (2) prior is univariate and can be converted to distance
         elif marginalize_distance_param != "distance":
@@ -884,7 +883,9 @@ def setup_distance_marg_interpolant(
         s_grid = sh * dist_rescale[None, :]
         if phase:
             s_grid = numpy.log(i0e(s_grid)) + s_grid
-        lvals[i] = logsumexp(s_grid - 0.5 * h_grid + logw, axis=-1)
+        arg = s_grid - 0.5 * h_grid + logw
+        amax = numpy.max(arg, axis=-1)
+        lvals[i] = amax + numpy.log(numpy.sum(numpy.exp(arg - amax[:, None]), axis=-1))
     interp = RectBivariateSpline(
         numpy.log(shr), numpy.log(hhr), lvals, kx=1, ky=1
     )

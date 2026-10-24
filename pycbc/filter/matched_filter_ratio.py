@@ -122,11 +122,12 @@ class DynamicSNRRenormFactor:
         else:
             self._factor = half
 
-        blocks = self._block_prefix(power)
-        if not np.isfinite(blocks[-1]):
+        self._csum = np.empty(n + 1, dtype=np.float64)
+        self._csum[0] = 0.0
+        np.cumsum(power, dtype=np.float64, out=self._csum[1:])
+        if not np.isfinite(self._csum[-1]):
             np.nan_to_num(power, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-            blocks = self._block_prefix(power)
-        self._power, self._blocks = power, blocks
+            np.cumsum(power, dtype=np.float64, out=self._csum[1:])
 
         self._w_outer = int(round((0.5 * window_duration) / dt))
         self._w_inner = int(round(hollow_duration / dt))
@@ -134,28 +135,9 @@ class DynamicSNRRenormFactor:
         self._max_boost = max_boost_factor
         self._dtype = np.float64 if arr.dtype == np.complex128 else np.float32
 
-    _PARTIAL = np.arange(_BLOCK - 1)
-
-    @classmethod
-    def _block_prefix(cls, power):
-        """blocks[j]: the float64 sum of power over samples [0, j * _BLOCK)."""
-        B, n = cls._BLOCK, len(power)
-        whole = n // B
-        blocks = np.zeros(-(-n // B) + 1, dtype=np.float64)
-        blocks[1 : whole + 1] = (
-            power[: whole * B].reshape(whole, B).sum(axis=1, dtype=np.float64)
-        )
-        if len(blocks) > whole + 1:
-            blocks[-1] = power[whole * B :].sum(dtype=np.float64)
-        return np.cumsum(blocks, out=blocks)
-
     def _prefix(self, m):
         """Sum of the power over samples [0, m), for a 1D integer array m in [0, n]."""
-        B = self._BLOCK
-        base = m - m % B
-        v = self._power[np.minimum(base[:, None] + self._PARTIAL, self._n - 1)]
-        v[(m - base)[:, None] <= self._PARTIAL] = 0
-        return self._blocks[m // B] + v.sum(axis=1, dtype=np.float64)
+        return self._csum[m]
 
     def __len__(self):
         return self._n

@@ -1515,7 +1515,7 @@ class RatioFilterBank(FilterBank):
                 sigs = g["sigmas"][:]
                 for j, cid in enumerate(c_idxs):
                     t_1d = taps_2d[j, : int(counts[j])]
-                    sr_sq = float((sigs[j, 2] / max(sigs[j, 0], 1e-30)) ** 2)
+                    sr_sq = float((sigs[j, -1] / max(sigs[j, 0], 1e-30)) ** 2)
                     child_to_parent[lvl][int(cid)] = (
                         p_id,
                         t_1d,

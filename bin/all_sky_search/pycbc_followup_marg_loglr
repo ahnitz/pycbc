@@ -209,6 +209,10 @@ def load_primary_triggers(
     segment_name=None,
     template_fraction_range="0/1",
     hash_to_gid=None,
+    sngl_ranking="newsnr_sgveto",
+    statistic_keywords=None,
+    trig_start_time=None,
+    trig_end_time=None,
 ):
     """Load primary triggers from raw or merged trigger HDF5 files."""
     if hash_to_gid is None:
@@ -216,6 +220,22 @@ def load_primary_triggers(
             hashes = bf["template_hash"][:]
         hash_to_gid = {int(h): idx for idx, h in enumerate(hashes)}
     n_templates = len(hash_to_gid)
+
+    kw_dict = {}
+    if statistic_keywords:
+        for item in statistic_keywords:
+            if isinstance(item, dict):
+                kw_dict.update(item)
+            elif ":" in str(item):
+                k, v = str(item).split(":", 1)
+                try:
+                    if "." in v or "e" in v.lower():
+                        v = float(v)
+                    else:
+                        v = int(v)
+                except ValueError:
+                    pass
+                kw_dict[k] = v
 
     tid_min, tid_max = 0, n_templates
     if template_fraction_range and template_fraction_range != "0/1":
@@ -251,6 +271,10 @@ def load_primary_triggers(
 
                 snr = g["snr"][:]
                 mask = snr >= primary_snr_threshold
+                if trig_start_time is not None:
+                    mask &= (g["end_time"][:] >= float(trig_start_time))
+                if trig_end_time is not None:
+                    mask &= (g["end_time"][:] < float(trig_end_time))
                 if not np.any(mask):
                     continue
 
@@ -280,11 +304,24 @@ def load_primary_triggers(
                 dof_val = np.where(chisq_dof > 1, 2.0 * chisq_dof - 2.0, 1.0)
                 rchisq = np.where(chisq > 0, chisq / dof_val, 1.0)
                 nsnr = ranking.newsnr(snr, rchisq)
-                eff_amp = (
-                    ranking.newsnr_sgveto(snr, rchisq, sg_chisq)
-                    if use_newsnr
-                    else snr
-                )
+                if use_newsnr:
+                    if sngl_ranking and sngl_ranking in ranking.sngls_ranking_function_dict:
+                        try:
+                            eff_amp_all = ranking.get_sngls_ranking_from_trigs(
+                                g, sngl_ranking, **kw_dict
+                            )
+                            eff_amp = eff_amp_all[idx_pass]
+                        except Exception as e:
+                            logging.warning(
+                                "Failed calculating %s: %s, falling back to newsnr_sgveto",
+                                sngl_ranking,
+                                e,
+                            )
+                            eff_amp = ranking.newsnr_sgveto(snr, rchisq, sg_chisq)
+                    else:
+                        eff_amp = ranking.newsnr_sgveto(snr, rchisq, sg_chisq)
+                else:
+                    eff_amp = snr
 
                 gate = (tids >= tid_min) & (tids < tid_max)
                 if primary_max_rchisq is not None and primary_max_rchisq > 0:
@@ -377,6 +414,7 @@ def build_single_template_evaluator(
         static_params={},
         marginalize_phase=True,
         marginalize_distance=True,
+        marginalize_distance_samples=2000,
         marginalize_distance_interpolator=True,
         marginalize_distance_snr_range=(0.02, 500.0),
         marginalize_distance_density=(256, 128),
@@ -533,6 +571,7 @@ def evaluate_segment_primaries(
     dynamic_snr_variance_floor=1.0,
     dynamic_snr_max_boost=None,
     primary_snr_threshold=6.0,
+    min_secondary_snr=2.8,
 ):
     """Evaluate marginal logLR across all primary triggers on conditioned ``segments``
     using ``SingleTemplate`` / ``DistMarg`` over both the primary peak snippet and
@@ -779,6 +818,7 @@ def evaluate_segment_primaries(
         sec_views = {}
         sigmasq_by_ifo = {}
         sum_max_sq = np.full(len(slides), cand["eff_snr"] ** 2, dtype=np.float64)
+        sec_max_snr = np.zeros(len(slides), dtype=np.float64)
 
         for ifo_s in valid_secs:
             min_m_i, _, snips_i, sq_i = sec_rec[ifo_s]
@@ -788,9 +828,12 @@ def evaluate_segment_primaries(
             sigmasq_by_ifo[ifo_s] = sq_i
             max_abs_i = np.max(np.abs(view_i), axis=1)
             sum_max_sq += max_abs_i ** 2
+            sec_max_snr = np.maximum(sec_max_snr, max_abs_i)
 
-        upper_bound = 0.5 * sum_max_sq - 4.5
+        upper_bound = 0.5 * sum_max_sq - 14.5
         eval_mask = (slides == 0) | (upper_bound >= background_stat_threshold)
+        if min_secondary_snr is not None and min_secondary_snr > 0:
+            eval_mask &= (sec_max_snr >= min_secondary_snr)
         if not np.any(eval_mask):
             continue
 
@@ -974,12 +1017,46 @@ def get_args(raw_argv=None):
     )
     parser.add_argument("--veto-files", nargs="*", action="append", default=[])
     parser.add_argument("--segment-name", nargs="*", action="append", default=[])
+    parser.add_argument(
+        "--min-secondary-snr",
+        type=float,
+        default=2.8,
+        help="Minimum secondary SNR required in coinc evaluation (default: 2.8).",
+    )
+    parser.add_argument(
+        "--sngl-ranking",
+        default="newsnr_sgveto",
+        help="Single-detector ranking statistic to compute effective SNR (default: newsnr_sgveto).",
+    )
+    parser.add_argument(
+        "--statistic-keywords",
+        nargs="*",
+        action="append",
+        default=[],
+        help="Extra keywords for the single-detector statistic (e.g. hollow_knee:5.5).",
+    )
+    parser.add_argument(
+        "--trig-start-time",
+        type=float,
+        default=None,
+        help="Only evaluate primary triggers with end_time >= trig_start_time.",
+    )
+    parser.add_argument(
+        "--trig-end-time",
+        type=float,
+        default=None,
+        help="Only evaluate primary triggers with end_time < trig_end_time.",
+    )
 
     argv = fix_frame_files_args(raw_argv)
     args = parser.parse_args(argv)
     args.trigger_files = sum(args.trigger_files, [])
     args.veto_files = sum(args.veto_files, [])
     args.segment_name = sum(args.segment_name, [])
+    if args.statistic_keywords:
+        args.statistic_keywords = sum(
+            [k if isinstance(k, list) else [k] for k in args.statistic_keywords], []
+        )
     return parser, args
 
 
@@ -1153,6 +1230,10 @@ def main():
         veto_files=args.veto_files,
         segment_name=args.segment_name,
         template_fraction_range=args.template_fraction_range,
+        sngl_ranking=args.sngl_ranking,
+        statistic_keywords=args.statistic_keywords,
+        trig_start_time=args.trig_start_time,
+        trig_end_time=args.trig_end_time,
     )
 
     if args.asym_num_bins is None:
@@ -1234,6 +1315,7 @@ def main():
             dynamic_snr_variance_floor=args.dynamic_snr_variance_floor,
             dynamic_snr_max_boost=args.dynamic_snr_max_boost,
             primary_snr_threshold=args.primary_snr_threshold,
+            min_secondary_snr=args.min_secondary_snr,
         )
 
         logging.info(

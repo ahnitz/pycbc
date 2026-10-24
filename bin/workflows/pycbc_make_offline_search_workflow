@@ -257,6 +257,7 @@ datafind_files, analyzable_file, analyzable_segs, analyzable_name = (
         workflow, ssegs, "datafind", seg_file=science_seg_file, tags=hoft_tags
     )
 )
+workflow.analyzable_segs = analyzable_segs
 
 final_veto_name = "vetoes"
 final_veto_file = wf.get_segments_file(
