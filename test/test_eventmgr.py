@@ -205,6 +205,19 @@ class TestEventManager(unittest.TestCase):
         with h5py.File(self.h5_path, "r") as hf:
             self.assertIn("H1/search/start_time", hf)
 
+    def test_eventmgr_non_threshold_time(self):
+        opt = MockOptions(channel_name="H1:STRAIN")
+        mgr = eventmgr.EventManager(opt, self.columns, self.column_types, ifo="H1")
+        mgr.non_threshold_time = 2.5
+        mgr.new_template(tmplt=MockTemplate(template_hash=999))
+        mgr.finalize_template_events()
+        mgr.write_events(self.h5_path)
+
+        with h5py.File(self.h5_path, "r") as hf:
+            self.assertIn("H1/search/non_threshold_time", hf)
+            self.assertEqual(float(hf["H1/search/non_threshold_time"][0]), 2.5)
+
 
 if __name__ == "__main__":
     unittest.main()
+
