@@ -861,9 +861,22 @@ def evaluate_segment_primaries(
             if z_sec_22 is None:
                 continue
 
-            snips_22 = sliding_window_view(z_sec_22, K)[rel_starts]
+            snips_raw = sliding_window_view(z_sec_22, K)[rel_starts]
+            max_abs_arr = np.max(np.abs(snips_raw), axis=1)
+            eff_snr_p = cand["eff_snr"]
+            ub_arr = 0.5 * (eff_snr_p ** 2 + max_abs_arr ** 2) - 14.5
+            surv_mask = (slides == 0) | (ub_arr >= background_stat_threshold)
+            if min_secondary_snr is not None and min_secondary_snr > 0:
+                surv_mask &= (max_abs_arr >= min_secondary_snr)
+
+            surv_idx = np.flatnonzero(surv_mask)
+            if len(surv_idx) == 0:
+                continue
+            surv_slides = slides[surv_idx]
+            surv_snips = np.ascontiguousarray(snips_raw[surv_idx])
+            del snips_raw
             base_sigmasq_s = max(float(norm_val * sc22), 1e-12)
-            cand["sec_reconstructed"][ifo] = (min_m, max_m, snips_22, base_sigmasq_s)
+            cand["sec_reconstructed"][ifo] = (surv_slides, surv_snips, base_sigmasq_s)
 
         res["filt_time"] += time.perf_counter() - t0_f
         del top_ser, rf
@@ -895,40 +908,27 @@ def evaluate_segment_primaries(
         if not valid_secs:
             continue
 
-        common_min_m = max(sec_rec[i][0] for i in valid_secs)
-        common_max_m = min(sec_rec[i][1] for i in valid_secs)
-        if common_min_m > common_max_m:
-            continue
-
-        slides = np.arange(common_min_m, common_max_m + 1, dtype=np.int32)
-        sec_views = {}
-        sigmasq_by_ifo = {}
-        sum_max_sq = np.full(len(slides), cand["eff_snr"] ** 2, dtype=np.float64)
-        sec_max_snr = np.zeros(len(slides), dtype=np.float64)
-
-        for ifo_s in valid_secs:
-            min_m_i, _, snips_i, sq_i = sec_rec[ifo_s]
-            offset = common_min_m - min_m_i
-            view_i = snips_i[offset : offset + len(slides)]
-            sec_views[ifo_s] = view_i
-            sigmasq_by_ifo[ifo_s] = sq_i
-            max_abs_i = np.max(np.abs(view_i), axis=1)
-            sum_max_sq += max_abs_i ** 2
-            sec_max_snr = np.maximum(sec_max_snr, max_abs_i)
-
-        upper_bound = 0.5 * sum_max_sq - 14.5
-        eval_mask = (slides == 0) | (upper_bound >= background_stat_threshold)
-        if min_secondary_snr is not None and min_secondary_snr > 0:
-            eval_mask &= (sec_max_snr >= min_secondary_snr)
-        if not np.any(eval_mask):
-            continue
-
-        eval_idx = np.flatnonzero(eval_mask)
-        sub_slides = slides[eval_idx]
-        sub_snips_by_ifo = {
-            ifo_s: np.ascontiguousarray(sec_views[ifo_s][eval_idx])
-            for ifo_s in valid_secs
-        }
+        if len(valid_secs) == 1:
+            ifo_s = valid_secs[0]
+            sub_slides, sub_snips, sq_s = sec_rec[ifo_s]
+            if len(sub_slides) == 0:
+                continue
+            sub_snips_by_ifo = {ifo_s: sub_snips}
+            sigmasq_by_ifo = {ifo_s: sq_s}
+        else:
+            common_slides = sec_rec[valid_secs[0]][0]
+            for ifo_s in valid_secs[1:]:
+                common_slides = np.intersect1d(common_slides, sec_rec[ifo_s][0])
+            if len(common_slides) == 0:
+                continue
+            sub_slides = common_slides
+            sub_snips_by_ifo = {}
+            sigmasq_by_ifo = {}
+            for ifo_s in valid_secs:
+                s_slides, s_snips, sq_s = sec_rec[ifo_s]
+                idx = np.searchsorted(s_slides, common_slides)
+                sub_snips_by_ifo[ifo_s] = np.ascontiguousarray(s_snips[idx])
+                sigmasq_by_ifo[ifo_s] = sq_s
 
         gid = cand["template_id"]
         base_sigmasq_p = max(float(cand["sigmasq"]), 1e-12)
