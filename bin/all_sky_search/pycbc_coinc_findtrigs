@@ -351,13 +351,14 @@ logging.info(
     original_bank_len,
 )
 
-# 'data' will store output of coinc finding
-# in addition to these lists of coinc info, will also store trigger times and
-# ids in each ifo
-data = {"stat": [], "decimation_factor": [], "timeslide_id": [], "template_id": []}
-for ifo in trigs.ifos:
-    data["%s/time" % ifo] = []
-    data["%s/trigger_id" % ifo] = []
+def init_coinc_data():
+    d = {"stat": [], "decimation_factor": [], "timeslide_id": [], "template_id": []}
+    for ifo in trigs.ifos:
+        d["%s/time" % ifo] = []
+        d["%s/trigger_id" % ifo] = []
+    return d
+
+data = init_coinc_data()
 
 factors = [1]
 threshes = [numpy.inf]
@@ -386,7 +387,7 @@ total_factors = numpy.cumprod(factors)
 
 # Gather the coincs from a single template
 def process_template(tnum):
-    local_data = copy.deepcopy(data)
+    local_data = init_coinc_data()
     times_full = {}
     sds_full = {}
     tids_full = {}
