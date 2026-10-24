@@ -143,18 +143,117 @@ def setup_strain_and_segments(args, instruments, flow, segs_by_ifo=None):
             active_segs = [(t_s, t_e)]
 
         for seg_start, seg_end in active_segs:
-            if seg_end <= seg_start:
+            if seg_end - seg_start < 512.0:
+                logging.info(
+                    "Skipping sub-segment [%s, %s] for %s (duration %.1fs < 512s)",
+                    seg_start,
+                    seg_end,
+                    ifo,
+                    seg_end - seg_start,
+                )
                 continue
-            sub_args = copy.deepcopy(args)
-            sub_args.trig_start_time = DictWithDefaultReturn(int, {ifo: int(seg_start)})
-            sub_args.trig_end_time = DictWithDefaultReturn(int, {ifo: int(seg_end)})
-            sub_args.gps_start_time = DictWithDefaultReturn(int, {ifo: int(seg_start)})
-            sub_args.gps_end_time = DictWithDefaultReturn(int, {ifo: int(seg_end)})
 
             try:
+                sub_args = copy.deepcopy(args)
+                sub_args.trig_start_time = DictWithDefaultReturn(int, {ifo: int(seg_start)})
+                sub_args.trig_end_time = DictWithDefaultReturn(int, {ifo: int(seg_end)})
+                sub_args.gps_start_time = DictWithDefaultReturn(int, {ifo: int(seg_start)})
+                sub_args.gps_end_time = DictWithDefaultReturn(int, {ifo: int(seg_end)})
+
                 ifo_strain = pycbc.strain.from_cli_single_ifo(
                     sub_args, ifo, inj_filter_rejector=None, dyn_range_fac=pycbc.DYN_RANGE_FAC
                 )
+
+                if ifo not in gwstrain_start_time:
+                    gwstrain_start_time[ifo] = float(ifo_strain.start_time)
+
+                raw_strain_for_psd = (
+                    ifo_strain.copy()
+                    if getattr(sub_args, "overwhiten_strain", False)
+                    else ifo_strain
+                )
+
+                if getattr(sub_args, "subtract_lines", False):
+                    from pycbc.filter.overwhiten import subtract_coherent_lines
+
+                    orig_injs = getattr(ifo_strain, "injections", None)
+                    orig_gating = getattr(ifo_strain, "gating_info", None)
+                    f_low_sub = max(25.0, getattr(sub_args, "overwhiten_f_low", 25.0))
+                    ifo_strain, _ = subtract_coherent_lines(ifo_strain, f_low=f_low_sub)
+                    ifo_strain = ifo_strain.astype(np.float32)
+                    if orig_injs is not None:
+                        ifo_strain.injections = orig_injs
+                    if orig_gating is not None:
+                        ifo_strain.gating_info = orig_gating
+
+                single_det_opt = pycbc.types.optparse.copy_opts_for_single_ifo(sub_args, ifo)
+                if getattr(sub_args, "overwhiten_strain", False):
+                    from pycbc.filter.overwhiten import overwhiten_strain
+
+                    orig_injs = getattr(ifo_strain, "injections", None)
+                    orig_gating = getattr(ifo_strain, "gating_info", None)
+                    f_low_ow = getattr(sub_args, "overwhiten_f_low", 18.0)
+                    max_dur_ow = getattr(sub_args, "overwhiten_max_filter_duration", 4.0)
+                    inpaint_ow = getattr(sub_args, "inpaint_edges", False)
+                    ow_psd_model = getattr(single_det_opt, "overwhiten_psd_model", None)
+                    if ow_psd_model is None:
+                        ow_psd_model = getattr(
+                            single_det_opt, "psd_estimation_method", None
+                        ) or getattr(single_det_opt, "psd_estimation", "welch")
+                    ifo_strain, _, _ = overwhiten_strain(
+                        ifo_strain,
+                        f_low=f_low_ow,
+                        max_filter_duration=max_dur_ow,
+                        f_high=getattr(sub_args, "high_frequency_cutoff", None),
+                        inpaint_edges=inpaint_ow,
+                        psd_model_type=ow_psd_model,
+                    )
+                    ifo_strain = ifo_strain.astype(np.float32)
+                    ifo_strain._is_overwhitened = True
+                    if orig_injs is not None:
+                        ifo_strain.injections = orig_injs
+                    if orig_gating is not None:
+                        ifo_strain.gating_info = orig_gating
+
+                ifo_segments = pycbc.strain.StrainSegments.from_cli_single_ifo(
+                    sub_args, ifo_strain, ifo
+                )
+                if sample_rate is None:
+                    sample_rate = float(ifo_strain.sample_rate)
+                    flen = ifo_segments.freq_len
+                    delta_f = ifo_segments.delta_f
+                else:
+                    if float(ifo_strain.sample_rate) != sample_rate:
+                        raise ValueError(f"Sample rate mismatch for {ifo}")
+                    if ifo_segments.freq_len != flen or ifo_segments.delta_f != delta_f:
+                        raise ValueError(f"Segment frequency grid mismatch for {ifo}")
+
+                fd_segs = ifo_segments.fourier_segments()
+                pycbc.psd.associate_psds_to_segments(
+                    single_det_opt,
+                    fd_segs,
+                    raw_strain_for_psd,
+                    flen,
+                    delta_f,
+                    flow,
+                    dyn_range_factor=pycbc.DYN_RANGE_FAC,
+                    precision="single",
+                )
+                strain_epoch_val = float(ifo_strain.start_time)
+                if not getattr(sub_args, "overwhiten_strain", False):
+                    for seg in fd_segs:
+                        seg[:] = seg / seg.psd
+                        seg.strain_epoch = strain_epoch_val
+                else:
+                    for seg in fd_segs:
+                        if seg.dtype != np.complex64:
+                            seg._data = seg._data.astype(np.complex64)
+                        seg.strain_epoch = strain_epoch_val
+                segments[ifo].extend(fd_segs)
+                del ifo_strain
+                if raw_strain_for_psd is not None:
+                    del raw_strain_for_psd
+                del ifo_segments
             except Exception as exc:
                 logging.warning(
                     "Skipping sub-segment [%s, %s] for %s due to error: %s",
@@ -164,97 +263,6 @@ def setup_strain_and_segments(args, instruments, flow, segs_by_ifo=None):
                     exc,
                 )
                 continue
-
-            if ifo not in gwstrain_start_time:
-                gwstrain_start_time[ifo] = float(ifo_strain.start_time)
-
-            raw_strain_for_psd = (
-                ifo_strain.copy()
-                if getattr(sub_args, "overwhiten_strain", False)
-                else ifo_strain
-            )
-
-            if getattr(sub_args, "subtract_lines", False):
-                from pycbc.filter.overwhiten import subtract_coherent_lines
-
-                orig_injs = getattr(ifo_strain, "injections", None)
-                orig_gating = getattr(ifo_strain, "gating_info", None)
-                f_low_sub = max(25.0, getattr(sub_args, "overwhiten_f_low", 25.0))
-                ifo_strain, _ = subtract_coherent_lines(ifo_strain, f_low=f_low_sub)
-                ifo_strain = ifo_strain.astype(np.float32)
-                if orig_injs is not None:
-                    ifo_strain.injections = orig_injs
-                if orig_gating is not None:
-                    ifo_strain.gating_info = orig_gating
-
-            single_det_opt = pycbc.types.optparse.copy_opts_for_single_ifo(sub_args, ifo)
-            if getattr(sub_args, "overwhiten_strain", False):
-                from pycbc.filter.overwhiten import overwhiten_strain
-
-                orig_injs = getattr(ifo_strain, "injections", None)
-                orig_gating = getattr(ifo_strain, "gating_info", None)
-                f_low_ow = getattr(sub_args, "overwhiten_f_low", 18.0)
-                max_dur_ow = getattr(sub_args, "overwhiten_max_filter_duration", 4.0)
-                inpaint_ow = getattr(sub_args, "inpaint_edges", False)
-                ow_psd_model = getattr(single_det_opt, "overwhiten_psd_model", None)
-                if ow_psd_model is None:
-                    ow_psd_model = getattr(
-                        single_det_opt, "psd_estimation_method", None
-                    ) or getattr(single_det_opt, "psd_estimation", "welch")
-                ifo_strain, _, _ = overwhiten_strain(
-                    ifo_strain,
-                    f_low=f_low_ow,
-                    max_filter_duration=max_dur_ow,
-                    f_high=getattr(sub_args, "high_frequency_cutoff", None),
-                    inpaint_edges=inpaint_ow,
-                    psd_model_type=ow_psd_model,
-                )
-                ifo_strain = ifo_strain.astype(np.float32)
-                ifo_strain._is_overwhitened = True
-                if orig_injs is not None:
-                    ifo_strain.injections = orig_injs
-                if orig_gating is not None:
-                    ifo_strain.gating_info = orig_gating
-
-            ifo_segments = pycbc.strain.StrainSegments.from_cli_single_ifo(
-                sub_args, ifo_strain, ifo
-            )
-            if sample_rate is None:
-                sample_rate = float(ifo_strain.sample_rate)
-                flen = ifo_segments.freq_len
-                delta_f = ifo_segments.delta_f
-            else:
-                if float(ifo_strain.sample_rate) != sample_rate:
-                    raise ValueError(f"Sample rate mismatch for {ifo}")
-                if ifo_segments.freq_len != flen or ifo_segments.delta_f != delta_f:
-                    raise ValueError(f"Segment frequency grid mismatch for {ifo}")
-
-            fd_segs = ifo_segments.fourier_segments()
-            pycbc.psd.associate_psds_to_segments(
-                single_det_opt,
-                fd_segs,
-                raw_strain_for_psd,
-                flen,
-                delta_f,
-                flow,
-                dyn_range_factor=pycbc.DYN_RANGE_FAC,
-                precision="single",
-            )
-            strain_epoch_val = float(ifo_strain.start_time)
-            if not getattr(sub_args, "overwhiten_strain", False):
-                for seg in fd_segs:
-                    seg[:] = seg / seg.psd
-                    seg.strain_epoch = strain_epoch_val
-            else:
-                for seg in fd_segs:
-                    if seg.dtype != np.complex64:
-                        seg._data = seg._data.astype(np.complex64)
-                    seg.strain_epoch = strain_epoch_val
-            segments[ifo].extend(fd_segs)
-            del ifo_strain
-            if raw_strain_for_psd is not None:
-                del raw_strain_for_psd
-            del ifo_segments
 
     return segments, gwstrain_start_time, sample_rate, flen, delta_f
 
@@ -1198,21 +1206,20 @@ def write_coinc_hdf(
             ifo_seglists[ifo] = igwn_segs.segmentlist([])
 
     with HFile(target_fn, "w") as f:
-        if len(stat_arr) > 0:
-            f.create_dataset("stat", data=stat_arr)
-            f.create_dataset("timeslide_id", data=slide_arr)
-            f.create_dataset("template_id", data=tmpl_arr)
-            f.create_dataset("decimation_factor", data=dec_arr)
-            for ifo in instruments:
-                f.create_dataset(f"{ifo}/time", data=time_arr[ifo])
-                f.create_dataset(f"{ifo}/trigger_id", data=tid_arr[ifo])
+        f.create_dataset("stat", data=stat_arr)
+        f.create_dataset("timeslide_id", data=slide_arr)
+        f.create_dataset("template_id", data=tmpl_arr)
+        f.create_dataset("decimation_factor", data=dec_arr)
+        for ifo in instruments:
+            f.create_dataset(f"{ifo}/time", data=time_arr[ifo])
+            f.create_dataset(f"{ifo}/trigger_id", data=tid_arr[ifo])
 
-            # Explicit detector combination label per candidate (e.g. b'H1L1', b'H1')
-            combo_strs = []
-            for idx in range(len(stat_arr)):
-                active = "".join(ifo for ifo in sorted(instruments) if time_arr[ifo][idx] > 0)
-                combo_strs.append(active.encode("utf8"))
-            f.create_dataset("ifo_combination", data=np.asarray(combo_strs, dtype="S"))
+        # Explicit detector combination label per candidate (e.g. b'H1L1', b'H1')
+        combo_strs = []
+        for idx in range(len(stat_arr)):
+            active = "".join(ifo for ifo in sorted(instruments) if time_arr[ifo][idx] > 0)
+            combo_strs.append(active.encode("utf8"))
+        f.create_dataset("ifo_combination", data=np.asarray(combo_strs, dtype="S"))
 
         # Write segment tables for every non-empty subset of instruments
         for r in range(1, len(instruments) + 1):
@@ -1530,6 +1537,31 @@ def main():
             )
         )
         logging.info("Strain & segment setup completed in %.2f s", time.perf_counter() - t_strain0)
+
+        if flen is None or any(len(segments[ifo]) == 0 for ifo in instruments) or n_prim_total == 0:
+            logging.warning(
+                "No coincident segments or primary triggers to evaluate for %s. Writing empty coinc file %s.",
+                instruments,
+                args.output_file,
+            )
+            write_coinc_hdf(
+                args.output_file,
+                [],
+                [],
+                [],
+                [],
+                {ifo: [] for ifo in instruments},
+                {ifo: [] for ifo in instruments},
+                segs_by_ifo,
+                instruments,
+                pivot_ifo=args.pivot_ifo,
+                fixed_ifo=args.fixed_ifo,
+                timeslide_interval=args.timeslide_interval,
+                asym_num_bins=args.asym_num_bins,
+                cluster_window=args.cluster_window,
+                t_start=t_start,
+            )
+            return
 
         t_init0 = time.perf_counter()
         bank = RatioFilterBank(
