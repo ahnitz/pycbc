@@ -879,7 +879,10 @@ def evaluate_segment_primaries(
             cand["sec_reconstructed"][ifo] = (surv_slides, surv_snips, base_sigmasq_s)
 
         res["filt_time"] += time.perf_counter() - t0_f
-        del top_ser, rf
+        del top_ser, rf, td_bank, meta
+
+    import gc
+    gc.collect()
 
     t_ev0 = time.perf_counter()
     for ifo_p, cand in single_only_candidates:
