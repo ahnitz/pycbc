@@ -666,20 +666,25 @@ def process_template(tnum):
     return local_data
 
 
+logging.info("processing templates and collecting coincident triggers")
 if args.nprocesses == 1:
-    ldatas = list(map(process_template, list(template_ids)))
+    template_iterator = map(process_template, list(template_ids))
 else:
     p = pool.BroadcastPool(args.nprocesses)
-    ldatas = p.map(process_template, list(template_ids))
+    template_iterator = p.map(process_template, list(template_ids))
 
-logging.info("merging data from the templates")
-for ldata in ldatas:
+for ldata in template_iterator:
     for key in data:
         data[key] += ldata[key]
+del template_iterator
+import gc; gc.collect()
 
 if len(data["stat"]) > 0:
-    for key in data:
-        data[key] = numpy.concatenate(data[key])
+    for key in list(data.keys()):
+        raw_list = data.pop(key)
+        data[key] = numpy.concatenate(raw_list)
+        del raw_list
+    gc.collect()
 
 if args.cluster_window and len(data["stat"]) > 0:
     timestring0 = "%s/time" % args.pivot_ifo
@@ -696,11 +701,15 @@ if args.cluster_window and len(data["stat"]) > 0:
 logging.info("saving coincident triggers")
 f = HFile(args.output_file, "w")
 if len(data["stat"]) > 0:
-    for key in data:
-        var = data[key][cid] if args.cluster_window else data[key]
+    for key in list(data.keys()):
+        var = data.pop(key)
+        if args.cluster_window:
+            var = var[cid]
         f.create_dataset(
             key, data=var, compression="gzip", compression_opts=9, shuffle=True
         )
+        del var
+    gc.collect()
 
 # Store coinc segments keyed by detector combination
 key = "".join(sorted(trigs.ifos))
