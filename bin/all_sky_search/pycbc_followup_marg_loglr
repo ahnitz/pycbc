@@ -773,21 +773,13 @@ def evaluate_segment_primaries(
                         (ifo_p, cand, s_start_s)
                     )
 
-    all_keys = sorted(set(prim_by_subseg_top.keys()) | set(sec_by_subseg_top.keys()))
-
-    for (s_num, ifo, top_id) in all_keys:
-        p_list = prim_by_subseg_top.get((s_num, ifo, top_id), [])
-        s_list = sec_by_subseg_top.get((s_num, ifo, top_id), [])
-        batch_gids = [c[0]["template_id"] for c in p_list] + [
-            c[1]["template_id"] for c in s_list
-        ]
-
-        t0_f = time.perf_counter()
+    # Phase 1: Reconstruct primary snippets for all primary triggers
+    for (s_num, ifo, top_id), p_list in prim_by_subseg_top.items():
+        batch_gids = [c[0]["template_id"] for c in p_list]
         st, top_ser, norm_val, rf, td_bank, meta = prepare_subseg_top(
             ifo, s_num, top_id, batch_gids
         )
         t0_ifo = getattr(st, "strain_epoch", gwstrain_start_time.get(ifo, 0.0))
-
         for cand, s_start_p in p_list:
             gid = cand["template_id"]
             phys_center_p = (
@@ -817,9 +809,42 @@ def evaluate_segment_primaries(
                 z_p_fb = np.zeros(P, dtype=np.complex64)
                 z_p_fb[half_P] = cand["eff_snr"] * np.exp(1j * cand["coa_phase"])
                 cand["z_p_snip"] = z_p_fb
+        del st, top_ser, norm_val, rf, td_bank, meta
 
+    # Phase 2: Evaluate single-only candidates
+    t_ev0 = time.perf_counter()
+    for ifo_p, cand in single_only_candidates:
+        lr_1d = evaluate_coinc_windows(
+            model,
+            ifo_p,
+            cand["z_p_snip"],
+            cand["sigmasq"],
+            sample_rate,
+        )
+        res["stat"].append(np.array([lr_1d], dtype=np.float32))
+        res["slide"].append(np.array([0], dtype=np.int32))
+        res["tmpl"].append(np.array([cand["template_id"]], dtype=np.int32))
+        res["dec"].append(np.array([1], dtype=np.int32))
+        for ifo in instruments:
+            if ifo == ifo_p:
+                res["time"][ifo].append(np.array([cand["end_time"]], dtype=np.float64))
+                res["tid"][ifo].append(np.array([cand["trig_id"]], dtype=np.int32))
+            else:
+                res["time"][ifo].append(np.array([-1.0], dtype=np.float64))
+                res["tid"][ifo].append(np.array([-1], dtype=np.int32))
+    res["eval_time"] += time.perf_counter() - t_ev0
+
+    # Phase 3: Streaming secondary snippet reconstruction and candidate evaluation
+    for (s_num, ifo_s, top_id), s_list in sec_by_subseg_top.items():
+        batch_gids = [c[1]["template_id"] for c in s_list]
+        t0_f = time.perf_counter()
+        st, top_ser, norm_val, rf, td_bank, meta = prepare_subseg_top(
+            ifo_s, s_num, top_id, batch_gids
+        )
+        t0_ifo = getattr(st, "strain_epoch", gwstrain_start_time.get(ifo_s, 0.0))
         a_start = st.analyze.start
         a_stop = st.analyze.stop
+
         for ifo_p, cand, s_start_s in s_list:
             gid = cand["template_id"]
             phys_center_s = (
@@ -874,110 +899,60 @@ def evaluate_segment_primaries(
                 continue
             surv_slides = slides[surv_idx]
             surv_snips = np.ascontiguousarray(snips_raw[surv_idx])
-            del snips_raw
+            del snips_raw, z_sec_22
+
             base_sigmasq_s = max(float(norm_val * sc22), 1e-12)
-            cand["sec_reconstructed"][ifo] = (surv_slides, surv_snips, base_sigmasq_s)
+            base_sigmasq_p = max(float(cand["sigmasq"]), 1e-12)
+
+            t_ev_c0 = time.perf_counter()
+            s_vals = evaluate_coinc_windows(
+                model,
+                ifo_p,
+                cand["z_p_snip"],
+                base_sigmasq_p,
+                sample_rate,
+                sec_snips_by_ifo={ifo_s: surv_snips},
+                sigmasq_by_ifo={ifo_s: base_sigmasq_s},
+            )
+            res["eval_time"] += time.perf_counter() - t_ev_c0
+            res["n_snippets"] += len(surv_slides)
+
+            keep = (surv_slides == 0) | (s_vals >= background_stat_threshold)
+            if np.any(keep):
+                k_idx = np.flatnonzero(keep)
+                kept_slides = surv_slides[k_idx]
+                coinc_slides = kept_slides if ifo_p == pivot_ifo else -kept_slides
+                n_k = len(k_idx)
+                res["stat"].append(s_vals[k_idx])
+                res["slide"].append(coinc_slides.astype(np.int32))
+                res["tmpl"].append(np.full(n_k, gid, dtype=np.int32))
+                res["dec"].append(np.ones(n_k, dtype=np.int32))
+
+                for ifo in instruments:
+                    if ifo == ifo_p:
+                        res["time"][ifo].append(
+                            np.full(n_k, cand["end_time"], dtype=np.float64)
+                        )
+                        res["tid"][ifo].append(
+                            np.full(n_k, cand["trig_id"], dtype=np.int32)
+                        )
+                    elif ifo == ifo_s:
+                        sub_b = surv_snips[k_idx]
+                        peak_k = np.argmax(np.abs(sub_b), axis=1)
+                        dt_peak = (peak_k - half_K) / sample_rate
+                        t_s_arr = cand["end_time"] + kept_slides * slide_step_sec + dt_peak
+                        res["time"][ifo].append(t_s_arr.astype(np.float64))
+                        res["tid"][ifo].append(np.full(n_k, -1, dtype=np.int32))
+                    else:
+                        res["time"][ifo].append(np.full(n_k, -1.0, dtype=np.float64))
+                        res["tid"][ifo].append(np.full(n_k, -1, dtype=np.int32))
+
+            del surv_slides, surv_snips, s_vals
 
         res["filt_time"] += time.perf_counter() - t0_f
-        del top_ser, rf, td_bank, meta
-
-    import gc
-    gc.collect()
-
-    t_ev0 = time.perf_counter()
-    for ifo_p, cand in single_only_candidates:
-        lr_1d = evaluate_coinc_windows(
-            model,
-            ifo_p,
-            cand["z_p_snip"],
-            cand["sigmasq"],
-            sample_rate,
-        )
-        res["stat"].append(np.array([lr_1d], dtype=np.float32))
-        res["slide"].append(np.array([0], dtype=np.int32))
-        res["tmpl"].append(np.array([cand["template_id"]], dtype=np.int32))
-        res["dec"].append(np.array([1], dtype=np.int32))
-        for ifo in instruments:
-            if ifo == ifo_p:
-                res["time"][ifo].append(np.array([cand["end_time"]], dtype=np.float64))
-                res["tid"][ifo].append(np.array([cand["trig_id"]], dtype=np.int32))
-            else:
-                res["time"][ifo].append(np.array([-1.0], dtype=np.float64))
-                res["tid"][ifo].append(np.array([-1], dtype=np.int32))
-
-    for ifo_p, active_sec_ifos, cand in multi_candidates:
-        sec_rec = cand.get("sec_reconstructed", {})
-        valid_secs = [i for i in active_sec_ifos if i in sec_rec]
-        if not valid_secs:
-            continue
-
-        if len(valid_secs) == 1:
-            ifo_s = valid_secs[0]
-            sub_slides, sub_snips, sq_s = sec_rec[ifo_s]
-            if len(sub_slides) == 0:
-                continue
-            sub_snips_by_ifo = {ifo_s: sub_snips}
-            sigmasq_by_ifo = {ifo_s: sq_s}
-        else:
-            common_slides = sec_rec[valid_secs[0]][0]
-            for ifo_s in valid_secs[1:]:
-                common_slides = np.intersect1d(common_slides, sec_rec[ifo_s][0])
-            if len(common_slides) == 0:
-                continue
-            sub_slides = common_slides
-            sub_snips_by_ifo = {}
-            sigmasq_by_ifo = {}
-            for ifo_s in valid_secs:
-                s_slides, s_snips, sq_s = sec_rec[ifo_s]
-                idx = np.searchsorted(s_slides, common_slides)
-                sub_snips_by_ifo[ifo_s] = np.ascontiguousarray(s_snips[idx])
-                sigmasq_by_ifo[ifo_s] = sq_s
-
-        gid = cand["template_id"]
-        base_sigmasq_p = max(float(cand["sigmasq"]), 1e-12)
-        s_vals = evaluate_coinc_windows(
-            model,
-            ifo_p,
-            cand["z_p_snip"],
-            base_sigmasq_p,
-            sample_rate,
-            sec_snips_by_ifo=sub_snips_by_ifo,
-            sigmasq_by_ifo=sigmasq_by_ifo,
-        )
-        res["n_snippets"] += len(sub_slides)
-
-        keep = (sub_slides == 0) | (s_vals >= background_stat_threshold)
-        if np.any(keep):
-            k_idx = np.flatnonzero(keep)
-            kept_slides = sub_slides[k_idx]
-            coinc_slides = kept_slides if ifo_p == pivot_ifo else -kept_slides
-            n_k = len(k_idx)
-            res["stat"].append(s_vals[k_idx])
-            res["slide"].append(coinc_slides.astype(np.int32))
-            res["tmpl"].append(np.full(n_k, gid, dtype=np.int32))
-            res["dec"].append(np.ones(n_k, dtype=np.int32))
-
-            for ifo in instruments:
-                if ifo == ifo_p:
-                    res["time"][ifo].append(
-                        np.full(n_k, cand["end_time"], dtype=np.float64)
-                    )
-                    res["tid"][ifo].append(
-                        np.full(n_k, cand["trig_id"], dtype=np.int32)
-                    )
-                elif ifo in sub_snips_by_ifo:
-                    sub_b = sub_snips_by_ifo[ifo][k_idx]
-                    peak_k = np.argmax(np.abs(sub_b), axis=1)
-                    dt_peak = (peak_k - half_K) / sample_rate
-                    t_s_arr = cand["end_time"] + kept_slides * slide_step_sec + dt_peak
-                    res["time"][ifo].append(t_s_arr.astype(np.float64))
-                    res["tid"][ifo].append(np.full(n_k, -1, dtype=np.int32))
-                else:
-                    res["time"][ifo].append(np.full(n_k, -1.0, dtype=np.float64))
-                    res["tid"][ifo].append(np.full(n_k, -1, dtype=np.int32))
-        cand.pop("sec_reconstructed", None)
-
-    res["eval_time"] += time.perf_counter() - t_ev0
+        del st, top_ser, norm_val, rf, td_bank, meta
+        import gc
+        gc.collect()
     return res
 
 
