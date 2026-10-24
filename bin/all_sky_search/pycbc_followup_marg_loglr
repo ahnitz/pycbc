@@ -1035,18 +1035,6 @@ def get_args(raw_argv=None):
         default=[],
         help="Extra keywords for the single-detector statistic (e.g. hollow_knee:5.5).",
     )
-    parser.add_argument(
-        "--trig-start-time",
-        type=float,
-        default=None,
-        help="Only evaluate primary triggers with end_time >= trig_start_time.",
-    )
-    parser.add_argument(
-        "--trig-end-time",
-        type=float,
-        default=None,
-        help="Only evaluate primary triggers with end_time < trig_end_time.",
-    )
 
     argv = fix_frame_files_args(raw_argv)
     args = parser.parse_args(argv)
