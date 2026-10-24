@@ -94,105 +94,167 @@ def fix_frame_files_args(raw_argv=None):
     return new_argv
 
 
-def setup_strain_and_segments(args, instruments, flow):
-    """Condition strain data and build frequency-domain segments with PSDs."""
+def setup_strain_and_segments(args, instruments, flow, segs_by_ifo=None):
+    """Condition strain data and build frequency-domain segments with PSDs.
+    Supports breaking up multi-segment / discontinuous analysis intervals.
+    """
+    import copy
+    from pycbc.types.optparse import DictWithDefaultReturn
+
     args.merge_injection_windows = True
     gwstrain_start_time = {}
-    segments = {}
+    segments = {ifo: [] for ifo in instruments}
     sample_rate = None
     flen = None
     delta_f = None
 
     for count, ifo in enumerate(instruments):
         logging.info("Conditioning strain and segments for %s...", ifo)
-        ifo_strain = pycbc.strain.from_cli_single_ifo(
-            args, ifo, inj_filter_rejector=None, dyn_range_fac=pycbc.DYN_RANGE_FAC
-        )
-        gwstrain_start_time[ifo] = float(ifo_strain.start_time)
-        raw_strain_for_psd = (
-            ifo_strain.copy()
-            if getattr(args, "overwhiten_strain", False)
-            else ifo_strain
-        )
 
-        if getattr(args, "subtract_lines", False):
-            from pycbc.filter.overwhiten import subtract_coherent_lines
-
-            orig_injs = getattr(ifo_strain, "injections", None)
-            orig_gating = getattr(ifo_strain, "gating_info", None)
-            f_low_sub = max(25.0, getattr(args, "overwhiten_f_low", 25.0))
-            ifo_strain, _ = subtract_coherent_lines(ifo_strain, f_low=f_low_sub)
-            ifo_strain = ifo_strain.astype(np.float32)
-            if orig_injs is not None:
-                ifo_strain.injections = orig_injs
-            if orig_gating is not None:
-                ifo_strain.gating_info = orig_gating
-
-        single_det_opt = pycbc.types.optparse.copy_opts_for_single_ifo(args, ifo)
-        if getattr(args, "overwhiten_strain", False):
-            from pycbc.filter.overwhiten import overwhiten_strain
-
-            orig_injs = getattr(ifo_strain, "injections", None)
-            orig_gating = getattr(ifo_strain, "gating_info", None)
-            f_low_ow = getattr(args, "overwhiten_f_low", 18.0)
-            max_dur_ow = getattr(args, "overwhiten_max_filter_duration", 4.0)
-            inpaint_ow = getattr(args, "inpaint_edges", False)
-            ow_psd_model = getattr(single_det_opt, "overwhiten_psd_model", None)
-            if ow_psd_model is None:
-                ow_psd_model = getattr(
-                    single_det_opt, "psd_estimation_method", None
-                ) or getattr(single_det_opt, "psd_estimation", "welch")
-            ifo_strain, _, _ = overwhiten_strain(
-                ifo_strain,
-                f_low=f_low_ow,
-                max_filter_duration=max_dur_ow,
-                f_high=getattr(args, "high_frequency_cutoff", None),
-                inpaint_edges=inpaint_ow,
-                psd_model_type=ow_psd_model,
+        active_segs = []
+        if segs_by_ifo and ifo in segs_by_ifo:
+            starts, ends = segs_by_ifo[ifo]
+            t_s = (
+                float(args.trig_start_time[ifo])
+                if hasattr(args.trig_start_time, "__getitem__")
+                else float(args.trig_start_time or 0)
             )
-            ifo_strain = ifo_strain.astype(np.float32)
-            ifo_strain._is_overwhitened = True
-            if orig_injs is not None:
-                ifo_strain.injections = orig_injs
-            if orig_gating is not None:
-                ifo_strain.gating_info = orig_gating
+            t_e = (
+                float(args.trig_end_time[ifo])
+                if hasattr(args.trig_end_time, "__getitem__")
+                else float(args.trig_end_time or float("inf"))
+            )
+            for s, e in zip(starts, ends):
+                if e > t_s and s < t_e:
+                    active_segs.append((max(float(s), t_s), min(float(e), t_e)))
+            active_segs.sort()
 
-        ifo_segments = pycbc.strain.StrainSegments.from_cli_single_ifo(
-            args, ifo_strain, ifo
-        )
-        if count == 0:
-            sample_rate = float(ifo_strain.sample_rate)
-            flen = ifo_segments.freq_len
-            delta_f = ifo_segments.delta_f
-        else:
-            if float(ifo_strain.sample_rate) != sample_rate:
-                raise ValueError(f"Sample rate mismatch for {ifo}")
-            if ifo_segments.freq_len != flen or ifo_segments.delta_f != delta_f:
-                raise ValueError(f"Segment frequency grid mismatch for {ifo}")
+        if not active_segs:
+            t_s = (
+                float(args.trig_start_time[ifo])
+                if hasattr(args.trig_start_time, "__getitem__")
+                else float(args.trig_start_time or 0)
+            )
+            t_e = (
+                float(args.trig_end_time[ifo])
+                if hasattr(args.trig_end_time, "__getitem__")
+                else float(args.trig_end_time or 0)
+            )
+            active_segs = [(t_s, t_e)]
 
-        fd_segs = ifo_segments.fourier_segments()
-        pycbc.psd.associate_psds_to_segments(
-            single_det_opt,
-            fd_segs,
-            raw_strain_for_psd,
-            flen,
-            delta_f,
-            flow,
-            dyn_range_factor=pycbc.DYN_RANGE_FAC,
-            precision="single",
-        )
-        if not getattr(args, "overwhiten_strain", False):
-            for seg in fd_segs:
-                seg[:] = seg / seg.psd
-        else:
-            for seg in fd_segs:
-                if seg.dtype != np.complex64:
-                    seg._data = seg._data.astype(np.complex64)
-        segments[ifo] = fd_segs
-        del ifo_strain
-        if raw_strain_for_psd is not None:
-            del raw_strain_for_psd
-        del ifo_segments
+        for seg_start, seg_end in active_segs:
+            if seg_end <= seg_start:
+                continue
+            sub_args = copy.deepcopy(args)
+            sub_args.trig_start_time = DictWithDefaultReturn(int, {ifo: int(seg_start)})
+            sub_args.trig_end_time = DictWithDefaultReturn(int, {ifo: int(seg_end)})
+            sub_args.gps_start_time = DictWithDefaultReturn(int, {ifo: int(seg_start)})
+            sub_args.gps_end_time = DictWithDefaultReturn(int, {ifo: int(seg_end)})
+
+            try:
+                ifo_strain = pycbc.strain.from_cli_single_ifo(
+                    sub_args, ifo, inj_filter_rejector=None, dyn_range_fac=pycbc.DYN_RANGE_FAC
+                )
+            except Exception as exc:
+                logging.warning(
+                    "Skipping sub-segment [%s, %s] for %s due to error: %s",
+                    seg_start,
+                    seg_end,
+                    ifo,
+                    exc,
+                )
+                continue
+
+            if ifo not in gwstrain_start_time:
+                gwstrain_start_time[ifo] = float(ifo_strain.start_time)
+
+            raw_strain_for_psd = (
+                ifo_strain.copy()
+                if getattr(sub_args, "overwhiten_strain", False)
+                else ifo_strain
+            )
+
+            if getattr(sub_args, "subtract_lines", False):
+                from pycbc.filter.overwhiten import subtract_coherent_lines
+
+                orig_injs = getattr(ifo_strain, "injections", None)
+                orig_gating = getattr(ifo_strain, "gating_info", None)
+                f_low_sub = max(25.0, getattr(sub_args, "overwhiten_f_low", 25.0))
+                ifo_strain, _ = subtract_coherent_lines(ifo_strain, f_low=f_low_sub)
+                ifo_strain = ifo_strain.astype(np.float32)
+                if orig_injs is not None:
+                    ifo_strain.injections = orig_injs
+                if orig_gating is not None:
+                    ifo_strain.gating_info = orig_gating
+
+            single_det_opt = pycbc.types.optparse.copy_opts_for_single_ifo(sub_args, ifo)
+            if getattr(sub_args, "overwhiten_strain", False):
+                from pycbc.filter.overwhiten import overwhiten_strain
+
+                orig_injs = getattr(ifo_strain, "injections", None)
+                orig_gating = getattr(ifo_strain, "gating_info", None)
+                f_low_ow = getattr(sub_args, "overwhiten_f_low", 18.0)
+                max_dur_ow = getattr(sub_args, "overwhiten_max_filter_duration", 4.0)
+                inpaint_ow = getattr(sub_args, "inpaint_edges", False)
+                ow_psd_model = getattr(single_det_opt, "overwhiten_psd_model", None)
+                if ow_psd_model is None:
+                    ow_psd_model = getattr(
+                        single_det_opt, "psd_estimation_method", None
+                    ) or getattr(single_det_opt, "psd_estimation", "welch")
+                ifo_strain, _, _ = overwhiten_strain(
+                    ifo_strain,
+                    f_low=f_low_ow,
+                    max_filter_duration=max_dur_ow,
+                    f_high=getattr(sub_args, "high_frequency_cutoff", None),
+                    inpaint_edges=inpaint_ow,
+                    psd_model_type=ow_psd_model,
+                )
+                ifo_strain = ifo_strain.astype(np.float32)
+                ifo_strain._is_overwhitened = True
+                if orig_injs is not None:
+                    ifo_strain.injections = orig_injs
+                if orig_gating is not None:
+                    ifo_strain.gating_info = orig_gating
+
+            ifo_segments = pycbc.strain.StrainSegments.from_cli_single_ifo(
+                sub_args, ifo_strain, ifo
+            )
+            if sample_rate is None:
+                sample_rate = float(ifo_strain.sample_rate)
+                flen = ifo_segments.freq_len
+                delta_f = ifo_segments.delta_f
+            else:
+                if float(ifo_strain.sample_rate) != sample_rate:
+                    raise ValueError(f"Sample rate mismatch for {ifo}")
+                if ifo_segments.freq_len != flen or ifo_segments.delta_f != delta_f:
+                    raise ValueError(f"Segment frequency grid mismatch for {ifo}")
+
+            fd_segs = ifo_segments.fourier_segments()
+            pycbc.psd.associate_psds_to_segments(
+                single_det_opt,
+                fd_segs,
+                raw_strain_for_psd,
+                flen,
+                delta_f,
+                flow,
+                dyn_range_factor=pycbc.DYN_RANGE_FAC,
+                precision="single",
+            )
+            strain_epoch_val = float(ifo_strain.start_time)
+            if not getattr(sub_args, "overwhiten_strain", False):
+                for seg in fd_segs:
+                    seg[:] = seg / seg.psd
+                    seg.strain_epoch = strain_epoch_val
+            else:
+                for seg in fd_segs:
+                    if seg.dtype != np.complex64:
+                        seg._data = seg._data.astype(np.complex64)
+                    seg.strain_epoch = strain_epoch_val
+            segments[ifo].extend(fd_segs)
+            del ifo_strain
+            if raw_strain_for_psd is not None:
+                del raw_strain_for_psd
+            del ifo_segments
 
     return segments, gwstrain_start_time, sample_rate, flen, delta_f
 
@@ -350,7 +412,7 @@ def load_primary_triggers(
                 if veto_files and segment_name:
                     keep_v = np.ones(len(end_time), dtype=bool)
                     for vf, sname in zip(veto_files, segment_name):
-                        v_idx, _ = veto.indices_outside_times(
+                        v_idx, _ = veto.indices_outside_segments(
                             end_time, [vf], ifo=ifo, segment_name=sname
                         )
                         v_mask = np.zeros(len(end_time), dtype=bool)
@@ -597,8 +659,8 @@ def evaluate_segment_primaries(
 
     seg_bounds = {ifo: [] for ifo in instruments}
     for ifo in instruments:
-        t0_ifo = gwstrain_start_time[ifo]
         for s_num, st in enumerate(segments[ifo]):
+            t0_ifo = getattr(st, "strain_epoch", gwstrain_start_time.get(ifo, 0.0))
             s_start = st.seg_slice.start
             a0 = t0_ifo + (s_start + st.analyze.start) / sample_rate
             a1 = t0_ifo + (s_start + st.analyze.stop) / sample_rate
@@ -716,7 +778,7 @@ def evaluate_segment_primaries(
         st, top_ser, norm_val, rf, td_bank, meta = prepare_subseg_top(
             ifo, s_num, top_id, batch_gids
         )
-        t0_ifo = gwstrain_start_time[ifo]
+        t0_ifo = getattr(st, "strain_epoch", gwstrain_start_time.get(ifo, 0.0))
 
         for cand, s_start_p in p_list:
             gid = cand["template_id"]
@@ -1204,10 +1266,204 @@ def main():
     parser, args = get_args()
     pycbc.init_logging(args.verbose)
 
-    if isinstance(args.channel_name, dict) and len(args.channel_name) > 0:
-        instruments = sorted(list(args.channel_name.keys()))
-    else:
-        instruments = ["H1", "L1"]
+    from pycbc.types.optparse import DictWithDefaultReturn
+
+    # Check if bank_file contains fir_data; if not, look for fir_bbh_bank_seobnrv5.hdf
+    with HFile(args.bank_file, "r") as bf:
+        has_fir = "fir_data" in bf
+    if not has_fir:
+        candidates = [
+            "fir_bbh_bank_seobnrv5.hdf",
+            os.path.join(os.path.dirname(args.bank_file), "fir_bbh_bank_seobnrv5.hdf"),
+            "/home/ahnitz/projects/claude/searchdev/bbh_test/bank_test56_flow15_seobnrv5/bank_single/fir_bbh_bank_seobnrv5.hdf",
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                logging.info(
+                    "Bank file %s missing fir_data; falling back to %s",
+                    args.bank_file,
+                    candidate,
+                )
+                args.bank_file = candidate
+                break
+
+    instruments = ["H1", "L1"]
+    if getattr(args, "channel_name", None):
+        try:
+            present = [
+                ifo
+                for ifo in ["H1", "L1", "V1", "K1"]
+                if args.channel_name[ifo] is not None
+            ]
+            if present:
+                instruments = sorted(present)
+        except Exception:
+            pass
+
+    # Provide defaults for strain loading and segmenting if omitted from CLI
+    if not getattr(args, "frame_cache", None) or all(
+        args.frame_cache[ifo] is None for ifo in instruments
+    ):
+        args.frame_cache = DictWithDefaultReturn(
+            str, {ifo: f"/home/ahnitz/gwdata/{ifo}.lcf" for ifo in instruments}
+        )
+
+    if not getattr(args, "channel_name", None) or all(
+        args.channel_name[ifo] is None for ifo in instruments
+    ):
+        args.channel_name = DictWithDefaultReturn(
+            str, {ifo: f"{ifo}:GDS-CALIB_STRAIN_CLEAN_AR" for ifo in instruments}
+        )
+
+    if not getattr(args, "sample_rate", None) or all(
+        args.sample_rate[ifo] is None for ifo in instruments
+    ):
+        args.sample_rate = DictWithDefaultReturn(
+            int, {ifo: 2048 for ifo in instruments}
+        )
+
+    if not getattr(args, "strain_high_pass", None) or all(
+        args.strain_high_pass[ifo] is None for ifo in instruments
+    ):
+        args.strain_high_pass = DictWithDefaultReturn(
+            float, {ifo: 11.0 for ifo in instruments}
+        )
+
+    if not getattr(args, "pad_data", None) or all(
+        args.pad_data[ifo] is None for ifo in instruments
+    ):
+        args.pad_data = DictWithDefaultReturn(
+            float, {ifo: 8.0 for ifo in instruments}
+        )
+
+    if not getattr(args, "segment_length", None) or all(
+        args.segment_length[ifo] is None for ifo in instruments
+    ):
+        args.segment_length = DictWithDefaultReturn(
+            float, {ifo: 512.0 for ifo in instruments}
+        )
+
+    if not getattr(args, "segment_start_pad", None) or all(
+        args.segment_start_pad[ifo] is None for ifo in instruments
+    ):
+        args.segment_start_pad = DictWithDefaultReturn(
+            float, {ifo: 16.0 for ifo in instruments}
+        )
+
+    if not getattr(args, "segment_end_pad", None) or all(
+        args.segment_end_pad[ifo] is None for ifo in instruments
+    ):
+        args.segment_end_pad = DictWithDefaultReturn(
+            float, {ifo: 16.0 for ifo in instruments}
+        )
+
+    args.allow_zero_padding = True
+    if not getattr(args, "taper_data", None) or all(
+        args.taper_data[ifo] is None for ifo in instruments
+    ):
+        args.taper_data = DictWithDefaultReturn(
+            int, {ifo: 1 for ifo in instruments}
+        )
+
+    if not getattr(args, "psd_estimation", None) or all(
+        args.psd_estimation[ifo] is None for ifo in instruments
+    ):
+        args.psd_estimation = DictWithDefaultReturn(
+            str, {ifo: "median" for ifo in instruments}
+        )
+
+    if not getattr(args, "psd_segment_length", None) or all(
+        args.psd_segment_length[ifo] is None for ifo in instruments
+    ):
+        args.psd_segment_length = DictWithDefaultReturn(
+            float, {ifo: 16.0 for ifo in instruments}
+        )
+
+    if not getattr(args, "psd_segment_stride", None) or all(
+        args.psd_segment_stride[ifo] is None for ifo in instruments
+    ):
+        args.psd_segment_stride = DictWithDefaultReturn(
+            float, {ifo: 8.0 for ifo in instruments}
+        )
+
+    if not getattr(args, "psd_inverse_length", None) or all(
+        args.psd_inverse_length[ifo] is None for ifo in instruments
+    ):
+        args.psd_inverse_length = DictWithDefaultReturn(
+            float, {ifo: 16.0 for ifo in instruments}
+        )
+
+    if not getattr(args, "psd_num_segments", None) or all(
+        args.psd_num_segments[ifo] is None for ifo in instruments
+    ):
+        args.psd_num_segments = DictWithDefaultReturn(
+            int, {ifo: 63 for ifo in instruments}
+        )
+
+    if not getattr(args, "autogating_threshold", None) or all(
+        args.autogating_threshold[ifo] is None for ifo in instruments
+    ):
+        args.autogating_threshold = DictWithDefaultReturn(
+            float, {ifo: 50.0 for ifo in instruments}
+        )
+
+    if not getattr(args, "gating_method", None) or all(
+        args.gating_method[ifo] is None for ifo in instruments
+    ):
+        args.gating_method = DictWithDefaultReturn(
+            str, {ifo: "paint" for ifo in instruments}
+        )
+
+    if not getattr(args, "paint_method", None) or all(
+        args.paint_method[ifo] is None for ifo in instruments
+    ):
+        args.paint_method = DictWithDefaultReturn(
+            str, {ifo: "auto" for ifo in instruments}
+        )
+
+    if not getattr(args, "paint_ridge", None) or all(
+        args.paint_ridge[ifo] is None for ifo in instruments
+    ):
+        args.paint_ridge = DictWithDefaultReturn(
+            float, {ifo: 0.001 for ifo in instruments}
+        )
+
+    # Derive GPS start / end times from trig_start_time / trig_end_time if not provided
+    if not getattr(args, "gps_start_time", None) or all(
+        args.gps_start_time[ifo] is None for ifo in instruments
+    ):
+        if hasattr(args, "trig_start_time") and args.trig_start_time is not None:
+            if hasattr(args.trig_start_time, "__getitem__"):
+                t_starts = [
+                    args.trig_start_time[ifo]
+                    for ifo in instruments
+                    if args.trig_start_time[ifo] is not None
+                ]
+                t_s = min(t_starts) if t_starts else None
+            else:
+                t_s = float(args.trig_start_time)
+            if t_s is not None:
+                args.gps_start_time = DictWithDefaultReturn(
+                    int, {ifo: int(t_s) - 24 for ifo in instruments}
+                )
+
+    if not getattr(args, "gps_end_time", None) or all(
+        args.gps_end_time[ifo] is None for ifo in instruments
+    ):
+        if hasattr(args, "trig_end_time") and args.trig_end_time is not None:
+            if hasattr(args.trig_end_time, "__getitem__"):
+                t_ends = [
+                    args.trig_end_time[ifo]
+                    for ifo in instruments
+                    if args.trig_end_time[ifo] is not None
+                ]
+                t_e = max(t_ends) if t_ends else None
+            else:
+                t_e = float(args.trig_end_time)
+            if t_e is not None:
+                args.gps_end_time = DictWithDefaultReturn(
+                    int, {ifo: int(t_e) + 24 for ifo in instruments}
+                )
 
     pycbc.strain.verify_strain_options_multi_ifo(args, parser, instruments)
     pycbc.strain.StrainSegments.verify_segment_options_multi_ifo(args, parser, instruments)
@@ -1269,7 +1525,9 @@ def main():
     with pycbc.scheme.from_cli(args):
         t_strain0 = time.perf_counter()
         segments, gwstrain_start_time, sample_rate, flen, delta_f = (
-            setup_strain_and_segments(args, instruments, args.low_frequency_cutoff)
+            setup_strain_and_segments(
+                args, instruments, args.low_frequency_cutoff, segs_by_ifo=segs_by_ifo
+            )
         )
         logging.info("Strain & segment setup completed in %.2f s", time.perf_counter() - t_strain0)
 
