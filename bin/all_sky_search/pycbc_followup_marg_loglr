@@ -272,9 +272,25 @@ def load_primary_triggers(
                 snr = g["snr"][:]
                 mask = snr >= primary_snr_threshold
                 if trig_start_time is not None:
-                    mask &= (g["end_time"][:] >= float(trig_start_time))
+                    if hasattr(trig_start_time, '__getitem__') and ifo in trig_start_time:
+                        t_start = float(trig_start_time[ifo])
+                    else:
+                        try:
+                            t_start = float(trig_start_time)
+                        except (TypeError, ValueError):
+                            t_start = 0.0
+                    if t_start > 0:
+                        mask &= (g["end_time"][:] >= t_start)
                 if trig_end_time is not None:
-                    mask &= (g["end_time"][:] < float(trig_end_time))
+                    if hasattr(trig_end_time, '__getitem__') and ifo in trig_end_time:
+                        t_end = float(trig_end_time[ifo])
+                    else:
+                        try:
+                            t_end = float(trig_end_time)
+                        except (TypeError, ValueError):
+                            t_end = 0.0
+                    if t_end > 0:
+                        mask &= (g["end_time"][:] < t_end)
                 if not np.any(mask):
                     continue
 
@@ -1035,9 +1051,19 @@ def get_args(raw_argv=None):
         default=[],
         help="Extra keywords for the single-detector statistic (e.g. hollow_knee:5.5).",
     )
+    # Workflow compatibility options passed from [coinc*] sections
+    parser.add_argument("--statistic-files", nargs="*", default=[])
+    parser.add_argument("--ranking-statistic", default=None)
+    parser.add_argument("--statistic-features", nargs="*", default=[])
+    parser.add_argument(
+        "--randomize-template-order", action="store_true", default=False
+    )
+    parser.add_argument("--loudest-keep-values", default=None)
 
     argv = fix_frame_files_args(raw_argv)
-    args = parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        logging.info("Ignored unknown CLI arguments: %s", unknown)
     args.trigger_files = sum(args.trigger_files, [])
     args.veto_files = sum(args.veto_files, [])
     args.segment_name = sum(args.segment_name, [])
