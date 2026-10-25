@@ -137,6 +137,7 @@ class PyCBCFollowupMargLogLRExecutable(Executable):
     """Find coinc triggers and evaluate coherent snippet marginal logLR using an FIR Ratio Bank"""
 
     current_retention_level = Executable.ALL_TRIGGERS
+    file_input_options = ["--statistic-files"]
 
     def create_node(
         self,
@@ -165,6 +166,10 @@ class PyCBCFollowupMargLogLRExecutable(Executable):
         node = Node(self)
         node.add_input_opt("--bank-file", bank_file)
         node.add_input_list_opt("--trigger-files", trig_files)
+        if len(stat_files) > 0:
+            node.add_input_list_opt(
+                "--statistic-files", stat_files, check_existing_options=False
+            )
         if frame_files is not None and len(frame_files) > 0:
             node.add_multiifo_input_list_opt("--frame-files", frame_files)
         if inj_file is not None:
@@ -675,6 +680,7 @@ def setup_interval_coinc_inj(
     pivot_ifo,
     fixed_ifo,
     tags=None,
+    inj_file=None,
 ):
     """
     This function sets up exact match coincidence for injections
@@ -720,6 +726,7 @@ def setup_interval_coinc_inj(
                 "0/1",
                 pivot_ifo,
                 fixed_ifo,
+                inj_file=inj_file,
                 tags=["SEG%d" % i],
                 trig_start_time=t_start,
                 trig_end_time=t_end,

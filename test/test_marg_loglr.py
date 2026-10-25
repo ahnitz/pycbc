@@ -266,6 +266,77 @@ class TestMarginalLogLR(unittest.TestCase):
             if os.path.exists(out_fn):
                 os.remove(out_fn)
 
+    def test_tiered_decimation_and_snr_capped_coherent_stat(self):
+        """Verify parse_loudest_keep_values, compute_sngl_lognoiserate, and
+        SNR-capped normalized SingleTemplate coherent statistic behavior.
+        """
+        import importlib.machinery
+        import importlib.util
+        import os
+
+        script_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "bin",
+            "all_sky_search",
+            "pycbc_followup_marg_loglr",
+        )
+        loader = importlib.machinery.SourceFileLoader("followup_mod2", script_path)
+        spec = importlib.util.spec_from_loader("followup_mod2", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+
+        tiers = mod.parse_loudest_keep_values("[7.5:1,6.0:10,4.0:50,2.0:250,0.0:1000]")
+        self.assertIsNotNone(tiers)
+        stat_vals, total_factors = tiers
+        np.testing.assert_allclose(stat_vals, [np.inf, 7.5, 6.0, 4.0, 2.0, 0.0])
+        np.testing.assert_array_equal(total_factors, [1, 10, 50, 250, 1000])
+
+        class DummyRankMethod:
+            alphabelow = 5.0
+            cap_alpha_below = True
+            fits_by_tid = {
+                "H1": {
+                    "smoothed_fit_coeff": np.array([5.5], dtype=np.float32),
+                    "smoothed_rate_above_thresh": np.array([1e-3], dtype=np.float32),
+                    "thresh": 6.0,
+                }
+            }
+
+        rm = DummyRankMethod()
+        ln_r_hi = float(mod.compute_sngl_lognoiserate(rm, "H1", 0, 8.0))
+        ln_r_lo = float(mod.compute_sngl_lognoiserate(rm, "H1", 0, 4.0))
+        self.assertLess(ln_r_hi, ln_r_lo)
+
+        model = mod.build_single_template_evaluator(
+            ["H1", "L1"],
+            sample_rate=2048.0,
+            half_P=8,
+            half_K=46,
+            vsamples=64,
+            sky_initial_samples=5000,
+            d_min=0.001,
+            d_max=10.0,
+        )
+        z_p = np.zeros(17, dtype=np.complex64)
+        z_p[8] = 20.0 * np.exp(0.4j)
+        z_s_coh = np.zeros((1, 93), dtype=np.complex64)
+        z_s_coh[0, 46] = -15.0 * np.exp(0.4j)
+        z_s_inc = np.zeros((1, 93), dtype=np.complex64)
+        z_s_inc[0, 46] = 15.0 * np.exp(0.4j + 1.57j)
+
+        gamma = 9.0 / np.hypot(20.0, 15.0)
+        lr_coh = float(
+            mod.evaluate_coinc_windows(
+                model, "H1", z_p * gamma, 1.0, 2048.0, "L1", z_s_coh * gamma, 1.0
+            )[0]
+        )
+        lr_inc = float(
+            mod.evaluate_coinc_windows(
+                model, "H1", z_p * gamma, 1.0, 2048.0, "L1", z_s_inc * gamma, 1.0
+            )[0]
+        )
+        self.assertGreater(lr_coh, lr_inc + 5.0)
+
 
 if __name__ == "__main__":
     unittest.main()

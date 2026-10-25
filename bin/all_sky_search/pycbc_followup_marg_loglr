@@ -4,16 +4,19 @@ Standalone snippet-based marginal log-likelihood-ratio (marginal_loglr)
 followup and coincidence tool.
 
 Takes primary candidate triggers from pycbc_inspiral_fir (or merged trigger
-HDF5 files), reconstructs the complex SNR time series around the primary trigger
-peak as well as across the zero-lag sky window and background time-slide windows
-in the secondary detector(s) using matchedfilter.TimeDomainFilterBank, evaluates
-the marginal logLR directly via PyCBC's SingleTemplate / DistMarg inference
-marginalization infrastructure, and writes a standard PyCBC coincidence HDF5
-output file supporting all active detector combinations.
+HDF5 files), applies full signal-consistency weighting (newsnr_sgveto_autochisq,
+rchisq, hollow veto, CAT2 vetoes) on both primary and secondary detectors,
+reconstructs complex SNR snippets around the primary peak and across the
+zero-lag sky window and decimated background time-slide windows in the
+secondary detector(s) using matchedfilter.TimeDomainFilterBank, combines
+SingleTemplate / DistMarg coherent extrinsic marginalization with
+ExpFitStatistic template-calibrated noise models, and writes a standard PyCBC
+coincidence HDF5 output file.
 """
 
 import argparse
 import collections
+import glob
 from itertools import combinations
 import logging
 import os
@@ -37,7 +40,7 @@ from pycbc.distributions import (
     UniformRadius,
 )
 import pycbc.events
-from pycbc.events import coinc, ranking, veto
+from pycbc.events import coinc, coinc_rate, ranking, stat as pycbc_stat, veto
 import pycbc.fft
 from pycbc.filter.matched_filter_ratio import (
     DynamicSNRRenormFactor,
@@ -92,6 +95,61 @@ def fix_frame_files_args(raw_argv=None):
         else:
             new_argv.append(a)
     return new_argv
+
+
+def parse_loudest_keep_values(loudest_keep_str):
+    """Parse --loudest-keep-values string (e.g. '[7.5:1,6.0:10,4.0:50,2.0:250,0.0:1000]')
+    into descending thresholds `threshes` (starting with +inf) and integer decimation
+    factors `total_factors` (one per interval `[threshes[kidx], threshes[kidx-1])`).
+    """
+    if not loudest_keep_str:
+        return None, None
+    s = str(loudest_keep_str).strip()
+    if not s or s == "None":
+        return None, None
+    raw_t = []
+    raw_f = []
+    for decstr in s.strip("[]").split(","):
+        decstr = decstr.strip()
+        if not decstr or ":" not in decstr:
+            continue
+        thresh_s, factor_s = decstr.split(":", 1)
+        factor_f = float(factor_s)
+        if factor_f % 1:
+            raise RuntimeError("Non-integer decimation is not supported")
+        factor_i = int(factor_f)
+        if factor_i < 1:
+            raise RuntimeError("Negative or zero decimation does not make sense")
+        raw_t.append(float(thresh_s))
+        raw_f.append(factor_i)
+
+    if not raw_t:
+        return None, None
+
+    order = np.argsort(raw_t)[::-1]
+    raw_t = np.asarray(raw_t, dtype=np.float64)[order]
+    raw_f = np.asarray(raw_f, dtype=np.int64)[order]
+
+    # Check if factors are already cumulative multiples (e.g. [1, 10, 50, 250, 1000])
+    is_cumulative = all(
+        raw_f[i] >= raw_f[i - 1] and (raw_f[i] % raw_f[i - 1] == 0)
+        for i in range(1, len(raw_f))
+    )
+    if is_cumulative and raw_f[0] == 1:
+        threshes = np.concatenate(([np.inf], raw_t))
+        total_factors = raw_f
+    else:
+        # Legacy step-factor format where factor==1 is skipped and cumprod is applied
+        t_list = [np.inf]
+        f_list = [1]
+        for t_val, f_val in zip(raw_t, raw_f):
+            if f_val == 1:
+                continue
+            t_list.append(float(t_val))
+            f_list.append(int(f_val))
+        threshes = np.asarray(t_list, dtype=np.float64)
+        total_factors = np.cumprod(np.asarray(f_list, dtype=np.int64))
+    return threshes, total_factors
 
 
 def setup_strain_and_segments(args, instruments, flow, segs_by_ifo=None):
@@ -274,17 +332,23 @@ def load_primary_triggers(
     primary_snr_threshold=6.0,
     primary_newsnr_threshold=5.5,
     primary_max_rchisq=5.0,
+    min_secondary_snr=2.8,
     use_newsnr=True,
     veto_files=None,
     segment_name=None,
     template_fraction_range="0/1",
     hash_to_gid=None,
-    sngl_ranking="newsnr_sgveto",
+    sngl_ranking="newsnr_sgveto_autochisq",
     statistic_keywords=None,
     trig_start_time=None,
     trig_end_time=None,
+    max_timeslide_extent=300.0,
+    return_secondary_info=False,
 ):
-    """Load primary triggers from raw or merged trigger HDF5 files."""
+    """Load primary triggers and per-template secondary trigger lookup tables
+    from raw or merged trigger HDF5 files, applying full signal-consistency
+    weighting (newsnr_sgveto_autochisq + hollow veto + rchisq gate + CAT2 vetoes).
+    """
     if hash_to_gid is None:
         with HFile(bank_file, "r") as bf:
             hashes = bf["template_hash"][:]
@@ -316,7 +380,11 @@ def load_primary_triggers(
 
     primaries = {ifo: [] for ifo in instruments}
     segs_by_ifo = {ifo: ([], []) for ifo in instruments}
+    valid_segs_by_ifo = {ifo: igwn_segs.segmentlist([]) for ifo in instruments}
+    sec_trigs_by_ifo_gid = {ifo: {} for ifo in instruments}
     non_thresh_times = []
+
+    raw_cache_by_ifo = {ifo: [] for ifo in instruments}
 
     for fn in trigger_files:
         if not os.path.exists(fn):
@@ -326,9 +394,13 @@ def load_primary_triggers(
                 if ifo not in f or not isinstance(f[ifo], h5py.Group):
                     continue
                 g = f[ifo]
+                s_starts = []
+                s_ends = []
                 if "search/start_time" in g and "search/end_time" in g:
-                    segs_by_ifo[ifo][0].extend(g["search/start_time"][:].tolist())
-                    segs_by_ifo[ifo][1].extend(g["search/end_time"][:].tolist())
+                    s_starts = g["search/start_time"][:].tolist()
+                    s_ends = g["search/end_time"][:].tolist()
+                    segs_by_ifo[ifo][0].extend(s_starts)
+                    segs_by_ifo[ifo][1].extend(s_ends)
                 if "search/non_threshold_time" in g:
                     try:
                         val = float(np.max(np.asarray(g["search/non_threshold_time"])))
@@ -336,118 +408,266 @@ def load_primary_triggers(
                             non_thresh_times.append(val)
                     except Exception:
                         pass
+
+                # Build valid segmentlist (science segments minus CAT2 vetoes)
+                if len(s_starts) > 0 and len(s_starts) == len(s_ends):
+                    ifo_vsegs = veto.start_end_to_segments(
+                        np.asarray(s_starts, dtype=np.float64),
+                        np.asarray(s_ends, dtype=np.float64),
+                    ).coalesce()
+                else:
+                    ifo_vsegs = igwn_segs.segmentlist(
+                        [igwn_segs.segment(-1e12, 1e12)]
+                    )
+                if veto_files and segment_name:
+                    for vf, sname in zip(veto_files, segment_name):
+                        try:
+                            v_seg = veto.select_segments_by_definer(
+                                vf, ifo=ifo, segment_name=sname
+                            )
+                            ifo_vsegs = (ifo_vsegs - v_seg).coalesce()
+                        except Exception:
+                            pass
+                valid_segs_by_ifo[ifo] = (valid_segs_by_ifo[ifo] | ifo_vsegs).coalesce()
+
                 if "snr" not in g or len(g["snr"]) == 0:
                     continue
 
-                snr = g["snr"][:]
-                mask = snr >= primary_snr_threshold
+                t_start = 0.0
                 if trig_start_time is not None:
-                    if hasattr(trig_start_time, '__getitem__') and ifo in trig_start_time:
+                    if hasattr(trig_start_time, "__getitem__") and ifo in trig_start_time:
                         t_start = float(trig_start_time[ifo])
                     else:
                         try:
                             t_start = float(trig_start_time)
                         except (TypeError, ValueError):
                             t_start = 0.0
-                    if t_start > 0:
-                        mask &= (g["end_time"][:] >= t_start)
+                t_end = float("inf")
                 if trig_end_time is not None:
-                    if hasattr(trig_end_time, '__getitem__') and ifo in trig_end_time:
+                    if hasattr(trig_end_time, "__getitem__") and ifo in trig_end_time:
                         t_end = float(trig_end_time[ifo])
                     else:
                         try:
                             t_end = float(trig_end_time)
                         except (TypeError, ValueError):
-                            t_end = 0.0
-                    if t_end > 0:
-                        mask &= (g["end_time"][:] < t_end)
-                if not np.any(mask):
+                            t_end = float("inf")
+
+                end_time_all = g["end_time"][:]
+                t_win_min = (t_start - max_timeslide_extent - 30.0) if t_start > 0 else -float("inf")
+                t_win_max = (t_end + max_timeslide_extent + 30.0) if np.isfinite(t_end) else float("inf")
+                win_mask = (end_time_all >= t_win_min) & (end_time_all < t_win_max)
+                if not np.any(win_mask):
                     continue
 
-                idx_pass = np.flatnonzero(mask)
-                snr = snr[idx_pass]
-                end_time = g["end_time"][:][idx_pass]
-                coa_phase = g["coa_phase"][:][idx_pass]
-                sigmasq = g["sigmasq"][:][idx_pass]
-                chisq = g["chisq"][:][idx_pass] if "chisq" in g else np.zeros_like(snr)
-                chisq_dof = (
-                    g["chisq_dof"][:][idx_pass]
+                win_idx = np.flatnonzero(win_mask)
+                end_time_w = end_time_all[win_idx]
+                snr_w = g["snr"][:][win_idx]
+                coa_phase_w = g["coa_phase"][:][win_idx]
+                sigmasq_w = g["sigmasq"][:][win_idx]
+                chisq_w = g["chisq"][:][win_idx] if "chisq" in g else np.zeros_like(snr_w)
+                chisq_dof_w = (
+                    g["chisq_dof"][:][win_idx]
                     if "chisq_dof" in g
-                    else np.ones(len(snr), dtype=np.int32)
+                    else np.ones(len(snr_w), dtype=np.int32)
                 )
-                sg_chisq = (
-                    g["sg_chisq"][:][idx_pass]
+                sg_chisq_w = (
+                    g["sg_chisq"][:][win_idx]
                     if "sg_chisq" in g
-                    else np.ones_like(snr)
+                    else np.ones_like(snr_w)
                 )
-
                 if "template_id" in g:
-                    tids = g["template_id"][:][idx_pass].astype(np.int64)
+                    tids_w = g["template_id"][:][win_idx].astype(np.int64)
                 else:
-                    th = g["template_hash"][:][idx_pass]
-                    tids = np.array([hash_to_gid[int(h)] for h in th], dtype=np.int64)
+                    th_w = g["template_hash"][:][win_idx]
+                    tids_w = np.array([hash_to_gid[int(h)] for h in th_w], dtype=np.int64)
 
-                dof_val = np.where(chisq_dof > 1, 2.0 * chisq_dof - 2.0, 1.0)
-                rchisq = np.where(chisq > 0, chisq / dof_val, 1.0)
-                nsnr = ranking.newsnr(snr, rchisq)
+                dof_val = np.where(chisq_dof_w > 1, 2.0 * chisq_dof_w - 2.0, 1.0)
+                rchisq_w = np.where(chisq_w > 0, chisq_w / dof_val, 1.0)
+                nsnr_w = ranking.newsnr(snr_w, rchisq_w)
+
+                # Build lightweight slice dict so get_sngls_ranking_from_trigs runs only on win_idx
+                sub_trigs = {
+                    "snr": snr_w,
+                    "chisq": chisq_w,
+                    "chisq_dof": chisq_dof_w,
+                    "sg_chisq": sg_chisq_w,
+                    "end_time": end_time_w,
+                    "template_id": tids_w,
+                }
+                for opt_col in (
+                    "cont_chisq",
+                    "cont_chisq_dof",
+                    "auto_chisq",
+                    "auto_chisq_dof",
+                    "hollow_density",
+                    "psd_var_val",
+                    "template_duration",
+                ):
+                    if opt_col in g:
+                        sub_trigs[opt_col] = g[opt_col][:][win_idx]
+
                 if use_newsnr:
                     if sngl_ranking and sngl_ranking in ranking.sngls_ranking_function_dict:
                         try:
-                            eff_amp_all = ranking.get_sngls_ranking_from_trigs(
-                                g, sngl_ranking, **kw_dict
+                            eff_amp_w = np.asarray(
+                                ranking.get_sngls_ranking_from_trigs(
+                                    sub_trigs, sngl_ranking, **kw_dict
+                                ),
+                                dtype=np.float32,
                             )
-                            eff_amp = eff_amp_all[idx_pass]
                         except Exception as e:
                             logging.warning(
                                 "Failed calculating %s: %s, falling back to newsnr_sgveto",
                                 sngl_ranking,
                                 e,
                             )
-                            eff_amp = ranking.newsnr_sgveto(snr, rchisq, sg_chisq)
+                            eff_amp_w = np.asarray(
+                                ranking.newsnr_sgveto(snr_w, rchisq_w, sg_chisq_w),
+                                dtype=np.float32,
+                            )
                     else:
-                        eff_amp = ranking.newsnr_sgveto(snr, rchisq, sg_chisq)
+                        eff_amp_w = np.asarray(
+                            ranking.newsnr_sgveto(snr_w, rchisq_w, sg_chisq_w),
+                            dtype=np.float32,
+                        )
                 else:
-                    eff_amp = snr
+                    eff_amp_w = snr_w.astype(np.float32)
 
-                gate = (tids >= tid_min) & (tids < tid_max)
-                if primary_max_rchisq is not None and primary_max_rchisq > 0:
-                    gate &= rchisq <= primary_max_rchisq
-                if primary_newsnr_threshold is not None and primary_newsnr_threshold > 0:
-                    gate &= nsnr >= primary_newsnr_threshold
-                if not np.any(gate):
-                    continue
-
-                if veto_files and segment_name:
-                    keep_v = np.ones(len(end_time), dtype=bool)
+                # Check valid segment membership (science minus CAT2 vetoes)
+                in_valid_w = np.ones(len(end_time_w), dtype=bool)
+                if len(valid_segs_by_ifo[ifo]) > 0:
+                    vs_s, vs_e = veto.segments_to_start_end(valid_segs_by_ifo[ifo])
+                    v_keep = veto.indices_within_times(end_time_w, vs_s, vs_e)
+                    in_valid_w = np.zeros(len(end_time_w), dtype=bool)
+                    in_valid_w[v_keep] = True
+                elif veto_files and segment_name:
                     for vf, sname in zip(veto_files, segment_name):
                         v_idx, _ = veto.indices_outside_segments(
-                            end_time, [vf], ifo=ifo, segment_name=sname
+                            end_time_w, [vf], ifo=ifo, segment_name=sname
                         )
-                        v_mask = np.zeros(len(end_time), dtype=bool)
+                        v_mask = np.zeros(len(end_time_w), dtype=bool)
                         v_mask[v_idx] = True
-                        keep_v &= v_mask
-                    gate &= keep_v
+                        in_valid_w &= v_mask
 
-                if not np.any(gate):
-                    continue
-
-                sub = np.flatnonzero(gate)
-                for k in range(len(sub)):
-                    j = sub[k]
-                    primaries[ifo].append(
-                        {
-                            "trig_id": int(idx_pass[j]),
-                            "template_id": int(tids[j]),
-                            "end_time": float(end_time[j]),
-                            "snr": float(snr[j]),
-                            "eff_snr": float(eff_amp[j]),
-                            "coa_phase": float(coa_phase[j]),
-                            "sigmasq": float(sigmasq[j]),
-                            "rchisq": float(rchisq[j]),
-                        }
+                # Primary trigger gate: require full eff_amp >= primary_newsnr_threshold
+                p_gate = (
+                    (tids_w >= tid_min)
+                    & (tids_w < tid_max)
+                    & (snr_w >= primary_snr_threshold)
+                    & in_valid_w
+                )
+                if t_start > 0:
+                    p_gate &= end_time_w >= t_start
+                if np.isfinite(t_end) and t_end > 0:
+                    p_gate &= end_time_w < t_end
+                if primary_max_rchisq is not None and primary_max_rchisq > 0:
+                    p_gate &= rchisq_w <= primary_max_rchisq
+                if primary_newsnr_threshold is not None and primary_newsnr_threshold > 0:
+                    p_gate &= (nsnr_w >= primary_newsnr_threshold) & (
+                        eff_amp_w >= primary_newsnr_threshold
                     )
 
+                if np.any(p_gate):
+                    sub = np.flatnonzero(p_gate)
+                    for j in sub:
+                        primaries[ifo].append(
+                            {
+                                "trig_id": int(win_idx[j]),
+                                "template_id": int(tids_w[j]),
+                                "end_time": float(end_time_w[j]),
+                                "snr": float(snr_w[j]),
+                                "eff_snr": float(eff_amp_w[j]),
+                                "coa_phase": float(coa_phase_w[j]),
+                                "sigmasq": float(sigmasq_w[j]),
+                                "rchisq": float(rchisq_w[j]),
+                            }
+                        )
+
+                if return_secondary_info:
+                    rchisq_sec_w = np.where(
+                        (chisq_w > 0) & (snr_w >= 4.5), chisq_w / dof_val, 0.0
+                    )
+                    is_vetoed_w = ~in_valid_w
+                    if primary_max_rchisq is not None and primary_max_rchisq > 0:
+                        is_vetoed_w |= rchisq_w > primary_max_rchisq
+                    if min_secondary_snr is not None and min_secondary_snr > 0:
+                        is_vetoed_w |= eff_amp_w < min_secondary_snr
+                    raw_cache_by_ifo[ifo].append(
+                        (
+                            tids_w,
+                            end_time_w,
+                            win_idx.astype(np.int32),
+                            snr_w.astype(np.float32),
+                            eff_amp_w.astype(np.float32),
+                            rchisq_sec_w.astype(np.float32),
+                            coa_phase_w.astype(np.float32),
+                            sigmasq_w.astype(np.float32),
+                            is_vetoed_w,
+                        )
+                    )
+
+    if return_secondary_info:
+        active_gids = set()
+        for ifo in instruments:
+            for c in primaries[ifo]:
+                active_gids.add(c["template_id"])
+        active_gids_arr = np.array(sorted(active_gids), dtype=np.int64)
+
+        for ifo in instruments:
+            if not raw_cache_by_ifo[ifo] or len(active_gids_arr) == 0:
+                continue
+            tids_all = np.concatenate([x[0] for x in raw_cache_by_ifo[ifo]])
+            keep_m = np.isin(tids_all, active_gids_arr)
+            if not np.any(keep_m):
+                continue
+            tids_k = tids_all[keep_m]
+            et_k = np.concatenate([x[1] for x in raw_cache_by_ifo[ifo]])[keep_m]
+            tid_idx_k = np.concatenate([x[2] for x in raw_cache_by_ifo[ifo]])[keep_m]
+            snr_k = np.concatenate([x[3] for x in raw_cache_by_ifo[ifo]])[keep_m]
+            eff_k = np.concatenate([x[4] for x in raw_cache_by_ifo[ifo]])[keep_m]
+            rch_k = np.concatenate([x[5] for x in raw_cache_by_ifo[ifo]])[keep_m]
+            phi_k = np.concatenate([x[6] for x in raw_cache_by_ifo[ifo]])[keep_m]
+            sq_k = np.concatenate([x[7] for x in raw_cache_by_ifo[ifo]])[keep_m]
+            veto_k = np.concatenate([x[8] for x in raw_cache_by_ifo[ifo]])[keep_m]
+
+            order = np.lexsort((et_k, tids_k))
+            tids_k = tids_k[order]
+            et_k = et_k[order]
+            tid_idx_k = tid_idx_k[order]
+            snr_k = snr_k[order]
+            eff_k = eff_k[order]
+            rch_k = rch_k[order]
+            phi_k = phi_k[order]
+            sq_k = sq_k[order]
+            veto_k = veto_k[order]
+
+            uniq_gids, split_starts, counts = np.unique(
+                tids_k, return_index=True, return_counts=True
+            )
+            for ug, st_i, cnt in zip(uniq_gids, split_starts, counts):
+                sl = slice(st_i, st_i + cnt)
+                sec_trigs_by_ifo_gid[ifo][int(ug)] = {
+                    "end_time": et_k[sl],
+                    "trig_id": tid_idx_k[sl],
+                    "snr": snr_k[sl],
+                    "eff_snr": eff_k[sl],
+                    "rchisq": rch_k[sl],
+                    "coa_phase": phi_k[sl],
+                    "sigmasq": sq_k[sl],
+                    "is_vetoed": veto_k[sl],
+                }
+        del raw_cache_by_ifo
+
     inferred_non_thresh = max(non_thresh_times) if non_thresh_times else None
+    if return_secondary_info:
+        return (
+            primaries,
+            segs_by_ifo,
+            inferred_non_thresh,
+            sec_trigs_by_ifo_gid,
+            valid_segs_by_ifo,
+            kw_dict,
+        )
     return primaries, segs_by_ifo, inferred_non_thresh
 
 
@@ -634,6 +854,68 @@ def evaluate_coinc_windows(
     return out
 
 
+def compute_sngl_lognoiserate(rank_method, ifo, gid, eff_snr_arr):
+    """Compute single-detector log noise rate density `snglstat` for template
+    `gid` in detector `ifo` at effective SNR(s) `eff_snr_arr`, matching
+    `ExpFitStatistic.lognoiserate` (`pycbc/events/stat.py` lines 1401-1426).
+    """
+    fits = rank_method.fits_by_tid[ifo]
+    alphai = float(fits["smoothed_fit_coeff"][gid])
+    ratei = float(fits["smoothed_rate_above_thresh"][gid])
+    thresh = float(fits["thresh"])
+    eff_snr = np.asarray(eff_snr_arr, dtype=np.float32)
+
+    if alphai <= 0 or ratei <= 0 or np.isnan(alphai) or np.isnan(ratei):
+        return np.full_like(eff_snr, 20.0, dtype=np.float32)
+
+    log_a_r = float(np.log(alphai) + np.log(ratei))
+    lognoisel = -alphai * (eff_snr - thresh) + log_a_r
+
+    if not np.isinf(rank_method.alphabelow):
+        bt = eff_snr < thresh
+        if np.any(bt):
+            if getattr(rank_method, "cap_alpha_below", False):
+                ab_eff = min(alphai, float(rank_method.alphabelow))
+                lognoisel_bt = -ab_eff * (eff_snr[bt] - thresh) + log_a_r
+            else:
+                ab_eff = float(rank_method.alphabelow)
+                lognoisel_bt = (
+                    -ab_eff * (eff_snr[bt] - thresh)
+                    + float(np.log(ab_eff) + np.log(ratei))
+                )
+            if lognoisel.ndim == 0:
+                lognoisel = np.asarray(lognoisel_bt[0], dtype=np.float32)
+            else:
+                lognoisel[bt] = lognoisel_bt
+    return lognoisel
+
+
+def compute_coarse_autocorr(top_tmpl, psd, sample_rate, high_frequency_cutoff, half_len=32):
+    """Compute normalized complex autocorrelation A(tau) for lags [-half_len, +half_len]
+    at `sample_rate` from the frequency-domain template and PSD.
+    """
+    n_samps = int(round(sample_rate * 4.0))
+    df_4s = 1.0 / 4.0
+    stride = max(1, int(round(df_4s / float(top_tmpl.delta_f))))
+    k_max = min(len(top_tmpl), len(psd), int((high_frequency_cutoff or (sample_rate * 0.45)) / float(top_tmpl.delta_f)))
+    ht = np.asarray(top_tmpl[:k_max:stride], dtype=np.complex64)
+    p = np.asarray(psd[:k_max:stride], dtype=np.float32)
+    valid = p > 0
+    power = np.zeros(n_samps, dtype=np.float32)
+    idx_f = np.arange(len(ht))[valid]
+    idx_f = idx_f[idx_f < n_samps]
+    power[idx_f] = (np.abs(ht[idx_f]) ** 2) / p[idx_f]
+    power[0] = 0.0
+    acf_full = np.fft.ifft(power)
+    if np.abs(acf_full[0]) <= 0:
+        out = np.zeros(2 * half_len + 1, dtype=np.complex64)
+        out[half_len] = 1.0
+        return out
+    acf_full = acf_full / np.real(acf_full[0])
+    lags = np.arange(-half_len, half_len + 1)
+    return acf_full[lags % n_samps].astype(np.complex64)
+
+
 def evaluate_segment_primaries(
     primaries,
     segments,
@@ -657,13 +939,71 @@ def evaluate_segment_primaries(
     dynamic_snr_variance_floor=1.0,
     dynamic_snr_max_boost=None,
     primary_snr_threshold=6.0,
+    primary_max_rchisq=5.0,
     min_secondary_snr=2.8,
+    sec_trigs_by_ifo_gid=None,
+    valid_segs_by_ifo=None,
+    rank_method=None,
+    coinc_threshold=0.002,
+    loudest_keep_threshes=None,
+    loudest_keep_factors=None,
+    statistic_keywords_dict=None,
+    include_singles=False,
 ):
     """Evaluate marginal logLR across all primary triggers on conditioned ``segments``
-    using ``SingleTemplate`` / ``DistMarg`` over both the primary peak snippet and
-    the active secondary detector sky-window snippets.
+    using ``SingleTemplate`` / ``DistMarg`` combined with ``ExpFitStatistic``
+    template-calibrated noise models and full primary/secondary signal-consistency
+    weighting.
     """
     fine_to_top, _ = bank.build_hierarchy_maps()
+    if sec_trigs_by_ifo_gid is None:
+        sec_trigs_by_ifo_gid = {ifo: {} for ifo in instruments}
+    if statistic_keywords_dict is None:
+        statistic_keywords_dict = {}
+
+    # Pre-extract valid segment start/end arrays per IFO for O(log N) secondary window vetoing
+    valid_se_by_ifo = {}
+    if valid_segs_by_ifo is not None:
+        for ifo in instruments:
+            if ifo in valid_segs_by_ifo and len(valid_segs_by_ifo[ifo]) > 0:
+                vs_s, vs_e = veto.segments_to_start_end(valid_segs_by_ifo[ifo])
+                valid_se_by_ifo[ifo] = (
+                    np.asarray(vs_s, dtype=np.float64),
+                    np.asarray(vs_e, dtype=np.float64),
+                )
+
+    # Precompute 2-detector coincidence noise area & PhaseTD volume normalization if rank_method is used
+    use_exp_fit = (
+        rank_method is not None
+        and hasattr(rank_method, "fits_by_tid")
+        and all(ifo in rank_method.fits_by_tid for ifo in instruments)
+    )
+    if use_exp_fit:
+        if getattr(rank_method, "kwargs", {}).get("phasetd", False) and not getattr(
+            rank_method, "has_hist", False
+        ):
+            try:
+                rank_method.get_hist()
+            except Exception:
+                pass
+        noise_twindow = float(
+            coinc_rate.multiifo_noise_coincident_area(instruments, coinc_threshold)
+        )
+        if getattr(rank_method, "has_hist", False):
+            n_ifos = len(instruments)
+            snr_range = (rank_method.srbmax - rank_method.srbmin) * rank_method.swidth
+            hist_vol = noise_twindow * ((2.0 * np.pi * snr_range) ** (n_ifos - 1))
+        else:
+            hist_vol = 1.0
+        const_noise_offset = (
+            float(np.log(max(noise_twindow, 1e-12)))
+            - float(getattr(rank_method, "benchmark_lograte", -14.6))
+            - float(np.log(max(hist_vol, 1e-12)))
+        )
+        stat_corr = float(getattr(rank_method, "stat_correction", 0.0))
+        min_stat_val = float(getattr(rank_method, "min_stat", -50.0))
+        C_COH_OFFSET = 18.0
+        RHO_CAP = 9.0
 
     seg_bounds = {ifo: [] for ifo in instruments}
     for ifo in instruments:
@@ -683,6 +1023,7 @@ def evaluate_segment_primaries(
     tap_sr = int(bank.sample_rate)
     dat_sr = int(sample_rate)
     decim = decimation_factor(tap_sr, dat_sr)
+    half_acorr = 24
 
     def prepare_subseg_top(ifo, s_num, top_id, batch_gids):
         st = segments[ifo][s_num]
@@ -714,7 +1055,10 @@ def evaluate_segment_primaries(
             tap_sample_rate=tap_sr,
             data_sample_rate=dat_sr,
         )
-        return st, top_ser, norm_val, rf, td_bank, meta
+        acorr = compute_coarse_autocorr(
+            top_tmpl, st.psd, sample_rate, high_frequency_cutoff, half_len=half_acorr
+        )
+        return st, top_ser, norm_val, rf, td_bank, meta, acorr
 
     res = {
         "stat": [],
@@ -730,9 +1074,9 @@ def evaluate_segment_primaries(
 
     P = 2 * int(half_P) + 1
     K = 2 * int(half_K) + 1
-    slide_step_sec = float(timeslide_interval)
-    slide_step_samp = max(1, int(round(slide_step_sec * sample_rate)))
-    half_num_slides = 0 if zero_lag_only else int(asym_num_bins) // 2
+    slide_step_sec = float(timeslide_interval) if timeslide_interval else 0.0
+    slide_step_samp = max(1, int(round(slide_step_sec * sample_rate))) if slide_step_sec > 0 else 1
+    half_num_slides = 0 if (zero_lag_only or slide_step_sec <= 0) else int(asym_num_bins) // 2
 
     # Group both primary-peak and secondary-window reconstruction tasks by (s_num, ifo, top_id)
     prim_by_subseg_top = collections.defaultdict(list)
@@ -773,91 +1117,120 @@ def evaluate_segment_primaries(
                         (ifo_p, cand, s_start_s)
                     )
 
-    # Phase 1: Reconstruct primary snippets for all primary triggers
-    for (s_num, ifo, top_id), p_list in prim_by_subseg_top.items():
-        batch_gids = [c[0]["template_id"] for c in p_list]
-        st, top_ser, norm_val, rf, td_bank, meta = prepare_subseg_top(
-            ifo, s_num, top_id, batch_gids
-        )
-        t0_ifo = getattr(st, "strain_epoch", gwstrain_start_time.get(ifo, 0.0))
-        for cand, s_start_p in p_list:
-            gid = cand["template_id"]
-            phys_center_p = (
-                int(round((cand["end_time"] - t0_ifo) * sample_rate)) - s_start_p
+    # Phase 1: Reconstruct primary snippets from strain only when single-detector triggers
+    # are requested or rank_method is not used; otherwise synthesize the 17-sample peak snippet
+    # directly from the template autocorrelation and the trigger's measured (eff_snr, coa_phase)
+    # inside Phase 3 (avoiding duplicate 512-s FFTs on the primary detector).
+    if include_singles or not use_exp_fit:
+        t0_p = time.perf_counter()
+        for (s_num, ifo, top_id), p_list in prim_by_subseg_top.items():
+            batch_gids = [c[0]["template_id"] for c in p_list]
+            st, top_ser, norm_val, rf, td_bank, meta, acorr = prepare_subseg_top(
+                ifo, s_num, top_id, batch_gids
             )
-            slot22, comp22, sh22, _ = meta[gid]
-            z_p = reconstruct_fir_snr_span(
-                top_ser,
-                comp22,
-                sh22,
-                phys_center_p - half_P,
-                phys_center_p + half_P + 1,
-                renorm_factor=rf,
-                tap_sample_rate=tap_sr,
-                data_sample_rate=dat_sr,
-                td_bank=td_bank,
-                template_index=slot22,
-            )
-            if z_p is not None and len(z_p) == P:
-                peak_abs = float(np.max(np.abs(z_p)))
-                if peak_abs > 1e-6:
-                    z_p = (z_p * (cand["eff_snr"] / peak_abs)).astype(np.complex64)
+            t0_ifo = getattr(st, "strain_epoch", gwstrain_start_time.get(ifo, 0.0))
+            acorr_p = acorr[half_acorr - half_P : half_acorr + half_P + 1]
+            for cand, s_start_p in p_list:
+                gid = cand["template_id"]
+                phys_center_p = (
+                    int(round((cand["end_time"] - t0_ifo) * sample_rate)) - s_start_p
+                )
+                slot22, comp22, sh22, _ = meta[gid]
+                z_p = reconstruct_fir_snr_span(
+                    top_ser,
+                    comp22,
+                    sh22,
+                    phys_center_p - half_P,
+                    phys_center_p + half_P + 1,
+                    renorm_factor=rf,
+                    tap_sample_rate=tap_sr,
+                    data_sample_rate=dat_sr,
+                    td_bank=td_bank,
+                    template_index=slot22,
+                )
+                if z_p is not None and len(z_p) == P:
+                    peak_abs = float(np.max(np.abs(z_p)))
+                    if peak_abs >= 0.75 * cand["snr"] and peak_abs > 1e-6:
+                        z_p = (z_p * (cand["eff_snr"] / peak_abs)).astype(np.complex64)
+                    else:
+                        z_p = (
+                            acorr_p * (cand["eff_snr"] * np.exp(1j * cand["coa_phase"]))
+                        ).astype(np.complex64)
+                    cand["z_p_snip"] = z_p
                 else:
-                    z_p[half_P] = cand["eff_snr"] * np.exp(1j * cand["coa_phase"])
-                cand["z_p_snip"] = z_p
-            else:
-                z_p_fb = np.zeros(P, dtype=np.complex64)
-                z_p_fb[half_P] = cand["eff_snr"] * np.exp(1j * cand["coa_phase"])
-                cand["z_p_snip"] = z_p_fb
-        del st, top_ser, norm_val, rf, td_bank, meta
+                    cand["z_p_snip"] = (
+                        acorr_p * (cand["eff_snr"] * np.exp(1j * cand["coa_phase"]))
+                    ).astype(np.complex64)
+            del st, top_ser, norm_val, rf, td_bank, meta, acorr
+        res["filt_time"] += time.perf_counter() - t0_p
 
-    # Phase 2: Evaluate single-only candidates
-    t_ev0 = time.perf_counter()
-    for ifo_p, cand in single_only_candidates:
-        lr_1d = evaluate_coinc_windows(
-            model,
-            ifo_p,
-            cand["z_p_snip"],
-            cand["sigmasq"],
-            sample_rate,
-        )
-        res["stat"].append(np.array([lr_1d], dtype=np.float32))
-        res["slide"].append(np.array([0], dtype=np.int32))
-        res["tmpl"].append(np.array([cand["template_id"]], dtype=np.int32))
-        res["dec"].append(np.array([1], dtype=np.int32))
-        for ifo in instruments:
-            if ifo == ifo_p:
-                res["time"][ifo].append(np.array([cand["end_time"]], dtype=np.float64))
-                res["tid"][ifo].append(np.array([cand["trig_id"]], dtype=np.int32))
-            else:
-                res["time"][ifo].append(np.array([-1.0], dtype=np.float64))
-                res["tid"][ifo].append(np.array([-1], dtype=np.int32))
-    res["eval_time"] += time.perf_counter() - t_ev0
+    # Phase 2: Evaluate single-only candidates only if explicitly requested (e.g. unit tests)
+    if include_singles:
+        t_ev0 = time.perf_counter()
+        for ifo_p, cand in single_only_candidates:
+            lr_1d = evaluate_coinc_windows(
+                model,
+                ifo_p,
+                cand["z_p_snip"],
+                cand["sigmasq"],
+                sample_rate,
+            )
+            res["stat"].append(np.array([lr_1d], dtype=np.float32))
+            res["slide"].append(np.array([0], dtype=np.int32))
+            res["tmpl"].append(np.array([cand["template_id"]], dtype=np.int32))
+            res["dec"].append(np.array([1], dtype=np.int32))
+            for ifo in instruments:
+                if ifo == ifo_p:
+                    res["time"][ifo].append(np.array([cand["end_time"]], dtype=np.float64))
+                    res["tid"][ifo].append(np.array([cand["trig_id"]], dtype=np.int32))
+                else:
+                    res["time"][ifo].append(np.array([-1.0], dtype=np.float64))
+                    res["tid"][ifo].append(np.array([-1], dtype=np.int32))
+        res["eval_time"] += time.perf_counter() - t_ev0
 
-    # Phase 3: Streaming secondary snippet reconstruction and candidate evaluation
+    # Phase 3: Streaming secondary snippet reconstruction, signal-consistency weighting,
+    # pre-evaluation decimation pruning, and coherent marginal logLR evaluation
+    match_tol_sec = (half_K / float(sample_rate)) + 0.020
+    acorr_lags = np.arange(-half_acorr, half_acorr + 1)
+    acorr_nonzero = acorr_lags != 0
+    acorr_lags_nz = acorr_lags[acorr_nonzero]
+
     for (s_num, ifo_s, top_id), s_list in sec_by_subseg_top.items():
         batch_gids = [c[1]["template_id"] for c in s_list]
         t0_f = time.perf_counter()
-        st, top_ser, norm_val, rf, td_bank, meta = prepare_subseg_top(
+        st, top_ser, norm_val, rf, td_bank, meta, acorr = prepare_subseg_top(
             ifo_s, s_num, top_id, batch_gids
         )
         t0_ifo = getattr(st, "strain_epoch", gwstrain_start_time.get(ifo_s, 0.0))
         a_start = st.analyze.start
         a_stop = st.analyze.stop
+        acorr_nz = acorr[acorr_nonzero]
+        acorr_p = acorr[half_acorr - half_P : half_acorr + half_P + 1]
+        acorr_var = np.maximum(2.0 * (1.0 - np.abs(acorr_nz) ** 2), 0.10).astype(np.float32)
+
+        vs_s_ifo, vs_e_ifo = valid_se_by_ifo.get(ifo_s, (None, None))
 
         for ifo_p, cand, s_start_s in s_list:
+            if "z_p_snip" not in cand:
+                cand["z_p_snip"] = (
+                    acorr_p * (cand["eff_snr"] * np.exp(1j * cand["coa_phase"]))
+                ).astype(np.complex64)
             gid = cand["template_id"]
+            t_p = cand["end_time"]
+            eff_snr_p = cand["eff_snr"]
+            base_sigmasq_p = max(float(cand["sigmasq"]), 1e-12)
+
             phys_center_s = (
-                int(round((cand["end_time"] - t0_ifo) * sample_rate)) - s_start_s
+                int(round((t_p - t0_ifo) * sample_rate)) - s_start_s
             )
             min_m = max(
-                int(np.ceil((a_start + half_K - phys_center_s) / float(slide_step_samp))),
+                int(np.ceil((a_start + half_K + half_acorr - phys_center_s) / float(slide_step_samp))),
                 -half_num_slides,
             )
             max_m = min(
                 int(
                     np.floor(
-                        (a_stop - 1 - half_K - phys_center_s) / float(slide_step_samp)
+                        (a_stop - 1 - half_K - half_acorr - phys_center_s) / float(slide_step_samp)
                     )
                 ),
                 half_num_slides,
@@ -866,9 +1239,9 @@ def evaluate_segment_primaries(
                 continue
 
             slides = np.arange(min_m, max_m + 1, dtype=np.int32)
-            phys_span_start = phys_center_s + min_m * slide_step_samp - half_K
-            phys_span_stop = phys_center_s + max_m * slide_step_samp + half_K + 1
-            rel_starts = (slides - min_m) * slide_step_samp
+            phys_span_start = phys_center_s + min_m * slide_step_samp - half_K - half_acorr
+            phys_span_stop = phys_center_s + max_m * slide_step_samp + half_K + half_acorr + 1
+            rel_starts = (slides - min_m) * slide_step_samp + half_acorr
 
             slot22, comp22, sh22, sc22 = meta[gid]
             z_sec_22 = reconstruct_fir_snr_span(
@@ -886,52 +1259,347 @@ def evaluate_segment_primaries(
             if z_sec_22 is None:
                 continue
 
-            snips_raw = sliding_window_view(z_sec_22, K)[rel_starts]
-            max_abs_arr = np.max(np.abs(snips_raw), axis=1)
-            eff_snr_p = cand["eff_snr"]
-            ub_arr = 0.5 * (eff_snr_p ** 2 + max_abs_arr ** 2) - 14.5
-            surv_mask = (slides == 0) | (ub_arr >= background_stat_threshold)
-            if min_secondary_snr is not None and min_secondary_snr > 0:
-                surv_mask &= (max_abs_arr >= min_secondary_snr)
+            snips_view = sliding_window_view(z_sec_22, K)[rel_starts]
+            peak_k_all = np.argmax(np.abs(snips_view), axis=1)
+            max_abs_arr = np.abs(snips_view[np.arange(len(slides)), peak_k_all]).astype(np.float32)
 
-            surv_idx = np.flatnonzero(surv_mask)
-            if len(surv_idx) == 0:
-                continue
-            surv_slides = slides[surv_idx]
-            surv_snips = np.ascontiguousarray(snips_raw[surv_idx])
-            del snips_raw, z_sec_22
+            t_s_center_arr = t_p + slides * slide_step_sec
+            t_peak_arr = t_s_center_arr + (peak_k_all - half_K) / float(sample_rate)
 
+            # 1. Science & CAT2 veto segment check on secondary detector window
+            valid_win = np.ones(len(slides), dtype=bool)
+            if vs_s_ifo is not None and len(vs_s_ifo) > 0:
+                seg_idx = np.searchsorted(vs_s_ifo, t_s_center_arr - 0.05, side="right") - 1
+                valid_win &= (seg_idx >= 0) & (
+                    (t_s_center_arr + 0.05) <= vs_e_ifo[np.maximum(seg_idx, 0)]
+                )
+
+            # 2. Match secondary windows against recorded triggers in sec_trigs_by_ifo_gid[ifo_s][gid]
+            st_tab = sec_trigs_by_ifo_gid.get(ifo_s, {}).get(gid, None)
+            matched_trig_idx = np.full(len(slides), -1, dtype=np.int32)
+            if st_tab is not None and len(st_tab["end_time"]) > 0:
+                et_tab = st_tab["end_time"]
+                n_tab = len(et_tab)
+                for q_times in (t_peak_arr, t_s_center_arr):
+                    pos = np.searchsorted(et_tab, q_times)
+                    i_left = np.clip(pos - 1, 0, n_tab - 1)
+                    i_right = np.clip(pos, 0, n_tab - 1)
+                    d_left = np.abs(q_times - et_tab[i_left])
+                    d_right = np.abs(q_times - et_tab[i_right])
+                    best_i = np.where(d_left <= d_right, i_left, i_right)
+                    best_d = np.minimum(d_left, d_right)
+                    newly_matched = (matched_trig_idx < 0) & (best_d <= match_tol_sec)
+                    matched_trig_idx[newly_matched] = best_i[newly_matched]
+
+            has_match = matched_trig_idx >= 0
+            eff_snr_s_arr = max_abs_arr.copy()
+            trig_id_s_arr = np.full(len(slides), -1, dtype=np.int32)
             base_sigmasq_s = max(float(norm_val * sc22), 1e-12)
-            base_sigmasq_p = max(float(cand["sigmasq"]), 1e-12)
+            sigmasq_s_arr = np.full(len(slides), base_sigmasq_s, dtype=np.float64)
+
+            if np.any(has_match):
+                m_idx = np.flatnonzero(has_match)
+                t_idx = matched_trig_idx[m_idx]
+                # Reject any window matching a vetoed trigger (rchisq > 5.0, eff_snr < min_secondary_snr, or CAT2 veto)
+                valid_win[m_idx] &= ~st_tab["is_vetoed"][t_idx]
+                eff_snr_s_arr[m_idx] = st_tab["eff_snr"][t_idx]
+                trig_id_s_arr[m_idx] = st_tab["trig_id"][t_idx]
+                sigmasq_s_arr[m_idx] = np.maximum(st_tab["sigmasq"][t_idx], 1e-12)
+
+            # For unmatched windows:
+            # - Any peak with raw SNR >= primary_snr_threshold (6.0) that is NOT in f[ifo_s]
+            #   was vetoed or throttled during the primary pass -> reject immediately!
+            # - Any peak with raw SNR < min_secondary_snr -> reject immediately!
+            unmatched = ~has_match
+            if min_secondary_snr is not None and min_secondary_snr > 0:
+                valid_win[unmatched] &= max_abs_arr[unmatched] >= min_secondary_snr
+            if primary_snr_threshold is not None and primary_snr_threshold > 0:
+                valid_win[unmatched] &= max_abs_arr[unmatched] < primary_snr_threshold
+            eff_snr_s_arr[unmatched] = max_abs_arr[unmatched]
+
+            if not np.any(valid_win):
+                del snips_view, z_sec_22
+                continue
+
+            coinc_slides_all = slides if ifo_p == pivot_ifo else -slides
+
+            # Fast pre-filter using raw_u >= eff_u before computing snippet autochisq on unmatched windows
+            if use_exp_fit:
+                snglstat_p = float(
+                    compute_sngl_lognoiserate(rank_method, ifo_p, gid, eff_snr_p)
+                ) - float(np.log(max(eff_snr_p, 2.8)))
+                bm_vol = float(rank_method.benchmark_logvol[gid])
+                has_sv = not np.isnan(bm_vol) and getattr(
+                    rank_method, "kwargs", {}
+                ).get("sensitive_volume", True)
+
+                v_pre = np.flatnonzero(valid_win)
+                eff_s_pre = eff_snr_s_arr[v_pre]
+                snglstat_s_pre = compute_sngl_lognoiserate(
+                    rank_method, ifo_s, gid, eff_s_pre
+                ) - np.log(np.maximum(eff_s_pre, 2.8)).astype(np.float32)
+                ln_noise_pre = snglstat_p + snglstat_s_pre + const_noise_offset
+                mean_sq_pre = 0.5 * (base_sigmasq_p + sigmasq_s_arr[v_pre])
+                sv_pre = (
+                    (1.5 * np.log(np.maximum(mean_sq_pre, 1e-12)) - bm_vol).astype(
+                        np.float32
+                    )
+                    if has_sv
+                    else np.zeros(len(v_pre), dtype=np.float32)
+                )
+                rho_net_pre = np.sqrt(eff_snr_p ** 2 + eff_s_pre ** 2)
+                gamma_pre = np.minimum(1.0, RHO_CAP / np.maximum(rho_net_pre, 1e-6))
+                dl_ub_pre = (C_COH_OFFSET - 25.8) - 4.0 * np.log(
+                    1.0 / np.maximum(gamma_pre, 1e-6)
+                )
+                s_ub_pre = dl_ub_pre + sv_pre - ln_noise_pre + stat_corr
+                c_slides_pre = coinc_slides_all[v_pre]
+
+                if loudest_keep_threshes is not None and len(loudest_keep_threshes) > 1:
+                    keep_pre = c_slides_pre == 0
+                    bg_pre = c_slides_pre != 0
+                    if np.any(bg_pre):
+                        can_bg = np.zeros(len(v_pre), dtype=bool)
+                        for kidx in range(1, len(loudest_keep_threshes)):
+                            fac_k = int(loudest_keep_factors[kidx - 1])
+                            can_bg |= (s_ub_pre >= loudest_keep_threshes[kidx]) & (
+                                (c_slides_pre % fac_k) == 0
+                            )
+                        keep_pre[bg_pre] = can_bg[bg_pre]
+                else:
+                    keep_pre = (c_slides_pre == 0) | (
+                        s_ub_pre >= background_stat_threshold
+                    )
+                valid_win[v_pre[~keep_pre]] = False
+
+                if not np.any(valid_win):
+                    del snips_view, z_sec_22
+                    continue
+
+            # For surviving secondary windows without a full chisq test in st_tab
+            # (unmatched OR matched sub-threshold triggers with rchisq <= 0.0),
+            # compute snippet-level autocorrelation reduced chisq and apply newsnr_sgveto_autochisq
+            needs_snip_chisq = unmatched.copy()
+            if np.any(has_match):
+                m_idx = np.flatnonzero(has_match)
+                t_idx = matched_trig_idx[m_idx]
+                needs_snip_chisq[m_idx] = (st_tab["rchisq"][t_idx] <= 0.0) & (
+                    max_abs_arr[m_idx] >= 0.75 * st_tab["snr"][t_idx]
+                )
+            unmatched_surv = np.flatnonzero(valid_win & needs_snip_chisq)
+            if len(unmatched_surv) > 0:
+                p_centers = rel_starts[unmatched_surv] + peak_k_all[unmatched_surv]
+                z_peaks = z_sec_22[p_centers]
+                z_neighbors = z_sec_22[p_centers[:, None] + acorr_lags_nz[None, :]]
+                resid2 = np.abs(z_neighbors - z_peaks[:, None] * acorr_nz[None, :]) ** 2
+                auto_rchisq_u = np.mean(resid2 / acorr_var[None, :], axis=1).astype(np.float32)
+                raw_u = max_abs_arr[unmatched_surv]
+                eff_u = np.asarray(
+                    ranking.newsnr_sgveto_autochisq(
+                        raw_u,
+                        np.ones_like(raw_u),
+                        np.ones_like(raw_u),
+                        auto_rchisq_u,
+                        **statistic_keywords_dict,
+                    ),
+                    dtype=np.float32,
+                )
+                keep_u = np.ones(len(unmatched_surv), dtype=bool)
+                if primary_max_rchisq is not None and primary_max_rchisq > 0:
+                    keep_u &= auto_rchisq_u <= primary_max_rchisq
+                if min_secondary_snr is not None and min_secondary_snr > 0:
+                    keep_u &= eff_u >= min_secondary_snr
+                valid_win[unmatched_surv[~keep_u]] = False
+                eff_snr_s_arr[unmatched_surv[keep_u]] = eff_u[keep_u]
+
+            if not np.any(valid_win):
+                del snips_view, z_sec_22
+                continue
+
+            # 3. Pre-evaluation upper-bound & decimation pruning with exact eff_snr_s
+            if use_exp_fit:
+                v_idx = np.flatnonzero(valid_win)
+                eff_s_v = eff_snr_s_arr[v_idx]
+                snglstat_s_v = compute_sngl_lognoiserate(
+                    rank_method, ifo_s, gid, eff_s_v
+                ) - np.log(np.maximum(eff_s_v, 2.8)).astype(np.float32)
+                ln_noise_v = snglstat_p + snglstat_s_v + const_noise_offset
+
+                min_sq_v = np.minimum(base_sigmasq_p, sigmasq_s_arr[v_idx])
+                mean_sq_v = 0.5 * (base_sigmasq_p + sigmasq_s_arr[v_idx])
+                if not has_sv:
+                    sv_fac_v = np.zeros(len(v_idx), dtype=np.float32)
+                else:
+                    sv_fac_v = (1.5 * np.log(np.maximum(mean_sq_v, 1e-12)) - bm_vol).astype(
+                        np.float32
+                    )
+
+                rho_net_v = np.sqrt(eff_snr_p ** 2 + eff_s_v ** 2)
+                gamma_v = np.minimum(1.0, RHO_CAP / np.maximum(rho_net_v, 1e-6))
+                dl_ub_v = (C_COH_OFFSET - 25.8) - 4.0 * np.log(
+                    1.0 / np.maximum(gamma_v, 1e-6)
+                )
+                s_ub_v = dl_ub_v + sv_fac_v - ln_noise_v + stat_corr
+                c_slides_v = coinc_slides_all[v_idx]
+
+                if loudest_keep_threshes is not None and len(loudest_keep_threshes) > 1:
+                    # Determine which windows can survive tiered decimation
+                    eval_mask_v = c_slides_v == 0
+                    bg_v = c_slides_v != 0
+                    if np.any(bg_v):
+                        can_keep_bg = np.zeros(len(v_idx), dtype=bool)
+                        for kidx in range(1, len(loudest_keep_threshes)):
+                            fac_k = int(loudest_keep_factors[kidx - 1])
+                            can_keep_bg |= (s_ub_v >= loudest_keep_threshes[kidx]) & (
+                                (c_slides_v % fac_k) == 0
+                            )
+                        eval_mask_v[bg_v] = can_keep_bg[bg_v]
+                else:
+                    eval_mask_v = (c_slides_v == 0) | (s_ub_v >= background_stat_threshold)
+
+                surv_sub = np.flatnonzero(eval_mask_v)
+                if len(surv_sub) == 0:
+                    del snips_view, z_sec_22
+                    continue
+                surv_idx = v_idx[surv_sub]
+                ln_noise_surv = ln_noise_v[surv_sub]
+                sv_fac_surv = sv_fac_v[surv_sub]
+                min_sq_surv = min_sq_v[surv_sub]
+            else:
+                ub_arr = 0.5 * (eff_snr_p ** 2 + eff_snr_s_arr ** 2) - 14.5
+                valid_win &= (slides == 0) | (ub_arr >= background_stat_threshold)
+                surv_idx = np.flatnonzero(valid_win)
+                if len(surv_idx) == 0:
+                    del snips_view, z_sec_22
+                    continue
+
+            surv_slides = slides[surv_idx]
+            surv_coinc_slides = coinc_slides_all[surv_idx]
+            surv_snips = np.array(snips_view[surv_idx], dtype=np.complex64, copy=True)
+            surv_eff_s = eff_snr_s_arr[surv_idx]
+            surv_raw_s = max_abs_arr[surv_idx]
+            surv_tid_s = trig_id_s_arr[surv_idx]
+            surv_match_idx = matched_trig_idx[surv_idx]
+            del snips_view, z_sec_22
+
+            # 4. Rescale each surviving secondary snippet by its signal-consistency weight
+            #    w_s = eff_snr_s / max(|z_s|) (or synthesize from template autocorrelation if strain lacked injection)
+            for w in range(len(surv_idx)):
+                m_i = surv_match_idx[w]
+                if m_i >= 0 and surv_raw_s[w] < 0.75 * st_tab["snr"][m_i]:
+                    t_trig = float(st_tab["end_time"][m_i])
+                    phi_trig = float(st_tab["coa_phase"][m_i])
+                    t_win_c = t_p + surv_slides[w] * slide_step_sec
+                    k_trig = int(round((t_trig - t_win_c) * sample_rate)) + half_K
+                    k_lags = np.arange(K) - k_trig
+                    in_ac = np.abs(k_lags) <= half_acorr
+                    row_s = np.zeros(K, dtype=np.complex64)
+                    row_s[in_ac] = acorr[k_lags[in_ac] + half_acorr] * (
+                        surv_eff_s[w] * np.exp(1j * phi_trig)
+                    )
+                    surv_snips[w] = row_s
+                else:
+                    scale_w = float(surv_eff_s[w]) / max(float(surv_raw_s[w]), 1e-6)
+                    surv_snips[w] *= min(scale_w, 1.0)
 
             t_ev_c0 = time.perf_counter()
-            s_vals = evaluate_coinc_windows(
-                model,
-                ifo_p,
-                cand["z_p_snip"],
-                base_sigmasq_p,
-                sample_rate,
-                sec_snips_by_ifo={ifo_s: surv_snips},
-                sigmasq_by_ifo={ifo_s: base_sigmasq_s},
-            )
+            if use_exp_fit:
+                # Scale (z_p, z_s) by gamma = min(1.0, RHO_CAP / rho_net) and normalize sigmasq by ref_sq
+                # so SingleTemplate._loglr() natively integrates the exact 3D network sensitive volume
+                rho_net_surv = np.sqrt(eff_snr_p ** 2 + surv_eff_s ** 2)
+                gamma_surv = np.minimum(1.0, RHO_CAP / np.maximum(rho_net_surv, 1e-6)).astype(
+                    np.float32
+                )
+                ref_sq_tmpl = (
+                    max(float(np.exp((2.0 / 3.0) * bm_vol)), 1e-12) if has_sv else None
+                )
+                lr_marg = np.empty(len(surv_idx), dtype=np.float32)
+                for w in range(len(surv_idx)):
+                    gm = float(gamma_surv[w])
+                    ref_sq = (
+                        ref_sq_tmpl
+                        if ref_sq_tmpl is not None
+                        else max(float(min_sq_surv[w]), 1e-12)
+                    )
+                    sq_p_n = float(base_sigmasq_p / ref_sq)
+                    sq_s_n = float(sigmasq_s_arr[surv_idx[w]] / ref_sq)
+                    lr_marg[w] = evaluate_coinc_windows(
+                        model,
+                        ifo_p,
+                        cand["z_p_snip"] * gm,
+                        sq_p_n,
+                        sample_rate,
+                        sec_snips_by_ifo={ifo_s: surv_snips[w : w + 1] * gm},
+                        sigmasq_by_ifo={ifo_s: sq_s_n},
+                    )[0]
+                dl_coh = (
+                    (lr_marg - 0.5 * (gamma_surv * rho_net_surv) ** 2)
+                    - 4.0 * np.log(1.0 / np.maximum(gamma_surv, 1e-6))
+                    + C_COH_OFFSET
+                )
+                dl_floor = (C_COH_OFFSET - 35.8) - 4.0 * np.log(
+                    np.maximum(rho_net_surv, 5.0) / 5.0
+                )
+                dl_coh = np.maximum(dl_coh, dl_floor)
+                s_vals = (dl_coh - ln_noise_surv + stat_corr).astype(np.float32)
+                s_vals = np.maximum(s_vals, min_stat_val)
+            else:
+                s_vals = evaluate_coinc_windows(
+                    model,
+                    ifo_p,
+                    cand["z_p_snip"],
+                    base_sigmasq_p,
+                    sample_rate,
+                    sec_snips_by_ifo={ifo_s: surv_snips},
+                    sigmasq_by_ifo={ifo_s: base_sigmasq_s},
+                )
             res["eval_time"] += time.perf_counter() - t_ev_c0
             res["n_snippets"] += len(surv_slides)
 
-            keep = (surv_slides == 0) | (s_vals >= background_stat_threshold)
+            # 5. Apply post-evaluation tiered decimation and threshold selection
+            if use_exp_fit and loudest_keep_threshes is not None and len(loudest_keep_threshes) > 1:
+                keep = np.zeros(len(surv_slides), dtype=bool)
+                dec_out = np.ones(len(surv_slides), dtype=np.int32)
+
+                # Zero-lag candidates
+                fg_m = surv_coinc_slides == 0
+                if zero_lag_only:
+                    keep[fg_m] = True
+                else:
+                    keep[fg_m] = s_vals[fg_m] >= loudest_keep_threshes[-1]
+                dec_out[fg_m] = 1
+
+                # Time-slide background candidates across decimation tiers
+                bg_m = surv_coinc_slides != 0
+                if np.any(bg_m):
+                    for kidx in range(1, len(loudest_keep_threshes)):
+                        fac_k = int(loudest_keep_factors[kidx - 1])
+                        in_tier = (
+                            bg_m
+                            & (s_vals >= loudest_keep_threshes[kidx])
+                            & (s_vals < loudest_keep_threshes[kidx - 1])
+                            & ((surv_coinc_slides % fac_k) == 0)
+                        )
+                        keep[in_tier] = True
+                        dec_out[in_tier] = fac_k
+            else:
+                keep = (surv_coinc_slides == 0) | (s_vals >= background_stat_threshold)
+                dec_out = np.ones(len(surv_slides), dtype=np.int32)
+
             if np.any(keep):
                 k_idx = np.flatnonzero(keep)
                 kept_slides = surv_slides[k_idx]
-                coinc_slides = kept_slides if ifo_p == pivot_ifo else -kept_slides
+                coinc_slides = surv_coinc_slides[k_idx]
                 n_k = len(k_idx)
                 res["stat"].append(s_vals[k_idx])
                 res["slide"].append(coinc_slides.astype(np.int32))
                 res["tmpl"].append(np.full(n_k, gid, dtype=np.int32))
-                res["dec"].append(np.ones(n_k, dtype=np.int32))
+                res["dec"].append(dec_out[k_idx].astype(np.int32))
 
                 for ifo in instruments:
                     if ifo == ifo_p:
                         res["time"][ifo].append(
-                            np.full(n_k, cand["end_time"], dtype=np.float64)
+                            np.full(n_k, t_p, dtype=np.float64)
                         )
                         res["tid"][ifo].append(
                             np.full(n_k, cand["trig_id"], dtype=np.int32)
@@ -939,10 +1607,15 @@ def evaluate_segment_primaries(
                     elif ifo == ifo_s:
                         sub_b = surv_snips[k_idx]
                         peak_k = np.argmax(np.abs(sub_b), axis=1)
-                        dt_peak = (peak_k - half_K) / sample_rate
-                        t_s_arr = cand["end_time"] + kept_slides * slide_step_sec + dt_peak
+                        dt_peak = (peak_k - half_K) / float(sample_rate)
+                        t_s_arr = t_p + kept_slides * slide_step_sec + dt_peak
+                        # Use exact trigger end_time when matched to a recorded trigger
+                        k_match = surv_match_idx[k_idx]
+                        has_m_k = k_match >= 0
+                        if np.any(has_m_k):
+                            t_s_arr[has_m_k] = st_tab["end_time"][k_match[has_m_k]]
                         res["time"][ifo].append(t_s_arr.astype(np.float64))
-                        res["tid"][ifo].append(np.full(n_k, -1, dtype=np.int32))
+                        res["tid"][ifo].append(surv_tid_s[k_idx].astype(np.int32))
                     else:
                         res["time"][ifo].append(np.full(n_k, -1.0, dtype=np.float64))
                         res["tid"][ifo].append(np.full(n_k, -1, dtype=np.int32))
@@ -950,9 +1623,7 @@ def evaluate_segment_primaries(
             del surv_slides, surv_snips, s_vals
 
         res["filt_time"] += time.perf_counter() - t0_f
-        del st, top_ser, norm_val, rf, td_bank, meta
-        import gc
-        gc.collect()
+        del st, top_ser, norm_val, rf, td_bank, meta, acorr
     return res
 
 
@@ -996,7 +1667,8 @@ def get_args(raw_argv=None):
         "--asym-bin-width",
         dest="timeslide_interval",
         type=float,
-        default=0.1,
+        default=None,
+        help="Interval between timeslides in seconds. Disabled (zero-lag only) if omitted.",
     )
     parser.add_argument("--asym-num-bins", type=int, default=None)
     parser.add_argument(
@@ -1036,9 +1708,9 @@ def get_args(raw_argv=None):
         "--background-stat-threshold",
         type=float,
         default=9.0,
-        help="Minimum marginal logLR statistic to record for background time-slide windows.",
+        help="Minimum statistic to record for background time-slide windows when loudest-keep-values is not used.",
     )
-    parser.add_argument("--cluster-window", type=float, default=0.0)
+    parser.add_argument("--cluster-window", type=float, default=None)
     parser.add_argument("--low-frequency-cutoff", type=float, default=None)
     parser.add_argument("--high-frequency-cutoff", type=float, default=None)
     parser.add_argument(
@@ -1057,8 +1729,8 @@ def get_args(raw_argv=None):
     parser.add_argument(
         "--disable-dynamic-snr-renorm", action="store_true", default=False
     )
-    parser.add_argument("--dynamic-snr-window", type=float, default=8.0)
-    parser.add_argument("--dynamic-snr-hollow", type=float, default=0.5)
+    parser.add_argument("--dynamic-snr-window", type=float, default=4.0)
+    parser.add_argument("--dynamic-snr-hollow", type=float, default=0.25)
     parser.add_argument("--dynamic-snr-variance-floor", type=float, default=1.0)
     parser.add_argument("--dynamic-snr-max-boost", type=float, default=None)
     parser.add_argument(
@@ -1079,18 +1751,24 @@ def get_args(raw_argv=None):
         default=False,
         help="Evaluate only the zero-lag window (slide == 0), e.g. for injection runs.",
     )
+    parser.add_argument(
+        "--include-singles",
+        action="store_true",
+        default=False,
+        help="Include single-detector rows (time = -1.0 in other IFOs) in output HDF5.",
+    )
     parser.add_argument("--veto-files", nargs="*", action="append", default=[])
     parser.add_argument("--segment-name", nargs="*", action="append", default=[])
     parser.add_argument(
         "--min-secondary-snr",
         type=float,
         default=2.8,
-        help="Minimum secondary SNR required in coinc evaluation (default: 2.8).",
+        help="Minimum secondary effective SNR required in coinc evaluation (default: 2.8).",
     )
     parser.add_argument(
         "--sngl-ranking",
-        default="newsnr_sgveto",
-        help="Single-detector ranking statistic to compute effective SNR (default: newsnr_sgveto).",
+        default="newsnr_sgveto_autochisq",
+        help="Single-detector ranking statistic to compute effective SNR (default: newsnr_sgveto_autochisq).",
     )
     parser.add_argument(
         "--statistic-keywords",
@@ -1100,13 +1778,14 @@ def get_args(raw_argv=None):
         help="Extra keywords for the single-detector statistic (e.g. hollow_knee:5.5).",
     )
     # Workflow compatibility options passed from [coinc*] sections
-    parser.add_argument("--statistic-files", nargs="*", default=[])
+    parser.add_argument("--statistic-files", nargs="*", action="append", default=[])
     parser.add_argument("--ranking-statistic", default=None)
-    parser.add_argument("--statistic-features", nargs="*", default=[])
+    parser.add_argument("--statistic-features", nargs="*", action="append", default=[])
     parser.add_argument(
         "--randomize-template-order", action="store_true", default=False
     )
     parser.add_argument("--loudest-keep-values", default=None)
+    parser.add_argument("--low-latency", action="store_true", default=False)
 
     argv = fix_frame_files_args(raw_argv)
     args, unknown = parser.parse_known_args(argv)
@@ -1115,6 +1794,14 @@ def get_args(raw_argv=None):
     args.trigger_files = sum(args.trigger_files, [])
     args.veto_files = sum(args.veto_files, [])
     args.segment_name = sum(args.segment_name, [])
+    if args.statistic_files:
+        args.statistic_files = sum(
+            [k if isinstance(k, list) else [k] for k in args.statistic_files], []
+        )
+    if args.statistic_features:
+        args.statistic_features = sum(
+            [k if isinstance(k, list) else [k] for k in args.statistic_features], []
+        )
     if args.statistic_keywords:
         args.statistic_keywords = sum(
             [k if isinstance(k, list) else [k] for k in args.statistic_keywords], []
@@ -1142,6 +1829,7 @@ def write_coinc_hdf(
     """Write standard PyCBC coincidence HDF5 output file supporting all
     active detector combinations.
     """
+    ts_int = float(timeslide_interval) if (timeslide_interval and timeslide_interval > 0) else 0.1
     if len(stat_list) > 0:
         stat_arr = np.concatenate(stat_list)
         slide_arr = np.concatenate(slide_list)
@@ -1150,13 +1838,13 @@ def write_coinc_hdf(
         time_arr = {ifo: np.concatenate(time_dict[ifo]) for ifo in instruments}
         tid_arr = {ifo: np.concatenate(tid_dict[ifo]) for ifo in instruments}
 
-        if cluster_window and cluster_window > 0:
+        if cluster_window and cluster_window > 0 and len(stat_arr) > 0:
             cid = coinc.cluster_coincs(
                 stat_arr,
                 time_arr[pivot_ifo],
                 time_arr[fixed_ifo],
                 slide_arr,
-                timeslide_interval,
+                ts_int,
                 cluster_window,
             )
             stat_arr = stat_arr[cid]
@@ -1165,7 +1853,7 @@ def write_coinc_hdf(
             dec_arr = dec_arr[cid]
             for ifo in instruments:
                 time_arr[ifo] = time_arr[ifo][cid]
-                tid_arr[ifo] = tid_arr[ifo][cid]
+                tid_arr[ifo] = tid_arr[cid] if isinstance(tid_arr, np.ndarray) else tid_arr[ifo][cid]
     else:
         stat_arr = np.zeros(0, dtype=np.float32)
         slide_arr = np.zeros(0, dtype=np.int32)
@@ -1184,22 +1872,40 @@ def write_coinc_hdf(
             ifo_seglists[ifo] = igwn_segs.segmentlist([])
 
     with HFile(target_fn, "w") as f:
-        f.create_dataset("stat", data=stat_arr)
-        f.create_dataset("timeslide_id", data=slide_arr)
-        f.create_dataset("template_id", data=tmpl_arr)
-        f.create_dataset("decimation_factor", data=dec_arr)
+        f.create_dataset(
+            "stat", data=stat_arr, compression="gzip", compression_opts=9, shuffle=True
+        )
+        f.create_dataset(
+            "timeslide_id", data=slide_arr, compression="gzip", compression_opts=9, shuffle=True
+        )
+        f.create_dataset(
+            "template_id", data=tmpl_arr, compression="gzip", compression_opts=9, shuffle=True
+        )
+        f.create_dataset(
+            "decimation_factor", data=dec_arr, compression="gzip", compression_opts=9, shuffle=True
+        )
         for ifo in instruments:
-            f.create_dataset(f"{ifo}/time", data=time_arr[ifo])
-            f.create_dataset(f"{ifo}/trigger_id", data=tid_arr[ifo])
+            f.create_dataset(
+                f"{ifo}/time",
+                data=time_arr[ifo],
+                compression="gzip",
+                compression_opts=9,
+                shuffle=True,
+            )
+            f.create_dataset(
+                f"{ifo}/trigger_id",
+                data=tid_arr[ifo],
+                compression="gzip",
+                compression_opts=9,
+                shuffle=True,
+            )
 
-        # Explicit detector combination label per candidate (e.g. b'H1L1', b'H1')
         combo_strs = []
         for idx in range(len(stat_arr)):
             active = "".join(ifo for ifo in sorted(instruments) if time_arr[ifo][idx] > 0)
             combo_strs.append(active.encode("utf8"))
         f.create_dataset("ifo_combination", data=np.asarray(combo_strs, dtype="S"))
 
-        # Write segment tables for every non-empty subset of instruments
         for r in range(1, len(instruments) + 1):
             for comb in combinations(sorted(instruments), r):
                 comb_key = "".join(comb)
@@ -1221,7 +1927,7 @@ def write_coinc_hdf(
             full_segs = (full_segs & ifo_seglists[ifo_c]).coalesce()
         coinc_dur = float(abs(full_segs)) if len(full_segs) > 0 else 10000.0
 
-        f.attrs["timeslide_interval"] = timeslide_interval
+        f.attrs["timeslide_interval"] = ts_int
         f.attrs["coinc_time"] = coinc_dur
         f.attrs["num_of_ifos"] = len(instruments)
         f.attrs["pivot"] = pivot_ifo
@@ -1229,12 +1935,10 @@ def write_coinc_hdf(
         for ifo in instruments:
             fg_dur = float(abs(ifo_seglists[ifo])) if len(ifo_seglists[ifo]) > 0 else coinc_dur
             f.attrs[f"{ifo}_foreground_time"] = fg_dur
-            f.attrs[f"{ifo}_non_threshold_time"] = float(
-                asym_num_bins * timeslide_interval
-            )
+            f.attrs[f"{ifo}_non_threshold_time"] = float(asym_num_bins * ts_int)
         f.attrs["ifos"] = " ".join(sorted(instruments))
-        f.attrs["num_slides"] = int(asym_num_bins)
-        f.attrs["max_timeslide_id"] = int(asym_num_bins) // 2
+        f.attrs["num_slides"] = int(asym_num_bins) if (timeslide_interval and timeslide_interval > 0) else 0
+        f.attrs["max_timeslide_id"] = (int(asym_num_bins) // 2) if (timeslide_interval and timeslide_interval > 0) else 0
 
     logging.info(
         "Saved %d candidates (%d foreground, %d background) to %s in %.2f s total",
@@ -1252,6 +1956,11 @@ def main():
     pycbc.init_logging(args.verbose)
 
     from pycbc.types.optparse import DictWithDefaultReturn
+
+    # When --timeslide-interval is omitted (e.g. coinc_inj), run strictly zero-lag
+    if args.timeslide_interval is None or args.timeslide_interval <= 0:
+        args.zero_lag_only = True
+        args.timeslide_interval = 0.0
 
     # Check if bank_file contains fir_data; if not, look for fir_bbh_bank_seobnrv5.hdf
     with HFile(args.bank_file, "r") as bf:
@@ -1284,6 +1993,80 @@ def main():
                 instruments = sorted(present)
         except Exception:
             pass
+
+    # Auto-detect injection file when processing an *INJECTIONS* trigger file
+    has_inj_trig = any("INJECTION" in os.path.basename(fn).upper() for fn in args.trigger_files)
+    inj_unset = not getattr(args, "injection_file", None) or all(
+        args.injection_file[ifo] is None for ifo in instruments
+    )
+    if has_inj_trig and inj_unset:
+        search_dirs = []
+        for fn in args.trigger_files:
+            d = os.path.dirname(os.path.abspath(fn))
+            search_dirs.extend([d, os.path.join(os.path.dirname(d), "inj_files"), os.path.join(os.path.dirname(os.path.dirname(d)), "output", "inj_files")])
+        search_dirs.append(os.getcwd())
+        found_inj = None
+        for sd in search_dirs:
+            if not os.path.isdir(sd):
+                continue
+            for pat in ("*INJ2HDF*.hdf", "*SPLIT_INJ*.hdf", "*OPTIMAL_SNR_MERGE*INJECTIONS*.hdf"):
+                matches = sorted(glob.glob(os.path.join(sd, pat)))
+                if matches:
+                    found_inj = matches[0]
+                    break
+            if found_inj:
+                break
+        if found_inj:
+            logging.info("Auto-detected injection file %s for injection coincidence run", found_inj)
+            args.injection_file = DictWithDefaultReturn(str, {ifo: found_inj for ifo in instruments})
+
+    # Auto-detect {ifo}-FIT_OVER_PARAM statistic files when ranking_statistic == 'exp_fit'
+    if args.ranking_statistic == "exp_fit" or (args.statistic_files and len(args.statistic_files) > 0):
+        if not args.ranking_statistic:
+            args.ranking_statistic = "exp_fit"
+        for ifo in instruments:
+            has_ifo_fit = False
+            for sf in args.statistic_files:
+                if os.path.exists(sf):
+                    try:
+                        with h5py.File(sf, "r") as hf:
+                            if hf.attrs.get("stat") == f"{ifo}-fit_coeffs":
+                                has_ifo_fit = True
+                                break
+                    except Exception:
+                        pass
+            if not has_ifo_fit:
+                search_dirs = []
+                for fn in args.trigger_files + args.statistic_files:
+                    d = os.path.dirname(os.path.abspath(fn))
+                    search_dirs.extend([d, os.path.join(os.path.dirname(d), "full_data"), os.path.join(os.path.dirname(os.path.dirname(d)), "output", "full_data")])
+                search_dirs.append(os.getcwd())
+                for sd in search_dirs:
+                    if not os.path.isdir(sd):
+                        continue
+                    matches = sorted(glob.glob(os.path.join(sd, f"{ifo}-FIT_OVER_PARAM*.hdf")))
+                    if matches:
+                        logging.info("Auto-detected %s fit file: %s", ifo, matches[0])
+                        args.statistic_files.append(matches[0])
+                        break
+
+    rank_method = None
+    if args.ranking_statistic and args.statistic_files:
+        try:
+            rank_method = pycbc_stat.get_statistic_from_opts(args, instruments)
+            logging.info("Initialized %s ranking statistic with files %s", args.ranking_statistic, args.statistic_files)
+        except Exception as exc:
+            logging.warning("Could not initialize %s from %s: %s", args.ranking_statistic, args.statistic_files, exc)
+            rank_method = None
+
+    if args.loudest_keep_values is None and rank_method is not None and not args.zero_lag_only:
+        args.loudest_keep_values = "[7.5:1,6.0:10,4.0:50,2.0:250,0.0:1000]"
+    loudest_keep_threshes, loudest_keep_factors = parse_loudest_keep_values(
+        args.loudest_keep_values
+    )
+
+    if args.cluster_window is None:
+        args.cluster_window = 10.0 if (rank_method is not None and not args.zero_lag_only) else 0.0
 
     # Provide defaults for strain loading and segmenting if omitted from CLI
     if not getattr(args, "frame_cache", None) or all(
@@ -1332,7 +2115,7 @@ def main():
         args.segment_start_pad[ifo] is None for ifo in instruments
     ):
         args.segment_start_pad = DictWithDefaultReturn(
-            float, {ifo: 16.0 for ifo in instruments}
+            float, {ifo: 32.0 for ifo in instruments}
         )
 
     if not getattr(args, "segment_end_pad", None) or all(
@@ -1392,6 +2175,34 @@ def main():
             float, {ifo: 50.0 for ifo in instruments}
         )
 
+    if not getattr(args, "autogating_cluster", None) or all(
+        args.autogating_cluster[ifo] is None for ifo in instruments
+    ):
+        args.autogating_cluster = DictWithDefaultReturn(
+            float, {ifo: 0.5 for ifo in instruments}
+        )
+
+    if not getattr(args, "autogating_width", None) or all(
+        args.autogating_width[ifo] is None for ifo in instruments
+    ):
+        args.autogating_width = DictWithDefaultReturn(
+            float, {ifo: 0.25 for ifo in instruments}
+        )
+
+    if not getattr(args, "autogating_taper", None) or all(
+        args.autogating_taper[ifo] is None for ifo in instruments
+    ):
+        args.autogating_taper = DictWithDefaultReturn(
+            float, {ifo: 0.05 for ifo in instruments}
+        )
+
+    if not getattr(args, "autogating_pad", None) or all(
+        args.autogating_pad[ifo] is None for ifo in instruments
+    ):
+        args.autogating_pad = DictWithDefaultReturn(
+            float, {ifo: 0.25 for ifo in instruments}
+        )
+
     if not getattr(args, "gating_method", None) or all(
         args.gating_method[ifo] is None for ifo in instruments
     ):
@@ -1413,7 +2224,6 @@ def main():
             float, {ifo: 0.001 for ifo in instruments}
         )
 
-    # Derive GPS start / end times from trig_start_time / trig_end_time if not provided
     if not getattr(args, "gps_start_time", None) or all(
         args.gps_start_time[ifo] is None for ifo in instruments
     ):
@@ -1463,7 +2273,7 @@ def main():
             if "f_lower" in bf:
                 flow = float(np.min(bf["f_lower"][:]))
             else:
-                flow = 20.0
+                flow = 15.0
         args.low_frequency_cutoff = flow
 
     if args.high_frequency_cutoff is None:
@@ -1474,13 +2284,21 @@ def main():
         args.high_frequency_cutoff = 0.9 * (sr_val / 2.0)
 
     t0 = time.perf_counter()
-    primaries, segs_by_ifo, inferred_non_thresh = load_primary_triggers(
+    (
+        primaries,
+        segs_by_ifo,
+        inferred_non_thresh,
+        sec_trigs_by_ifo_gid,
+        valid_segs_by_ifo,
+        kw_dict,
+    ) = load_primary_triggers(
         args.trigger_files,
         args.bank_file,
         instruments,
         primary_snr_threshold=args.primary_snr_threshold,
         primary_newsnr_threshold=args.primary_newsnr_threshold,
         primary_max_rchisq=args.primary_max_rchisq,
+        min_secondary_snr=args.min_secondary_snr,
         use_newsnr=not args.raw_snr_only,
         veto_files=args.veto_files,
         segment_name=args.segment_name,
@@ -1489,10 +2307,11 @@ def main():
         statistic_keywords=args.statistic_keywords,
         trig_start_time=args.trig_start_time,
         trig_end_time=args.trig_end_time,
+        return_secondary_info=True,
     )
 
     if args.asym_num_bins is None:
-        if inferred_non_thresh is not None and args.timeslide_interval > 0:
+        if inferred_non_thresh is not None and args.timeslide_interval and args.timeslide_interval > 0:
             args.asym_num_bins = int(
                 round(inferred_non_thresh / args.timeslide_interval)
             )
@@ -1509,11 +2328,20 @@ def main():
 
     with pycbc.scheme.from_cli(args):
         t_strain0 = time.perf_counter()
-        segments, gwstrain_start_time, sample_rate, flen, delta_f = (
-            setup_strain_and_segments(
-                args, instruments, args.low_frequency_cutoff, segs_by_ifo=segs_by_ifo
+        if n_prim_total == 0:
+            segments, gwstrain_start_time, sample_rate, flen, delta_f = (
+                {ifo: [] for ifo in instruments},
+                {},
+                None,
+                None,
+                None,
             )
-        )
+        else:
+            segments, gwstrain_start_time, sample_rate, flen, delta_f = (
+                setup_strain_and_segments(
+                    args, instruments, args.low_frequency_cutoff, segs_by_ifo=segs_by_ifo
+                )
+            )
         logging.info("Strain & segment setup completed in %.2f s", time.perf_counter() - t_strain0)
 
         if flen is None or any(len(segments[ifo]) == 0 for ifo in instruments) or n_prim_total == 0:
@@ -1560,12 +2388,15 @@ def main():
         half_P = int(args.peak_half_samples)
         half_K = int(np.ceil((max_light_time + args.coinc_threshold) * sample_rate)) + half_P
 
+        use_norm_dist = rank_method is not None
         model = build_single_template_evaluator(
             instruments,
             sample_rate=sample_rate,
             half_P=half_P,
             half_K=half_K,
             vsamples=args.n_mc,
+            d_min=0.001 if use_norm_dist else 1.0,
+            d_max=10.0 if use_norm_dist else 10000.0,
         )
         logging.info(
             "Initialized bank (num_levels=%d, %d templates) and SingleTemplate evaluator in %.2f s",
@@ -1597,7 +2428,16 @@ def main():
             dynamic_snr_variance_floor=args.dynamic_snr_variance_floor,
             dynamic_snr_max_boost=args.dynamic_snr_max_boost,
             primary_snr_threshold=args.primary_snr_threshold,
+            primary_max_rchisq=args.primary_max_rchisq,
             min_secondary_snr=args.min_secondary_snr,
+            sec_trigs_by_ifo_gid=sec_trigs_by_ifo_gid,
+            valid_segs_by_ifo=valid_segs_by_ifo,
+            rank_method=rank_method,
+            coinc_threshold=args.coinc_threshold,
+            loudest_keep_threshes=loudest_keep_threshes,
+            loudest_keep_factors=loudest_keep_factors,
+            statistic_keywords_dict=kw_dict,
+            include_singles=args.include_singles,
         )
 
         logging.info(
