@@ -965,6 +965,8 @@ class ExpFitStatistic(PhaseTDStatistic):
         self.coinc_long_dur_exp = float(self.kwargs.get("coinc_long_dur_exp", 0.0))
         self.coinc_chieff_knee = float(self.kwargs.get("coinc_chieff_knee", 1.0))
         self.coinc_chieff_slope = float(self.kwargs.get("coinc_chieff_slope", 0.0))
+        self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
+        self.coinc_eta_slope = float(self.kwargs.get("coinc_eta_slope", 0.0))
         self.coinc_dur_prior = None
 
         # This will be used to keep track of the template number being used
@@ -1414,6 +1416,17 @@ class ExpFitStatistic(PhaseTDStatistic):
                 prior[chi_mask] -= (
                     self.coinc_chieff_slope
                     * (chieff[chi_mask] - self.coinc_chieff_knee)
+                ).astype(numpy.float32)
+        if (
+            self.coinc_eta_slope > 0.0
+            and self.coinc_eta_knee > 0.0
+            and eta is not None
+        ):
+            eta_mask = eta < self.coinc_eta_knee
+            if numpy.any(eta_mask):
+                prior[eta_mask] -= (
+                    self.coinc_eta_slope
+                    * (self.coinc_eta_knee - eta[eta_mask])
                 ).astype(numpy.float32)
         self.coinc_dur_prior = prior
 
@@ -2169,6 +2182,8 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         self.coinc_long_dur_exp = float(self.kwargs.get("coinc_long_dur_exp", 0.0))
         self.coinc_chieff_knee = float(self.kwargs.get("coinc_chieff_knee", 1.0))
         self.coinc_chieff_slope = float(self.kwargs.get("coinc_chieff_slope", 0.0))
+        self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
+        self.coinc_eta_slope = float(self.kwargs.get("coinc_eta_slope", 0.0))
         self.coinc_dur_prior = None
 
     def single(self, trigs):
