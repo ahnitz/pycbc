@@ -946,13 +946,15 @@ class ExpFitStatistic(PhaseTDStatistic):
         else:
             self.cap_alpha_below = bool(val_cap)
 
-        # Optional template-duration prior for multi-detector coincidences
+        # Optional template-duration and effective-spin prior for multi-detector coincidences
         self.coinc_dur_exp = float(self.kwargs.get("coinc_dur_exp", 0.0))
         self.coinc_dur_knee = float(self.kwargs.get("coinc_dur_knee", 1.0))
         self.coinc_dur_ref = float(self.kwargs.get("coinc_dur_ref", 7.0))
         self.coinc_dur_max = float(self.kwargs.get("coinc_dur_max", 22.0))
         self.coinc_short_dur_knee = float(self.kwargs.get("coinc_short_dur_knee", 0.0))
         self.coinc_short_dur_exp = float(self.kwargs.get("coinc_short_dur_exp", 0.0))
+        self.coinc_chieff_knee = float(self.kwargs.get("coinc_chieff_knee", 1.0))
+        self.coinc_chieff_slope = float(self.kwargs.get("coinc_chieff_slope", 0.0))
         self.coinc_dur_prior = None
 
         # This will be used to keep track of the template number being used
@@ -1240,6 +1242,10 @@ class ExpFitStatistic(PhaseTDStatistic):
             fits_by_tid_dict["template_duration"] = coeff_file[
                 "template_duration"
             ][:][tid_sort].astype(float)
+        if "chi_eff" in coeff_file:
+            fits_by_tid_dict["chi_eff"] = coeff_file[
+                "chi_eff"
+            ][:][tid_sort].astype(float)
 
         # The by-template fits may have been stored in the smoothed fits file
         if "fit_by_template" in coeff_file:
@@ -1315,10 +1321,15 @@ class ExpFitStatistic(PhaseTDStatistic):
 
     def _compute_coinc_dur_prior(self):
         """
-        Compute template-duration prior array over template_id for multi-detector
-        coincident ranking when coinc_dur_exp or coinc_short_dur_exp is enabled.
+        Compute template-duration and effective-spin prior array over template_id
+        for multi-detector coincident ranking when coinc_dur_exp, coinc_short_dur_exp,
+        or coinc_chieff_slope is enabled.
         """
-        if self.coinc_dur_exp == 0.0 and self.coinc_short_dur_exp == 0.0:
+        if (
+            self.coinc_dur_exp == 0.0
+            and self.coinc_short_dur_exp == 0.0
+            and self.coinc_chieff_slope == 0.0
+        ):
             self.coinc_dur_prior = None
             return
         dur = None
@@ -1346,6 +1357,22 @@ class ExpFitStatistic(PhaseTDStatistic):
                     self.coinc_short_dur_knee
                     / numpy.maximum(dur[short_mask], 0.05)
                 ).astype(numpy.float32)
+        if self.coinc_chieff_slope > 0.0:
+            chieff = None
+            for ifo in list(self.ifos) + list(self.fits_by_tid.keys()):
+                if (
+                    ifo in self.fits_by_tid
+                    and "chi_eff" in self.fits_by_tid[ifo]
+                ):
+                    chieff = self.fits_by_tid[ifo]["chi_eff"]
+                    break
+            if chieff is not None:
+                chi_mask = chieff > self.coinc_chieff_knee
+                if numpy.any(chi_mask):
+                    prior[chi_mask] -= (
+                        self.coinc_chieff_slope
+                        * (chieff[chi_mask] - self.coinc_chieff_knee)
+                    ).astype(numpy.float32)
         self.coinc_dur_prior = prior
 
     def find_fits(self, trigs):
@@ -1472,7 +1499,7 @@ class ExpFitStatistic(PhaseTDStatistic):
                     ab_eff = numpy.minimum(alphai, self.alphabelow)
                 lognoiselbt = (
                     -ab_eff * (sngl_stat - thresh)
-                    + numpy.log(alphai)
+                    + numpy.log(ab_eff)
                     + numpy.log(ratei)
                 )
             else:
@@ -2058,13 +2085,15 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         else:
             self.cap_alpha_below = bool(val_cap)
 
-        # Optional template-duration prior for multi-detector coincidences
+        # Optional template-duration and effective-spin prior for multi-detector coincidences
         self.coinc_dur_exp = float(self.kwargs.get("coinc_dur_exp", 0.0))
         self.coinc_dur_knee = float(self.kwargs.get("coinc_dur_knee", 1.0))
         self.coinc_dur_ref = float(self.kwargs.get("coinc_dur_ref", 7.0))
         self.coinc_dur_max = float(self.kwargs.get("coinc_dur_max", 22.0))
         self.coinc_short_dur_knee = float(self.kwargs.get("coinc_short_dur_knee", 0.0))
         self.coinc_short_dur_exp = float(self.kwargs.get("coinc_short_dur_exp", 0.0))
+        self.coinc_chieff_knee = float(self.kwargs.get("coinc_chieff_knee", 1.0))
+        self.coinc_chieff_slope = float(self.kwargs.get("coinc_chieff_slope", 0.0))
         self.coinc_dur_prior = None
 
     def single(self, trigs):
