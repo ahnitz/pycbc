@@ -709,6 +709,9 @@ def build_single_template_evaluator(
         UniformRadius(distance=(float(d_min), float(d_max))),
     )
 
+    # Fix RNG seed so Monte Carlo extrinsic vector & sky-delay grid initialization is deterministic
+    np.random.seed(42)
+
     model = SingleTemplate(
         vparams,
         data=None,
@@ -1349,8 +1352,29 @@ def evaluate_segment_primaries(
                 )
                 rho_net_pre = np.sqrt(eff_snr_p ** 2 + eff_s_pre ** 2)
                 gamma_pre = np.minimum(1.0, RHO_CAP / np.maximum(rho_net_pre, 1e-6))
-                dl_ub_pre = (C_COH_OFFSET - 25.8) - 4.0 * np.log(
-                    1.0 / np.maximum(gamma_pre, 1e-6)
+                sig_rat_ps_pre = np.sqrt(
+                    base_sigmasq_p / np.maximum(sigmasq_s_arr[v_pre], 1e-12)
+                ).astype(np.float32)
+                sig_rat_sp_pre = 1.0 / np.maximum(sig_rat_ps_pre, 1e-6)
+                dp_sky_pre = np.maximum(
+                    0.0,
+                    np.maximum(
+                        eff_snr_p - 1.35 * sig_rat_ps_pre * eff_s_pre,
+                        eff_s_pre - 1.35 * sig_rat_sp_pre * eff_snr_p,
+                    ),
+                )
+                dp_null_pre = np.maximum(
+                    0.0,
+                    np.maximum(
+                        eff_snr_p - 2.0 * sig_rat_ps_pre * eff_s_pre,
+                        eff_s_pre - 2.0 * sig_rat_sp_pre * eff_snr_p,
+                    ),
+                )
+                dl_ub_pre = (
+                    (C_COH_OFFSET - 16.8)
+                    - 4.0 * np.log(1.0 / np.maximum(gamma_pre, 1e-6))
+                    - 0.5 * (gamma_pre ** 2) * (dp_sky_pre ** 2 / 2.8225)
+                    - 0.5 * (1.0 - gamma_pre ** 2) * (dp_null_pre ** 2 / 5.0)
                 )
                 s_ub_pre = dl_ub_pre + sv_pre - ln_noise_pre + stat_corr
                 c_slides_pre = coinc_slides_all[v_pre]
@@ -1436,8 +1460,29 @@ def evaluate_segment_primaries(
 
                 rho_net_v = np.sqrt(eff_snr_p ** 2 + eff_s_v ** 2)
                 gamma_v = np.minimum(1.0, RHO_CAP / np.maximum(rho_net_v, 1e-6))
-                dl_ub_v = (C_COH_OFFSET - 25.8) - 4.0 * np.log(
-                    1.0 / np.maximum(gamma_v, 1e-6)
+                sig_rat_ps_v = np.sqrt(
+                    base_sigmasq_p / np.maximum(sigmasq_s_arr[v_idx], 1e-12)
+                ).astype(np.float32)
+                sig_rat_sp_v = 1.0 / np.maximum(sig_rat_ps_v, 1e-6)
+                dp_sky_v = np.maximum(
+                    0.0,
+                    np.maximum(
+                        eff_snr_p - 1.35 * sig_rat_ps_v * eff_s_v,
+                        eff_s_v - 1.35 * sig_rat_sp_v * eff_snr_p,
+                    ),
+                )
+                dp_null_v = np.maximum(
+                    0.0,
+                    np.maximum(
+                        eff_snr_p - 2.0 * sig_rat_ps_v * eff_s_v,
+                        eff_s_v - 2.0 * sig_rat_sp_v * eff_snr_p,
+                    ),
+                )
+                dl_ub_v = (
+                    (C_COH_OFFSET - 16.8)
+                    - 4.0 * np.log(1.0 / np.maximum(gamma_v, 1e-6))
+                    - 0.5 * (gamma_v ** 2) * (dp_sky_v ** 2 / 2.8225)
+                    - 0.5 * (1.0 - gamma_v ** 2) * (dp_null_v ** 2 / 5.0)
                 )
                 s_ub_v = dl_ub_v + sv_fac_v - ln_noise_v + stat_corr
                 c_slides_v = coinc_slides_all[v_idx]
@@ -1532,13 +1577,31 @@ def evaluate_segment_primaries(
                         sec_snips_by_ifo={ifo_s: surv_snips[w : w + 1] * gm},
                         sigmasq_by_ifo={ifo_s: sq_s_n},
                     )[0]
+                sig_rat_ps_surv = np.sqrt(
+                    base_sigmasq_p / np.maximum(sigmasq_s_arr[surv_idx], 1e-12)
+                ).astype(np.float32)
+                sig_rat_sp_surv = 1.0 / np.maximum(sig_rat_ps_surv, 1e-6)
+                dp_null_surv = np.maximum(
+                    0.0,
+                    np.maximum(
+                        eff_snr_p - 2.0 * sig_rat_ps_surv * surv_eff_s,
+                        surv_eff_s - 2.0 * sig_rat_sp_surv * eff_snr_p,
+                    ),
+                )
+                amp_null_pen_surv = (
+                    -0.5 * (1.0 - gamma_surv ** 2) * (dp_null_surv ** 2 / 5.0)
+                )
                 dl_coh = (
                     (lr_marg - 0.5 * (gamma_surv * rho_net_surv) ** 2)
                     - 4.0 * np.log(1.0 / np.maximum(gamma_surv, 1e-6))
+                    + amp_null_pen_surv
                     + C_COH_OFFSET
                 )
-                dl_floor = (C_COH_OFFSET - 35.8) - 4.0 * np.log(
-                    np.maximum(rho_net_surv, 5.0) / 5.0
+                dl_floor = (
+                    sv_fac_surv
+                    + (C_COH_OFFSET - 35.8)
+                    - 4.0 * np.log(np.maximum(rho_net_surv, 5.0) / 5.0)
+                    + amp_null_pen_surv
                 )
                 dl_coh = np.maximum(dl_coh, dl_floor)
                 s_vals = (dl_coh - ln_noise_surv + stat_corr).astype(np.float32)
