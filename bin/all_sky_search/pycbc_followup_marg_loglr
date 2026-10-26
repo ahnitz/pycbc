@@ -878,7 +878,7 @@ def compute_sngl_lognoiserate(rank_method, ifo, gid, eff_snr_arr):
         bt = eff_snr < thresh
         if np.any(bt):
             if getattr(rank_method, "cap_alpha_below", False):
-                ab_eff = min(alphai, float(rank_method.alphabelow))
+                ab_eff = min(max(alphai, 3.2), float(rank_method.alphabelow))
                 lognoisel_bt = -ab_eff * (eff_snr[bt] - thresh) + log_a_r
             else:
                 ab_eff = float(rank_method.alphabelow)
@@ -1005,7 +1005,7 @@ def evaluate_segment_primaries(
         )
         stat_corr = float(getattr(rank_method, "stat_correction", 0.0))
         min_stat_val = float(getattr(rank_method, "min_stat", -50.0))
-        C_COH_OFFSET = 18.0
+        C_COH_OFFSET = 18.2
         RHO_CAP = 9.0
 
     seg_bounds = {ifo: [] for ifo in instruments}
@@ -1079,6 +1079,7 @@ def evaluate_segment_primaries(
     K = 2 * int(half_K) + 1
     slide_step_sec = float(timeslide_interval) if timeslide_interval else 0.0
     slide_step_samp = max(1, int(round(slide_step_sec * sample_rate))) if slide_step_sec > 0 else 1
+    slide_step_true = (float(slide_step_samp) / float(sample_rate)) if slide_step_sec > 0 else 0.0
     half_num_slides = 0 if (zero_lag_only or slide_step_sec <= 0) else int(asym_num_bins) // 2
 
     # Group both primary-peak and secondary-window reconstruction tasks by (s_num, ifo, top_id)
@@ -1193,7 +1194,7 @@ def evaluate_segment_primaries(
 
     # Phase 3: Streaming secondary snippet reconstruction, signal-consistency weighting,
     # pre-evaluation decimation pruning, and coherent marginal logLR evaluation
-    match_tol_sec = (half_K / float(sample_rate)) + 0.020
+    match_tol_sec = (half_K / float(sample_rate)) + 0.002
     acorr_lags = np.arange(-half_acorr, half_acorr + 1)
     acorr_nonzero = acorr_lags != 0
     acorr_lags_nz = acorr_lags[acorr_nonzero]
@@ -1266,7 +1267,7 @@ def evaluate_segment_primaries(
             peak_k_all = np.argmax(np.abs(snips_view), axis=1)
             max_abs_arr = np.abs(snips_view[np.arange(len(slides)), peak_k_all]).astype(np.float32)
 
-            t_s_center_arr = t_p + slides * slide_step_sec
+            t_s_center_arr = t_p + slides * slide_step_true
             t_peak_arr = t_s_center_arr + (peak_k_all - half_K) / float(sample_rate)
 
             # 1. Science & CAT2 veto segment check on secondary detector window
@@ -1282,16 +1283,23 @@ def evaluate_segment_primaries(
             matched_trig_idx = np.full(len(slides), -1, dtype=np.int32)
             if st_tab is not None and len(st_tab["end_time"]) > 0:
                 et_tab = st_tab["end_time"]
+                snr_tab = st_tab["snr"]
                 n_tab = len(et_tab)
-                for q_times in (t_peak_arr, t_s_center_arr):
+                for q_times, q_tol in ((t_peak_arr, 0.006), (t_s_center_arr, match_tol_sec)):
                     pos = np.searchsorted(et_tab, q_times)
                     i_left = np.clip(pos - 1, 0, n_tab - 1)
                     i_right = np.clip(pos, 0, n_tab - 1)
                     d_left = np.abs(q_times - et_tab[i_left])
                     d_right = np.abs(q_times - et_tab[i_right])
-                    best_i = np.where(d_left <= d_right, i_left, i_right)
-                    best_d = np.minimum(d_left, d_right)
-                    newly_matched = (matched_trig_idx < 0) & (best_d <= match_tol_sec)
+                    both_close = (d_left <= 0.004) & (d_right <= 0.004)
+                    prefer_left = np.where(
+                        both_close,
+                        snr_tab[i_left] >= snr_tab[i_right],
+                        d_left <= d_right,
+                    )
+                    best_i = np.where(prefer_left, i_left, i_right)
+                    best_d = np.where(prefer_left, d_left, d_right)
+                    newly_matched = (matched_trig_idx < 0) & (best_d <= q_tol)
                     matched_trig_idx[newly_matched] = best_i[newly_matched]
 
             has_match = matched_trig_idx >= 0
@@ -1417,7 +1425,11 @@ def evaluate_segment_primaries(
                 z_neighbors = z_sec_22[p_centers[:, None] + acorr_lags_nz[None, :]]
                 resid2 = np.abs(z_neighbors - z_peaks[:, None] * acorr_nz[None, :]) ** 2
                 auto_rchisq_u = np.mean(resid2 / acorr_var[None, :], axis=1).astype(np.float32)
-                raw_u = max_abs_arr[unmatched_surv]
+                raw_u = max_abs_arr[unmatched_surv].copy()
+                has_m_u = has_match[unmatched_surv]
+                if np.any(has_m_u):
+                    t_u = matched_trig_idx[unmatched_surv[has_m_u]]
+                    raw_u[has_m_u] = np.minimum(raw_u[has_m_u], st_tab["eff_snr"][t_u])
                 eff_u = np.asarray(
                     ranking.newsnr_sgveto_autochisq(
                         raw_u,
@@ -1528,13 +1540,13 @@ def evaluate_segment_primaries(
             del snips_view, z_sec_22
 
             # 4. Rescale each surviving secondary snippet by its signal-consistency weight
-            #    w_s = eff_snr_s / max(|z_s|) (or synthesize from template autocorrelation if strain lacked injection)
+            #    w_s = eff_snr_s / max(|z_s|) (or synthesize from template autocorrelation on injection runs if strain lacked injection)
             for w in range(len(surv_idx)):
                 m_i = surv_match_idx[w]
-                if m_i >= 0 and surv_raw_s[w] < 0.75 * st_tab["snr"][m_i]:
+                if zero_lag_only and m_i >= 0 and surv_raw_s[w] < 0.75 * st_tab["snr"][m_i]:
                     t_trig = float(st_tab["end_time"][m_i])
                     phi_trig = float(st_tab["coa_phase"][m_i])
-                    t_win_c = t_p + surv_slides[w] * slide_step_sec
+                    t_win_c = t_p + surv_slides[w] * slide_step_true
                     k_trig = int(round((t_trig - t_win_c) * sample_rate)) + half_K
                     k_lags = np.arange(K) - k_trig
                     in_ac = np.abs(k_lags) <= half_acorr
@@ -1671,7 +1683,7 @@ def evaluate_segment_primaries(
                         sub_b = surv_snips[k_idx]
                         peak_k = np.argmax(np.abs(sub_b), axis=1)
                         dt_peak = (peak_k - half_K) / float(sample_rate)
-                        t_s_arr = t_p + kept_slides * slide_step_sec + dt_peak
+                        t_s_arr = t_p + kept_slides * slide_step_true + dt_peak
                         # Use exact trigger end_time when matched to a recorded trigger
                         k_match = surv_match_idx[k_idx]
                         has_m_k = k_match >= 0
