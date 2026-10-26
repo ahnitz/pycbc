@@ -996,6 +996,7 @@ for inj_file, tag in zip(inj_files, inj_tags):
             pivot_ifo,
             fixed_ifo,
             tags=ctagcomb,
+            inj_file=inj_file,
         )
 
         # Rerank events

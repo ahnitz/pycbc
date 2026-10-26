@@ -442,12 +442,10 @@ fg_coinc_type = fg_coinc_type[cidx]
 n_triggers = f["foreground/stat"].size
 
 logging.info("Calculating event times to determine which types of coinc are available")
-times_tuple = (f[f"foreground/{ifo}/time"][:] for ifo in all_ifos)
-test_times = np.array(
-    [pycbc.events.mean_if_greater_than_zero(tc)[0] for tc in zip(*times_tuple)]
-)
-
-del times_tuple
+t_mat = np.vstack([f[f"foreground/{ifo}/time"][:] for ifo in all_ifos])
+pos_mask = t_mat > 0
+test_times = np.sum(np.where(pos_mask, t_mat, 0.0), axis=0) / np.maximum(np.sum(pos_mask, axis=0), 1)
+del t_mat, pos_mask
 
 # Create a dictionary of whether the coincidence is in an available time for
 # each interferometer combination
@@ -529,7 +527,7 @@ def compute_combined_fars(
     If isolate_backgrounds is False (default):
     - Sums FARs across all active background times matching upstream PyCBC behavior.
     """
-    isincombo_mask = np.array([list(in_combo_time[ct]) for ct in combos])
+    isincombo_mask = np.vstack([np.asarray(in_combo_time[ct]) for ct in combos])
     if not isolate_backgrounds:
         return np.sum(isincombo_mask * in_fars, axis=0)
 
@@ -567,8 +565,8 @@ def compute_combined_fars(
 
 
 # Create n_combos by n_triggers arrays of FARs
-fg_fars = np.array([list(far[ct]) for ct in all_ifo_combos])
-fg_fars_exc = np.array([list(far_exc[ct]) for ct in all_ifo_combos])
+fg_fars = np.vstack([np.asarray(far[ct]) for ct in all_ifo_combos])
+fg_fars_exc = np.vstack([np.asarray(far_exc[ct]) for ct in all_ifo_combos])
 
 # Combine the FARs with the compatibility mask to obtain the new ifars
 fg_fars_out = compute_combined_fars(
@@ -860,6 +858,7 @@ while True:
     logging.info(
         f"Removing background triggers at time {maxtime} within window {args.hierarchical_removal_window}s"
     )
+    bg_removed_any = {}
     for combo in all_ifo_combos:
         all_hred_idx = []
         for ifo in all_ifos:
@@ -868,64 +867,53 @@ while True:
                 hred_ids = np.nonzero(
                     abs(times - maxtime) < args.hierarchical_removal_window
                 )[0]
-                all_hred_idx += list(hred_ids)
-        logging.info(f"Removing {len(all_hred_idx)} background triggers from {combo}")
-        sep_bg_data[combo] = sep_bg_data[combo].remove(all_hred_idx)
+                if len(hred_ids) > 0:
+                    all_hred_idx.append(hred_ids)
+        if all_hred_idx:
+            all_hred_idx = np.unique(np.concatenate(all_hred_idx))
+            logging.info(f"Removing {len(all_hred_idx)} background triggers from {combo}")
+            sep_bg_data[combo] = sep_bg_data[combo].remove(all_hred_idx)
+            bg_removed_any[combo] = True
+        else:
+            logging.info(f"Removing 0 background triggers from {combo}")
+            bg_removed_any[combo] = False
 
-    hred_ids = []
-    for ifo in all_ifos:
-        times = combined_bg_data.data["%s/time" % ifo][:]
-        within_window = np.flatnonzero(
-            abs(times - maxtime) < args.hierarchical_removal_window
-        )
-        hred_ids += list(within_window)
-    logging.info(
-        f"Removing {len(hred_ids)} background triggers from combined background"
-    )
-    combined_bg_data = combined_bg_data.remove(hred_ids)
-
-    logging.info("Recalculating IFARs")
-    times_tuple = tuple(combined_fg_data.data[ifo + "/time"][:] for ifo in all_ifos)
-    test_times = np.array(
-        [pycbc.events.mean_if_greater_than_zero(tc)[0] for tc in zip(*times_tuple)]
-    )
+    logging.info("Recalculating IFARs and combined IFARs")
+    t_mat = np.vstack([combined_fg_data.data[ifo + "/time"][:] for ifo in all_ifos])
+    pos_mask = t_mat > 0
+    test_times = np.sum(np.where(pos_mask, t_mat, 0.0), axis=0) / np.maximum(np.sum(pos_mask, axis=0), 1)
+    del t_mat, pos_mask
+    sec_per_yr = 1.0 / conv.sec_to_year(1.0)
     for key in all_ifo_combos:
-        # In principle, bg time should be adjusted, but is expected to be a
-        # negligible correction
         fg_time_ct[key] -= args.cluster_window
-        bg_t_y = conv.sec_to_year(bg_time_ct[key])
         fg_t_y = conv.sec_to_year(fg_time_ct[key])
-        bg_far, fg_far, _ = significance.get_far(
-            sep_bg_data[key].data["stat"],
-            sep_fg_data[key].data["stat"],
-            sep_bg_data[key].data["decimation_factor"],
-            bg_t_y,
-            **significance_dict[key],
-        )
-        fg_far = significance.apply_far_limit(
-            fg_far,
-            significance_dict,
-            combo=key,
-        )
-        bg_far = significance.apply_far_limit(
-            bg_far,
-            significance_dict,
-            combo=key,
-        )
-
-        sep_bg_data[key].data["ifar"] = 1.0 / bg_far
-        sep_fg_data[key].data["ifar"] = 1.0 / fg_far
-        sep_fg_data[key].data["fap"] = 1 - np.exp(-fg_t_y * fg_far)
-
-    logging.info("Recalculating combined IFARs")
-    for key in all_ifo_combos:
-        _, far[key], _ = significance.get_far(
-            sep_bg_data[key].data["stat"],
-            combined_fg_data.data["stat"],
-            sep_bg_data[key].data["decimation_factor"],
-            bg_time_ct[key],
-            **significance_dict[key],
-        )
+        if bg_removed_any.get(key, True) or h_iterations == 1:
+            bg_far_sec, far[key], _ = significance.get_far(
+                sep_bg_data[key].data["stat"],
+                combined_fg_data.data["stat"],
+                sep_bg_data[key].data["decimation_factor"],
+                bg_time_ct[key],
+                **significance_dict[key],
+            )
+            bg_far = bg_far_sec * sec_per_yr
+            fg_far_sub = far[key][fg_coinc_type == key.encode("utf8")] * sec_per_yr
+            fg_far = significance.apply_far_limit(
+                fg_far_sub,
+                significance_dict,
+                combo=key,
+            )
+            bg_far = significance.apply_far_limit(
+                bg_far,
+                significance_dict,
+                combo=key,
+            )
+            sep_bg_data[key].data["ifar"] = 1.0 / bg_far
+            sep_fg_data[key].data["ifar"] = 1.0 / fg_far
+            sep_fg_data[key].data["fap"] = 1 - np.exp(-fg_t_y * fg_far)
+        else:
+            far[key] = np.delete(far[key], where_combined)
+            fg_far = 1.0 / np.maximum(sep_fg_data[key].data["ifar"], 1e-30)
+            sep_fg_data[key].data["fap"] = 1 - np.exp(-fg_t_y * fg_far)
         # Set up variable for whether each coincidence is available in each coincidence time
         is_in_combo_time[key] = np.zeros(n_triggers)
         end_times = np.array(f["segments/%s/end" % key][:])
@@ -935,7 +923,7 @@ while True:
         )
         is_in_combo_time[key][idx_within_segment] = np.ones_like(idx_within_segment)
 
-    fg_fars = np.array([list(far[ct]) for ct in all_ifo_combos])
+    fg_fars = np.vstack([np.asarray(far[ct]) for ct in all_ifo_combos])
     fg_fars_out = compute_combined_fars(
         all_ifo_combos,
         all_ifos,
@@ -957,62 +945,10 @@ while True:
     )
 
     if args.hierarchical_removal_against == "exclusive":
-        for key in all_ifo_combos:
-            if key in sep_bg_exc_data:
-                _, fg_far_exc, _ = significance.get_far(
-                    sep_bg_exc_data[key].data["stat"],
-                    sep_fg_data[key].data["stat"],
-                    sep_bg_exc_data[key].data["decimation_factor"],
-                    bg_time_ct_exc[key],
-                    **significance_dict[key],
-                )
-                fg_far_exc = significance.apply_far_limit(
-                    fg_far_exc,
-                    significance_dict,
-                    combo=key,
-                )
-                sep_fg_data[key].data["ifar_exc"] = conv.sec_to_year(1.0 / fg_far_exc)
-                fg_time_ct_exc_val = (
-                    f[key].attrs.get("foreground_time_exc", fg_time_ct[key])
-                    if key in f
-                    else fg_time_ct[key]
-                )
-                sep_fg_data[key].data["fap_exc"] = 1 - np.exp(
-                    -conv.sec_to_year(fg_time_ct_exc_val)
-                    / sep_fg_data[key].data["ifar_exc"]
-                )
-
-        far_exc = {}
-        for key in all_ifo_combos:
-            if key in sep_bg_exc_data:
-                _, far_exc[key], _ = significance.get_far(
-                    sep_bg_exc_data[key].data["stat"],
-                    combined_fg_data.data["stat"],
-                    sep_bg_exc_data[key].data["decimation_factor"],
-                    bg_time_ct_exc[key],
-                    **significance_dict[key],
-                )
-            else:
-                far_exc[key] = far[key]
-        fg_fars_exc = np.array([list(far_exc[ct]) for ct in all_ifo_combos])
-        fg_fars_exc_out = compute_combined_fars(
-            all_ifo_combos,
-            all_ifos,
-            is_in_combo_time,
-            fg_fars_exc,
-            combined_fg_data.data,
-            args.isolate_backgrounds,
-        )
-        fg_fars_exc_out = significance.apply_far_limit(
-            fg_fars_exc_out,
-            significance_dict,
-            combo=fg_coinc_type,
-        )
-        combined_fg_data.data["ifar_exc"] = conv.sec_to_year(1.0 / fg_fars_exc_out)
-        fg_time_exc = f.attrs.get("foreground_time_exc", fg_time)
-        combined_fg_data.data["fap_exc"] = 1 - np.exp(
-            -conv.sec_to_year(fg_time_exc) / combined_fg_data.data["ifar_exc"]
-        )
+        # sep_bg_exc_data and fg_time_exc are invariant across hierarchical removals;
+        # sep_fg_data[maxcombo].remove() and combined_fg_data.remove() already sliced
+        # ifar_exc and fap_exc in place.
+        pass
 
 # Write final background triggers once if hierarchical removals were performed
 if h_iterations > 0:
@@ -1025,7 +961,9 @@ if h_iterations > 0:
         f[combo].attrs["foreground_time_h%s" % h_iterations] = fg_time_ct[combo]
         f.attrs["foreground_time_h%s" % h_iterations] = fg_time
     for key in combined_bg_data.data:
-        f["background_h%s/%s" % (h_iterations, key)] = combined_bg_data.data[key][:]
+        f["background_h%s/%s" % (h_iterations, key)] = np.concatenate(
+            [sep_bg_data[c].data[key][:] for c in all_ifo_combos]
+        )
 
 for combo in all_ifo_combos:
     final_fg_data[combo] = final_fg_data[combo] + sep_fg_data[combo]

@@ -435,17 +435,23 @@ logging.info("calculating ifar/fap values")
 if fore_locs.sum() > 0:
     ifar = 1.0 / fg_far
     fap = 1 - numpy.exp(-coinc_time / ifar)
-    f["foreground/ifar"] = conv.sec_to_year(ifar)
-    f["foreground/fap"] = fap
+    fg_ifar_mem = conv.sec_to_year(ifar).copy()
+    fg_fap_mem = fap.copy()
+    f["foreground/ifar"] = fg_ifar_mem
+    f["foreground/fap"] = fg_fap_mem
     for key, value in sig_info.items():
         f["foreground"].attrs[key] = value
     ifar_exc = 1.0 / fg_far_exc
     fap_exc = 1 - numpy.exp(-coinc_time_exc / ifar_exc)
-    f["foreground/ifar_exc"] = conv.sec_to_year(ifar_exc)
+    fg_ifar_exc_mem = conv.sec_to_year(ifar_exc).copy()
+    f["foreground/ifar_exc"] = fg_ifar_exc_mem
     f["foreground/fap_exc"] = fap_exc
     for key, value in exc_sig_info.items():
         f["foreground"].attrs[key + "_exc"] = value
 else:
+    fg_ifar_mem = numpy.array([])
+    fg_fap_mem = numpy.array([])
+    fg_ifar_exc_mem = numpy.array([])
     f["foreground/ifar"] = ifar = numpy.array([])
     f["foreground/fap"] = numpy.array([])
     f["foreground/ifar_exc"] = ifar_exc = numpy.array([])
@@ -552,10 +558,10 @@ while True:
 
     # Store any foreground trigger's information that we want to
     # hierarchically remove.
-    f["foreground/ifar"][orig_fore_idx] = conv.sec_to_year(ifar[max_stat_idx])
-    f["foreground/fap"][orig_fore_idx] = fap[max_stat_idx]
-    if args.hierarchical_removal_against == "exclusive" and "foreground/ifar_exc" in f:
-        f["foreground/ifar_exc"][orig_fore_idx] = conv.sec_to_year(ifar_foreground[max_stat_idx])
+    fg_ifar_mem[orig_fore_idx] = conv.sec_to_year(ifar[max_stat_idx])
+    fg_fap_mem[orig_fore_idx] = fap[max_stat_idx]
+    if args.hierarchical_removal_against == "exclusive" and len(fg_ifar_exc_mem) > orig_fore_idx:
+        fg_ifar_exc_mem[orig_fore_idx] = conv.sec_to_year(ifar_foreground[max_stat_idx])
 
     logging.info(
         "Removing foreground trigger that is louder than the inclusive background."
@@ -574,9 +580,10 @@ while True:
             [ave_rm_time - args.hierarchical_removal_window],
             [ave_rm_time + args.hierarchical_removal_window],
         )
-    indices_to_rm = []
+    indices_to_rm = [numpy.array([rm_trig_idx], dtype=int)]
     for ifo in args.ifos:
-        indices_to_rm = numpy.concatenate([indices_to_rm, ind_to_rm[ifo]])
+        indices_to_rm.append(ind_to_rm[ifo])
+    indices_to_rm = numpy.unique(numpy.concatenate(indices_to_rm))
 
     all_trigs = all_trigs.remove(indices_to_rm.astype(int))
     logging.info(
@@ -665,13 +672,18 @@ while True:
         for key, value in sig_info.items():
             f["foreground_h%s" % h_iterations].attrs[key] = value
 
-        # Update ifar and fap for other foreground triggers
+        # Update ifar and fap for other foreground triggers in memory
+        ifar_yr = conv.sec_to_year(ifar)
+        ifar_fg_yr = conv.sec_to_year(ifar_foreground)
+        stat_to_idx = {float(v): idx for idx, v in enumerate(orig_fore_stat)}
         for i in range(len(ifar)):
-            orig_fore_idx = numpy.where(orig_fore_stat == fore_stat[i])[0][0]
-            f["foreground/ifar"][orig_fore_idx] = conv.sec_to_year(ifar[i])
-            f["foreground/fap"][orig_fore_idx] = fap[i]
-            if args.hierarchical_removal_against == "exclusive" and "foreground/ifar_exc" in f:
-                f["foreground/ifar_exc"][orig_fore_idx] = conv.sec_to_year(ifar_foreground[i])
+            orig_fore_idx = stat_to_idx.get(float(fore_stat[i]))
+            if orig_fore_idx is None:
+                orig_fore_idx = numpy.where(orig_fore_stat == fore_stat[i])[0][0]
+            fg_ifar_mem[orig_fore_idx] = ifar_yr[i]
+            fg_fap_mem[orig_fore_idx] = fap[i]
+            if args.hierarchical_removal_against == "exclusive" and len(fg_ifar_exc_mem) > orig_fore_idx:
+                fg_ifar_exc_mem[orig_fore_idx] = ifar_fg_yr[i]
 
         # Save trigger ids for foreground triggers for downstream plotting code.
         # These don't change with the iterations but should be written at every
@@ -696,6 +708,11 @@ while True:
 
 # Write final background triggers once if hierarchical removals were performed
 if h_iterations > 0:
+    if len(fg_ifar_mem) > 0:
+        f["foreground/ifar"] = fg_ifar_mem
+        f["foreground/fap"] = fg_fap_mem
+        if args.hierarchical_removal_against == "exclusive" and "foreground/ifar_exc" in f:
+            f["foreground/ifar_exc"] = fg_ifar_exc_mem
     logging.info("Dumping final background triggers for iteration %s", h_iterations)
     for k in all_trigs.data:
         f["background_h%s/" % h_iterations + k] = all_trigs.data[k][back_locs]

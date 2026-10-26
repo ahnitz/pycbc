@@ -447,6 +447,14 @@ class MultiifoStatmapData(StatmapData):
             groups += ["%s/trigger_id" % ifo]
 
         super().__init__(data=data, files=files, groups=groups, attrs=attrs, seg=seg)
+        if files is not None and ifos is not None and len(ifos) >= 2 and len(self.stat) > 0:
+            valid_mask = np.ones(len(self.stat), dtype=bool)
+            for ifo in ifos:
+                t_key = "%s/time" % ifo
+                if t_key in self.data:
+                    valid_mask &= self.data[t_key] > 0
+            if not np.all(valid_mask):
+                self.select(valid_mask, inplace=True)
 
     def _return(self, data):
         ifolist = self.attrs["ifos"].split(" ")

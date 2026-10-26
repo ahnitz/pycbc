@@ -918,6 +918,17 @@ class ExpFitStatistic(PhaseTDStatistic):
                 "attribute called {ifo}-fit_coeffs !"
             )
 
+        # Modifier to get a sensible value of the fit slope and rate floor below threshold
+        self.alphabelow = float(self.kwargs.get("alpha_below_thresh", numpy.inf))
+        self.alpha_below_min = float(self.kwargs.get("alpha_below_min", 0.0))
+        self.count_below_min = float(self.kwargs.get("count_below_min", 0.0))
+        self.rate_below_min = float(self.kwargs.get("rate_below_min", 0.0))
+        val_cap = self.kwargs.get("cap_alpha_below", False)
+        if isinstance(val_cap, str):
+            self.cap_alpha_below = val_cap.lower() in ["true", "1", "yes", "t"]
+        else:
+            self.cap_alpha_below = bool(val_cap)
+
         # Get the single-detector rates fit values
         self.fits_by_tid = {}
         for i in self.bg_ifos:
@@ -936,15 +947,6 @@ class ExpFitStatistic(PhaseTDStatistic):
         # Some modifiers for the statistic to get it into a nice range
         self.benchmark_lograte = float(self.kwargs.get("benchmark_lograte", -14.6))
         self.min_stat = float(self.kwargs.get("minimum_statistic_cutoff", -30.0))
-
-        # Modifier to get a sensible value of the fit slope below threshold
-        self.alphabelow = float(self.kwargs.get("alpha_below_thresh", numpy.inf))
-        self.alpha_below_min = float(self.kwargs.get("alpha_below_min", 0.0))
-        val_cap = self.kwargs.get("cap_alpha_below", False)
-        if isinstance(val_cap, str):
-            self.cap_alpha_below = val_cap.lower() in ["true", "1", "yes", "t"]
-        else:
-            self.cap_alpha_below = bool(val_cap)
 
         # Optional template-duration and effective-spin prior for multi-detector coincidences
         self.coinc_dur_exp = float(self.kwargs.get("coinc_dur_exp", 0.0))
@@ -1206,6 +1208,16 @@ class ExpFitStatistic(PhaseTDStatistic):
             fbt = "fit_by_template" in coeff_file
 
         self.fits_by_tid[ifo]["smoothed_rate_above_thresh"] /= analysis_time
+        if "smoothed_rate_below_thresh" in self.fits_by_tid[ifo]:
+            self.fits_by_tid[ifo]["smoothed_rate_below_thresh"] /= analysis_time
+        rate_below_min = float(self.kwargs.get("rate_below_min", 0.0))
+        if (
+            rate_below_min > 0.0
+            and "smoothed_rate_below_thresh" in self.fits_by_tid[ifo]
+        ):
+            self.fits_by_tid[ifo]["smoothed_rate_below_thresh"] = numpy.maximum(
+                self.fits_by_tid[ifo]["smoothed_rate_below_thresh"], rate_below_min
+            )
         self.fits_by_tid[ifo]["smoothed_rate_in_template"] /= analysis_time
         # The by-template fits may have been stored in the smoothed fits file
         if fbt:
@@ -1236,9 +1248,20 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         fits_by_tid_dict = {}
         fits_by_tid_dict["smoothed_fit_coeff"] = coeff_file["fit_coeff"][:][tid_sort]
-        fits_by_tid_dict["smoothed_rate_above_thresh"] = coeff_file[
-            "count_above_thresh"
-        ][:][tid_sort].astype(float)
+        raw_count_above = coeff_file["count_above_thresh"][:][tid_sort].astype(float)
+        fits_by_tid_dict["smoothed_rate_above_thresh"] = raw_count_above.copy()
+        count_below_min = float(self.kwargs.get("count_below_min", 0.0))
+        if count_below_min > 0.0:
+            fits_by_tid_dict["smoothed_rate_below_thresh"] = numpy.maximum(
+                raw_count_above, count_below_min
+            )
+        else:
+            fits_by_tid_dict["smoothed_rate_below_thresh"] = raw_count_above.copy()
+        rate_below_min = float(self.kwargs.get("rate_below_min", 0.0))
+        if rate_below_min > 0.0 and not self.kwargs.get("normalize_fit_rate", False):
+            fits_by_tid_dict["smoothed_rate_below_thresh"] = numpy.maximum(
+                fits_by_tid_dict["smoothed_rate_below_thresh"], rate_below_min
+            )
         fits_by_tid_dict["smoothed_rate_in_template"] = coeff_file["count_in_template"][
             :
         ][tid_sort].astype(float)
@@ -1504,10 +1527,29 @@ class ExpFitStatistic(PhaseTDStatistic):
             -alphai * (sngl_stat - thresh) + numpy.log(alphai) + numpy.log(ratei)
         )
 
-        if not numpy.isinf(self.alphabelow):
+        if (
+            not numpy.isinf(self.alphabelow)
+            or getattr(self, "count_below_min", 0.0) > 0.0
+            or getattr(self, "rate_below_min", 0.0) > 0.0
+        ):
             # Above the threshold we use the usual fit coefficient (alphai)
-            # below threshold use specified alphabelow
+            # below threshold use specified alphabelow and sub-threshold rate floor
             bt = sngl_stat < thresh
+            ratei_bt = ratei
+            if (
+                getattr(self, "count_below_min", 0.0) > 0.0
+                or getattr(self, "rate_below_min", 0.0) > 0.0
+            ):
+                try:
+                    ifo = trigs.ifo
+                except AttributeError:
+                    ifo = trigs.get("ifo", None)
+                    if ifo is None:
+                        ifo = self.ifos[0]
+                if "smoothed_rate_below_thresh" in self.fits_by_tid[ifo]:
+                    ratei_bt = self.fits_by_tid[ifo][
+                        "smoothed_rate_below_thresh"
+                    ][self.curr_tnum]
             if getattr(self, "cap_alpha_below", False):
                 ab_min = getattr(self, "alpha_below_min", 0.0)
                 if ab_min > 0.0:
@@ -1519,13 +1561,19 @@ class ExpFitStatistic(PhaseTDStatistic):
                 lognoiselbt = (
                     -ab_eff * (sngl_stat - thresh)
                     + numpy.log(ab_eff)
-                    + numpy.log(ratei)
+                    + numpy.log(ratei_bt)
                 )
-            else:
+            elif not numpy.isinf(self.alphabelow):
                 lognoiselbt = (
                     -self.alphabelow * (sngl_stat - thresh)
                     + numpy.log(self.alphabelow)
-                    + numpy.log(ratei)
+                    + numpy.log(ratei_bt)
+                )
+            else:
+                lognoiselbt = (
+                    -alphai * (sngl_stat - thresh)
+                    + numpy.log(alphai)
+                    + numpy.log(ratei_bt)
                 )
             lognoisel[bt] = lognoiselbt[bt]
 
