@@ -939,11 +939,21 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         # Modifier to get a sensible value of the fit slope below threshold
         self.alphabelow = float(self.kwargs.get("alpha_below_thresh", numpy.inf))
+        self.alpha_below_min = float(self.kwargs.get("alpha_below_min", 0.0))
         val_cap = self.kwargs.get("cap_alpha_below", False)
         if isinstance(val_cap, str):
             self.cap_alpha_below = val_cap.lower() in ["true", "1", "yes", "t"]
         else:
             self.cap_alpha_below = bool(val_cap)
+
+        # Optional template-duration prior for multi-detector coincidences
+        self.coinc_dur_exp = float(self.kwargs.get("coinc_dur_exp", 0.0))
+        self.coinc_dur_knee = float(self.kwargs.get("coinc_dur_knee", 1.0))
+        self.coinc_dur_ref = float(self.kwargs.get("coinc_dur_ref", 7.0))
+        self.coinc_dur_max = float(self.kwargs.get("coinc_dur_max", 22.0))
+        self.coinc_short_dur_knee = float(self.kwargs.get("coinc_short_dur_knee", 0.0))
+        self.coinc_short_dur_exp = float(self.kwargs.get("coinc_short_dur_exp", 0.0))
+        self.coinc_dur_prior = None
 
         # This will be used to keep track of the template number being used
         self.curr_tnum = None
@@ -965,6 +975,10 @@ class ExpFitStatistic(PhaseTDStatistic):
                 axis=0,
             )
             self.benchmark_logvol = 3.0 * numpy.log(hl_net_med_sigma)
+
+        self._compute_coinc_dur_prior()
+        if self.coinc_dur_prior is not None:
+            self.single_dtype.append(("coinc_dur_prior", numpy.float32))
 
         if self.kwargs["dq"]:
             # Reweight the noise rate by the dq reweighting factor
@@ -1222,6 +1236,10 @@ class ExpFitStatistic(PhaseTDStatistic):
             fits_by_tid_dict["median_sigma"] = coeff_file["median_sigma"][:][
                 tid_sort
             ].astype(float)
+        if "template_duration" in coeff_file:
+            fits_by_tid_dict["template_duration"] = coeff_file[
+                "template_duration"
+            ][:][tid_sort].astype(float)
 
         # The by-template fits may have been stored in the smoothed fits file
         if "fit_by_template" in coeff_file:
@@ -1260,6 +1278,7 @@ class ExpFitStatistic(PhaseTDStatistic):
             if self.kwargs["normalize_fit_rate"]:
                 self.reassign_rate(ifo)
             self.get_ref_vals(ifo)
+            self._compute_coinc_dur_prior()
             logger.info("Updating %s statistic %s file", "".join(self.ifos), key)
             return True
 
@@ -1293,6 +1312,41 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         """
         self.alphamax[ifo] = self.fits_by_tid[ifo]["smoothed_fit_coeff"].max()
+
+    def _compute_coinc_dur_prior(self):
+        """
+        Compute template-duration prior array over template_id for multi-detector
+        coincident ranking when coinc_dur_exp or coinc_short_dur_exp is enabled.
+        """
+        if self.coinc_dur_exp == 0.0 and self.coinc_short_dur_exp == 0.0:
+            self.coinc_dur_prior = None
+            return
+        dur = None
+        for ifo in list(self.ifos) + list(self.fits_by_tid.keys()):
+            if (
+                ifo in self.fits_by_tid
+                and "template_duration" in self.fits_by_tid[ifo]
+            ):
+                dur = self.fits_by_tid[ifo]["template_duration"]
+                break
+        if dur is None:
+            self.coinc_dur_prior = None
+            return
+
+        prior = numpy.zeros_like(dur, dtype=numpy.float32)
+        if self.coinc_dur_exp != 0.0:
+            dur_eff = numpy.clip(dur, self.coinc_dur_knee, self.coinc_dur_max)
+            prior += -self.coinc_dur_exp * numpy.log(
+                dur_eff / self.coinc_dur_ref
+            ).astype(numpy.float32)
+        if self.coinc_short_dur_exp > 0.0 and self.coinc_short_dur_knee > 0.0:
+            short_mask = dur < self.coinc_short_dur_knee
+            if numpy.any(short_mask):
+                prior[short_mask] -= self.coinc_short_dur_exp * numpy.log(
+                    self.coinc_short_dur_knee
+                    / numpy.maximum(dur[short_mask], 0.05)
+                ).astype(numpy.float32)
+        self.coinc_dur_prior = prior
 
     def find_fits(self, trigs):
         """
@@ -1409,7 +1463,13 @@ class ExpFitStatistic(PhaseTDStatistic):
             # below threshold use specified alphabelow
             bt = sngl_stat < thresh
             if getattr(self, "cap_alpha_below", False):
-                ab_eff = numpy.minimum(alphai, self.alphabelow)
+                ab_min = getattr(self, "alpha_below_min", 0.0)
+                if ab_min > 0.0:
+                    ab_eff = numpy.minimum(
+                        numpy.maximum(alphai, ab_min), self.alphabelow
+                    )
+                else:
+                    ab_eff = numpy.minimum(alphai, self.alphabelow)
                 lognoiselbt = (
                     -ab_eff * (sngl_stat - thresh)
                     + numpy.log(alphai)
@@ -1612,6 +1672,9 @@ class ExpFitStatistic(PhaseTDStatistic):
             if singles["sigmasq"].size:
                 max_sigsq = numpy.max(singles["sigmasq"])
                 self.max_sigmasq = max(max_sigsq, self.max_sigmasq)
+
+        if self.coinc_dur_prior is not None:
+            singles["coinc_dur_prior"] = self.coinc_dur_prior[self.curr_tnum]
 
         if self.kwargs["chirp_mass"]:
             from pycbc.conversions import mchirp_from_mass1_mass2
@@ -1854,6 +1917,11 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         # Add in the feature-dependent terms to the signal rate
         ln_s += self.logsignalrate_shared(s)
+        if (
+            self.coinc_dur_prior is not None
+            and "coinc_dur_prior" in s[0][1].dtype.names
+        ):
+            ln_s += s[0][1]["coinc_dur_prior"]
 
         # Combine the signal and noise rates
         loglr = ln_s - ln_noise_rate
@@ -1933,6 +2001,11 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         # Shared info is the same as in the coinc calculation
         ln_s += self.logsignalrate_shared(s)
+        if (
+            self.coinc_dur_prior is not None
+            and "coinc_dur_prior" in s[0][1].dtype.names
+        ):
+            ln_s += s[0][1]["coinc_dur_prior"]
 
         # Combine the signal and noise rates
         loglr = ln_s - ln_noise_rate
@@ -1978,11 +2051,21 @@ class ExpFitCombinedSNR(ExpFitStatistic):
 
         # Modifier to get a sensible value of the fit slope below threshold
         self.alphabelow = float(self.kwargs.get("alpha_below_thresh", numpy.inf))
+        self.alpha_below_min = float(self.kwargs.get("alpha_below_min", 0.0))
         val_cap = self.kwargs.get("cap_alpha_below", False)
         if isinstance(val_cap, str):
             self.cap_alpha_below = val_cap.lower() in ["true", "1", "yes", "t"]
         else:
             self.cap_alpha_below = bool(val_cap)
+
+        # Optional template-duration prior for multi-detector coincidences
+        self.coinc_dur_exp = float(self.kwargs.get("coinc_dur_exp", 0.0))
+        self.coinc_dur_knee = float(self.kwargs.get("coinc_dur_knee", 1.0))
+        self.coinc_dur_ref = float(self.kwargs.get("coinc_dur_ref", 7.0))
+        self.coinc_dur_max = float(self.kwargs.get("coinc_dur_max", 22.0))
+        self.coinc_short_dur_knee = float(self.kwargs.get("coinc_short_dur_knee", 0.0))
+        self.coinc_short_dur_exp = float(self.kwargs.get("coinc_short_dur_exp", 0.0))
+        self.coinc_dur_prior = None
 
     def single(self, trigs):
         """
