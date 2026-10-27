@@ -980,8 +980,20 @@ class ExpFitStatistic(PhaseTDStatistic):
         )
         self.coinc_chieff_knee = float(self.kwargs.get("coinc_chieff_knee", 1.0))
         self.coinc_chieff_slope = float(self.kwargs.get("coinc_chieff_slope", 0.0))
+        self.coinc_neg_chieff_knee = float(
+            self.kwargs.get("coinc_neg_chieff_knee", -1.0)
+        )
+        self.coinc_neg_chieff_slope = float(
+            self.kwargs.get("coinc_neg_chieff_slope", 0.0)
+        )
         self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
         self.coinc_eta_slope = float(self.kwargs.get("coinc_eta_slope", 0.0))
+        self.coinc_low_alpha_knee = float(
+            self.kwargs.get("coinc_low_alpha_knee", 0.0)
+        )
+        self.coinc_low_alpha_slope = float(
+            self.kwargs.get("coinc_low_alpha_slope", 0.0)
+        )
         self.coinc_net_ns_coeff = float(self.kwargs.get("coinc_net_ns_coeff", 0.0))
         self.coinc_net_ns_min = float(self.kwargs.get("coinc_net_ns_min", 7.0))
         self.coinc_net_ns_max = float(self.kwargs.get("coinc_net_ns_max", 9.2))
@@ -1438,15 +1450,18 @@ class ExpFitStatistic(PhaseTDStatistic):
 
     def _compute_coinc_dur_prior(self):
         """
-        Compute template-duration, effective-spin, and symmetric-mass-ratio prior array
-        over template_id for multi-detector coincident ranking when coinc_dur_exp,
-        coinc_short_dur_exp, coinc_long_dur_exp, or coinc_chieff_slope is enabled.
+        Compute template-duration, effective-spin, symmetric-mass-ratio, and
+        low-alpha glitch-shelf prior array over template_id for multi-detector
+        coincident ranking when enabled.
         """
         if (
             self.coinc_dur_exp == 0.0
             and self.coinc_short_dur_exp == 0.0
             and self.coinc_long_dur_exp == 0.0
             and self.coinc_chieff_slope == 0.0
+            and self.coinc_neg_chieff_slope == 0.0
+            and self.coinc_eta_slope == 0.0
+            and self.coinc_low_alpha_slope == 0.0
         ):
             self.coinc_dur_prior = None
             return
@@ -1510,6 +1525,13 @@ class ExpFitStatistic(PhaseTDStatistic):
                     self.coinc_chieff_slope
                     * (chieff[chi_mask] - self.coinc_chieff_knee)
                 ).astype(numpy.float32)
+        if self.coinc_neg_chieff_slope > 0.0 and chieff is not None:
+            neg_chi_mask = chieff < self.coinc_neg_chieff_knee
+            if numpy.any(neg_chi_mask):
+                prior[neg_chi_mask] -= (
+                    self.coinc_neg_chieff_slope
+                    * (self.coinc_neg_chieff_knee - chieff[neg_chi_mask])
+                ).astype(numpy.float32)
         if (
             self.coinc_eta_slope > 0.0
             and self.coinc_eta_knee > 0.0
@@ -1521,6 +1543,26 @@ class ExpFitStatistic(PhaseTDStatistic):
                     self.coinc_eta_slope
                     * (self.coinc_eta_knee - eta[eta_mask])
                 ).astype(numpy.float32)
+        if self.coinc_low_alpha_slope > 0.0 and self.coinc_low_alpha_knee > 0.0:
+            alpha_ifos = (
+                list(self.ifos)
+                if len(getattr(self, "ifos", [])) >= 2
+                else list(self.fits_by_tid.keys())
+            )
+            for ifo in alpha_ifos:
+                if (
+                    ifo in self.fits_by_tid
+                    and "smoothed_fit_coeff" in self.fits_by_tid[ifo]
+                ):
+                    a_ifo = self.fits_by_tid[ifo]["smoothed_fit_coeff"].astype(
+                        numpy.float32
+                    )
+                    low_a_mask = a_ifo < self.coinc_low_alpha_knee
+                    if numpy.any(low_a_mask):
+                        prior[low_a_mask] -= (
+                            self.coinc_low_alpha_slope
+                            * (self.coinc_low_alpha_knee - a_ifo[low_a_mask])
+                        ).astype(numpy.float32)
         self.coinc_dur_prior = prior
 
     def find_fits(self, trigs):
@@ -2323,8 +2365,20 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         )
         self.coinc_chieff_knee = float(self.kwargs.get("coinc_chieff_knee", 1.0))
         self.coinc_chieff_slope = float(self.kwargs.get("coinc_chieff_slope", 0.0))
+        self.coinc_neg_chieff_knee = float(
+            self.kwargs.get("coinc_neg_chieff_knee", -1.0)
+        )
+        self.coinc_neg_chieff_slope = float(
+            self.kwargs.get("coinc_neg_chieff_slope", 0.0)
+        )
         self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
         self.coinc_eta_slope = float(self.kwargs.get("coinc_eta_slope", 0.0))
+        self.coinc_low_alpha_knee = float(
+            self.kwargs.get("coinc_low_alpha_knee", 0.0)
+        )
+        self.coinc_low_alpha_slope = float(
+            self.kwargs.get("coinc_low_alpha_slope", 0.0)
+        )
         self.coinc_net_ns_coeff = float(self.kwargs.get("coinc_net_ns_coeff", 0.0))
         self.coinc_net_ns_min = float(self.kwargs.get("coinc_net_ns_min", 7.0))
         self.coinc_net_ns_max = float(self.kwargs.get("coinc_net_ns_max", 9.2))
