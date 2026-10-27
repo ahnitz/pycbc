@@ -921,6 +921,7 @@ class ExpFitStatistic(PhaseTDStatistic):
         # Modifier to get a sensible value of the fit slope and rate floor below threshold
         self.alphabelow = float(self.kwargs.get("alpha_below_thresh", numpy.inf))
         self.alpha_below_min = float(self.kwargs.get("alpha_below_min", 0.0))
+        self.count_above_min = float(self.kwargs.get("count_above_min", 0.0))
         self.count_below_min = float(self.kwargs.get("count_below_min", 0.0))
         self.rate_below_min = float(self.kwargs.get("rate_below_min", 0.0))
         val_cap = self.kwargs.get("cap_alpha_below", False)
@@ -957,6 +958,9 @@ class ExpFitStatistic(PhaseTDStatistic):
         self.coinc_short_dur_exp = float(self.kwargs.get("coinc_short_dur_exp", 0.0))
         self.coinc_short_chieff_coeff = float(
             self.kwargs.get("coinc_short_chieff_coeff", 0.0)
+        )
+        self.coinc_short_chieff_min = float(
+            self.kwargs.get("coinc_short_chieff_min", -1.0)
         )
         self.coinc_short_eta_coeff = float(
             self.kwargs.get("coinc_short_eta_coeff", 0.0)
@@ -1259,7 +1263,13 @@ class ExpFitStatistic(PhaseTDStatistic):
         fits_by_tid_dict = {}
         fits_by_tid_dict["smoothed_fit_coeff"] = coeff_file["fit_coeff"][:][tid_sort]
         raw_count_above = coeff_file["count_above_thresh"][:][tid_sort].astype(float)
-        fits_by_tid_dict["smoothed_rate_above_thresh"] = raw_count_above.copy()
+        count_above_min = float(self.kwargs.get("count_above_min", 0.0))
+        if count_above_min > 0.0:
+            fits_by_tid_dict["smoothed_rate_above_thresh"] = numpy.maximum(
+                raw_count_above, count_above_min
+            )
+        else:
+            fits_by_tid_dict["smoothed_rate_above_thresh"] = raw_count_above.copy()
         count_below_min = float(self.kwargs.get("count_below_min", 0.0))
         if count_below_min > 0.0:
             fits_by_tid_dict["smoothed_rate_below_thresh"] = numpy.maximum(
@@ -1402,7 +1412,15 @@ class ExpFitStatistic(PhaseTDStatistic):
         if self.coinc_short_dur_exp > 0.0 and self.coinc_short_dur_knee > 0.0:
             tau0 = dur.copy()
             if self.coinc_short_chieff_coeff != 0.0 and chieff is not None:
-                tau0 = tau0 * numpy.exp(-self.coinc_short_chieff_coeff * chieff)
+                if self.coinc_short_chieff_min > -1.0:
+                    chi_eff_short = numpy.maximum(
+                        chieff, self.coinc_short_chieff_min
+                    )
+                else:
+                    chi_eff_short = chieff
+                tau0 = tau0 * numpy.exp(
+                    -self.coinc_short_chieff_coeff * chi_eff_short
+                )
             if self.coinc_short_eta_coeff != 0.0 and eta is not None:
                 tau0 = tau0 * numpy.exp(-self.coinc_short_eta_coeff * (0.25 - eta))
             short_mask = tau0 < self.coinc_short_dur_knee
@@ -2210,6 +2228,9 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         self.coinc_short_dur_exp = float(self.kwargs.get("coinc_short_dur_exp", 0.0))
         self.coinc_short_chieff_coeff = float(
             self.kwargs.get("coinc_short_chieff_coeff", 0.0)
+        )
+        self.coinc_short_chieff_min = float(
+            self.kwargs.get("coinc_short_chieff_min", -1.0)
         )
         self.coinc_short_eta_coeff = float(
             self.kwargs.get("coinc_short_eta_coeff", 0.0)
