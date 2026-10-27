@@ -967,6 +967,10 @@ class ExpFitStatistic(PhaseTDStatistic):
         self.coinc_chieff_slope = float(self.kwargs.get("coinc_chieff_slope", 0.0))
         self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
         self.coinc_eta_slope = float(self.kwargs.get("coinc_eta_slope", 0.0))
+        self.coinc_net_ns_coeff = float(self.kwargs.get("coinc_net_ns_coeff", 0.0))
+        self.coinc_net_ns_min = float(self.kwargs.get("coinc_net_ns_min", 7.0))
+        self.coinc_net_ns_max = float(self.kwargs.get("coinc_net_ns_max", 9.2))
+        self.coinc_net_ns_ref = float(self.kwargs.get("coinc_net_ns_ref", 8.4))
         self.coinc_dur_prior = None
 
         # This will be used to keep track of the template number being used
@@ -993,6 +997,10 @@ class ExpFitStatistic(PhaseTDStatistic):
         self._compute_coinc_dur_prior()
         if self.coinc_dur_prior is not None:
             self.single_dtype.append(("coinc_dur_prior", numpy.float32))
+        if self.coinc_net_ns_coeff != 0.0 and not any(
+            f[0] == "newsnr" for f in self.single_dtype
+        ):
+            self.single_dtype.append(("newsnr", numpy.float32))
 
         if self.kwargs["dq"]:
             # Reweight the noise rate by the dq reweighting factor
@@ -1536,6 +1544,7 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         alphai, ratei, thresh = self.find_fits(trigs)
         sngl_stat = self.get_sngl_ranking(trigs)
+        self._last_sngl_ranking = sngl_stat
         lognoisel = (
             -alphai * (sngl_stat - thresh) + numpy.log(alphai) + numpy.log(ratei)
         )
@@ -1782,6 +1791,10 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         if self.coinc_dur_prior is not None:
             singles["coinc_dur_prior"] = self.coinc_dur_prior[self.curr_tnum]
+        if self.coinc_net_ns_coeff != 0.0 and "newsnr" in singles.dtype.names:
+            singles["newsnr"] = getattr(
+                self, "_last_sngl_ranking", self.get_sngl_ranking(trigs)
+            )
 
         if self.kwargs["chirp_mass"]:
             from pycbc.conversions import mchirp_from_mass1_mass2
@@ -2029,6 +2042,21 @@ class ExpFitStatistic(PhaseTDStatistic):
             and "coinc_dur_prior" in s[0][1].dtype.names
         ):
             ln_s += s[0][1]["coinc_dur_prior"]
+        if (
+            self.coinc_net_ns_coeff != 0.0
+            and len(s) >= 2
+            and "newsnr" in s[0][1].dtype.names
+        ):
+            net_ns = numpy.sqrt(
+                sum(
+                    numpy.asarray(sngl[1]["newsnr"], dtype=numpy.float32) ** 2
+                    for sngl in s
+                )
+            )
+            ln_s += self.coinc_net_ns_coeff * (
+                numpy.clip(net_ns, self.coinc_net_ns_min, self.coinc_net_ns_max)
+                - self.coinc_net_ns_ref
+            )
 
         # Combine the signal and noise rates
         loglr = ln_s - ln_noise_rate
@@ -2113,6 +2141,14 @@ class ExpFitStatistic(PhaseTDStatistic):
             and "coinc_dur_prior" in s[0][1].dtype.names
         ):
             ln_s += s[0][1]["coinc_dur_prior"]
+        if self.coinc_net_ns_coeff > 0.0:
+            ln_s += self.coinc_net_ns_coeff * (
+                self.coinc_net_ns_max - self.coinc_net_ns_ref
+            )
+        elif self.coinc_net_ns_coeff < 0.0:
+            ln_s += self.coinc_net_ns_coeff * (
+                self.coinc_net_ns_min - self.coinc_net_ns_ref
+            )
 
         # Combine the signal and noise rates
         loglr = ln_s - ln_noise_rate
@@ -2184,6 +2220,10 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         self.coinc_chieff_slope = float(self.kwargs.get("coinc_chieff_slope", 0.0))
         self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
         self.coinc_eta_slope = float(self.kwargs.get("coinc_eta_slope", 0.0))
+        self.coinc_net_ns_coeff = float(self.kwargs.get("coinc_net_ns_coeff", 0.0))
+        self.coinc_net_ns_min = float(self.kwargs.get("coinc_net_ns_min", 7.0))
+        self.coinc_net_ns_max = float(self.kwargs.get("coinc_net_ns_max", 9.2))
+        self.coinc_net_ns_ref = float(self.kwargs.get("coinc_net_ns_ref", 8.4))
         self.coinc_dur_prior = None
 
     def single(self, trigs):
