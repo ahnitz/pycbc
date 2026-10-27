@@ -975,6 +975,9 @@ class ExpFitStatistic(PhaseTDStatistic):
         )
         self.coinc_long_dur_knee = float(self.kwargs.get("coinc_long_dur_knee", 0.0))
         self.coinc_long_dur_exp = float(self.kwargs.get("coinc_long_dur_exp", 0.0))
+        self.coinc_long_chieff_coeff = float(
+            self.kwargs.get("coinc_long_chieff_coeff", 0.0)
+        )
         self.coinc_chieff_knee = float(self.kwargs.get("coinc_chieff_knee", 1.0))
         self.coinc_chieff_slope = float(self.kwargs.get("coinc_chieff_slope", 0.0))
         self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
@@ -1292,19 +1295,14 @@ class ExpFitStatistic(PhaseTDStatistic):
             if is_multi:
                 fbt_blend = float(self.kwargs.get("fbt_blend", 0.0))
                 if fbt_blend > 0.0:
-                    eff_count_above = numpy.maximum(
-                        eff_count_above,
-                        (1.0 - fbt_blend) * raw_count_above
-                        + fbt_blend * fbt_count_above,
+                    eff_count_above = eff_count_above + fbt_blend * numpy.maximum(
+                        0.0, fbt_count_above - raw_count_above
                     )
                 fbt_in_scale = float(self.kwargs.get("fbt_in_scale", 0.0))
                 fbt_in_knee = float(self.kwargs.get("fbt_in_knee", 800.0))
                 if fbt_in_scale > 0.0:
-                    eff_count_above = numpy.maximum(
-                        eff_count_above,
-                        raw_count_above
-                        + fbt_in_scale
-                        * numpy.maximum(0.0, fbt_count_in - fbt_in_knee),
+                    eff_count_above = eff_count_above + fbt_in_scale * numpy.maximum(
+                        0.0, fbt_count_in - fbt_in_knee
                     )
                 fbt_alpha_blend = float(self.kwargs.get("fbt_alpha_blend", 0.0))
                 fbt_alpha_min_count = float(
@@ -1494,10 +1492,15 @@ class ExpFitStatistic(PhaseTDStatistic):
                     / numpy.maximum(tau0[short_mask], 0.05)
                 ).astype(numpy.float32)
         if self.coinc_long_dur_exp > 0.0 and self.coinc_long_dur_knee > 0.0:
-            long_mask = dur > self.coinc_long_dur_knee
+            tau_long = dur.copy()
+            if self.coinc_long_chieff_coeff != 0.0 and chieff is not None:
+                tau_long = tau_long * numpy.exp(
+                    self.coinc_long_chieff_coeff * numpy.maximum(0.0, chieff)
+                )
+            long_mask = tau_long > self.coinc_long_dur_knee
             if numpy.any(long_mask):
                 prior[long_mask] -= self.coinc_long_dur_exp * numpy.log(
-                    numpy.minimum(dur[long_mask], 25.0)
+                    numpy.minimum(tau_long[long_mask], 25.0)
                     / self.coinc_long_dur_knee
                 ).astype(numpy.float32)
         if self.coinc_chieff_slope > 0.0 and chieff is not None:
@@ -2315,6 +2318,9 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         )
         self.coinc_long_dur_knee = float(self.kwargs.get("coinc_long_dur_knee", 0.0))
         self.coinc_long_dur_exp = float(self.kwargs.get("coinc_long_dur_exp", 0.0))
+        self.coinc_long_chieff_coeff = float(
+            self.kwargs.get("coinc_long_chieff_coeff", 0.0)
+        )
         self.coinc_chieff_knee = float(self.kwargs.get("coinc_chieff_knee", 1.0))
         self.coinc_chieff_slope = float(self.kwargs.get("coinc_chieff_slope", 0.0))
         self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
