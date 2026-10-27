@@ -921,9 +921,17 @@ class ExpFitStatistic(PhaseTDStatistic):
         # Modifier to get a sensible value of the fit slope and rate floor below threshold
         self.alphabelow = float(self.kwargs.get("alpha_below_thresh", numpy.inf))
         self.alpha_below_min = float(self.kwargs.get("alpha_below_min", 0.0))
+        self.alpha_norm_min = float(self.kwargs.get("alpha_norm_min", 0.0))
         self.count_above_min = float(self.kwargs.get("count_above_min", 0.0))
         self.count_below_min = float(self.kwargs.get("count_below_min", 0.0))
         self.rate_below_min = float(self.kwargs.get("rate_below_min", 0.0))
+        self.fbt_blend = float(self.kwargs.get("fbt_blend", 0.0))
+        self.fbt_in_scale = float(self.kwargs.get("fbt_in_scale", 0.0))
+        self.fbt_in_knee = float(self.kwargs.get("fbt_in_knee", 800.0))
+        self.fbt_alpha_blend = float(self.kwargs.get("fbt_alpha_blend", 0.0))
+        self.fbt_alpha_min_count = float(
+            self.kwargs.get("fbt_alpha_min_count", 15.0)
+        )
         val_cap = self.kwargs.get("cap_alpha_below", False)
         if isinstance(val_cap, str):
             self.cap_alpha_below = val_cap.lower() in ["true", "1", "yes", "t"]
@@ -1261,22 +1269,89 @@ class ExpFitStatistic(PhaseTDStatistic):
         tid_sort = numpy.argsort(template_id)
 
         fits_by_tid_dict = {}
-        fits_by_tid_dict["smoothed_fit_coeff"] = coeff_file["fit_coeff"][:][tid_sort]
+        raw_alpha = coeff_file["fit_coeff"][:][tid_sort]
+        fits_by_tid_dict["smoothed_fit_coeff"] = raw_alpha
         raw_count_above = coeff_file["count_above_thresh"][:][tid_sort].astype(float)
+        eff_count_above = raw_count_above.copy()
+        eff_alpha = raw_alpha.astype(float).copy()
+        is_multi = len(getattr(self, "ifos", [])) >= 2
+
+        # The by-template fits may have been stored in the smoothed fits file
+        if "fit_by_template" in coeff_file:
+            coeff_fbt = coeff_file["fit_by_template"]
+            fbt_alpha = coeff_fbt["fit_coeff"][:][tid_sort].astype(float)
+            fbt_count_above = coeff_fbt["count_above_thresh"][:][tid_sort].astype(
+                float
+            )
+            fbt_count_in = coeff_fbt["count_in_template"][:][tid_sort].astype(
+                float
+            )
+            fits_by_tid_dict["fit_by_fit_coeff"] = fbt_alpha
+            fits_by_tid_dict["fit_by_rate_above_thresh"] = fbt_count_above
+            fits_by_tid_dict["fit_by_rate_in_template"] = fbt_count_in
+            if is_multi:
+                fbt_blend = float(self.kwargs.get("fbt_blend", 0.0))
+                if fbt_blend > 0.0:
+                    eff_count_above = numpy.maximum(
+                        eff_count_above,
+                        (1.0 - fbt_blend) * raw_count_above
+                        + fbt_blend * fbt_count_above,
+                    )
+                fbt_in_scale = float(self.kwargs.get("fbt_in_scale", 0.0))
+                fbt_in_knee = float(self.kwargs.get("fbt_in_knee", 800.0))
+                if fbt_in_scale > 0.0:
+                    eff_count_above = numpy.maximum(
+                        eff_count_above,
+                        raw_count_above
+                        + fbt_in_scale
+                        * numpy.maximum(0.0, fbt_count_in - fbt_in_knee),
+                    )
+                fbt_alpha_blend = float(self.kwargs.get("fbt_alpha_blend", 0.0))
+                fbt_alpha_min_count = float(
+                    self.kwargs.get("fbt_alpha_min_count", 15.0)
+                )
+                if fbt_alpha_blend > 0.0:
+                    fl_mask = (
+                        (fbt_count_above >= fbt_alpha_min_count)
+                        & (fbt_alpha > 0.0)
+                        & (fbt_alpha < eff_alpha)
+                    )
+                    eff_alpha = numpy.where(
+                        fl_mask,
+                        (1.0 - fbt_alpha_blend) * eff_alpha
+                        + fbt_alpha_blend * numpy.maximum(fbt_alpha, 2.5),
+                        eff_alpha,
+                    )
+
+        fits_by_tid_dict["above_fit_coeff"] = eff_alpha
+        alpha_norm_min = (
+            float(self.kwargs.get("alpha_norm_min", 0.0)) if is_multi else 0.0
+        )
+        if alpha_norm_min > 0.0:
+            fits_by_tid_dict["norm_fit_coeff"] = numpy.maximum(
+                raw_alpha.astype(float), alpha_norm_min
+            )
+        else:
+            fits_by_tid_dict["norm_fit_coeff"] = eff_alpha
+
         count_above_min = float(self.kwargs.get("count_above_min", 0.0))
+        if is_multi and "coinc_count_above_min" in self.kwargs:
+            count_above_min = float(self.kwargs["coinc_count_above_min"])
         if count_above_min > 0.0:
             fits_by_tid_dict["smoothed_rate_above_thresh"] = numpy.maximum(
-                raw_count_above, count_above_min
+                eff_count_above, count_above_min
             )
         else:
-            fits_by_tid_dict["smoothed_rate_above_thresh"] = raw_count_above.copy()
+            fits_by_tid_dict["smoothed_rate_above_thresh"] = eff_count_above.copy()
         count_below_min = float(self.kwargs.get("count_below_min", 0.0))
+        if is_multi and "coinc_count_below_min" in self.kwargs:
+            count_below_min = float(self.kwargs["coinc_count_below_min"])
         if count_below_min > 0.0:
             fits_by_tid_dict["smoothed_rate_below_thresh"] = numpy.maximum(
-                raw_count_above, count_below_min
+                eff_count_above, count_below_min
             )
         else:
-            fits_by_tid_dict["smoothed_rate_below_thresh"] = raw_count_above.copy()
+            fits_by_tid_dict["smoothed_rate_below_thresh"] = eff_count_above.copy()
         rate_below_min = float(self.kwargs.get("rate_below_min", 0.0))
         if rate_below_min > 0.0 and not self.kwargs.get("normalize_fit_rate", False):
             fits_by_tid_dict["smoothed_rate_below_thresh"] = numpy.maximum(
@@ -1300,17 +1375,6 @@ class ExpFitStatistic(PhaseTDStatistic):
         if "eta" in coeff_file:
             fits_by_tid_dict["eta"] = coeff_file[
                 "eta"
-            ][:][tid_sort].astype(float)
-
-        # The by-template fits may have been stored in the smoothed fits file
-        if "fit_by_template" in coeff_file:
-            coeff_fbt = coeff_file["fit_by_template"]
-            fits_by_tid_dict["fit_by_fit_coeff"] = coeff_fbt["fit_coeff"][:][tid_sort]
-            fits_by_tid_dict["fit_by_rate_above_thresh"] = coeff_fbt[
-                "count_above_thresh"
-            ][:][tid_sort].astype(float)
-            fits_by_tid_dict["fit_by_rate_in_template"] = coeff_file[
-                "count_in_template"
             ][:][tid_sort].astype(float)
 
         # Keep the fit threshold in fits_by_tid
@@ -1561,10 +1625,24 @@ class ExpFitStatistic(PhaseTDStatistic):
             self.curr_tnum = trigs["template_id"]
 
         alphai, ratei, thresh = self.find_fits(trigs)
+        try:
+            ifo = trigs.ifo
+        except AttributeError:
+            ifo = trigs.get("ifo", None)
+            if ifo is None:
+                ifo = self.ifos[0]
+        alphai_ab = self.fits_by_tid[ifo].get(
+            "above_fit_coeff", self.fits_by_tid[ifo]["smoothed_fit_coeff"]
+        )[self.curr_tnum]
+        alphai_norm = self.fits_by_tid[ifo].get(
+            "norm_fit_coeff", self.fits_by_tid[ifo]["smoothed_fit_coeff"]
+        )[self.curr_tnum]
         sngl_stat = self.get_sngl_ranking(trigs)
         self._last_sngl_ranking = sngl_stat
         lognoisel = (
-            -alphai * (sngl_stat - thresh) + numpy.log(alphai) + numpy.log(ratei)
+            -alphai_ab * (sngl_stat - thresh)
+            + numpy.log(alphai_norm)
+            + numpy.log(ratei)
         )
 
         if (
