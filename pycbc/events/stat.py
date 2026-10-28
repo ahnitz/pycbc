@@ -1051,6 +1051,12 @@ class ExpFitStatistic(PhaseTDStatistic):
         self.coinc_fbt_low_alpha_min_count = float(
             self.kwargs.get("coinc_fbt_low_alpha_min_count", 2.0)
         )
+        self.coinc_fbt_sngl_low_alpha_knee = float(
+            self.kwargs.get("coinc_fbt_sngl_low_alpha_knee", 0.0)
+        )
+        self.coinc_fbt_sngl_low_alpha_slope = float(
+            self.kwargs.get("coinc_fbt_sngl_low_alpha_slope", 0.0)
+        )
         self.coinc_net_ns_coeff = float(self.kwargs.get("coinc_net_ns_coeff", 0.0))
         self.coinc_net_ns_min = float(self.kwargs.get("coinc_net_ns_min", 7.0))
         self.coinc_net_ns_max = float(self.kwargs.get("coinc_net_ns_max", 9.2))
@@ -1586,6 +1592,7 @@ class ExpFitStatistic(PhaseTDStatistic):
             and self.coinc_eta_slope == 0.0
             and self.coinc_low_alpha_slope == 0.0
             and self.coinc_fbt_low_alpha_slope == 0.0
+            and self.coinc_fbt_sngl_low_alpha_slope == 0.0
         )
         has_net_w = (
             self.coinc_net_chisq_short_weight > 0.0
@@ -1790,6 +1797,52 @@ class ExpFitStatistic(PhaseTDStatistic):
                         self.coinc_fbt_low_alpha_slope
                         * (self.coinc_fbt_low_alpha_knee - mean_afbt[both_flat])
                     ).astype(numpy.float32)
+        if (
+            self.coinc_fbt_sngl_low_alpha_slope > 0.0
+            and self.coinc_fbt_sngl_low_alpha_knee > 0.0
+        ):
+            sngl_fbt_ifos = (
+                list(self.ifos)
+                if len(getattr(self, "ifos", [])) >= 2
+                else list(self.fits_by_tid.keys())
+            )
+            for ifo in sngl_fbt_ifos:
+                if (
+                    ifo in self.fits_by_tid
+                    and "fit_by_fit_coeff" in self.fits_by_tid[ifo]
+                    and "fit_by_count_above_thresh" in self.fits_by_tid[ifo]
+                    and "smoothed_fit_coeff" in self.fits_by_tid[ifo]
+                ):
+                    a_fbt = self.fits_by_tid[ifo]["fit_by_fit_coeff"].astype(
+                        numpy.float64
+                    )
+                    c_fbt = self.fits_by_tid[ifo][
+                        "fit_by_count_above_thresh"
+                    ].astype(numpy.float64)
+                    a_sm = self.fits_by_tid[ifo]["smoothed_fit_coeff"].astype(
+                        numpy.float64
+                    )
+                    sngl_flat = (
+                        (c_fbt >= 1.0)
+                        & (a_fbt > 0.5)
+                        & (a_fbt < self.coinc_fbt_sngl_low_alpha_knee)
+                        & (
+                            a_sm
+                            < (
+                                self.coinc_low_alpha_knee
+                                if self.coinc_low_alpha_knee > 0.0
+                                else 3.00
+                            )
+                        )
+                    )
+                    if numpy.any(sngl_flat):
+                        prior[sngl_flat] -= (
+                            self.coinc_fbt_sngl_low_alpha_slope
+                            * (
+                                self.coinc_fbt_sngl_low_alpha_knee
+                                - numpy.maximum(1.0, a_fbt[sngl_flat])
+                            )
+                        ).astype(numpy.float32)
         self.coinc_dur_prior = prior
 
     def find_fits(self, trigs):
@@ -2722,6 +2775,12 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         )
         self.coinc_fbt_low_alpha_min_count = float(
             self.kwargs.get("coinc_fbt_low_alpha_min_count", 2.0)
+        )
+        self.coinc_fbt_sngl_low_alpha_knee = float(
+            self.kwargs.get("coinc_fbt_sngl_low_alpha_knee", 0.0)
+        )
+        self.coinc_fbt_sngl_low_alpha_slope = float(
+            self.kwargs.get("coinc_fbt_sngl_low_alpha_slope", 0.0)
         )
         self.coinc_net_ns_coeff = float(self.kwargs.get("coinc_net_ns_coeff", 0.0))
         self.coinc_net_ns_min = float(self.kwargs.get("coinc_net_ns_min", 7.0))
