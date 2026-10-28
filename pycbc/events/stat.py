@@ -563,7 +563,6 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             # histogram entries. All histograms in a given file have the same
             # min entry by design, so use the min of the last one read in.
             self.max_penalty = self.weights[ifo].min()
-            self.hist_max = max(self.hist_max, self.weights[ifo].max())
 
             if self.two_det_flag:
                 # The density of signals is computed as a function of 3 binned
@@ -618,6 +617,37 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                     + self.c2_size[ifo] // 2
                 )
                 self.two_det_weights[ifo][id0, id1, id2] = self.weights[ifo]
+                st = float(self.kwargs.get("phasetd_smooth_t", 0.0))
+                sp = float(self.kwargs.get("phasetd_smooth_p", 0.0))
+                ss = float(self.kwargs.get("phasetd_smooth_s", 0.0))
+                if st > 0.0 or sp > 0.0 or ss > 0.0:
+                    from scipy.ndimage import gaussian_filter
+
+                    w_exc = numpy.maximum(
+                        0.0,
+                        self.two_det_weights[ifo].astype(numpy.float64)
+                        - float(self.max_penalty),
+                    )
+                    w_sm = (
+                        gaussian_filter(
+                            w_exc,
+                            sigma=(st, sp, ss),
+                            mode=["constant", "wrap", "nearest"],
+                        )
+                        + float(self.max_penalty)
+                    )
+                    self.two_det_weights[ifo] = w_sm.astype(dtypec)
+                max_lnw = float(self.kwargs.get("phasetd_max_lnw", numpy.inf))
+                if numpy.isfinite(max_lnw):
+                    self.two_det_weights[ifo] = numpy.minimum(
+                        self.two_det_weights[ifo],
+                        dtypec.type(numpy.exp(max_lnw)),
+                    )
+                self.hist_max = max(
+                    self.hist_max, float(self.two_det_weights[ifo].max())
+                )
+            else:
+                self.hist_max = max(self.hist_max, self.weights[ifo].max())
 
         for ifo, sense in zip(self.hist_ifos, relfac):
             self.relsense[ifo] = sense
@@ -985,6 +1015,18 @@ class ExpFitStatistic(PhaseTDStatistic):
         )
         self.coinc_neg_chieff_slope = float(
             self.kwargs.get("coinc_neg_chieff_slope", 0.0)
+        )
+        self.coinc_neg_s1z_knee = float(
+            self.kwargs.get("coinc_neg_s1z_knee", -1.0)
+        )
+        self.coinc_neg_s1z_slope = float(
+            self.kwargs.get("coinc_neg_s1z_slope", 0.0)
+        )
+        self.coinc_neg_dsz_knee = float(
+            self.kwargs.get("coinc_neg_dsz_knee", -2.0)
+        )
+        self.coinc_neg_dsz_slope = float(
+            self.kwargs.get("coinc_neg_dsz_slope", 0.0)
         )
         self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
         self.coinc_eta_slope = float(self.kwargs.get("coinc_eta_slope", 0.0))
@@ -1389,6 +1431,14 @@ class ExpFitStatistic(PhaseTDStatistic):
             fits_by_tid_dict["eta"] = coeff_file[
                 "eta"
             ][:][tid_sort].astype(float)
+        if "spin1z" in coeff_file:
+            fits_by_tid_dict["spin1z"] = coeff_file[
+                "spin1z"
+            ][:][tid_sort].astype(float)
+        if "spin2z" in coeff_file:
+            fits_by_tid_dict["spin2z"] = coeff_file[
+                "spin2z"
+            ][:][tid_sort].astype(float)
 
         # Keep the fit threshold in fits_by_tid
         fits_by_tid_dict["thresh"] = coeff_file.attrs["stat_threshold"]
@@ -1463,6 +1513,8 @@ class ExpFitStatistic(PhaseTDStatistic):
             and self.coinc_long_dur_exp == 0.0
             and self.coinc_chieff_slope == 0.0
             and self.coinc_neg_chieff_slope == 0.0
+            and self.coinc_neg_s1z_slope == 0.0
+            and self.coinc_neg_dsz_slope == 0.0
             and self.coinc_eta_slope == 0.0
             and self.coinc_low_alpha_slope == 0.0
         ):
@@ -1471,6 +1523,8 @@ class ExpFitStatistic(PhaseTDStatistic):
         dur = None
         chieff = None
         eta = None
+        s1z = None
+        s2z = None
         for ifo in list(self.ifos) + list(self.fits_by_tid.keys()):
             if ifo in self.fits_by_tid:
                 if dur is None and "template_duration" in self.fits_by_tid[ifo]:
@@ -1479,6 +1533,10 @@ class ExpFitStatistic(PhaseTDStatistic):
                     chieff = self.fits_by_tid[ifo]["chi_eff"]
                 if eta is None and "eta" in self.fits_by_tid[ifo]:
                     eta = self.fits_by_tid[ifo]["eta"]
+                if s1z is None and "spin1z" in self.fits_by_tid[ifo]:
+                    s1z = self.fits_by_tid[ifo]["spin1z"]
+                if s2z is None and "spin2z" in self.fits_by_tid[ifo]:
+                    s2z = self.fits_by_tid[ifo]["spin2z"]
         if dur is None:
             self.coinc_dur_prior = None
             return
@@ -1534,6 +1592,25 @@ class ExpFitStatistic(PhaseTDStatistic):
                 prior[neg_chi_mask] -= (
                     self.coinc_neg_chieff_slope
                     * (self.coinc_neg_chieff_knee - chieff[neg_chi_mask])
+                ).astype(numpy.float32)
+        if self.coinc_neg_s1z_slope > 0.0 and s1z is not None:
+            neg_s1z_mask = s1z < self.coinc_neg_s1z_knee
+            if numpy.any(neg_s1z_mask):
+                prior[neg_s1z_mask] -= (
+                    self.coinc_neg_s1z_slope
+                    * (self.coinc_neg_s1z_knee - s1z[neg_s1z_mask])
+                ).astype(numpy.float32)
+        if (
+            self.coinc_neg_dsz_slope > 0.0
+            and s1z is not None
+            and s2z is not None
+        ):
+            dsz = s1z - s2z
+            neg_dsz_mask = dsz < self.coinc_neg_dsz_knee
+            if numpy.any(neg_dsz_mask):
+                prior[neg_dsz_mask] -= (
+                    self.coinc_neg_dsz_slope
+                    * (self.coinc_neg_dsz_knee - dsz[neg_dsz_mask])
                 ).astype(numpy.float32)
         if (
             self.coinc_eta_slope > 0.0
@@ -2390,6 +2467,18 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         )
         self.coinc_neg_chieff_slope = float(
             self.kwargs.get("coinc_neg_chieff_slope", 0.0)
+        )
+        self.coinc_neg_s1z_knee = float(
+            self.kwargs.get("coinc_neg_s1z_knee", -1.0)
+        )
+        self.coinc_neg_s1z_slope = float(
+            self.kwargs.get("coinc_neg_s1z_slope", 0.0)
+        )
+        self.coinc_neg_dsz_knee = float(
+            self.kwargs.get("coinc_neg_dsz_knee", -2.0)
+        )
+        self.coinc_neg_dsz_slope = float(
+            self.kwargs.get("coinc_neg_dsz_slope", 0.0)
         )
         self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
         self.coinc_eta_slope = float(self.kwargs.get("coinc_eta_slope", 0.0))

@@ -595,6 +595,10 @@ for param, vals, slog in zip(args.fit_param, parvals, args.log_param):
         outfile[param] = vals
     elif slog in ["true", "True", "TRUE"]:
         outfile[param] = numpy.exp(vals)
+if "spin1z" not in outfile:
+    outfile["spin1z"] = s1z
+if "spin2z" not in outfile:
+    outfile["spin2z"] = s2z
 
 if args.output_fits_by_template:
     fbt_group = outfile.create_group("fit_by_template")
