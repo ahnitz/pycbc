@@ -1042,10 +1042,41 @@ class ExpFitStatistic(PhaseTDStatistic):
         self.coinc_low_alpha_slope = float(
             self.kwargs.get("coinc_low_alpha_slope", 0.0)
         )
+        self.coinc_fbt_low_alpha_knee = float(
+            self.kwargs.get("coinc_fbt_low_alpha_knee", 0.0)
+        )
+        self.coinc_fbt_low_alpha_slope = float(
+            self.kwargs.get("coinc_fbt_low_alpha_slope", 0.0)
+        )
+        self.coinc_fbt_low_alpha_min_count = float(
+            self.kwargs.get("coinc_fbt_low_alpha_min_count", 2.0)
+        )
         self.coinc_net_ns_coeff = float(self.kwargs.get("coinc_net_ns_coeff", 0.0))
         self.coinc_net_ns_min = float(self.kwargs.get("coinc_net_ns_min", 7.0))
         self.coinc_net_ns_max = float(self.kwargs.get("coinc_net_ns_max", 9.2))
         self.coinc_net_ns_ref = float(self.kwargs.get("coinc_net_ns_ref", 8.4))
+        self.coinc_net_chisq_knee = float(
+            self.kwargs.get("coinc_net_chisq_knee", 8.03)
+        )
+        self.coinc_net_chisq_short_weight = float(
+            self.kwargs.get("coinc_net_chisq_short_weight", 0.0)
+        )
+        self.coinc_net_chisq_short_knee = float(
+            self.kwargs.get("coinc_net_chisq_short_knee", 1.00)
+        )
+        self.coinc_net_chisq_short_scale = float(
+            self.kwargs.get("coinc_net_chisq_short_scale", 0.60)
+        )
+        self.coinc_net_chisq_mid_weight = float(
+            self.kwargs.get("coinc_net_chisq_mid_weight", 0.0)
+        )
+        self.coinc_net_chisq_dur_knee = float(
+            self.kwargs.get("coinc_net_chisq_dur_knee", 4.50)
+        )
+        self.coinc_net_chisq_dur_scale = float(
+            self.kwargs.get("coinc_net_chisq_dur_scale", 4.50)
+        )
+        self.coinc_net_chisq_weight = None
         self.coinc_l2_l1_coeff = float(self.kwargs.get("coinc_l2_l1_coeff", 0.0))
         self.coinc_l2_l1_max = float(self.kwargs.get("coinc_l2_l1_max", 0.55))
         self.coinc_l2_l1_ref = float(self.kwargs.get("coinc_l2_l1_ref", 0.15))
@@ -1098,11 +1129,16 @@ class ExpFitStatistic(PhaseTDStatistic):
         ) and not any(f[0] == "newsnr" for f in self.single_dtype):
             self.single_dtype.append(("newsnr", numpy.float32))
         if (
-            self.coinc_l2_l1_coeff != 0.0
+            (self.coinc_l2_l1_coeff != 0.0 or self.coinc_net_chisq_weight is not None)
             and self.coinc_l2_rchisq_knee > 0.0
             and not any(f[0] == "l2_damp" for f in self.single_dtype)
         ):
             self.single_dtype.append(("l2_damp", numpy.float32))
+        if (
+            self.coinc_net_chisq_weight is not None
+            and not any(f[0] == "net_damp" for f in self.single_dtype)
+        ):
+            self.single_dtype.append(("net_damp", numpy.float32))
 
         if self.kwargs["dq"]:
             # Reweight the noise rate by the dq reweighting factor
@@ -1377,6 +1413,7 @@ class ExpFitStatistic(PhaseTDStatistic):
                 float
             )
             fits_by_tid_dict["fit_by_fit_coeff"] = fbt_alpha
+            fits_by_tid_dict["fit_by_count_above_thresh"] = fbt_count_above.copy()
             fits_by_tid_dict["fit_by_rate_above_thresh"] = fbt_count_above
             fits_by_tid_dict["fit_by_rate_in_template"] = fbt_count_in
             if is_multi:
@@ -1537,7 +1574,7 @@ class ExpFitStatistic(PhaseTDStatistic):
         low-alpha glitch-shelf prior array over template_id for multi-detector
         coincident ranking when enabled.
         """
-        if (
+        has_prior = not (
             self.coinc_dur_exp == 0.0
             and self.coinc_short_dur_exp == 0.0
             and self.coinc_long_dur_exp == 0.0
@@ -1548,8 +1585,15 @@ class ExpFitStatistic(PhaseTDStatistic):
             and self.coinc_pos_dsz_slope == 0.0
             and self.coinc_eta_slope == 0.0
             and self.coinc_low_alpha_slope == 0.0
-        ):
+            and self.coinc_fbt_low_alpha_slope == 0.0
+        )
+        has_net_w = (
+            self.coinc_net_chisq_short_weight > 0.0
+            or self.coinc_net_chisq_mid_weight > 0.0
+        )
+        if not has_prior and not has_net_w:
             self.coinc_dur_prior = None
+            self.coinc_net_chisq_weight = None
             return
         dur = None
         chieff = None
@@ -1569,6 +1613,28 @@ class ExpFitStatistic(PhaseTDStatistic):
                 if s2z is None and "spin2z" in self.fits_by_tid[ifo]:
                     s2z = self.fits_by_tid[ifo]["spin2z"]
         if dur is None:
+            self.coinc_dur_prior = None
+            self.coinc_net_chisq_weight = None
+            return
+        if has_net_w:
+            w_s = (
+                self.coinc_net_chisq_short_weight
+                * numpy.exp(
+                    -numpy.maximum(0.0, dur - self.coinc_net_chisq_short_knee)
+                    / max(self.coinc_net_chisq_short_scale, 1e-6)
+                )
+            )
+            w_m = (
+                self.coinc_net_chisq_mid_weight
+                * numpy.exp(
+                    -numpy.maximum(0.0, dur - self.coinc_net_chisq_dur_knee)
+                    / max(self.coinc_net_chisq_dur_scale, 1e-6)
+                )
+            )
+            self.coinc_net_chisq_weight = (w_s + w_m).astype(numpy.float32)
+        else:
+            self.coinc_net_chisq_weight = None
+        if not has_prior:
             self.coinc_dur_prior = None
             return
 
@@ -1686,6 +1752,44 @@ class ExpFitStatistic(PhaseTDStatistic):
                             self.coinc_low_alpha_slope
                             * (self.coinc_low_alpha_knee - a_ifo[low_a_mask])
                         ).astype(numpy.float32)
+        if (
+            self.coinc_fbt_low_alpha_slope > 0.0
+            and self.coinc_fbt_low_alpha_knee > 0.0
+        ):
+            fbt_ifos = (
+                list(self.ifos)
+                if len(getattr(self, "ifos", [])) >= 2
+                else list(self.fits_by_tid.keys())
+            )
+            valid_ifos = [
+                ifo
+                for ifo in fbt_ifos
+                if ifo in self.fits_by_tid
+                and "fit_by_fit_coeff" in self.fits_by_tid[ifo]
+                and "fit_by_count_above_thresh" in self.fits_by_tid[ifo]
+            ]
+            if len(valid_ifos) >= 2:
+                both_flat = numpy.ones(len(dur), dtype=bool)
+                mean_afbt = numpy.zeros(len(dur), dtype=numpy.float64)
+                for ifo in valid_ifos:
+                    a_fbt = self.fits_by_tid[ifo]["fit_by_fit_coeff"].astype(
+                        numpy.float64
+                    )
+                    c_fbt = self.fits_by_tid[ifo][
+                        "fit_by_count_above_thresh"
+                    ].astype(numpy.float64)
+                    both_flat &= (
+                        (c_fbt >= self.coinc_fbt_low_alpha_min_count)
+                        & (a_fbt > 0.5)
+                        & (a_fbt < self.coinc_fbt_low_alpha_knee)
+                    )
+                    mean_afbt += numpy.maximum(1.5, a_fbt)
+                mean_afbt /= float(len(valid_ifos))
+                if numpy.any(both_flat):
+                    prior[both_flat] -= (
+                        self.coinc_fbt_low_alpha_slope
+                        * (self.coinc_fbt_low_alpha_knee - mean_afbt[both_flat])
+                    ).astype(numpy.float32)
         self.coinc_dur_prior = prior
 
     def find_fits(self, trigs):
@@ -2062,7 +2166,7 @@ class ExpFitStatistic(PhaseTDStatistic):
                 self, "_last_sngl_ranking", self.get_sngl_ranking(trigs)
             )
         if (
-            self.coinc_l2_l1_coeff != 0.0
+            (self.coinc_l2_l1_coeff != 0.0 or self.coinc_net_chisq_weight is not None)
             and self.coinc_l2_rchisq_knee > 0.0
             and "l2_damp" in singles.dtype.names
         ):
@@ -2102,6 +2206,14 @@ class ExpFitStatistic(PhaseTDStatistic):
             except (KeyError, ValueError, TypeError):
                 pass
             singles["l2_damp"] = numpy.exp(-z_tot).astype(numpy.float32)
+            if (
+                self.coinc_net_chisq_weight is not None
+                and "net_damp" in singles.dtype.names
+            ):
+                singles["net_damp"] = (
+                    self.coinc_net_chisq_weight[self.curr_tnum]
+                    * (1.0 - singles["l2_damp"])
+                ).astype(numpy.float32)
 
         if self.kwargs["chirp_mass"]:
             from pycbc.conversions import mchirp_from_mass1_mass2
@@ -2364,6 +2476,20 @@ class ExpFitStatistic(PhaseTDStatistic):
                     numpy.clip(net_ns, self.coinc_net_ns_min, self.coinc_net_ns_max)
                     - self.coinc_net_ns_ref
                 )
+                if (
+                    self.coinc_net_chisq_weight is not None
+                    and "net_damp" in s[0][1].dtype.names
+                    and len(s) == 2
+                ):
+                    nd0 = numpy.asarray(s[0][1]["net_damp"], dtype=numpy.float32)
+                    nd1 = numpy.asarray(s[1][1]["net_damp"], dtype=numpy.float32)
+                    nd_prim = numpy.where(ns_list[0] >= ns_list[1], nd0, nd1)
+                    net_excess = numpy.maximum(
+                        0.0,
+                        numpy.minimum(net_ns, self.coinc_net_ns_max)
+                        - self.coinc_net_chisq_knee,
+                    )
+                    ln_s -= self.coinc_net_ns_coeff * nd_prim * net_excess
             if self.coinc_l2_l1_coeff != 0.0:
                 l1_ns = sum(ns_list)
                 l2_l1 = numpy.maximum(
@@ -2588,10 +2714,41 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         self.coinc_low_alpha_slope = float(
             self.kwargs.get("coinc_low_alpha_slope", 0.0)
         )
+        self.coinc_fbt_low_alpha_knee = float(
+            self.kwargs.get("coinc_fbt_low_alpha_knee", 0.0)
+        )
+        self.coinc_fbt_low_alpha_slope = float(
+            self.kwargs.get("coinc_fbt_low_alpha_slope", 0.0)
+        )
+        self.coinc_fbt_low_alpha_min_count = float(
+            self.kwargs.get("coinc_fbt_low_alpha_min_count", 2.0)
+        )
         self.coinc_net_ns_coeff = float(self.kwargs.get("coinc_net_ns_coeff", 0.0))
         self.coinc_net_ns_min = float(self.kwargs.get("coinc_net_ns_min", 7.0))
         self.coinc_net_ns_max = float(self.kwargs.get("coinc_net_ns_max", 9.2))
         self.coinc_net_ns_ref = float(self.kwargs.get("coinc_net_ns_ref", 8.4))
+        self.coinc_net_chisq_knee = float(
+            self.kwargs.get("coinc_net_chisq_knee", 8.03)
+        )
+        self.coinc_net_chisq_short_weight = float(
+            self.kwargs.get("coinc_net_chisq_short_weight", 0.0)
+        )
+        self.coinc_net_chisq_short_knee = float(
+            self.kwargs.get("coinc_net_chisq_short_knee", 1.00)
+        )
+        self.coinc_net_chisq_short_scale = float(
+            self.kwargs.get("coinc_net_chisq_short_scale", 0.60)
+        )
+        self.coinc_net_chisq_mid_weight = float(
+            self.kwargs.get("coinc_net_chisq_mid_weight", 0.0)
+        )
+        self.coinc_net_chisq_dur_knee = float(
+            self.kwargs.get("coinc_net_chisq_dur_knee", 4.50)
+        )
+        self.coinc_net_chisq_dur_scale = float(
+            self.kwargs.get("coinc_net_chisq_dur_scale", 4.50)
+        )
+        self.coinc_net_chisq_weight = None
         self.coinc_l2_l1_coeff = float(self.kwargs.get("coinc_l2_l1_coeff", 0.0))
         self.coinc_l2_l1_max = float(self.kwargs.get("coinc_l2_l1_max", 0.55))
         self.coinc_l2_l1_ref = float(self.kwargs.get("coinc_l2_l1_ref", 0.15))
