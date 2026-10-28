@@ -1028,6 +1028,12 @@ class ExpFitStatistic(PhaseTDStatistic):
         self.coinc_neg_dsz_slope = float(
             self.kwargs.get("coinc_neg_dsz_slope", 0.0)
         )
+        self.coinc_pos_dsz_knee = float(
+            self.kwargs.get("coinc_pos_dsz_knee", 2.0)
+        )
+        self.coinc_pos_dsz_slope = float(
+            self.kwargs.get("coinc_pos_dsz_slope", 0.0)
+        )
         self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
         self.coinc_eta_slope = float(self.kwargs.get("coinc_eta_slope", 0.0))
         self.coinc_low_alpha_knee = float(
@@ -1043,6 +1049,24 @@ class ExpFitStatistic(PhaseTDStatistic):
         self.coinc_l2_l1_coeff = float(self.kwargs.get("coinc_l2_l1_coeff", 0.0))
         self.coinc_l2_l1_max = float(self.kwargs.get("coinc_l2_l1_max", 0.55))
         self.coinc_l2_l1_ref = float(self.kwargs.get("coinc_l2_l1_ref", 0.15))
+        self.coinc_l2_rchisq_knee = float(
+            self.kwargs.get("coinc_l2_rchisq_knee", 0.0)
+        )
+        self.coinc_l2_rchisq_scale = float(
+            self.kwargs.get("coinc_l2_rchisq_scale", 0.15)
+        )
+        self.coinc_l2_sg_knee = float(
+            self.kwargs.get("coinc_l2_sg_knee", 1.60)
+        )
+        self.coinc_l2_sg_scale = float(
+            self.kwargs.get("coinc_l2_sg_scale", 0.60)
+        )
+        self.coinc_l2_auto_knee = float(
+            self.kwargs.get("coinc_l2_auto_knee", 1.15)
+        )
+        self.coinc_l2_auto_scale = float(
+            self.kwargs.get("coinc_l2_auto_scale", 0.35)
+        )
         self.coinc_dur_prior = None
 
         # This will be used to keep track of the template number being used
@@ -1073,6 +1097,12 @@ class ExpFitStatistic(PhaseTDStatistic):
             self.coinc_net_ns_coeff != 0.0 or self.coinc_l2_l1_coeff != 0.0
         ) and not any(f[0] == "newsnr" for f in self.single_dtype):
             self.single_dtype.append(("newsnr", numpy.float32))
+        if (
+            self.coinc_l2_l1_coeff != 0.0
+            and self.coinc_l2_rchisq_knee > 0.0
+            and not any(f[0] == "l2_damp" for f in self.single_dtype)
+        ):
+            self.single_dtype.append(("l2_damp", numpy.float32))
 
         if self.kwargs["dq"]:
             # Reweight the noise rate by the dq reweighting factor
@@ -1515,6 +1545,7 @@ class ExpFitStatistic(PhaseTDStatistic):
             and self.coinc_neg_chieff_slope == 0.0
             and self.coinc_neg_s1z_slope == 0.0
             and self.coinc_neg_dsz_slope == 0.0
+            and self.coinc_pos_dsz_slope == 0.0
             and self.coinc_eta_slope == 0.0
             and self.coinc_low_alpha_slope == 0.0
         ):
@@ -1611,6 +1642,18 @@ class ExpFitStatistic(PhaseTDStatistic):
                 prior[neg_dsz_mask] -= (
                     self.coinc_neg_dsz_slope
                     * (self.coinc_neg_dsz_knee - dsz[neg_dsz_mask])
+                ).astype(numpy.float32)
+        if (
+            self.coinc_pos_dsz_slope > 0.0
+            and s1z is not None
+            and s2z is not None
+        ):
+            dsz = s1z - s2z
+            pos_dsz_mask = dsz > self.coinc_pos_dsz_knee
+            if numpy.any(pos_dsz_mask):
+                prior[pos_dsz_mask] -= (
+                    self.coinc_pos_dsz_slope
+                    * (dsz[pos_dsz_mask] - self.coinc_pos_dsz_knee)
                 ).astype(numpy.float32)
         if (
             self.coinc_eta_slope > 0.0
@@ -2018,6 +2061,47 @@ class ExpFitStatistic(PhaseTDStatistic):
             singles["newsnr"] = getattr(
                 self, "_last_sngl_ranking", self.get_sngl_ranking(trigs)
             )
+        if (
+            self.coinc_l2_l1_coeff != 0.0
+            and self.coinc_l2_rchisq_knee > 0.0
+            and "l2_damp" in singles.dtype.names
+        ):
+            snr_f = numpy.asarray(singles["snr"], dtype=numpy.float64)
+            s2_pa = numpy.minimum(snr_f**2, 300.0)
+            s2_sg = numpy.minimum(snr_f**2, 5000.0)
+            z_tot = numpy.zeros_like(snr_f)
+            try:
+                dof = numpy.maximum(1.0, 2.0 * trigs["chisq_dof"][:] - 2.0)
+                rchisq = trigs["chisq"][:] / dof
+                z_tot += numpy.maximum(
+                    0.0,
+                    (rchisq - (self.coinc_l2_rchisq_knee + 0.0018 * s2_pa))
+                    / self.coinc_l2_rchisq_scale,
+                )
+            except (KeyError, ValueError, TypeError):
+                pass
+            try:
+                sgchisq = trigs["sg_chisq"][:]
+                c_sg = float(self.kwargs.get("sngl_ranking_c_sg", 0.012))
+                z_tot += numpy.maximum(
+                    0.0,
+                    (sgchisq - (self.coinc_l2_sg_knee + c_sg * s2_sg))
+                    / self.coinc_l2_sg_scale,
+                )
+            except (KeyError, ValueError, TypeError):
+                pass
+            try:
+                autochisq = trigs["cont_chisq"][:] / numpy.maximum(
+                    1.0, trigs["cont_chisq_dof"][:]
+                )
+                z_tot += numpy.maximum(
+                    0.0,
+                    (autochisq - (self.coinc_l2_auto_knee + 0.0028 * s2_pa))
+                    / self.coinc_l2_auto_scale,
+                )
+            except (KeyError, ValueError, TypeError):
+                pass
+            singles["l2_damp"] = numpy.exp(-z_tot).astype(numpy.float32)
 
         if self.kwargs["chirp_mass"]:
             from pycbc.conversions import mchirp_from_mass1_mass2
@@ -2285,10 +2369,20 @@ class ExpFitStatistic(PhaseTDStatistic):
                 l2_l1 = numpy.maximum(
                     0.0, numpy.sqrt(float(len(s))) * net_ns - l1_ns
                 )
-                ln_s += self.coinc_l2_l1_coeff * (
+                b_l2 = self.coinc_l2_l1_coeff * (
                     numpy.minimum(l2_l1, self.coinc_l2_l1_max)
                     - self.coinc_l2_l1_ref
                 )
+                if (
+                    self.coinc_l2_rchisq_knee > 0.0
+                    and "l2_damp" in s[0][1].dtype.names
+                    and len(s) == 2
+                ):
+                    d0 = numpy.asarray(s[0][1]["l2_damp"], dtype=numpy.float32)
+                    d1 = numpy.asarray(s[1][1]["l2_damp"], dtype=numpy.float32)
+                    d_prim = numpy.where(ns_list[0] >= ns_list[1], d0, d1)
+                    b_l2 = numpy.where(b_l2 > 0.0, b_l2 * d_prim, b_l2)
+                ln_s += b_l2
 
         # Combine the signal and noise rates
         loglr = ln_s - ln_noise_rate
@@ -2480,6 +2574,12 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         self.coinc_neg_dsz_slope = float(
             self.kwargs.get("coinc_neg_dsz_slope", 0.0)
         )
+        self.coinc_pos_dsz_knee = float(
+            self.kwargs.get("coinc_pos_dsz_knee", 2.0)
+        )
+        self.coinc_pos_dsz_slope = float(
+            self.kwargs.get("coinc_pos_dsz_slope", 0.0)
+        )
         self.coinc_eta_knee = float(self.kwargs.get("coinc_eta_knee", 0.0))
         self.coinc_eta_slope = float(self.kwargs.get("coinc_eta_slope", 0.0))
         self.coinc_low_alpha_knee = float(
@@ -2495,6 +2595,24 @@ class ExpFitCombinedSNR(ExpFitStatistic):
         self.coinc_l2_l1_coeff = float(self.kwargs.get("coinc_l2_l1_coeff", 0.0))
         self.coinc_l2_l1_max = float(self.kwargs.get("coinc_l2_l1_max", 0.55))
         self.coinc_l2_l1_ref = float(self.kwargs.get("coinc_l2_l1_ref", 0.15))
+        self.coinc_l2_rchisq_knee = float(
+            self.kwargs.get("coinc_l2_rchisq_knee", 0.0)
+        )
+        self.coinc_l2_rchisq_scale = float(
+            self.kwargs.get("coinc_l2_rchisq_scale", 0.15)
+        )
+        self.coinc_l2_sg_knee = float(
+            self.kwargs.get("coinc_l2_sg_knee", 1.60)
+        )
+        self.coinc_l2_sg_scale = float(
+            self.kwargs.get("coinc_l2_sg_scale", 0.60)
+        )
+        self.coinc_l2_auto_knee = float(
+            self.kwargs.get("coinc_l2_auto_knee", 1.15)
+        )
+        self.coinc_l2_auto_scale = float(
+            self.kwargs.get("coinc_l2_auto_scale", 0.35)
+        )
         self.coinc_dur_prior = None
 
     def single(self, trigs):
