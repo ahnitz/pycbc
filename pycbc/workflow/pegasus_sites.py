@@ -154,8 +154,7 @@ def _build_condorio_site(name, cp):
 def add_condorpool_copy_site(sitecat, cp):
     """Add condorpool_copy site to site catalog"""
     site = _build_condorio_site("condorpool_copy", cp)
-    site.add_profiles(Namespace.PEGASUS, key='auxillary.local',
-                      value="true")
+    site.add_profiles(Namespace.PEGASUS, key="auxillary.local", value="true")
     sitecat.add_sites(site)
 
 
@@ -292,7 +291,9 @@ def add_clusterlink_site(sitecat, cp):
     site.add_profiles(
         Namespace.PEGASUS, key="transfer.bypass.input.staging", value="true"
     )
-    site.add_profiles(Namespace.PEGASUS, key="auxillary.local", value="true")
+    # Clusterlink sites do not share a filesystem with the submit host, so
+    # disable local symlinks so Pegasus transfers inputs via Condor I/O.
+    site.add_profiles(Namespace.PEGASUS, key="nosymlink", value=True)
     # Clusterlink always executes jobs inside its generated container image,
     # where the Pegasus worker package is installed at /opt/clusterlink/pegasus.
     # Setting PEGASUS_HOME on this site also instructs Pegasus not to transfer
