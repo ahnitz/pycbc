@@ -225,6 +225,52 @@ class TestChain(unittest.TestCase):
         numpy.testing.assert_allclose(vals["bank_chisq"], expect_bank, rtol=1e-5)
         numpy.testing.assert_array_equal(vals["bank_chisq_dof"], expect_bank_dof)
 
+    def test_power_evaluate_batch_out_of_band_snr_is_nonnegative(self):
+        """Out-of-band correlation power must not produce negative power chisq."""
+        n, sr = 8192, 1024.0
+        df = sr / n
+        hp, _ = get_fd_waveform(
+            approximant="TaylorF2", mass1=10, mass2=10, f_lower=30, delta_f=df
+        )
+        hp.resize(n // 2 + 1)
+        hp.f_lower = 30.0
+        hp.params = types.SimpleNamespace(mass1=10.0, mass2=10.0)
+        psd = FrequencySeries(numpy.ones(n // 2 + 1), delta_f=df)
+        hp.psd = psd
+
+        power = SingleDetPowerChisq(num_bins=8)
+        bins, _ = power.cached_chisq_bins_and_weights(hp, psd)
+        index = 123
+        corr_arr = numpy.zeros(n, dtype=numpy.complex128)
+        freq_idx = numpy.arange(n)
+        # Put in-band matched template power over [bins[0], bins[-1]) summing to SNR 10
+        inband = slice(bins[0], bins[-1])
+        weights_inband = abs(hp.numpy()[inband]) ** 2
+        corr_arr[inband] = (
+            10.0
+            * weights_inband
+            / numpy.sum(weights_inband)
+            * numpy.exp(-2j * numpy.pi * index / n * freq_idx[inband])
+        )
+        # Inject out-of-band leakage below f_lower so full-band SNR > in-band SNR
+        corr_arr[1:5] = (
+            10.0 / 4.0 * numpy.exp(-2j * numpy.pi * index / n * freq_idx[1:5])
+        )
+        corr = FrequencySeries(corr_arr, delta_f=df)
+        full_snr = numpy.sum(corr_arr * numpy.exp(2j * numpy.pi * index / n * freq_idx))
+
+        chain = SignalConsistencyChain(power, steps=["power"])
+        keep, vals = run(
+            chain,
+            [full_snr],
+            [index],
+            template=lambda j: hp,
+            correlation=lambda j, reach: (corr, index),
+        )
+        self.assertTrue(keep.all())
+        self.assertGreater(vals["chisq_dof"][0], 0)
+        self.assertGreater(vals["chisq"][0], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

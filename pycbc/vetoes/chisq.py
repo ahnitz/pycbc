@@ -511,9 +511,25 @@ class SingleDetPowerChisq:
         corr, index = batch.correlation(j, 0)
         template = batch.template(j)
         psd = getattr(template, "psd", getattr(batch.stilde, "psd", None))
+        snr_val = batch.snr[j]
+        if (
+            self.do
+            and corr is not None
+            and psd is not None
+            and (not self.snr_threshold or abs(snr_val) > self.snr_threshold)
+        ):
+            # Compute exact in-band SNR over [bins[0], bins[-1]) so out-of-band FIR/FFT
+            # leakage in batch.snr[j] cannot violate Cauchy-Schwarz vs shift_sum.
+            bins, _ = self.cached_chisq_bins_and_weights(template, psd)
+            freq_idx = numpy.arange(bins[0], bins[-1])
+            corr_arr = corr.numpy() if hasattr(corr, "numpy") else numpy.asarray(corr)
+            snr_val = numpy.sum(
+                corr_arr[bins[0] : bins[-1]]
+                * numpy.exp(2j * numpy.pi * index / len(corr_arr) * freq_idx)
+            )
         chi, dof = self.values(
             corr,
-            numpy.array([batch.snr[j]]),
+            numpy.array([snr_val]),
             1,
             psd,
             numpy.array([index]),
@@ -521,7 +537,8 @@ class SingleDetPowerChisq:
         )
         if chi is None or not len(chi):
             return None
-        return {"chisq": chi[0], "chisq_dof": dof[0]}
+        chisq_val = numpy.float32(1e-6) if dof[0] > 0 and chi[0] < 1e-6 else chi[0]
+        return {"chisq": chisq_val, "chisq_dof": dof[0]}
 
     @staticmethod
     def parse_option(row, arg):
