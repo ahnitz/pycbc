@@ -32,6 +32,7 @@ from hashlib import sha1
 
 import h5py
 import numpy
+from scipy.ndimage import gaussian_filter
 
 from . import coinc_rate, ranking
 from .eventmgr_cython import (
@@ -383,6 +384,9 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         files=None,
         ifos=None,
         pregenerate_hist=True,
+        phasetd_smooth_t=None,
+        phasetd_smooth_p=None,
+        phasetd_smooth_s=None,
         **kwargs,
     ):
         """
@@ -391,22 +395,47 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         sngl_ranking: str
             The name of the ranking to use for the single-detector triggers.
 
-        files: list of strs, unused here
+        files: list of strs, optional
             A list containing the filenames of hdf format files used to help
             construct the coincident statistics. The files must have a 'stat'
             attribute which is used to associate them with the appropriate
             statistic class.
 
-        ifos: list of strs, needed here
-            The list of detector names
+        ifos: list of strs, optional
+            The list of detector names.
 
         pregenerate_hist: bool, optional
             If False, do not pregenerate histogram on class instantiation.
             Default is True.
 
+        phasetd_smooth_t: float, optional
+            Gaussian smoothing width in time-difference bins for 2-detector
+            signal density lookup tables. Default is None (disabled).
+
+        phasetd_smooth_p: float, optional
+            Gaussian smoothing width in phase-difference bins (periodic) for
+            2-detector signal density lookup tables. Default is None (disabled).
+
+        phasetd_smooth_s: float, optional
+            Gaussian smoothing width in SNR-ratio bins for 2-detector signal
+            density lookup tables. Default is None (disabled).
+
         """
         QuadratureSumStatistic.__init__(
             self, sngl_ranking, files=files, ifos=ifos, **kwargs
+        )
+
+        # Parse optional 3D mismatch smoothing widths (disabled when None or all <= 0)
+        smooth_sigmas = tuple(
+            0.0 if val is None else float(val)
+            for val in (phasetd_smooth_t, phasetd_smooth_p, phasetd_smooth_s)
+        )
+        if any(sigma < 0.0 for sigma in smooth_sigmas):
+            raise ValueError(
+                f"PhaseTD smoothing widths must be non-negative; got {smooth_sigmas}"
+            )
+        self.phasetd_smooth_sigma = (
+            smooth_sigmas if any(sigma > 0.0 for sigma in smooth_sigmas) else None
         )
 
         self.single_dtype = [
@@ -614,6 +643,31 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                     + self.c2_size[ifo] // 2
                 )
                 self.two_det_weights[ifo][id0, id1, id2] = self.weights[ifo]
+
+                # Smooth active physical 3D grid over (dt, dphi, dsnr_ratio) above floor
+                if self.phasetd_smooth_sigma is not None:
+                    phase_start = int(self.c1_size[ifo] // 2)
+                    snr_ratio_start = int(self.c2_size[ifo] // 2)
+                    active_grid = self.two_det_weights[ifo][
+                        :, phase_start:, snr_ratio_start:
+                    ]
+                    excess_density = numpy.maximum(
+                        0.0,
+                        active_grid.astype(numpy.float64) - float(self.max_penalty),
+                    )
+                    smoothed_excess = gaussian_filter(
+                        excess_density,
+                        sigma=self.phasetd_smooth_sigma,
+                        mode=["constant", "wrap", "nearest"],
+                    )
+                    self.two_det_weights[ifo][:, phase_start:, snr_ratio_start:] = (
+                        smoothed_excess + float(self.max_penalty)
+                    ).astype(dtypec)
+
+        if self.two_det_flag and self.phasetd_smooth_sigma is not None:
+            self.hist_max = max(
+                float(self.two_det_weights[ifo].max()) for ifo in self.hist_ifos
+            )
 
         for ifo, sense in zip(self.hist_ifos, relfac, strict=True):
             self.relsense[ifo] = sense
