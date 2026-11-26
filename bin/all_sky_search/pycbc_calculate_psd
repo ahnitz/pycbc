@@ -40,6 +40,31 @@ parser.add_argument("--segment-name", help="Name of segment list to use")
 parser.add_argument("--cores", default=1, type=int)
 parser.add_argument("--output-file", required=True)
 parser.add_argument("--num-data-retries", default=10, type=int)
+parser.add_argument(
+    "--psd-delta-f",
+    type=float,
+    default=None,
+    help="Target frequency resolution for output PSDs in Hz (e.g. 0.0625 for 1/16 Hz). "
+    "Optional; if omitted and --native-welch-resolution is set, defaults to "
+    "1.0 / psd_segment_length.",
+)
+parser.add_argument(
+    "--native-welch-resolution",
+    "--native-psd-resolution",
+    dest="native_welch_resolution",
+    action="store_true",
+    default=False,
+    help="Optional: store PSDs at native Welch estimation resolution "
+    "(1.0 / psd_segment_length) instead of interpolating to full segment resolution.",
+)
+parser.add_argument(
+    "--no-native-welch-resolution",
+    "--interpolated-resolution",
+    dest="native_welch_resolution",
+    action="store_false",
+    help="Disable native Welch resolution and store PSDs at interpolated full "
+    "segment resolution (default).",
+)
 
 pycbc.psd.insert_psd_option_group(parser, output=False)
 pycbc.strain.insert_strain_option_group(parser, gps_times=False)
@@ -97,8 +122,17 @@ def get_psd(input_tuple):
     strain_segments = pycbc.strain.StrainSegments.from_cli(args, gwstrain)
 
     flow = args.low_frequency_cutoff
-    flen = strain_segments.freq_len
-    delta_f = strain_segments.delta_f
+    if args.psd_delta_f is not None:
+        delta_f = float(args.psd_delta_f)
+    elif args.native_welch_resolution and args.psd_segment_length is not None:
+        delta_f = 1.0 / float(args.psd_segment_length)
+    else:
+        delta_f = strain_segments.delta_f
+
+    if delta_f != strain_segments.delta_f:
+        flen = int(gwstrain.sample_rate / 2.0 / delta_f) + 1
+    else:
+        flen = strain_segments.freq_len
 
     logger.info("%d: calculating psd", i)
     analysis_segments = [

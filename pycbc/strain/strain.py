@@ -408,11 +408,44 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
     else:
         raise ValueError(f"Unrecognized precision {precision}")
 
-    if opt.gating_file is not None:
-        logger.info("Gating times contained in gating file")
-        gate_params = numpy.loadtxt(opt.gating_file)
-        if len(gate_params.shape) == 1:
-            gate_params = [gate_params]
+    invpsd_gating = None
+
+    def _get_gating_invpsd(initial_gate_params=None):
+        nonlocal invpsd_gating
+        if invpsd_gating is None:
+            flow = opt.strain_high_pass or 20.0
+            psd_seg_len = min(16.0, max(2.0, strain.duration / 4.0))
+            psd_strain = (
+                gate_data(strain.copy(), initial_gate_params)
+                if initial_gate_params
+                else strain
+            )
+            invpsd_gating = 1.0 / psd_strain.filter_psd(
+                psd_seg_len, strain.delta_f, flow
+            )
+        return invpsd_gating
+
+    paint_method = getattr(opt, "paint_method", "auto")
+    paint_ridge = getattr(opt, "paint_ridge", 1e-7)
+
+    def _apply_gates(gate_params):
+        nonlocal strain
+        invpsd = (
+            _get_gating_invpsd(gate_params) if opt.gating_method == "paint" else None
+        )
+        if opt.gating_method == "paint" and paint_method != "matmul":
+            from pycbc.strain.gate import gate_and_paint_multi
+
+            intervals = [strain.get_gate_indices(gt, gw) for gt, gw, _ in gate_params]
+            strain = gate_and_paint_multi(
+                strain,
+                intervals,
+                invpsd,
+                copy=False,
+                method=paint_method,
+                ridge=paint_ridge,
+            )
+            return
         for gate_time, gate_window, gate_taper in gate_params:
             strain = strain.gate(
                 gate_time,
@@ -420,7 +453,17 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
                 method=opt.gating_method,
                 copy=False,
                 taper_width=gate_taper,
+                invpsd=invpsd,
+                paint_method=paint_method,
+                paint_ridge=paint_ridge,
             )
+
+    if opt.gating_file is not None:
+        logger.info("Gating times contained in gating file")
+        gate_params = numpy.loadtxt(opt.gating_file)
+        if len(gate_params.shape) == 1:
+            gate_params = [gate_params]
+        _apply_gates(gate_params)
         gating_info["file"] = [
             gp
             for gp in gate_params
@@ -438,26 +481,19 @@ def from_cli(opt, dyn_range_fac=1, precision="single", inj_filter_rejector=None)
                 low_freq_cutoff=opt.strain_high_pass,
                 corrupt_time=opt.pad_data + opt.autogating_pad,
             )
+            if len(glitch_times) == 0:
+                break
             gate_params = [
                 [gt, opt.autogating_width, opt.autogating_taper] for gt in glitch_times
             ]
             gating_info["auto"] += gate_params
-            for gate_time, gate_window, gate_taper in gate_params:
-                strain = strain.gate(
-                    gate_time,
-                    window=gate_window,
-                    method=opt.gating_method,
-                    copy=False,
-                    taper_width=gate_taper,
-                )
-            if len(glitch_times) > 0:
-                logger.info(
-                    "Autogating at %s", ", ".join([f"{gt:.3f}" for gt in glitch_times])
-                )
-            else:
-                break
+            _apply_gates(gate_params)
+            logger.info(
+                "Autogating at %s", ", ".join([f"{gt:.3f}" for gt in glitch_times])
+            )
 
-    if opt.strain_high_pass:
+    # Skip re-highpassing after inpainting so the covariance null space is preserved
+    if opt.strain_high_pass and opt.gating_method != "paint":
         logger.info("Highpass Filtering")
         strain = highpass(strain, frequency=opt.strain_high_pass)
 
@@ -816,6 +852,21 @@ def insert_strain_option_group(parser, gps_times=True):
         default="taper",
         help="Choose the method for gating. Default: `taper`",
         choices=["hard", "taper", "paint"],
+    )
+    data_reading_group.add_argument(
+        "--paint-method",
+        type=str,
+        default="auto",
+        choices=["cholesky", "toeplitz", "matmul", "auto"],
+        help="Optional solver for gating-method='paint' ('toeplitz', 'cholesky', "
+        "'matmul', or 'auto', which selects regularized toeplitz). Default: 'auto'.",
+    )
+    data_reading_group.add_argument(
+        "--paint-ridge",
+        type=float,
+        default=1e-7,
+        help="Optional diagonal regularization ridge parameter for inpainting "
+        "gating. Default: 1e-7.",
     )
     # Optional
     data_reading_group.add_argument(
@@ -1244,6 +1295,25 @@ def insert_strain_option_group_multi_ifo(parser, gps_times=True):
         help="Choose the method for gating. Default: `taper`",
         choices=["hard", "taper", "paint"],
     )
+    data_reading_group_multi.add_argument(
+        "--paint-method",
+        type=str,
+        nargs="+",
+        action=MultiDetOptionAction,
+        default="auto",
+        metavar="IFO:METHOD",
+        help="Optional solver for gating-method='paint' ('toeplitz', 'cholesky', "
+        "'matmul', or 'auto', which selects regularized toeplitz). Default: 'auto'.",
+    )
+    data_reading_group_multi.add_argument(
+        "--paint-ridge",
+        type=float,
+        nargs="+",
+        action=MultiDetOptionAction,
+        default=1e-7,
+        help="Optional diagonal regularization ridge parameter for inpainting "
+        "gating. Default: 1e-7.",
+    )
 
     # Optional
     data_reading_group_multi.add_argument(
@@ -1428,13 +1498,48 @@ class StrainSegments:
         filter_inj_only=False,
         injection_window=None,  # noqa: ARG002
         allow_zero_padding=False,
+        inpaint_edges=False,
+        low_frequency_cutoff=20.0,
     ):
-        """
-        Determine how to chop up the strain data into smaller segments
-        for analysis.
+        """Determine how to chop up the strain data into smaller segments.
+
+        Parameters
+        ----------
+        strain : TimeSeries
+            Input strain time series.
+        segment_length : int, optional
+            Length of each analysis segment in seconds. Defaults to
+            ``strain.duration``.
+        segment_start_pad : int, optional
+            Padding seconds to discard from the start of each segment.
+            Default is 0.
+        segment_end_pad : int, optional
+            Padding seconds to discard from the end of each segment.
+            Default is 0.
+        trigger_start : int, optional
+            GPS time to start recording triggers.
+        trigger_end : int, optional
+            GPS time to stop recording triggers.
+        filter_inj_only : bool, optional
+            Analyze only segments containing an injection. Default is False.
+        injection_window : float, optional
+            Unused compatibility parameter. Default is None.
+        allow_zero_padding : bool, optional
+            Allow zero padding at data boundaries when segment padding extends
+            beyond ``strain``. Default is False.
+        inpaint_edges : bool, optional
+            If True, inpaint zero-padded boundary regions in ``fourier_segments``
+            instead of leaving hard zero edges. Default is False.
+        low_frequency_cutoff : float, optional
+            Low-frequency cutoff (Hz) used when estimating the inverse PSD for
+            edge inpainting. Default is 20.0.
+
         """
         self._fourier_segments = None
+        self._inpaint_invpsd = None
         self.strain = strain
+        self.inpaint_edges = inpaint_edges
+        self.low_frequency_cutoff = low_frequency_cutoff
 
         self.delta_t = strain.delta_t
         self.sample_rate = strain.sample_rate
@@ -1573,6 +1678,47 @@ class StrainSegments:
         self.segment_slices = segment_slices_red
         self.analyze_slices = analyze_slices_red
 
+    def _get_inpaint_invpsd(self):
+        """Compute and cache a tapered inverse PSD for boundary edge inpainting."""
+        if self._inpaint_invpsd is None:
+            psd_seg_len = min(16.0, max(2.0, self.strain.duration / 4.0))
+            f_low = float(self.low_frequency_cutoff)
+            psd_raw = self.strain.filter_psd(psd_seg_len, self.delta_f, f_low)
+            freqs = psd_raw.sample_frequencies.numpy()
+            f_taper = min(4.0, f_low)
+            f_start = max(0.0, f_low - f_taper)
+
+            # Smooth cosine roll-on below low_frequency_cutoff to avoid Gibbs ringing
+            taper = numpy.ones(len(freqs), dtype=numpy.float64)
+            taper[freqs < f_start] = 0.0
+            mid = (freqs >= f_start) & (freqs < f_low)
+            if numpy.any(mid) and f_taper > 0:
+                taper[mid] = 0.5 * (
+                    1.0 - numpy.cos(numpy.pi * (freqs[mid] - f_start) / f_taper)
+                )
+
+            psd_vals = numpy.maximum(psd_raw.numpy(), 1e-60)
+            inv_vals = numpy.where(taper > 0, taper / psd_vals, 0.0)
+            self._inpaint_invpsd = FrequencySeries(inv_vals, delta_f=self.delta_f)
+            if hasattr(self.strain, "precision") and self.strain.precision == "single":
+                self._inpaint_invpsd = self._inpaint_invpsd.astype(numpy.float32)
+        return self._inpaint_invpsd
+
+    def _inpaint_edge(self, strain_chunk, lindex, rindex):
+        """Inpaint a zero-padded boundary region if edge inpainting is active."""
+        if self.inpaint_edges and not getattr(self.strain, "_is_overwhitened", False):
+            from pycbc.strain.gate import gate_and_paint
+
+            gate_and_paint(
+                strain_chunk,
+                lindex,
+                rindex,
+                self._get_inpaint_invpsd(),
+                copy=False,
+                method="toeplitz",
+                ridge=1e-7,
+            )
+
     def fourier_segments(self):
         """
         Return a list of the FFT'd segments.
@@ -1594,10 +1740,13 @@ class StrainSegments:
                 elif seg_slice.start < 0:
                     strain_chunk = self.strain[: seg_slice.stop]
                     strain_chunk.prepend_zeros(-seg_slice.start)
+                    self._inpaint_edge(strain_chunk, 0, -seg_slice.start)
                     freq_seg = make_frequency_series(strain_chunk)
                 elif seg_slice.stop > len(self.strain):
+                    orig_len = len(self.strain) - seg_slice.start
                     strain_chunk = self.strain[seg_slice.start :]
                     strain_chunk.append_zeros(seg_slice.stop - len(self.strain))
+                    self._inpaint_edge(strain_chunk, orig_len, len(strain_chunk))
                     freq_seg = make_frequency_series(strain_chunk)
                 freq_seg.analyze = ana
                 freq_seg.cumulative_index = seg_slice.start + ana.start
@@ -1622,6 +1771,7 @@ class StrainSegments:
             filter_inj_only=opt.filter_inj_only,
             injection_window=opt.injection_window,
             allow_zero_padding=opt.allow_zero_padding,
+            inpaint_edges=getattr(opt, "inpaint_edges", False),
         )
 
     @classmethod
@@ -1667,6 +1817,12 @@ class StrainSegments:
             help="Allow for zero padding of data to "
             "analyze requested times, if needed.",
         )
+        segment_group.add_argument(
+            "--inpaint-edges",
+            action="store_true",
+            help="Optional: inpaint zero-padded boundaries instead of hard zeros "
+            "to reduce segment-edge filter ringing. Default: False.",
+        )
         # Injection optimization options
         segment_group.add_argument(
             "--filter-inj-only",
@@ -1702,6 +1858,7 @@ class StrainSegments:
             trigger_end=opt.trig_end_time[ifo],
             filter_inj_only=opt.filter_inj_only,
             allow_zero_padding=opt.allow_zero_padding,
+            inpaint_edges=getattr(opt, "inpaint_edges", False),
         )
 
     @classmethod
@@ -1772,6 +1929,12 @@ class StrainSegments:
             action="store_true",
             help="Allow for zero padding of data to analyze "
             "requested times, if needed.",
+        )
+        segment_group.add_argument(
+            "--inpaint-edges",
+            action="store_true",
+            help="Optional: inpaint zero-padded boundaries instead of hard zeros "
+            "to reduce segment-edge filter ringing. Default: False.",
         )
         segment_group.add_argument(
             "--filter-inj-only",

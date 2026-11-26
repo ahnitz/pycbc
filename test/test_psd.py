@@ -386,6 +386,45 @@ class TestPSDSegmentPlacement(unittest.TestCase):
         self.assertTrue(fd_segments)
         self.assertTrue(all(fs.psd is not None for fs in fd_segments))
 
+    def test_zero_padded_segment_psd_fallback(self):
+        # Zero data on the right half causes zero/inf/NaN Welch PSD there;
+        # generate_segment_psds substitutes the nearest valid segment PSD
+        # both with and without inverse_spectrum_truncation.
+        noise = self._white_noise(8192)
+        noise[4096:] = 0.0
+        analysis_segments = [
+            (0, 2048, 256, 1792),
+            (6144, 8192, 6400, 7936),
+        ]
+        for inv_len in (None, 256.0):
+            opt = SimpleNamespace(
+                psd_estimation="median",
+                psd_segment_length=512,
+                psd_segment_stride=256,
+                psd_num_segments=2,
+                psd_inverse_length=inv_len,
+                psd_model=None,
+                psd_file=None,
+                asd_file=None,
+                psd_low_frequency_cutoff=None,
+                invpsd_trunc_method="hann" if inv_len is not None else None,
+            )
+            with self.context:
+                out = generate_segment_psds(
+                    opt,
+                    noise,
+                    analysis_segments,
+                    257,
+                    1.0 / 512.0,
+                    0.1,
+                )
+            self.assertEqual(len(out), 2)
+            for _, _, psd in out:
+                vals = psd.numpy()
+                self.assertFalse(numpy.isnan(vals).any())
+                self.assertTrue(numpy.any(numpy.isfinite(vals) & (vals > 0)))
+            self.assertIs(out[1][2], out[0][2])
+
 
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPSD))

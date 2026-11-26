@@ -16,6 +16,8 @@
 import copy
 import logging
 
+import numpy as np
+
 from pycbc.psd.analytical import *
 from pycbc.psd.analytical_space import *
 from pycbc.psd.estimate import *
@@ -829,6 +831,27 @@ def generate_segment_psds(
             epoch + p0 / sample_rate,
             epoch + p1 / sample_rate,
         )
+
+    # Substitute nearest valid PSD if any segment (e.g. zero-padded edge)
+    # produced NaN or no positive finite values.
+    is_valid = []
+    valid_psds = []
+    for idx, (_, _, p) in enumerate(psds_and_times):
+        valid = False
+        if p is not None:
+            vals = p.numpy()
+            valid = not np.isnan(vals).any() and np.any(np.isfinite(vals) & (vals > 0))
+        is_valid.append(valid)
+        if valid:
+            valid_psds.append((idx, p))
+
+    if valid_psds and len(valid_psds) < len(psds_and_times):
+        for i, ((p_start, p_stop, _), valid) in enumerate(
+            zip(psds_and_times, is_valid, strict=True)
+        ):
+            if not valid:
+                _, nearest_psd = min(valid_psds, key=lambda item: abs(item[0] - i))
+                psds_and_times[i] = (p_start, p_stop, nearest_psd)
 
     return psds_and_times
 
