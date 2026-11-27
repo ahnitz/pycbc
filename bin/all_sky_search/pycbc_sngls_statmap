@@ -309,8 +309,7 @@ while numpy.any(ifar_louder > hier_ifar_thresh_s):
     if h_iterations == 0:
         f[f"background_h{h_iterations}/stat"] = back_stat
         f[f"background_h{h_iterations}/ifar"] = conv.sec_to_year(bg_ifar)
-        for k in all_trigs.data:
-            f[f"background_h{h_iterations}/" + k] = all_trigs.data[k]
+        f[f"background_h{h_iterations}/decimation_factor"] = bkg_dec_facs
         f[f"foreground_h{h_iterations}/stat"] = fore_stat
         f[f"foreground_h{h_iterations}/ifar"] = conv.sec_to_year(fg_ifar)
         f[f"foreground_h{h_iterations}/ifar_exc"] = conv.sec_to_year(fg_ifar_exc)
@@ -367,11 +366,6 @@ while numpy.any(ifar_louder > hier_ifar_thresh_s):
     logger.info("%s clustered foreground triggers", len(all_trigs))
     logger.info("%s hierarchically removed foreground trigger(s)", h_iterations)
 
-    logger.info("Dumping foreground triggers")
-    logger.info("Dumping background triggers (inclusive of zerolag)")
-    for k in all_trigs.data:
-        f[f"background_h{h_iterations}/" + k] = all_trigs.data[k]
-
     logger.info("Calculating FAN from background statistic values")
     back_stat = fore_stat = all_trigs.stat
     bkg_dec_facs = all_trigs.decimation_factor
@@ -425,7 +419,6 @@ while numpy.any(ifar_louder > hier_ifar_thresh_s):
     # louder_foreground has been updated and the code can continue.
 
     logger.info("Calculating ifar/fap values")
-    f[f"background_h{h_iterations}/ifar"] = conv.sec_to_year(bg_ifar)
     f.attrs[f"background_time_h{h_iterations}"] = fg_time
     f.attrs[f"foreground_time_h{h_iterations}"] = fg_time
 
@@ -467,6 +460,13 @@ while numpy.any(ifar_louder > hier_ifar_thresh_s):
         f[f"foreground_h{h_iterations}/template_id"] = numpy.array([])
         f[f"foreground_h{h_iterations}/{ifo}/time"] = numpy.array([])
         f[f"foreground_h{h_iterations}/{ifo}/trigger_id"] = numpy.array([])
+
+# Write final background_h{N} summary once after removals complete
+if h_iterations > 0:
+    logger.info("Dumping final background_h%d summary datasets", h_iterations)
+    f[f"background_h{h_iterations}/stat"] = back_stat
+    f[f"background_h{h_iterations}/ifar"] = conv.sec_to_year(bg_ifar)
+    f[f"background_h{h_iterations}/decimation_factor"] = bkg_dec_facs
 
 # Write to file how many hierarchical removals were implemented.
 f.attrs["hierarchical_removal_iterations"] = h_iterations

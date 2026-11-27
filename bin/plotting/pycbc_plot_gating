@@ -39,20 +39,22 @@ gate_data = {}
 have_gates = False
 for fn in args.input_file:
     logger.info("Reading gates from %s", fn)
-    f = HFile(fn, "r")
-    ifo = next(iter(f.keys()))
-    for gate_type in ["file", "auto"]:
-        try:
-            gate_time = f[ifo + "/gating/" + gate_type + "/time"][:]
-            gate_width = f[ifo + "/gating/" + gate_type + "/width"][:]
-            gate_pad = f[ifo + "/gating/" + gate_type + "/pad"][:]
-        except KeyError:
-            continue
-        key = (ifo, gate_type)
-        if key not in gate_data:
-            gate_data[key] = []
-        gate_data[key] += list(zip(gate_time, gate_width, gate_pad, strict=True))
-        have_gates = have_gates or (len(gate_data[key]) > 0)
+    with HFile(fn, "r") as f:
+        for ifo in f:
+            for gate_type in ["file", "auto"]:
+                try:
+                    gate_time = f[ifo + "/gating/" + gate_type + "/time"][:]
+                    gate_width = f[ifo + "/gating/" + gate_type + "/width"][:]
+                    gate_pad = f[ifo + "/gating/" + gate_type + "/pad"][:]
+                except KeyError:
+                    continue
+                key = (ifo, gate_type)
+                if key not in gate_data:
+                    gate_data[key] = []
+                gate_data[key] += list(
+                    zip(gate_time, gate_width, gate_pad, strict=True)
+                )
+                have_gates = have_gates or (len(gate_data[key]) > 0)
 
 mpld3.plugins.DEFAULT_PLUGINS = []
 fig = plt.figure(figsize=(10, 5))

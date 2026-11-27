@@ -110,6 +110,17 @@ parser.add_argument(
     '(little-dogs-out) background. [default="none"]',
 )
 parser.add_argument(
+    "--hierarchical-removal-ifar-thresh",
+    "--hierarchical-removal-threshold-ifar",
+    "--hierarchical-removal-ifar-threshold",
+    dest="hierarchical_removal_ifar_thresh",
+    type=float,
+    default=None,
+    help="IFAR threshold (in years) above which foreground triggers continue "
+    "to be hierarchically removed. Default is None (dynamically use the "
+    "active inclusive or exclusive background time).",
+)
+parser.add_argument(
     "--additional-event-times",
     type=float,
     nargs="+",
@@ -474,8 +485,17 @@ else:
 # This is a workaround for the case that we have no foreground, so that the
 # while loop comparison doesnt fail straight away
 ifar_foreground = numpy.append(ifar_foreground, 0)
+ifar_thresh_sec = (
+    conv.year_to_sec(args.hierarchical_removal_ifar_thresh)
+    if args.hierarchical_removal_ifar_thresh is not None
+    else (
+        background_time_exc
+        if args.hierarchical_removal_against == "exclusive"
+        else background_time
+    )
+)
 
-while numpy.any(ifar_foreground >= background_time):
+while numpy.any(ifar_foreground >= ifar_thresh_sec):
     # If the user wants to stop doing hierarchical removals after a set
     # number of iterations then break when that happens.
     if h_iterations == args.max_hierarchical_removal:
@@ -489,6 +509,9 @@ while numpy.any(ifar_foreground >= background_time):
         f[f"background_h{h_iterations}/timeslide_id"] = all_trigs.data["timeslide_id"][
             back_locs
         ]
+        f[f"background_h{h_iterations}/decimation_factor"] = all_trigs.data[
+            "decimation_factor"
+        ][back_locs]
         f[f"foreground_h{h_iterations}/stat"] = fore_stat
         f[f"foreground_h{h_iterations}/ifar"] = conv.sec_to_year(ifar)
         f[f"foreground_h{h_iterations}/fap"] = fap
@@ -554,11 +577,6 @@ while numpy.any(ifar_foreground >= background_time):
 
     back_locs = all_trigs.timeslide_id != 0
 
-    logger.info("Dumping foreground triggers")
-    logger.info("Dumping background triggers (inclusive of zerolag)")
-    for k in all_trigs.data:
-        f[f"background_h{h_iterations}/" + k] = all_trigs.data[k][back_locs]
-
     maxtime = all_trigs.attrs[f"{f.attrs['pivot']}_foreground_time"]
     for ifo in ifos:
         maxtime = max(maxtime, all_trigs.attrs[f"{ifo}_foreground_time"])
@@ -619,7 +637,6 @@ while numpy.any(ifar_foreground >= background_time):
     # ifar_foreground has been updated and the code can continue.
 
     logger.info("Calculating ifar/fap values")
-    f[f"background_h{h_iterations}/ifar"] = conv.sec_to_year(1.0 / bg_far)
     f.attrs[f"background_time_h{h_iterations}"] = background_time
     f.attrs[f"foreground_time_h{h_iterations}"] = coinc_time
 
@@ -660,6 +677,18 @@ while numpy.any(ifar_foreground >= background_time):
         for ifo in args.ifos:
             f[f"foreground_h{h_iterations}/{ifo}/time"] = numpy.array([])
             f[f"foreground_h{h_iterations}/{ifo}/trigger_id"] = numpy.array([])
+
+# Write final background_h{N} summary once after removals complete
+if h_iterations > 0:
+    logger.info("Dumping final background_h%d summary datasets", h_iterations)
+    f[f"background_h{h_iterations}/stat"] = back_stat
+    f[f"background_h{h_iterations}/ifar"] = conv.sec_to_year(1.0 / bg_far)
+    f[f"background_h{h_iterations}/timeslide_id"] = all_trigs.data["timeslide_id"][
+        back_locs
+    ]
+    f[f"background_h{h_iterations}/decimation_factor"] = all_trigs.data[
+        "decimation_factor"
+    ][back_locs]
 
 # Write to file how many hierarchical removals were implemented.
 f.attrs["hierarchical_removal_iterations"] = h_iterations

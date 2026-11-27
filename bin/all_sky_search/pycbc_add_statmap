@@ -97,10 +97,14 @@ parser.add_argument(
 )
 parser.add_argument(
     "--hierarchical-removal-ifar-thresh",
+    "--hierarchical-removal-threshold-ifar",
+    "--hierarchical-removal-ifar-threshold",
+    dest="hierarchical_removal_ifar_thresh",
     type=float,
-    default=100.0,
+    default=None,
     help="Minimum IFAR for a foreground event to be hierarchically removed "
-    "from background of quieter events (years) [default=100yr]",
+    "from background of quieter events (years). Default is None (dynamically "
+    "use the active inclusive or exclusive background time in years).",
 )
 parser.add_argument(
     "--hierarchical-removal-against",
@@ -558,6 +562,9 @@ h_iterations = 0
 
 ifar_key = "ifar" if args.hierarchical_removal_against == "inclusive" else "ifar_exc"
 
+bg_time_exc_total = sum(f_in.attrs["background_time_exc"] for f_in in files)
+bg_time_total = sum(bg_time_ct.values())
+
 # Break out of loop if max number of removals is reached
 # or no more triggers above specified IFAR threshold
 while True:
@@ -566,28 +573,25 @@ while True:
 
     if h_iterations == 0:  # copy over existing data as h0
         for combo in all_ifo_combos:
-            bg_grps[combo] = ["ifar", "stat", "timeslide_id"]
-            for key in sep_fg_data[combo].data:
-                full_fg_key = f"foreground_h0/{combo}/{key}"
-                f[full_fg_key] = sep_fg_data[combo].data[key][:]
-            for key in bg_grps[combo]:
-                f[f"background_h0/{combo}/{key}"] = sep_bg_data[combo].data[key][:]
-        for key in ["stat", "timeslide_id"]:
-            f[f"background_h0/{key}"] = combined_bg_data.data[key][:]
-        for key in combined_fg_data.data:
-            f[f"foreground_h0/{key}"] = combined_fg_data.data[key][:]
-    else:
-        for combo in all_ifo_combos:
             bg_grps[combo] = [
                 "ifar",
                 "stat",
                 "timeslide_id",
                 "decimation_factor",
-                "template_id",
             ]
             for key in sep_fg_data[combo].data:
-                if key.split("/")[0] in all_ifos:
-                    bg_grps[combo] += [key]
+                full_fg_key = f"foreground_h0/{combo}/{key}"
+                f[full_fg_key] = sep_fg_data[combo].data[key][:]
+            for key in bg_grps[combo]:
+                f[f"background_h0/{combo}/{key}"] = sep_bg_data[combo].data[key][:]
+        for key in ["stat", "timeslide_id", "decimation_factor"]:
+            f[f"background_h0/{key}"] = combined_bg_data.data[key][:]
+        for key in combined_fg_data.data:
+            f[f"foreground_h0/{key}"] = combined_fg_data.data[key][:]
+    else:
+        for combo in all_ifo_combos:
+            bg_grps[combo] = ["ifar", "stat", "timeslide_id", "decimation_factor"]
+            for key in sep_fg_data[combo].data:
                 full_fg_key = f"foreground_h{h_iterations}/{combo}/{key}"
                 comp_fg_key = f"foreground_h{h_iterations - 1}/{combo}/{key}"
                 if (
@@ -599,20 +603,16 @@ while True:
                     f[full_fg_key] = f[comp_fg_key]
                 else:
                     f[full_fg_key] = sep_fg_data[combo].data[key][:]
-            for key in bg_grps[combo]:
-                # The background will (almost certainly) be affected,
-                # so copy as normal
-                f[f"background_h{h_iterations}/{combo}/{key}"] = sep_bg_data[
-                    combo
-                ].data[key][:]
+            # Omit intermediate background_h1..hN-1 copies; write final hN once
             f[combo].attrs[f"foreground_time_h{h_iterations}"] = fg_time_ct[combo]
             f.attrs[f"foreground_time_h{h_iterations}"] = fg_time
-        for key in combined_bg_data.data:
-            f[f"background_h{h_iterations}/{key}"] = combined_bg_data.data[key][:]
         for key in combined_fg_data.data:
             f[f"foreground_h{h_iterations}/{key}"] = combined_fg_data.data[key][:]
 
-    if h_iterations == args.max_hierarchical_removal:
+    if (
+        args.max_hierarchical_removal >= 0
+        and h_iterations >= args.max_hierarchical_removal
+    ):
         logger.info(
             "Reached hierarchical removal limit of %d", args.max_hierarchical_removal
         )
@@ -623,6 +623,8 @@ while True:
         for combo in all_ifo_combos
         if len(sep_fg_data[combo].data[ifar_key][:]) > 0
     }
+    if not max_each_combo:
+        break
     max_ifars = {
         combo: sep_fg_data[combo].data[ifar_key][:][hidx]
         for combo, hidx in max_each_combo.items()
@@ -639,13 +641,22 @@ while True:
     maxcombo = max(max_ifars, key=lambda k: max_ifars[k])
     max_ifar_idx = max_each_combo[maxcombo]
     max_ifar = max_ifars[maxcombo]
-    if not max_ifar > args.hierarchical_removal_ifar_thresh:
+    active_ifar_thresh = (
+        args.hierarchical_removal_ifar_thresh
+        if args.hierarchical_removal_ifar_thresh is not None
+        else conv.sec_to_year(
+            bg_time_exc_total
+            if args.hierarchical_removal_against == "exclusive"
+            else bg_time_total
+        )
+    )
+    if not max_ifar > active_ifar_thresh:
         logger.info(
             "Loudest event IFAR of %.3f in %s is less than threshold %f, stopping "
             "hierarchical removal",
             max_ifar,
             maxcombo,
-            args.hierarchical_removal_ifar_thresh,
+            active_ifar_thresh,
         )
         break
 
@@ -722,13 +733,12 @@ while True:
         # In principle, bg time should be adjusted, but is expected to be a
         # negligible correction
         fg_time_ct[key] -= args.cluster_window
-        bg_t_y = conv.sec_to_year(bg_time_ct[key])
         fg_t_y = conv.sec_to_year(fg_time_ct[key])
         bg_far, fg_far, _ = significance.get_far(
             sep_bg_data[key].data["stat"],
             sep_fg_data[key].data["stat"],
             sep_bg_data[key].data["decimation_factor"],
-            bg_t_y,
+            bg_time_ct[key],
             **significance_dict[key],
         )
         fg_far = significance.apply_far_limit(
@@ -742,9 +752,9 @@ while True:
             combo=key,
         )
 
-        sep_bg_data[key].data["ifar"] = 1.0 / bg_far
-        sep_fg_data[key].data["ifar"] = 1.0 / fg_far
-        sep_fg_data[key].data["fap"] = 1 - np.exp(-fg_t_y * fg_far)
+        sep_bg_data[key].data["ifar"] = conv.sec_to_year(1.0 / bg_far)
+        sep_fg_data[key].data["ifar"] = conv.sec_to_year(1.0 / fg_far)
+        sep_fg_data[key].data["fap"] = 1 - np.exp(-fg_time_ct[key] * fg_far)
 
     logger.info("Recalculating combined IFARs")
     for key in all_ifo_combos:
@@ -780,6 +790,19 @@ while True:
         -conv.sec_to_year(fg_time) / combined_fg_data.data["ifar"]
     )
 
+# Write final background_h{N} summary once if hierarchical removals occurred
+if h_iterations > 0:
+    logger.info("Dumping final background_h%d summary datasets", h_iterations)
+    for combo in all_ifo_combos:
+        for key in bg_grps[combo]:
+            f[f"background_h{h_iterations}/{combo}/{key}"] = sep_bg_data[combo].data[
+                key
+            ][:]
+        f[combo].attrs[f"foreground_time_h{h_iterations}"] = fg_time_ct[combo]
+        f.attrs[f"foreground_time_h{h_iterations}"] = fg_time
+    for key in ["stat", "timeslide_id", "decimation_factor"]:
+        f[f"background_h{h_iterations}/{key}"] = combined_bg_data.data[key][:]
+
 for combo in all_ifo_combos:
     final_fg_data[combo] = final_fg_data[combo] + sep_fg_data[combo]
     for key in final_fg_data[combo].data:
@@ -795,8 +818,8 @@ for key in final_combined_fg.data:
         del f[full_key]
     f[full_key] = final_combined_fg.data[key]
 
-for key in f:
-    if "background" in key and (key + "/ifar") in f:
+for key in ["background", "background_exc"]:
+    if key in f and (key + "/ifar") in f:
         del f[key + "/ifar"]
 
 f.attrs["hierarchical_removal_iterations"] = h_iterations
