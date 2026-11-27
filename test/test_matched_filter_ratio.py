@@ -406,6 +406,215 @@ class TestMatchedFilterRatio(unittest.TestCase):
                 )
             bank.close_filehandler()
 
+    def test_whitened_prefilter_modes_and_suppression(self):
+        """Verify Gaussian invariance, FD line suppression, and TD blip suppression."""
+        sample_rate = 2048.0
+        seg_len = 64.0
+        n_samples = round(sample_rate * seg_len)
+        t_inj = 32.0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bank_path = os.path.join(tmpdir, "bank.hdf")
+            htilde, delta_f, flen, f_low = _make_synthetic_fir_bank(
+                bank_path, num_levels=2, sample_rate=sample_rate, seg_len=seg_len
+            )
+            bank = RatioFilterBank(
+                bank_path,
+                filter_length=flen,
+                delta_f=delta_f,
+                dtype=np.complex64,
+                low_frequency_cutoff=f_low,
+            )
+
+            freqs = np.arange(flen) * delta_f
+            psd = (
+                pycbc.psd.aLIGOZeroDetHighPower(flen, delta_f, f_low)
+                * (pycbc.DYN_RANGE_FAC**2)
+            ).astype(np.float32)
+            p_arr = psd.numpy()
+            rng = np.random.default_rng(123)
+            amp = np.where(p_arr > 0.0, np.sqrt(p_arr / (4.0 * delta_f)), 0.0)
+            z = rng.standard_normal(flen) + 1j * rng.standard_normal(flen)
+            z[0] = rng.standard_normal()
+            z[-1] = rng.standard_normal()
+            st_noise = FrequencySeries(
+                (z * amp).astype(np.complex64), delta_f=delta_f, epoch=1000.0
+            )
+            st_noise.psd = psd
+            st_noise.analyze = slice(4096, n_samples - 4096)
+            st_noise.cumulative_index = 4096
+
+            # Default None and explicit 'gaussian' match st / st.psd exactly
+            ctrl_default = MatchedFilterRatioControl(
+                bank, {"H1": [st_noise]}, snr_threshold=5.5, high_frequency_cutoff=900.0
+            )
+            ctrl_gauss = MatchedFilterRatioControl(
+                bank,
+                {"H1": [st_noise]},
+                snr_threshold=5.5,
+                high_frequency_cutoff=900.0,
+                fd_prefilter="gaussian",
+                td_prefilter="gaussian",
+            )
+            np.testing.assert_allclose(
+                ctrl_default.overwhitened["H1"][0].numpy(),
+                ctrl_gauss.overwhitened["H1"][0].numpy(),
+                rtol=0.0,
+                atol=0.0,
+            )
+
+            # Variance renormalization preserves Gaussian noise power at small delta
+            band = (freqs >= f_low) & (freqs < 900.0) & (p_arr > 0.0)
+            raw_power = float(
+                np.mean(
+                    np.abs(ctrl_gauss.overwhitened["H1"][0].numpy()[band]) ** 2
+                    * p_arr[band]
+                )
+            )
+            for p_kw in (
+                {"fd_prefilter": "hyperbolic", "fd_prefilter_delta": 1.5},
+                {"td_prefilter": "hyperbolic", "td_prefilter_delta": 1.5},
+            ):
+                ctrl_var = MatchedFilterRatioControl(
+                    bank,
+                    {"H1": [st_noise]},
+                    snr_threshold=5.5,
+                    high_frequency_cutoff=900.0,
+                    **p_kw,
+                )
+                filt_power = float(
+                    np.mean(
+                        np.abs(ctrl_var.overwhitened["H1"][0].numpy()[band]) ** 2
+                        * p_arr[band]
+                    )
+                )
+                self.assertAlmostEqual(filt_power / raw_power, 1.0, delta=0.08)
+
+            # Invalid mode, missing delta, or non-finite delta raises ValueError
+            with self.assertRaises(ValueError):
+                MatchedFilterRatioControl(
+                    bank, {"H1": [st_noise]}, snr_threshold=5.5, fd_prefilter="invalid"
+                )
+            with self.assertRaises(ValueError):
+                MatchedFilterRatioControl(
+                    bank,
+                    {"H1": [st_noise]},
+                    snr_threshold=5.5,
+                    td_prefilter="hyperbolic",
+                )
+            with self.assertRaises(ValueError):
+                MatchedFilterRatioControl(
+                    bank,
+                    {"H1": [st_noise]},
+                    snr_threshold=5.5,
+                    fd_prefilter="hyperbolic",
+                    fd_prefilter_delta=float("nan"),
+                )
+
+            # Broadband CBC signal at t=32s + 100-sigma line + 80-sigma TD blip
+            sig_unit = htilde / float(
+                sigma(
+                    htilde,
+                    psd=psd,
+                    low_frequency_cutoff=f_low,
+                    high_frequency_cutoff=900.0,
+                )
+            )
+            phase = np.exp(-2j * np.pi * freqs * t_inj).astype(np.complex64)
+            sig_fd = 15.0 * sig_unit.numpy() * phase
+
+            line_bin = round(120.0 / delta_f)
+            st_line = FrequencySeries(
+                (st_noise.numpy() + sig_fd).astype(np.complex64),
+                delta_f=delta_f,
+                epoch=1000.0,
+            )
+            st_line[line_bin] += 100.0 * np.sqrt(p_arr[line_bin] / (2.0 * delta_f))
+            st_line.psd = psd
+            st_line.analyze = slice(4096, n_samples - 4096)
+            st_line.cumulative_index = 4096
+
+            ctrl_fd = MatchedFilterRatioControl(
+                bank,
+                {"H1": [st_line]},
+                snr_threshold=6.0,
+                high_frequency_cutoff=900.0,
+                cluster_window=1.0,
+                fd_prefilter="hyperbolic",
+                fd_prefilter_delta=4.0,
+            )
+            raw_line_mag = abs(st_line[line_bin] / p_arr[line_bin])
+            filt_line_mag = abs(ctrl_fd.overwhitened["H1"][0][line_bin])
+            self.assertLess(filt_line_mag, 0.1 * raw_line_mag)
+            trigs_fd, _ = ctrl_fd.run_top(int(bank.top_indices[0]))
+            self.assertGreater(float(np.max(np.abs(trigs_fd["H1"]["snr"]))), 12.0)
+
+            # Add an 80-sigma 80 Hz sine-Gaussian TD blip (~10 ms) at t=16s
+            td_norm = np.sqrt(np.sum(band) * delta_f)
+            t_grid = np.arange(n_samples) / sample_rate
+            dt_blip = t_grid - 16.0
+            blip_ts = (
+                80.0
+                * td_norm
+                * np.exp(-0.5 * (dt_blip / 0.01) ** 2)
+                * np.cos(2.0 * np.pi * 80.0 * dt_blip)
+            )
+            blip_fd = TimeSeries(
+                blip_ts, delta_t=1.0 / sample_rate
+            ).to_frequencyseries().numpy() * np.sqrt(np.maximum(p_arr, 0.0))
+            st_blip = FrequencySeries(
+                (st_noise.numpy() + sig_fd + blip_fd).astype(np.complex64),
+                delta_f=delta_f,
+                epoch=1000.0,
+            )
+            st_blip.psd = psd
+            st_blip.analyze = slice(4096, n_samples - 4096)
+            st_blip.cumulative_index = 4096
+
+            ctrl_td = MatchedFilterRatioControl(
+                bank,
+                {"H1": [st_blip]},
+                snr_threshold=6.0,
+                high_frequency_cutoff=900.0,
+                cluster_window=1.0,
+                fd_prefilter="hyperbolic",
+                fd_prefilter_delta=4.0,
+                td_prefilter="hyperbolic",
+                td_prefilter_delta=5.0,
+            )
+            ctrl_raw_blip = MatchedFilterRatioControl(
+                bank,
+                {"H1": [st_blip]},
+                snr_threshold=6.0,
+                high_frequency_cutoff=900.0,
+                cluster_window=1.0,
+            )
+            trigs_raw, _ = ctrl_raw_blip.run_top(int(bank.top_indices[0]))
+            trigs_td, _ = ctrl_td.run_top(int(bank.top_indices[0]))
+
+            raw_times = trigs_raw["H1"]["time_index"] / sample_rate
+            td_times = (
+                trigs_td["H1"]["time_index"] / sample_rate
+                if "time_index" in trigs_td["H1"]
+                else np.empty(0)
+            )
+            blip_mask_raw = (raw_times >= 15.0) & (raw_times < 26.0)
+            blip_mask_td = (td_times >= 15.0) & (td_times < 26.0)
+            max_blip_raw = float(np.max(np.abs(trigs_raw["H1"]["snr"][blip_mask_raw])))
+            max_blip_td = (
+                float(np.max(np.abs(trigs_td["H1"]["snr"][blip_mask_td])))
+                if np.any(blip_mask_td)
+                else 0.0
+            )
+            self.assertGreater(max_blip_raw, 12.0)
+            self.assertLess(max_blip_td, 0.5 * max_blip_raw)
+
+            sig_mask_td = np.abs(td_times - t_inj) < 0.2
+            self.assertGreater(
+                float(np.max(np.abs(trigs_td["H1"]["snr"][sig_mask_td]))), 12.0
+            )
+            bank.close_filehandler()
+
 
 if __name__ == "__main__":
     unittest.main()

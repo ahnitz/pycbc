@@ -25,7 +25,7 @@ import numpy as np
 
 from pycbc.filter.matchedfilter import get_cutoff_indices
 from pycbc.libutils import import_optional
-from pycbc.types import FrequencySeries, complex64, float32
+from pycbc.types import FrequencySeries, TimeSeries, complex64, float32
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,20 @@ class MatchedFilterRatioControl:
     cores : int, optional
         Number of CPU cores to use for multiprocessing over top-level templates
         (default: 1).
+    fd_prefilter : {'gaussian', 'hyperbolic'}, optional
+        Optional frequency-domain whitened strain prefilter mode (default:
+        None, disabling prefiltering / equivalent to ``'gaussian'``).
+    fd_prefilter_delta : float, optional
+        Saturation scale ``delta`` in whitened standard deviations for
+        ``fd_prefilter='hyperbolic'`` (default: None; required and positive when
+        ``fd_prefilter='hyperbolic'``).
+    td_prefilter : {'gaussian', 'hyperbolic'}, optional
+        Optional time-domain whitened strain prefilter mode (default: None,
+        disabling prefiltering / equivalent to ``'gaussian'``).
+    td_prefilter_delta : float, optional
+        Saturation scale ``delta`` in whitened standard deviations for
+        ``td_prefilter='hyperbolic'`` (default: None; required and positive when
+        ``td_prefilter='hyperbolic'``).
     """
 
     def __init__(
@@ -112,6 +126,10 @@ class MatchedFilterRatioControl:
         followup_keep_loudest=None,
         false_dismissal=1e-3,
         cores=1,
+        fd_prefilter=None,
+        fd_prefilter_delta=None,
+        td_prefilter=None,
+        td_prefilter_delta=None,
     ):
         self.bank = bank
         self.segments = segments
@@ -163,6 +181,32 @@ class MatchedFilterRatioControl:
                 f"multiple of data sample rate ({self.sample_rate} Hz)."
             )
 
+        for mode_name, mode_val, delta_val in (
+            ("fd_prefilter", fd_prefilter, fd_prefilter_delta),
+            ("td_prefilter", td_prefilter, td_prefilter_delta),
+        ):
+            if mode_val not in (None, "gaussian", "hyperbolic"):
+                raise ValueError(
+                    f"Unknown {mode_name}: {mode_val!r} "
+                    "(expected None, 'gaussian', or 'hyperbolic')."
+                )
+            if mode_val == "hyperbolic" and (
+                delta_val is None
+                or not np.isfinite(float(delta_val))
+                or float(delta_val) <= 0.0
+            ):
+                raise ValueError(
+                    f"{mode_name}_delta must be positive when {mode_name}='hyperbolic'."
+                )
+        self.fd_prefilter = fd_prefilter
+        self.fd_prefilter_delta = (
+            float(fd_prefilter_delta) if fd_prefilter_delta is not None else None
+        )
+        self.td_prefilter = td_prefilter
+        self.td_prefilter_delta = (
+            float(td_prefilter_delta) if td_prefilter_delta is not None else None
+        )
+
         # Configure leaf TimeDomainFilterBank options and pre-overwhiten segments
         self.leaf_options = {
             "tap_sample_rate": int(bank.sample_rate),
@@ -175,10 +219,83 @@ class MatchedFilterRatioControl:
         for ifo in self.seg_ifos:
             ow_segs = []
             for st in segments[ifo]:
-                ow = st / st.psd
+                ow = self._overwhiten_segment(st)
                 st.overwhitened = ow
                 ow_segs.append(ow)
             self.overwhitened[ifo] = ow_segs
+
+    def _overwhiten_segment(self, st):
+        """Return overwhitened data for segment ``st``, applying optional FD/TD
+        variance-renormalized hyperbolic whitened prefiltering.
+        """
+        if self.fd_prefilter != "hyperbolic" and self.td_prefilter != "hyperbolic":
+            return st / st.psd
+
+        n_series = (len(st) - 1) * 2
+        f_low = float(
+            getattr(self.bank, "min_f_lower", None)
+            or getattr(self.bank, "f_lower", 0.0)
+            or 0.0
+        )
+        kmin, kmax = get_cutoff_indices(f_low, self.f_high, st.delta_f, n_series)
+        psd = st.psd.numpy().astype(np.float64)
+        arr = st.numpy().astype(np.complex128).copy()
+        band = np.zeros(len(arr), dtype=bool)
+        band[kmin:kmax] = psd[kmin:kmax] > 0.0
+        if not np.any(band):
+            return FrequencySeries(
+                np.zeros(len(arr), dtype=np.complex64),
+                delta_f=st.delta_f,
+                epoch=st.epoch,
+            )
+
+        # Apply frequency-domain radial hyperbolic soft-limiter before TD transform
+        if self.fd_prefilter == "hyperbolic":
+            delta_fd = self.fd_prefilter_delta
+            r_nodes, r_weights = np.polynomial.laguerre.laggauss(64)
+            sigma_fd = float(
+                np.sqrt(np.sum(r_weights * r_nodes / (1.0 + r_nodes / (delta_fd**2))))
+            )
+            fd_scale = np.sqrt(psd[band] / (2.0 * float(st.delta_f)))
+            z_fd = arr[band] / fd_scale
+            z_fd = z_fd / np.sqrt(1.0 + (np.abs(z_fd) / delta_fd) ** 2) / sigma_fd
+            arr[band] = z_fd * fd_scale
+
+        # Apply time-domain hyperbolic soft-limiter on unit-variance whitened strain
+        if self.td_prefilter == "hyperbolic":
+            delta_td = self.td_prefilter_delta
+            x_nodes, x_weights = np.polynomial.hermite_e.hermegauss(64)
+            sigma_td = float(
+                np.sqrt(
+                    np.sum(
+                        (x_weights / np.sqrt(2.0 * np.pi))
+                        * (x_nodes**2)
+                        / (1.0 + (x_nodes / delta_td) ** 2)
+                    )
+                )
+            )
+            td_norm = float(np.sqrt(np.sum(band) * float(st.delta_f)))
+            w_fd = np.zeros_like(arr)
+            w_fd[band] = arr[band] / np.sqrt(psd[band])
+            w_ts = (
+                FrequencySeries(w_fd, delta_f=st.delta_f, copy=False)
+                .to_timeseries()
+                .numpy()
+                / td_norm
+            )
+            w_ts = w_ts / np.sqrt(1.0 + (w_ts / delta_td) ** 2) / sigma_td
+            w_back = (
+                TimeSeries(w_ts * td_norm, delta_t=st.delta_t, copy=False)
+                .to_frequencyseries()
+                .numpy()
+            )
+            arr[band] = w_back[band] * np.sqrt(psd[band])
+
+        ow = np.zeros_like(arr)
+        ow[band] = arr[band] / psd[band]
+        return FrequencySeries(
+            ow.astype(np.complex64), delta_f=st.delta_f, epoch=st.epoch
+        )
 
     @staticmethod
     def insert_option_group(parser):
@@ -251,6 +368,36 @@ class MatchedFilterRatioControl:
             help="Optional number of CPU cores to use for multiprocessing "
             "over top templates (default: 1).",
         )
+        group.add_argument(
+            "--fd-whitened-prefilter",
+            choices=["gaussian", "hyperbolic"],
+            default=None,
+            help="Optional frequency-domain whitened strain prefilter "
+            "('gaussian' or 'hyperbolic'). Default: None (disabled / gaussian).",
+        )
+        group.add_argument(
+            "--fd-whitened-prefilter-delta",
+            type=float,
+            default=None,
+            help="Optional saturation scale delta (in whitened standard "
+            "deviations) when --fd-whitened-prefilter='hyperbolic' "
+            "(default: None).",
+        )
+        group.add_argument(
+            "--td-whitened-prefilter",
+            choices=["gaussian", "hyperbolic"],
+            default=None,
+            help="Optional time-domain whitened strain prefilter "
+            "('gaussian' or 'hyperbolic'). Default: None (disabled / gaussian).",
+        )
+        group.add_argument(
+            "--td-whitened-prefilter-delta",
+            type=float,
+            default=None,
+            help="Optional saturation scale delta (in whitened standard "
+            "deviations) when --td-whitened-prefilter='hyperbolic' "
+            "(default: None).",
+        )
         return group
 
     @classmethod
@@ -269,6 +416,10 @@ class MatchedFilterRatioControl:
             followup_keep_loudest=args.followup_keep_loudest,
             false_dismissal=args.ratio_filter_false_dismissal,
             cores=args.cores,
+            fd_prefilter=args.fd_whitened_prefilter,
+            fd_prefilter_delta=args.fd_whitened_prefilter_delta,
+            td_prefilter=args.td_whitened_prefilter,
+            td_prefilter_delta=args.td_whitened_prefilter_delta,
         )
 
     def run(self, veto_callback=None, top_indices=None, start_time=None):
