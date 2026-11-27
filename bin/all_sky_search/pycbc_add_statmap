@@ -733,7 +733,6 @@ while True:
         # In principle, bg time should be adjusted, but is expected to be a
         # negligible correction
         fg_time_ct[key] -= args.cluster_window
-        fg_t_y = conv.sec_to_year(fg_time_ct[key])
         bg_far, fg_far, _ = significance.get_far(
             sep_bg_data[key].data["stat"],
             sep_fg_data[key].data["stat"],
