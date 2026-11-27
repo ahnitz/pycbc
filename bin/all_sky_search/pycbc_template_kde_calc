@@ -103,6 +103,28 @@ parser.add_argument(
     type=float,
     help="Minimum ratio for template_kde relative to the maximum",
 )
+parser.add_argument(
+    "--f-lower",
+    type=float,
+    default=None,
+    help="Start frequency for calculating template duration.",
+)
+parser.add_argument(
+    "--min-duration",
+    type=float,
+    default=0.0,
+    help="Minimum duration offset added when computing template_duration.",
+)
+parser.add_argument(
+    "--approximant",
+    default=None,
+    help="Waveform approximant for calculating template_duration.",
+)
+parser.add_argument(
+    "--standardize",
+    action="store_true",
+    help="Standardize fit parameters by training standard deviation before KDE.",
+)
 args = parser.parse_args()
 init_logging(args.verbose)
 
@@ -222,19 +244,45 @@ with HFile(args.template_file, "r") as f_src:
 temp_samples = numpy.vstack(template_pars).T
 
 
+def evaluate_scaled_kde(train_samples, eval_samples, standardize=False):
+    """
+    Optionally standardize KDE training and evaluation coordinates.
+
+    Parameters
+    ----------
+    train_samples : numpy.ndarray
+        Training samples of shape ``(n_train, n_dims)``.
+    eval_samples : numpy.ndarray
+        Evaluation grid samples of shape ``(n_eval, n_dims)``.
+    standardize : bool, optional
+        If True, center and divide each coordinate by the training standard
+        deviation. Default is False.
+
+    Returns
+    -------
+    tuple
+        ``(train_samples, eval_samples, jacobian_scale)`` where
+        ``jacobian_scale`` is the product of coordinate standard deviations
+        to divide predicted densities by.
+    """
+    if not standardize:
+        return train_samples, eval_samples, 1.0
+    mean = numpy.mean(train_samples, axis=0)
+    scale = numpy.std(train_samples, axis=0)
+    scale = numpy.where(scale > 0.0, scale, 1.0)
+    return (
+        (train_samples - mean) / scale,
+        (eval_samples - mean) / scale,
+        float(numpy.prod(scale)),
+    )
+
+
 if args.make_template_kde:
     # Rejection sampling to reduce computational load
     if args.mchirp_downsample_power is not None:
         logger.info("Downsampling with mchirp power %s", args.mchirp_downsample_power)
         f_dest.attrs["mchirp_downsample_power"] = args.mchirp_downsample_power
-        try:
-            mchirp_index = args.fit_param.index("mchirp")
-        except ValueError as err:
-            raise ValueError("mchirp does not exist in args.fit_param") from err
-
-        mc_vals = template_pars[mchirp_index]
-        if args.log_param[mchirp_index]:
-            mc_vals = numpy.exp(mc_vals)
+        mc_vals = triggers.get_param("mchirp", args, *mass_spin)
         power_vals = mc_vals**args.mchirp_downsample_power
         probabilities = power_vals / numpy.max(power_vals)
         if args.seed is not None:
@@ -246,17 +294,20 @@ if args.make_template_kde:
         kde_train_samples = temp_samples[ind]
         f_dest.create_dataset("kde_train_samples", data=kde_train_samples)
 
+        train_in, eval_in, jac_scale = evaluate_scaled_kde(
+            kde_train_samples, temp_samples, standardize=args.standardize
+        )
         logger.info("Starting optimization of template KDE parameters")
         optbw, optalpha = optimizedparam(
-            kde_train_samples,
+            train_in,
             alphagrid=args.alpha_grid,
             bwgrid=args.bw_grid,
             nfold=args.nfold_template,
         )
         logger.info("Bandwidth %.4f, alpha %.2f", optbw, optalpha)
         logger.info("Evaluating template KDE")
-        template_kde = kde_awkde(
-            kde_train_samples, temp_samples, alp=optalpha, gl_bandwidth=optbw
+        template_kde = (
+            kde_awkde(train_in, eval_in, alp=optalpha, gl_bandwidth=optbw) / jac_scale
         )
 
         # Compensation factor for downsampling of templates
@@ -268,17 +319,20 @@ if args.make_template_kde:
             template_kde = numpy.maximum(template_kde, min_val)
 
     else:
+        train_in, eval_in, jac_scale = evaluate_scaled_kde(
+            temp_samples, temp_samples, standardize=args.standardize
+        )
         logger.info("Starting optimization of template KDE parameters")
         optbw, optalpha = optimizedparam(
-            temp_samples,
+            train_in,
             alphagrid=args.alpha_grid,
             bwgrid=args.bw_grid,
             nfold=args.nfold_template,
         )
         logger.info("Bandwidth %.4f, alpha %.2f", optbw, optalpha)
         logger.info("Evaluating template KDE")
-        template_kde = kde_awkde(
-            temp_samples, temp_samples, alp=optalpha, gl_bandwidth=optbw
+        template_kde = (
+            kde_awkde(train_in, eval_in, alp=optalpha, gl_bandwidth=optbw) / jac_scale
         )
 
     f_dest.create_dataset("data_kde", data=template_kde)
@@ -315,9 +369,25 @@ if args.make_signal_kde:
         idx = numpy.full(N_original, True)
     mass1_sgnl = signal_file["mass1"][idx]
     assert min(mass1_sgnl - mass2_sgnl) > 0
+    col_names = signal_file.dtype.names or ()
+    spin1z_sgnl = (
+        signal_file["spin1z"][idx]
+        if "spin1z" in col_names
+        else numpy.zeros_like(mass1_sgnl)
+    )
+    spin2z_sgnl = (
+        signal_file["spin2z"][idx]
+        if "spin2z" in col_names
+        else numpy.zeros_like(mass1_sgnl)
+    )
 
     for param, slog in zip(args.fit_param, args.log_param, strict=True):
-        pvals = signal_file[param][idx]
+        if param in col_names:
+            pvals = signal_file[param][idx]
+        else:
+            pvals = triggers.get_param(
+                param, args, mass1_sgnl, mass2_sgnl, spin1z_sgnl, spin2z_sgnl
+            )
         if slog in ["False"]:
             logger.info("Using param: %s", param)
             signal_pars.append(pvals)
@@ -332,17 +402,20 @@ if args.make_signal_kde:
 
     signal_samples = numpy.vstack(signal_pars).T
     f_dest.create_dataset("kde_train_samples", data=signal_samples)
+    train_in, eval_in, jac_scale = evaluate_scaled_kde(
+        signal_samples, temp_samples, standardize=args.standardize
+    )
     logger.info("Starting optimization of signal KDE parameters")
     optbw, optalpha = optimizedparam(
-        signal_samples,
+        train_in,
         bwgrid=args.bw_grid,
         alphagrid=args.alpha_grid,
         nfold=args.nfold_signal,
     )
     logger.info("Bandwidth %.4f, alpha %.2f", optbw, optalpha)
     logger.info("Evaluating signal KDE")
-    signal_kde = kde_awkde(
-        signal_samples, temp_samples, alp=optalpha, gl_bandwidth=optbw
+    signal_kde = (
+        kde_awkde(train_in, eval_in, alp=optalpha, gl_bandwidth=optbw) / jac_scale
     )
     if args.extra_cpt_fraction is not None and args.temp_volume is not None:
         f_dest.attrs.update(
@@ -392,17 +465,20 @@ if args.make_injection_kde:
 
     inj_samples = numpy.vstack(inj_pars).T
     f_dest.create_dataset("kde_train_samples", data=inj_samples)
+    train_in, eval_in, jac_scale = evaluate_scaled_kde(
+        inj_samples, temp_samples, standardize=args.standardize
+    )
     logger.info("Starting optimization of injection KDE parameters")
     optbw, optalpha = optimizedparam(
-        inj_samples,
+        train_in,
         alphagrid=args.alpha_grid,
         bwgrid=args.bw_grid,
         nfold=args.nfold_injection,
     )
     logger.info("Bandwidth %.4f, alpha %.2f", optbw, optalpha)
     logger.info("Evaluating injection KDE")
-    injection_kde = kde_awkde(
-        inj_samples, temp_samples, alp=optalpha, gl_bandwidth=optbw
+    injection_kde = (
+        kde_awkde(train_in, eval_in, alp=optalpha, gl_bandwidth=optbw) / jac_scale
     )
     if args.extra_cpt_fraction is not None and args.temp_volume is not None:
         f_dest.attrs.update(

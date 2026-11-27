@@ -49,6 +49,9 @@ _allowed_statistic_features = [
     "chirp_mass",
     "sensitive_volume",
     "normalize_fit_rate",
+    "empirical_bayes_fit",
+    "network_l2_newsnr",
+    "template_prior",
 ]
 
 
@@ -968,6 +971,18 @@ class ExpFitStatistic(PhaseTDStatistic):
                 "attribute called {ifo}-fit_coeffs !"
             )
 
+        # Empirical Bayes shrinkage hyperparameters (used before assign_fits)
+        self.eb_alpha_prior_count = float(self.kwargs.get("eb_alpha_prior_count", 10.0))
+        self.eb_rate_prior_count = float(self.kwargs.get("eb_rate_prior_count", 10.0))
+        eb_alpha_min_val = self.kwargs.get("eb_alpha_min", None)
+        self.eb_alpha_min = (
+            None if eb_alpha_min_val is None else float(eb_alpha_min_val)
+        )
+        if self.eb_alpha_prior_count <= 0 or self.eb_rate_prior_count <= 0:
+            raise ValueError("eb_alpha_prior_count and eb_rate_prior_count must be > 0")
+        if self.eb_alpha_min is not None and self.eb_alpha_min <= 0:
+            raise ValueError("eb_alpha_min must be > 0 when specified")
+
         # Get the single-detector rates fit values
         self.fits_by_tid = {}
         for i in self.bg_ifos:
@@ -1045,6 +1060,39 @@ class ExpFitStatistic(PhaseTDStatistic):
             self.kde_by_tid = {}
             for kname in self.kde_names:
                 self.assign_kdes(kname)
+
+        if self.kwargs.get("network_l2_newsnr", False):
+            # Euclidean L2 network NewSNR parameters for multi-detector coincs
+            self.l2_newsnr_coeff = float(self.kwargs.get("l2_newsnr_coeff", 1.0))
+            self.l2_newsnr_min = float(self.kwargs.get("l2_newsnr_min", 0.0))
+            self.l2_newsnr_max = float(self.kwargs.get("l2_newsnr_max", 15.0))
+            self.l2_newsnr_ref = float(self.kwargs.get("l2_newsnr_ref", 11.0))
+            self.l2_l1_excess_coeff = float(self.kwargs.get("l2_l1_excess_coeff", 0.0))
+            self.l2_l1_excess_max = float(self.kwargs.get("l2_l1_excess_max", 1.0))
+            if self.l2_newsnr_max < self.l2_newsnr_min:
+                raise ValueError("l2_newsnr_max must be >= l2_newsnr_min")
+            if self.l2_l1_excess_max < 0:
+                raise ValueError("l2_l1_excess_max must be >= 0")
+            self.single_dtype.append(("newsnr", numpy.float32))
+
+        self.template_prior = None
+        if self.kwargs.get("template_prior", False):
+            # Clean per-template log-odds prior parameters
+            self.prior_short_dur_weight = float(
+                self.kwargs.get("prior_short_dur_weight", 0.0)
+            )
+            self.prior_dur_knee = float(self.kwargs.get("prior_dur_knee", 0.5))
+            self.prior_dur_scale = float(self.kwargs.get("prior_dur_scale", 0.25))
+            if self.prior_dur_scale <= 0:
+                raise ValueError("prior_dur_scale must be > 0")
+            self.prior_chi_eff_coeff = float(
+                self.kwargs.get("prior_chi_eff_coeff", 0.0)
+            )
+            self.prior_chi_eff_knee = float(self.kwargs.get("prior_chi_eff_knee", 0.3))
+            self.prior_eta_coeff = float(self.kwargs.get("prior_eta_coeff", 0.0))
+            self.prior_eta_knee = float(self.kwargs.get("prior_eta_knee", 0.16))
+            self.compute_template_prior()
+            self.single_dtype.append(("template_prior", numpy.float32))
 
     def assign_template_bins(self, key):
         """
@@ -1233,12 +1281,57 @@ class ExpFitStatistic(PhaseTDStatistic):
         if "fit_by_template" in coeff_file:
             coeff_fbt = coeff_file["fit_by_template"]
             fits_by_tid_dict["fit_by_fit_coeff"] = coeff_fbt["fit_coeff"][:][tid_sort]
-            fits_by_tid_dict["fit_by_rate_above_thresh"] = coeff_fbt[
+            fits_by_tid_dict["fit_by_count_above_thresh"] = coeff_fbt[
                 "count_above_thresh"
             ][:][tid_sort].astype(float)
-            fits_by_tid_dict["fit_by_rate_in_template"] = coeff_file[
+            fits_by_tid_dict["fit_by_rate_above_thresh"] = fits_by_tid_dict[
+                "fit_by_count_above_thresh"
+            ].copy()
+            fbt_in_grp = coeff_fbt if "count_in_template" in coeff_fbt else coeff_file
+            fits_by_tid_dict["fit_by_rate_in_template"] = fbt_in_grp[
                 "count_in_template"
             ][:][tid_sort].astype(float)
+
+            if self.kwargs.get("empirical_bayes_fit", False):
+                # Conjugate Gamma-Exponential / Gamma-Poisson Empirical Bayes shrinkage
+                alpha_smooth = fits_by_tid_dict["smoothed_fit_coeff"].astype(float)
+                rate_smooth = fits_by_tid_dict["smoothed_rate_above_thresh"].astype(
+                    float
+                )
+                fbt_alpha = fits_by_tid_dict["fit_by_fit_coeff"].astype(float)
+                fbt_count = fits_by_tid_dict["fit_by_count_above_thresh"]
+                valid_alpha = (
+                    (fbt_count > 0.0) & (fbt_alpha > 0.0) & (alpha_smooth > 0.0)
+                )
+                alpha_prior_term = self.eb_alpha_prior_count / numpy.where(
+                    alpha_smooth > 0.0, alpha_smooth, 1.0
+                )
+                alpha_data_term = numpy.where(
+                    valid_alpha,
+                    fbt_count / numpy.where(valid_alpha, fbt_alpha, 1.0),
+                    0.0,
+                )
+                eff_count = numpy.where(valid_alpha, fbt_count, 0.0)
+                alpha_post = numpy.where(
+                    alpha_smooth > 0.0,
+                    (eff_count + self.eb_alpha_prior_count)
+                    / (alpha_data_term + alpha_prior_term),
+                    alpha_smooth,
+                )
+                if self.eb_alpha_min is not None:
+                    alpha_post = numpy.maximum(alpha_post, self.eb_alpha_min)
+                fits_by_tid_dict["smoothed_fit_coeff"] = alpha_post
+                fits_by_tid_dict["smoothed_rate_above_thresh"] = rate_smooth * (
+                    (fbt_count + self.eb_rate_prior_count)
+                    / (rate_smooth + self.eb_rate_prior_count)
+                )
+
+        # Store optional template parameters for template_prior feature
+        for param_key in ("template_duration", "chi_eff", "eta"):
+            if param_key in coeff_file:
+                fits_by_tid_dict[param_key] = coeff_file[param_key][:][tid_sort].astype(
+                    float
+                )
 
         # Keep the fit threshold in fits_by_tid
         fits_by_tid_dict["thresh"] = coeff_file.attrs["stat_threshold"]
@@ -1246,6 +1339,55 @@ class ExpFitStatistic(PhaseTDStatistic):
         coeff_file.close()
 
         return fits_by_tid_dict
+
+    def compute_template_prior(self):
+        """
+        Compute optional per-template log-odds prior from fit file metadata.
+
+        Reads ``template_duration``, ``chi_eff``, and ``eta`` arrays stored
+        on the reference detector's fit table and computes ``self.template_prior``
+        indexed by ``template_id``.
+        """
+        ref_fits = self.fits_by_tid[self.bg_ifos[0]]
+        n_templates = len(ref_fits["smoothed_fit_coeff"])
+        prior = numpy.zeros(n_templates, dtype=numpy.float32)
+
+        if self.prior_short_dur_weight != 0.0:
+            if "template_duration" in ref_fits:
+                dur = ref_fits["template_duration"]
+                prior -= self.prior_short_dur_weight * numpy.log1p(
+                    numpy.maximum(0.0, self.prior_dur_knee - dur) / self.prior_dur_scale
+                )
+            else:
+                logger.warning(
+                    "prior_short_dur_weight is non-zero but template_duration "
+                    "is missing from fit_coeffs"
+                )
+
+        if self.prior_chi_eff_coeff != 0.0:
+            if "chi_eff" in ref_fits:
+                chi_eff = ref_fits["chi_eff"]
+                prior -= self.prior_chi_eff_coeff * numpy.maximum(
+                    0.0, numpy.abs(chi_eff) - self.prior_chi_eff_knee
+                )
+            else:
+                logger.warning(
+                    "prior_chi_eff_coeff is non-zero but chi_eff is missing "
+                    "from fit_coeffs"
+                )
+
+        if self.prior_eta_coeff != 0.0:
+            if "eta" in ref_fits:
+                eta = ref_fits["eta"]
+                prior -= self.prior_eta_coeff * numpy.maximum(
+                    0.0, self.prior_eta_knee - eta
+                )
+            else:
+                logger.warning(
+                    "prior_eta_coeff is non-zero but eta is missing from fit_coeffs"
+                )
+
+        self.template_prior = prior.astype(numpy.float32)
 
     def update_file(self, key):
         """
@@ -1266,6 +1408,8 @@ class ExpFitStatistic(PhaseTDStatistic):
             if self.kwargs["normalize_fit_rate"]:
                 self.reassign_rate(ifo)
             self.get_ref_vals(ifo)
+            if self.kwargs.get("template_prior", False):
+                self.compute_template_prior()
             logger.info("Updating %s statistic %s file", "".join(self.ifos), key)
             return True
 
@@ -1365,15 +1509,24 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         """
         with h5py.File(self.files[kname + "-kde_file"], "r") as kde_file:
-            self.kde_by_tid[kname + "_kdevals"] = kde_file["data_kde"][:]
+            kde_vals = kde_file["data_kde"][:]
+            if "template_id" in kde_file:
+                tid_sort = numpy.argsort(kde_file["template_id"][:])
+                kde_vals = kde_vals[tid_sort]
+            self.kde_by_tid[kname + "_kdevals"] = kde_vals
 
     def kde_ratio(self):
         """
         Calculate the weighting factor according to the ratio of the
         signal and template KDE lookup tables
         """
-        signal_kde = self.kde_by_tid["signal_kdevals"][self.curr_tnum]
-        template_kde = self.kde_by_tid["template_kdevals"][self.curr_tnum]
+        tiny = numpy.finfo(float).tiny
+        signal_kde = numpy.maximum(
+            self.kde_by_tid["signal_kdevals"][self.curr_tnum], tiny
+        )
+        template_kde = numpy.maximum(
+            self.kde_by_tid["template_kdevals"][self.curr_tnum], tiny
+        )
 
         return numpy.log(signal_kde / template_kde)
 
@@ -1497,6 +1650,12 @@ class ExpFitStatistic(PhaseTDStatistic):
             dq_rate = numpy.maximum(dq_rate, 1)
             sngl_stat += numpy.log(dq_rate)
 
+        if self.kwargs.get("network_l2_newsnr", False):
+            singles["newsnr"] = self.get_sngl_ranking(trigs)
+
+        if self.kwargs.get("template_prior", False):
+            singles["template_prior"] = self.template_prior[self.curr_tnum]
+
         singles["snglstat"] = sngl_stat
         return numpy.array(singles, ndmin=1)
 
@@ -1579,6 +1738,10 @@ class ExpFitStatistic(PhaseTDStatistic):
         if self.kwargs["kde"]:
             # KDE reweighting
             sr_factor += self.kde_ratio()
+
+        if self.kwargs.get("template_prior", False):
+            # Per-template log-odds prior (identical across detectors)
+            sr_factor += sngls_info[0][1]["template_prior"]
 
         return sr_factor
 
@@ -1693,6 +1856,23 @@ class ExpFitStatistic(PhaseTDStatistic):
         # Add in the feature-dependent terms to the signal rate
         ln_s += self.logsignalrate_shared(s)
 
+        if self.kwargs.get("network_l2_newsnr", False) and len(sngl_dict) >= 2:
+            # Euclidean L2 network NewSNR enhancement for multi-detector coincs
+            newsnr_stack = numpy.array([sngl[1]["newsnr"] for sngl in s], dtype=float)
+            l2_net_newsnr = numpy.sqrt(numpy.sum(newsnr_stack**2, axis=0))
+            ln_s += self.l2_newsnr_coeff * (
+                numpy.clip(l2_net_newsnr, self.l2_newsnr_min, self.l2_newsnr_max)
+                - self.l2_newsnr_ref
+            )
+            if self.l2_l1_excess_coeff != 0.0:
+                l1_newsnr = numpy.sum(newsnr_stack, axis=0)
+                l2_l1_excess = numpy.maximum(
+                    0.0, l2_net_newsnr - l1_newsnr / numpy.sqrt(float(len(s)))
+                )
+                ln_s += self.l2_l1_excess_coeff * numpy.minimum(
+                    l2_l1_excess, self.l2_l1_excess_max
+                )
+
         # Combine the signal and noise rates
         loglr = ln_s - ln_noise_rate
 
@@ -1771,6 +1951,14 @@ class ExpFitStatistic(PhaseTDStatistic):
 
         # Shared info is the same as in the coinc calculation
         ln_s += self.logsignalrate_shared(s)
+
+        if self.kwargs.get("network_l2_newsnr", False) and len(sngl_dict) >= 2:
+            # Conservative upper bound on L2 network NewSNR contribution
+            ln_s += max(
+                self.l2_newsnr_coeff * (self.l2_newsnr_min - self.l2_newsnr_ref),
+                self.l2_newsnr_coeff * (self.l2_newsnr_max - self.l2_newsnr_ref),
+            )
+            ln_s += max(0.0, self.l2_l1_excess_coeff * self.l2_l1_excess_max)
 
         # Combine the signal and noise rates
         loglr = ln_s - ln_noise_rate
