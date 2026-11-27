@@ -5,15 +5,15 @@ statistic values
 
 import logging
 
-import numpy
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
 def effsnr(snr, reduced_x2, fac=250.0, **kwargs):  # pylint:disable=unused-argument
     """Calculate the effective SNR statistic. See (S5y1 paper) for definition."""
-    snr = numpy.array(snr, ndmin=1, dtype=numpy.float64)
-    rchisq = numpy.array(reduced_x2, ndmin=1, dtype=numpy.float64)
+    snr = np.array(snr, ndmin=1, dtype=np.float64)
+    rchisq = np.array(reduced_x2, ndmin=1, dtype=np.float64)
     esnr = snr / (1 + snr**2 / fac) ** 0.25 / rchisq**0.25
 
     # If snr input is float, return a float. Otherwise return numpy array.
@@ -22,18 +22,53 @@ def effsnr(snr, reduced_x2, fac=250.0, **kwargs):  # pylint:disable=unused-argum
     return esnr[0]
 
 
-def newsnr(snr, reduced_x2, q=6.0, n=2.0, **kwargs):  # pylint:disable=unused-argument
-    """
-    Calculate the re-weighted SNR statistic ('newSNR') from given SNR and
-    reduced chi-squared values. See http://arxiv.org/abs/1208.3491 for
-    definition. Previous implementation in glue/ligolw/lsctables.py
-    """
-    nsnr = numpy.array(snr, ndmin=1, dtype=numpy.float64)
-    reduced_x2 = numpy.array(reduced_x2, ndmin=1, dtype=numpy.float64)
+def newsnr(
+    snr,
+    reduced_x2,
+    q=6.0,
+    n=2.0,
+    chisq_thresh=1.0,
+    chisq_scale=0.0,
+    chisq_max_snr2=300.0,
+    **kwargs,  # pylint:disable=unused-argument
+):
+    """Calculate the re-weighted SNR statistic ('newSNR').
 
-    # newsnr is only different from snr if reduced chisq > 1
-    ind = numpy.where(reduced_x2 > 1.0)[0]
-    nsnr[ind] *= (0.5 * (1.0 + reduced_x2[ind] ** (q / n))) ** (-1.0 / q)
+    Parameters
+    ----------
+    snr : float or array_like
+        Matched-filter signal-to-noise ratio values.
+    reduced_x2 : float or array_like
+        Reduced power chi-squared values.
+    q : float, optional
+        Exponent controlling asymptotic penalty steepness. Default is 6.0.
+    n : float, optional
+        Chi-squared normalization power. Default is 2.0.
+    chisq_thresh : float, optional
+        Baseline reduced chi-squared plateau above which reweighting begins.
+        Default is 1.0.
+    chisq_scale : float, optional
+        Quadratic SNR-squared tolerance coefficient added to ``chisq_thresh``
+        as ``chisq_scale * min(snr**2, chisq_max_snr2)``. Default is 0.0.
+    chisq_max_snr2 : float, optional
+        Upper cap on ``snr**2`` for quadratic tolerance scaling. Default is
+        300.0.
+
+    Returns
+    -------
+    float or numpy.ndarray
+        Re-weighted SNR values matching scalar/array type of ``snr``.
+    """
+    snr_arr = np.array(snr, ndmin=1, dtype=np.float64)
+    nsnr = snr_arr.copy()
+    reduced_x2 = np.array(reduced_x2, ndmin=1, dtype=np.float64)
+
+    # Apply SNR^2-scaled threshold tolerance above chisq_thresh
+    thresh = chisq_thresh + chisq_scale * np.minimum(snr_arr**2, chisq_max_snr2)
+    ind = np.where(reduced_x2 > thresh)[0]
+    if len(ind):
+        scaled_x2 = reduced_x2[ind] / thresh[ind]
+        nsnr[ind] *= (0.5 * (1.0 + scaled_x2 ** (q / n))) ** (-1.0 / q)
 
     # If snr input is float, return a float. Otherwise return numpy array.
     if hasattr(snr, "__len__"):
@@ -41,15 +76,113 @@ def newsnr(snr, reduced_x2, q=6.0, n=2.0, **kwargs):  # pylint:disable=unused-ar
     return nsnr[0]
 
 
-def newsnr_sgveto(snr, brchisq, sgchisq, **kwargs):
-    """Combined SNR derived from NewSNR and Sine-Gaussian Chisq"""
-    nsnr = numpy.array(newsnr(snr, brchisq, **kwargs), ndmin=1)
-    sgchisq = numpy.array(sgchisq, ndmin=1)
-    t = numpy.array(sgchisq > 4, ndmin=1)
-    if len(t):
-        nsnr[t] = nsnr[t] / (sgchisq[t] / 4.0) ** 0.5
+def newsnr_sgveto(
+    snr,
+    brchisq,
+    sgchisq,
+    sgchisq_thresh=4.0,
+    sgchisq_scale=0.0,
+    sgchisq_max_snr2=5000.0,
+    **kwargs,
+):
+    """Calculate combined SNR derived from NewSNR and sine-Gaussian chisq.
+
+    Parameters
+    ----------
+    snr : float or array_like
+        Matched-filter signal-to-noise ratio values.
+    brchisq : float or array_like
+        Reduced power chi-squared values.
+    sgchisq : float or array_like
+        Sine-Gaussian chi-squared values.
+    sgchisq_thresh : float, optional
+        Baseline sine-Gaussian chi-squared threshold. Default is 4.0.
+    sgchisq_scale : float, optional
+        Quadratic higher-order-mode tolerance coefficient added to
+        ``sgchisq_thresh`` as ``sgchisq_scale * min(snr**2, sgchisq_max_snr2)``.
+        Default is 0.0.
+    sgchisq_max_snr2 : float, optional
+        Upper cap on ``snr**2`` for sine-Gaussian tolerance scaling. Default is
+        5000.0.
+
+    Returns
+    -------
+    float or numpy.ndarray
+        Re-weighted SNR values matching scalar/array type of ``snr``.
+    """
+    snr_arr = np.array(snr, ndmin=1, dtype=np.float64)
+    nsnr = np.array(newsnr(snr_arr, brchisq, **kwargs), ndmin=1)
+    sgchisq = np.array(sgchisq, ndmin=1, dtype=np.float64)
+
+    # Downweight triggers exceeding the SNR^2-scaled sine-Gaussian threshold
+    thresh = sgchisq_thresh + sgchisq_scale * np.minimum(snr_arr**2, sgchisq_max_snr2)
+    mask = sgchisq > thresh
+    if np.any(mask):
+        nsnr[mask] /= (sgchisq[mask] / thresh[mask]) ** 0.5
 
     # If snr input is float, return a float. Otherwise return numpy array.
+    if hasattr(snr, "__len__"):
+        return nsnr
+    return nsnr[0]
+
+
+def newsnr_sgveto_autochisq(
+    snr,
+    brchisq,
+    sgchisq,
+    autochisq,
+    q=6.0,
+    n=2.0,
+    autochisq_thresh=1.0,
+    autochisq_scale=0.0,
+    autochisq_max_snr2=300.0,
+    **kwargs,
+):
+    """Calculate combined SNR from NewSNR, sine-Gaussian chisq, and auto-chisq.
+
+    Parameters
+    ----------
+    snr : float or array_like
+        Matched-filter signal-to-noise ratio values.
+    brchisq : float or array_like
+        Reduced power chi-squared values.
+    sgchisq : float or array_like
+        Sine-Gaussian chi-squared values.
+    autochisq : float or array_like
+        Reduced autocorrelation chi-squared values.
+    q : float, optional
+        Exponent controlling asymptotic penalty steepness. Default is 6.0.
+    n : float, optional
+        Chi-squared normalization power. Default is 2.0.
+    autochisq_thresh : float, optional
+        Baseline reduced auto-chisq threshold. Default is 1.0.
+    autochisq_scale : float, optional
+        Quadratic SNR-squared tolerance coefficient for auto-chisq. Default is
+        0.0.
+    autochisq_max_snr2 : float, optional
+        Upper cap on ``snr**2`` for auto-chisq scaling. Default is 300.0.
+
+    Returns
+    -------
+    float or numpy.ndarray
+        Re-weighted SNR values matching scalar/array type of ``snr``.
+    """
+    snr_arr = np.array(snr, ndmin=1, dtype=np.float64)
+    nsnr = np.array(
+        newsnr_sgveto(snr_arr, brchisq, sgchisq, q=q, n=n, **kwargs),
+        ndmin=1,
+    )
+    rauto = np.array(autochisq, ndmin=1, dtype=np.float64)
+
+    # Apply continuous NewSNR-style reweighting above auto-chisq threshold
+    thresh = autochisq_thresh + autochisq_scale * np.minimum(
+        snr_arr**2, autochisq_max_snr2
+    )
+    mask = rauto > thresh
+    if np.any(mask):
+        scaled = rauto[mask] / thresh[mask]
+        nsnr[mask] *= (0.5 * (1.0 + scaled ** (q / n))) ** (-1.0 / q)
+
     if hasattr(snr, "__len__"):
         return nsnr
     return nsnr[0]
@@ -65,7 +198,7 @@ def newsnr_sgveto_psdvar(
     # If PSD var is lower than the 'minimum usually expected value' stop this
     # being used in the statistic. This low value might arise because a
     # significant fraction of the "short" PSD period was gated (for instance).
-    psd_var_val = numpy.array(psd_var_val, copy=True)
+    psd_var_val = np.array(psd_var_val, copy=True)
     psd_var_val[psd_var_val < min_expected_psdvar] = 1.0
     scaled_snr = snr * (psd_var_val**-0.5)
     scaled_brchisq = brchisq * (psd_var_val**-1.0)
@@ -101,7 +234,7 @@ def newsnr_sgveto_psdvar_threshold(
         min_expected_psdvar=min_expected_psdvar,
         **kwargs,
     )
-    nsnr = numpy.array(nsnr, ndmin=1)
+    nsnr = np.array(nsnr, ndmin=1)
     nsnr[brchisq > brchisq_threshold] = 1.0
     nsnr[psd_var_val > psd_var_val_threshold] = 1.0
 
@@ -118,8 +251,8 @@ def newsnr_sgveto_psdvar_scaled(
     Combined SNR derived from NewSNR, Sine-Gaussian Chisq and scaled PSD
     variation statistic.
     """
-    nsnr = numpy.array(newsnr_sgveto(snr, brchisq, sgchisq, **kwargs), ndmin=1)
-    psd_var_val = numpy.array(psd_var_val, ndmin=1, copy=True)
+    nsnr = np.array(newsnr_sgveto(snr, brchisq, sgchisq, **kwargs), ndmin=1)
+    psd_var_val = np.array(psd_var_val, ndmin=1, copy=True)
     psd_var_val[psd_var_val < min_expected_psdvar] = 1.0
 
     # Default scale is 0.33 as tuned from analysis of data from O2 chunks
@@ -139,7 +272,7 @@ def newsnr_sgveto_psdvar_scaled_threshold(
     scaled psd variation.
     """
     nsnr = newsnr_sgveto_psdvar_scaled(snr, bchisq, sgchisq, psd_var_val, **kwargs)
-    nsnr = numpy.array(nsnr, ndmin=1)
+    nsnr = np.array(nsnr, ndmin=1)
     nsnr[bchisq > threshold] = 1.0
 
     # If snr input is float, return a float. Otherwise return numpy array.
@@ -164,7 +297,7 @@ def get_snr(trigs, **kwargs):  # pylint:disable=unused-argument
         Array of snr values
 
     """
-    return numpy.array(trigs["snr"][:], ndmin=1, dtype=numpy.float32)
+    return np.array(trigs["snr"][:], ndmin=1, dtype=np.float32)
 
 
 def get_newsnr(trigs, **kwargs):
@@ -185,7 +318,7 @@ def get_newsnr(trigs, **kwargs):
     """
     dof = 2.0 * trigs["chisq_dof"][:] - 2.0
     nsnr = newsnr(trigs["snr"][:], trigs["chisq"][:] / dof, **kwargs)
-    return numpy.array(nsnr, ndmin=1, dtype=numpy.float32)
+    return np.array(nsnr, ndmin=1, dtype=np.float32)
 
 
 def get_newsnr_sgveto(trigs, **kwargs):
@@ -208,7 +341,7 @@ def get_newsnr_sgveto(trigs, **kwargs):
     nsnr_sg = newsnr_sgveto(
         trigs["snr"][:], trigs["chisq"][:] / dof, trigs["sg_chisq"][:], **kwargs
     )
-    return numpy.array(nsnr_sg, ndmin=1, dtype=numpy.float32)
+    return np.array(nsnr_sg, ndmin=1, dtype=np.float32)
 
 
 def get_newsnr_sgveto_psdvar(trigs, **kwargs):
@@ -236,7 +369,7 @@ def get_newsnr_sgveto_psdvar(trigs, **kwargs):
         trigs["psd_var_val"][:],
         **kwargs,
     )
-    return numpy.array(nsnr_sg_psd, ndmin=1, dtype=numpy.float32)
+    return np.array(nsnr_sg_psd, ndmin=1, dtype=np.float32)
 
 
 def get_newsnr_sgveto_psdvar_threshold(trigs, **kwargs):
@@ -264,7 +397,7 @@ def get_newsnr_sgveto_psdvar_threshold(trigs, **kwargs):
         trigs["psd_var_val"][:],
         **kwargs,
     )
-    return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
+    return np.array(nsnr_sg_psdt, ndmin=1, dtype=np.float32)
 
 
 def get_newsnr_sgveto_psdvar_scaled(trigs, **kwargs):
@@ -292,7 +425,7 @@ def get_newsnr_sgveto_psdvar_scaled(trigs, **kwargs):
         trigs["psd_var_val"][:],
         **kwargs,
     )
-    return numpy.array(nsnr_sg_psdscale, ndmin=1, dtype=numpy.float32)
+    return np.array(nsnr_sg_psdscale, ndmin=1, dtype=np.float32)
 
 
 def get_newsnr_sgveto_psdvar_scaled_threshold(trigs, **kwargs):
@@ -321,7 +454,38 @@ def get_newsnr_sgveto_psdvar_scaled_threshold(trigs, **kwargs):
         trigs["psd_var_val"][:],
         **kwargs,
     )
-    return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
+    return np.array(nsnr_sg_psdt, ndmin=1, dtype=np.float32)
+
+
+def get_newsnr_sgveto_autochisq(trigs, **kwargs):
+    """Calculate newsnr re-weighted by sine-Gaussian and auto-chisq vetoes.
+
+    Parameters
+    ----------
+    trigs : dict of numpy.ndarray or h5py.Group
+        Mapping holding single-detector trigger arrays, including ``'snr'``,
+        ``'chisq'``, ``'chisq_dof'``, ``'sg_chisq'``, ``'cont_chisq'``, and
+        ``'cont_chisq_dof'``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of re-weighted SNR values.
+    """
+    dof = 2.0 * trigs["chisq_dof"][:] - 2.0
+    red_brchisq = trigs["chisq"][:] / dof
+    auto_dof = trigs["cont_chisq_dof"][:]
+    red_autochisq = np.where(
+        auto_dof > 0, trigs["cont_chisq"][:] / np.maximum(auto_dof, 1), 1.0
+    )
+    nsnr_sga = newsnr_sgveto_autochisq(
+        trigs["snr"][:],
+        red_brchisq,
+        trigs["sg_chisq"][:],
+        red_autochisq,
+        **kwargs,
+    )
+    return np.array(nsnr_sga, ndmin=1, dtype=np.float32)
 
 
 sngls_ranking_function_dict = {
@@ -329,6 +493,7 @@ sngls_ranking_function_dict = {
     "newsnr": get_newsnr,
     "new_snr": get_newsnr,
     "newsnr_sgveto": get_newsnr_sgveto,
+    "newsnr_sgveto_autochisq": get_newsnr_sgveto_autochisq,
     "newsnr_sgveto_psdvar": get_newsnr_sgveto_psdvar,
     "newsnr_sgveto_psdvar_threshold": get_newsnr_sgveto_psdvar_threshold,
     "newsnr_sgveto_psdvar_scaled": get_newsnr_sgveto_psdvar_scaled,
@@ -341,6 +506,10 @@ reqd_datasets["snr"] = ["snr"]
 reqd_datasets["newsnr"] = reqd_datasets["snr"] + ["chisq", "chisq_dof"]
 reqd_datasets["new_snr"] = reqd_datasets["newsnr"]
 reqd_datasets["newsnr_sgveto"] = reqd_datasets["newsnr"] + ["sg_chisq"]
+reqd_datasets["newsnr_sgveto_autochisq"] = reqd_datasets["newsnr_sgveto"] + [
+    "cont_chisq",
+    "cont_chisq_dof",
+]
 reqd_datasets["newsnr_sgveto_psdvar"] = reqd_datasets["newsnr_sgveto"] + ["psd_var_val"]
 reqd_datasets["newsnr_sgveto_psdvar_threshold"] = reqd_datasets["newsnr_sgveto_psdvar"]
 reqd_datasets["newsnr_sgveto_psdvar_scaled"] = reqd_datasets["newsnr_sgveto_psdvar"]
