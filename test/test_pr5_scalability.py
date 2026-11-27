@@ -228,6 +228,149 @@ class PR5ScalabilityTest(unittest.TestCase):
         self.assertIn('<img data-src="well_2.html.png"', rendered)
         self.assertIn('<img data-src="extra.png"', rendered)
 
+    def test_sngls_statmap_timeslide_id_and_page_ifar_open_box(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sngls_hdf = os.path.join(tmpdir, "sngls.hdf")
+            statmap_hdf = os.path.join(tmpdir, "statmap_1det.hdf")
+            out_png = os.path.join(tmpdir, "ifar_open.png")
+            out_png_fallback = os.path.join(tmpdir, "ifar_open_fallback.png")
+            n_trigs = 12
+            with h5py.File(sngls_hdf, "w") as hf:
+                hf.attrs["ifos"] = "H1"
+                hf.attrs["pivot"] = "H1"
+                hf.attrs["fixed"] = "H1"
+                hf.attrs["foreground_time"] = 1e6
+                hf.attrs["timeslide_interval"] = 0.0
+                hf["stat"] = np.concatenate(
+                    [np.array([25.0]), np.linspace(5.0, 9.0, n_trigs - 1)]
+                ).astype(np.float32)
+                hf["timeslide_id"] = np.zeros(n_trigs, dtype=np.int32)
+                hf["template_id"] = np.zeros(n_trigs, dtype=np.int32)
+                hf["decimation_factor"] = np.ones(n_trigs, dtype=np.int32)
+                hf["H1/time"] = np.linspace(1000.0, 1110.0, n_trigs)
+                hf["H1/trigger_id"] = np.arange(n_trigs, dtype=np.int64)
+                hf["segments/H1/start"] = np.array([1000.0], dtype=np.float64)
+                hf["segments/H1/end"] = np.array([1001000.0], dtype=np.float64)
+
+            env = os.environ.copy()
+            env["PYTHONPATH"] = REPO_ROOT
+            statmap_script = os.path.join(
+                REPO_ROOT, "bin", "all_sky_search", "pycbc_sngls_statmap"
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    statmap_script,
+                    "--sngls-files",
+                    sngls_hdf,
+                    "--output-file",
+                    statmap_hdf,
+                    "--ifos",
+                    "H1",
+                    "--cluster-window",
+                    "1.0",
+                    "--max-hierarchical-removal",
+                    "1",
+                    "--hierarchical-removal-against",
+                    "exclusive",
+                    "--hierarchical-removal-ifar-threshold",
+                    "0.01",
+                ],
+                check=True,
+                env=env,
+            )
+            with h5py.File(statmap_hdf, "r") as hf:
+                self.assertEqual(int(hf.attrs["hierarchical_removal_iterations"]), 1)
+                self.assertIn("background_h0/timeslide_id", hf)
+                self.assertIn("background_h1/timeslide_id", hf)
+
+            ifar_script = os.path.join(REPO_ROOT, "bin", "plotting", "pycbc_page_ifar")
+            for out_path, delete_tsid in ((out_png, False), (out_png_fallback, True)):
+                if delete_tsid:
+                    with h5py.File(statmap_hdf, "r+") as hf:
+                        del hf["background_h0/timeslide_id"]
+                        del hf["background_h1/timeslide_id"]
+                subprocess.run(
+                    [
+                        sys.executable,
+                        ifar_script,
+                        "--trigger-file",
+                        statmap_hdf,
+                        "--decimation-factor",
+                        "100",
+                        "--open-box",
+                        "--use-hierarchical-level",
+                        "1",
+                        "--output-file",
+                        out_path,
+                    ],
+                    check=True,
+                    env=env,
+                )
+                self.assertTrue(os.path.exists(out_path))
+                self.assertGreater(os.path.getsize(out_path), 0)
+
+    def test_page_foreground_invalid_chisq_dof(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            statmap_hdf = os.path.join(tmpdir, "statmap.hdf")
+            bank_hdf = os.path.join(tmpdir, "bank.hdf")
+            sngl_hdf = os.path.join(tmpdir, "H1_sngls.hdf")
+            out_html = os.path.join(tmpdir, "foreground.html")
+
+            with h5py.File(bank_hdf, "w") as hf:
+                hf["mass1"] = np.array([10.0], dtype=np.float32)
+                hf["mass2"] = np.array([10.0], dtype=np.float32)
+                hf["spin1z"] = np.array([0.0], dtype=np.float32)
+                hf["spin2z"] = np.array([0.0], dtype=np.float32)
+
+            with h5py.File(sngl_hdf, "w") as hf:
+                grp = hf.create_group("H1")
+                grp["snr"] = np.array([8.5, 9.5], dtype=np.float32)
+                grp["chisq"] = np.array([0.0, 14.0], dtype=np.float32)
+                grp["chisq_dof"] = np.array([0, 8], dtype=np.int32)
+                grp["end_time"] = np.array([1010.0, 1020.0], dtype=np.float64)
+                grp["search/start_time"] = np.array([1000.0], dtype=np.float64)
+                grp["search/end_time"] = np.array([1100.0], dtype=np.float64)
+
+            with h5py.File(statmap_hdf, "w") as hf:
+                hf.attrs["ifos"] = "H1"
+                hf.attrs["hierarchical_removal_iterations"] = 0
+                fg = hf.create_group("foreground")
+                fg["ifar"] = np.array([1.0, 2.0], dtype=np.float64)
+                fg["ifar_exc"] = np.array([1.0, 2.0], dtype=np.float64)
+                fg["fap"] = np.array([0.5, 0.25], dtype=np.float64)
+                fg["fap_exc"] = np.array([0.5, 0.25], dtype=np.float64)
+                fg["stat"] = np.array([9.0, 10.0], dtype=np.float32)
+                fg["template_id"] = np.array([0, 0], dtype=np.int32)
+                fg["H1/time"] = np.array([1010.0, 1020.0], dtype=np.float64)
+                fg["H1/trigger_id"] = np.array([0, 1], dtype=np.int64)
+                hf["segments/H1/start"] = np.array([1000.0], dtype=np.float64)
+                hf["segments/H1/end"] = np.array([1100.0], dtype=np.float64)
+
+            script = os.path.join(REPO_ROOT, "bin", "plotting", "pycbc_page_foreground")
+            env = os.environ.copy()
+            env["PYTHONPATH"] = REPO_ROOT
+            subprocess.run(
+                [
+                    sys.executable,
+                    script,
+                    "--trigger-file",
+                    statmap_hdf,
+                    "--bank-file",
+                    bank_hdf,
+                    "--single-detector-triggers",
+                    sngl_hdf,
+                    "--output-file",
+                    out_html,
+                ],
+                check=True,
+                env=env,
+            )
+            with open(out_html, encoding="utf-8") as fp:
+                html_text = fp.read()
+            self.assertNotIn("-0.00", html_text)
+            self.assertIn("1.00", html_text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -212,10 +212,12 @@ if args.output_file.endswith(".html"):
             for idx in range(len(single_snr[ifo][0])):
                 if single_snr[ifo][1][idx]:
                     snrs.append(f"{single_snr[ifo][0][idx]:.2f}")
-                    rchisq = single_chisq[ifo][0][idx] / (
-                        single_chisq_dof[ifo][0][idx] * 2 - 2
-                    )
-                    chisqs.append(f"{rchisq:.2f}")
+                    chisq_dof_denom = single_chisq_dof[ifo][0][idx] * 2 - 2
+                    if chisq_dof_denom > 0:
+                        rchisq = single_chisq[ifo][0][idx] / chisq_dof_denom
+                        chisqs.append(f"{rchisq:.2f}")
+                    else:
+                        chisqs.append(" ")
                 else:
                     snrs.append(" ")
                     chisqs.append(" ")

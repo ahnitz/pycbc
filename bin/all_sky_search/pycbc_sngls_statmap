@@ -309,6 +309,7 @@ while numpy.any(ifar_louder > hier_ifar_thresh_s):
     if h_iterations == 0:
         f[f"background_h{h_iterations}/stat"] = back_stat
         f[f"background_h{h_iterations}/ifar"] = conv.sec_to_year(bg_ifar)
+        f[f"background_h{h_iterations}/timeslide_id"] = all_trigs.data["timeslide_id"]
         f[f"background_h{h_iterations}/decimation_factor"] = bkg_dec_facs
         f[f"foreground_h{h_iterations}/stat"] = fore_stat
         f[f"foreground_h{h_iterations}/ifar"] = conv.sec_to_year(fg_ifar)
@@ -466,6 +467,7 @@ if h_iterations > 0:
     logger.info("Dumping final background_h%d summary datasets", h_iterations)
     f[f"background_h{h_iterations}/stat"] = back_stat
     f[f"background_h{h_iterations}/ifar"] = conv.sec_to_year(bg_ifar)
+    f[f"background_h{h_iterations}/timeslide_id"] = all_trigs.data["timeslide_id"]
     f[f"background_h{h_iterations}/decimation_factor"] = bkg_dec_facs
 
 # Write to file how many hierarchical removals were implemented.

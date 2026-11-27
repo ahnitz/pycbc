@@ -195,8 +195,16 @@ expected_cumnum = conv.sec_to_year(fp.attrs["foreground_time"] / expected_ifar)
 # and test for backwards compatibility and that stage was written.
 if opts.open_box:
     if h_inc_back_num >= 0 and h_iterations is not None and h_iterations != 0:
-        back_tsid = fp[f"background_h{h_inc_back_num}/timeslide_id"][:]
         back_ifar = fp[f"background_h{h_inc_back_num}/ifar"][:]
+        tsid_key = f"background_h{h_inc_back_num}/timeslide_id"
+        if tsid_key in fp:
+            back_tsid = fp[tsid_key][:]
+        elif fp.attrs.get("timeslide_interval", 0) == 0:
+            back_tsid = numpy.zeros(len(back_ifar), dtype=numpy.int64)
+        elif h_inc_back_num == 0 and "background/timeslide_id" in fp:
+            back_tsid = fp["background/timeslide_id"][:]
+        else:
+            raise KeyError(tsid_key)
 
     # If the user wants to plot foreground events at h_inc_back_num == 0
     # and h_iterations == 0 then no hierarchical removals were done and
@@ -212,8 +220,13 @@ if opts.open_box:
 # removals. Results should be agnostic of judgments about
 # whether a hierarchical removal was done.
 elif h_iterations > 0 and h_iterations is not None:
-    back_tsid = fp["background_h0/timeslide_id"][:]
     back_ifar = fp["background_h0/ifar"][:]
+    if "background_h0/timeslide_id" in fp:
+        back_tsid = fp["background_h0/timeslide_id"][:]
+    elif fp.attrs.get("timeslide_interval", 0) == 0:
+        back_tsid = numpy.zeros(len(back_ifar), dtype=numpy.int64)
+    else:
+        back_tsid = fp["background/timeslide_id"][:]
 
 # Otherwise the box is closed and no hierarchical removals
 # were done so use top level background
