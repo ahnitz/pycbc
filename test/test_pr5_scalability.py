@@ -56,10 +56,12 @@ class PR5ScalabilityTest(unittest.TestCase):
             out_png = os.path.join(tmpdir, "snrchi.png")
             with h5py.File(trig_hdf, "w") as hf:
                 grp = hf.create_group("H1")
-                grp["snr"] = np.array([6.5, 7.5, 9.0], dtype=np.float32)
-                grp["chisq"] = np.array([0.0, 14.0, 28.0], dtype=np.float32)
-                grp["chisq_dof"] = np.array([8, 8, 8], dtype=np.int32)
-                grp["end_time"] = np.array([1000.0, 1001.0, 1002.0], dtype=np.float64)
+                grp["snr"] = np.array([6.5, 7.5, 9.0, 8.0], dtype=np.float32)
+                grp["chisq"] = np.array([0.0, 14.0, 28.0, 0.0], dtype=np.float32)
+                grp["chisq_dof"] = np.array([8, 8, 8, 0], dtype=np.int32)
+                grp["end_time"] = np.array(
+                    [1000.0, 1001.0, 1002.0, 1003.0], dtype=np.float64
+                )
                 hf["H1/segments/start"] = np.array([990.0], dtype=np.float64)
                 hf["H1/segments/end"] = np.array([1010.0], dtype=np.float64)
 

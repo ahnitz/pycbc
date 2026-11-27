@@ -88,7 +88,7 @@ logger.info(
 snr = trigs.snr
 chisq = get_chisq_from_file_choice(trigs, args.chisq_choice)
 if chisq is not None and len(chisq) > 0:
-    pos_mask = chisq > 0
+    pos_mask = numpy.isfinite(chisq) & (chisq > 0) & numpy.isfinite(snr) & (snr > 0)
     snr = snr[pos_mask]
     chisq = chisq[pos_mask]
 if chisq is None or len(chisq) == 0:
