@@ -613,6 +613,65 @@ class TestMatchedFilterRatio(unittest.TestCase):
             self.assertGreater(
                 float(np.max(np.abs(trigs_td["H1"]["snr"][sig_mask_td]))), 12.0
             )
+
+            # Unclipped vetoes keep SNR capped while evaluating chisq/auto/sg unclipped
+            chain = SignalConsistencyChain(
+                SingleDetPowerChisq(num_bins=8, snr_threshold=4.5),
+                SingleDetAutoChisq(stride=1, num_points=5, twophase=True),
+                SingleDetSGChisq(
+                    bank=bank,
+                    num_bins="8",
+                    snr_threshold=4.5,
+                    chisq_locations=["mtotal>0:20-30"],
+                ),
+                steps=["power", "auto", "sg"],
+            )
+            ctrl_clip_veto = MatchedFilterRatioControl(
+                bank,
+                {"H1": [st_blip]},
+                snr_threshold=6.0,
+                high_frequency_cutoff=900.0,
+                cluster_window=1.0,
+                td_prefilter="hyperbolic",
+                td_prefilter_delta=5.0,
+                unclipped_vetoes=False,
+            )
+            trigs_clip_v, _ = ctrl_clip_veto.run_top(
+                int(bank.top_indices[0]), veto_callback=chain.values
+            )
+            ctrl_unclip = MatchedFilterRatioControl(
+                bank,
+                {"H1": [st_blip]},
+                snr_threshold=6.0,
+                high_frequency_cutoff=900.0,
+                cluster_window=1.0,
+                td_prefilter="hyperbolic",
+                td_prefilter_delta=5.0,
+                unclipped_vetoes=True,
+            )
+            trigs_unclip_v, _ = ctrl_unclip.run_top(
+                int(bank.top_indices[0]), veto_callback=chain.values
+            )
+            clip_b = (trigs_clip_v["H1"]["time_index"] / sample_rate >= 15.0) & (
+                trigs_clip_v["H1"]["time_index"] / sample_rate < 26.0
+            )
+            unclip_b = (trigs_unclip_v["H1"]["time_index"] / sample_rate >= 15.0) & (
+                trigs_unclip_v["H1"]["time_index"] / sample_rate < 26.0
+            )
+            self.assertTrue(np.any(clip_b) and np.any(unclip_b))
+            np.testing.assert_allclose(
+                np.abs(trigs_unclip_v["H1"]["snr"][unclip_b]),
+                np.abs(trigs_clip_v["H1"]["snr"][clip_b]),
+                rtol=1e-5,
+            )
+            self.assertGreater(
+                float(np.max(trigs_unclip_v["H1"]["chisq"][unclip_b])),
+                float(np.max(trigs_clip_v["H1"]["chisq"][clip_b])),
+            )
+            self.assertGreater(
+                float(np.max(trigs_unclip_v["H1"]["sg_chisq"][unclip_b])),
+                float(np.max(trigs_clip_v["H1"]["sg_chisq"][clip_b])),
+            )
             bank.close_filehandler()
 
 

@@ -92,11 +92,28 @@ class SingleDetSGChisq(SingleDetPowerChisq):
         stilde = batch.stilde
         overwhitened = getattr(stilde, "overwhitened", None)
         template = batch.template(j)
+        snr_val = batch.snr[j]
+        if (
+            self.do
+            and overwhitened is not None
+            and template.params.template_hash in self.params
+            and getattr(batch, "correlation", None) is not None
+        ):
+            corr, index = batch.correlation(j, 0)
+            if corr is not None:
+                corr_arr = (
+                    corr.numpy() if hasattr(corr, "numpy") else numpy.asarray(corr)
+                )
+                freq_idx = numpy.arange(len(corr_arr))
+                snr_val = numpy.sum(
+                    corr_arr
+                    * numpy.exp(2j * numpy.pi * index / len(corr_arr) * freq_idx)
+                )
         val = self.values(
             overwhitened if overwhitened is not None else stilde,
             template,
             stilde.psd,
-            numpy.array([batch.snr[j]]),
+            numpy.array([snr_val]),
             1,
             indices=numpy.array([batch.time_index[j]]),
             overwhitened=overwhitened is not None,

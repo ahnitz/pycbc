@@ -110,6 +110,11 @@ class MatchedFilterRatioControl:
         Saturation scale ``delta`` in whitened standard deviations for
         ``td_prefilter='hyperbolic'`` (default: None; required and positive when
         ``td_prefilter='hyperbolic'``).
+    unclipped_vetoes : bool, optional
+        When True and ``fd_prefilter`` or ``td_prefilter`` is ``'hyperbolic'``,
+        evaluate signal-consistency vetoes on the unclipped overwhitened strain
+        ``st / st.psd`` while keeping matched-filter SNR thresholding on the
+        prefiltered strain (default: False).
     """
 
     def __init__(
@@ -130,6 +135,7 @@ class MatchedFilterRatioControl:
         fd_prefilter_delta=None,
         td_prefilter=None,
         td_prefilter_delta=None,
+        unclipped_vetoes=False,
     ):
         self.bank = bank
         self.segments = segments
@@ -206,6 +212,10 @@ class MatchedFilterRatioControl:
         self.td_prefilter_delta = (
             float(td_prefilter_delta) if td_prefilter_delta is not None else None
         )
+        self.unclipped_vetoes = bool(unclipped_vetoes)
+        self._use_unclipped_vetoes = self.unclipped_vetoes and (
+            self.fd_prefilter == "hyperbolic" or self.td_prefilter == "hyperbolic"
+        )
 
         # Configure leaf TimeDomainFilterBank options and pre-overwhiten segments
         self.leaf_options = {
@@ -220,7 +230,7 @@ class MatchedFilterRatioControl:
             ow_segs = []
             for st in segments[ifo]:
                 ow = self._overwhiten_segment(st)
-                st.overwhitened = ow
+                st.overwhitened = st / st.psd if self._use_unclipped_vetoes else ow
                 ow_segs.append(ow)
             self.overwhitened[ifo] = ow_segs
 
@@ -398,6 +408,14 @@ class MatchedFilterRatioControl:
             "deviations) when --td-whitened-prefilter='hyperbolic' "
             "(default: None).",
         )
+        group.add_argument(
+            "--unclipped-vetoes",
+            action="store_true",
+            default=False,
+            help="Optional flag to evaluate signal-consistency vetoes on the "
+            "unclipped overwhitened strain while filtering SNR on the FD/TD "
+            "prefiltered strain (default: False).",
+        )
         return group
 
     @classmethod
@@ -420,6 +438,7 @@ class MatchedFilterRatioControl:
             fd_prefilter_delta=args.fd_whitened_prefilter_delta,
             td_prefilter=args.td_whitened_prefilter,
             td_prefilter_delta=args.td_whitened_prefilter_delta,
+            unclipped_vetoes=args.unclipped_vetoes,
         )
 
     def run(self, veto_callback=None, top_indices=None, start_time=None):
@@ -613,6 +632,7 @@ class MatchedFilterRatioControl:
 
         self._fine_correlations = {}
         self._ref_blocks = {}
+        self._unclipped_series = {}
         self._batch = None
 
         # Normalize each segment's root C2R IFFT output to unit-variance SNR
@@ -646,12 +666,40 @@ class MatchedFilterRatioControl:
         }
         return collapsed, self._followup
 
+    def _unclipped_root_series(self, ifo, stilde):
+        """Return lazily cached root SNR series evaluated on unclipped strain."""
+        key = (ifo, id(stilde))
+        ref_snr = self._unclipped_series.get(key)
+        if ref_snr is None:
+            k0, k1 = self.root.band
+            n_root = 2 * (len(stilde) - 1)
+            scale = (
+                2.0
+                * float(stilde.delta_f)
+                * float(stilde.delta_t)
+                / (
+                    np.sqrt(float(self.top_template.sigmasq(stilde.psd)))
+                    * self.decimation
+                )
+            )
+            prod = np.zeros(len(stilde), dtype=np.complex128)
+            prod[k0:k1] = (
+                np.conj(self.root.spectrum[k0:k1]) * stilde.overwhitened.numpy()[k0:k1]
+            )
+            ref_snr = (np.fft.irfft(prod, n=n_root) * (scale * n_root)).astype(
+                np.float32
+            )
+            self._unclipped_series[key] = ref_snr
+        return ref_snr
+
     def fine_correlation(self, j, reach=0):
         """Return ``(corr, index)`` for trigger ``j`` in the current batch over
         one leaf FFT block around the trigger, re-centering if ``reach`` extends
         into the FIR wrap-around region.
         """
-        ifo, leaf_bank, cid, local_idxs, t_idxs, tstarts, ref_snr = self._batch
+        ifo, leaf_bank, cid, local_idxs, t_idxs, tstarts, ref_snr, stilde = self._batch
+        if self._use_unclipped_vetoes:
+            ref_snr = self._unclipped_root_series(ifo, stilde)
         i = int(local_idxs[j])
         t = int(t_idxs[j])
         tstart = int(tstarts[j])
@@ -745,6 +793,7 @@ class MatchedFilterRatioControl:
                 t_idxs,
                 tstarts,
                 ctx.series(ifo),
+                stilde,
             )
 
             def _template(j):
