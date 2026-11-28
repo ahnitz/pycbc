@@ -672,6 +672,10 @@ class TestMatchedFilterRatio(unittest.TestCase):
                 float(np.max(trigs_unclip_v["H1"]["sg_chisq"][unclip_b])),
                 float(np.max(trigs_clip_v["H1"]["sg_chisq"][clip_b])),
             )
+            hi_unclip = np.abs(trigs_unclip_v["H1"]["snr"]) > 4.5
+            self.assertTrue(np.any(hi_unclip))
+            self.assertTrue(np.all(trigs_unclip_v["H1"]["chisq_dof"][hi_unclip] > 0))
+            self.assertTrue(np.all(trigs_unclip_v["H1"]["chisq"][hi_unclip] > 0.0))
             bank.close_filehandler()
 
 

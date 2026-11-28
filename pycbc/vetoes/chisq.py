@@ -519,14 +519,32 @@ class SingleDetPowerChisq:
             and (not self.snr_threshold or abs(snr_val) > self.snr_threshold)
         ):
             # Compute exact in-band SNR over [bins[0], bins[-1]) so out-of-band FIR/FFT
-            # leakage in batch.snr[j] cannot violate Cauchy-Schwarz vs shift_sum.
-            bins, _ = self.cached_chisq_bins_and_weights(template, psd)
+            # leakage or prefiltered clipping cannot mismatch shift_sum and drop chisq.
+            bins, weights = self.cached_chisq_bins_and_weights(template, psd)
             freq_idx = numpy.arange(bins[0], bins[-1])
             corr_arr = corr.numpy() if hasattr(corr, "numpy") else numpy.asarray(corr)
             snr_val = numpy.sum(
                 corr_arr[bins[0] : bins[-1]]
                 * numpy.exp(2j * numpy.pi * index / len(corr_arr) * freq_idx)
             )
+            # Trigger already passed self.snr_threshold on batch.snr[j]; evaluate
+            # directly so values() does not re-threshold on unclipped/in-band snr_val.
+            if type(self).values is SingleDetPowerChisq.values:
+                chi = power_chisq_at_points_from_precomputed(
+                    corr,
+                    numpy.array([snr_val]),
+                    1,
+                    bins,
+                    numpy.array([index]),
+                    weights,
+                )
+                dof = (len(bins) - 1) * 2 - 2
+                chisq_val = (
+                    numpy.float32(1e-6)
+                    if dof > 0 and chi[0] < 1e-6
+                    else numpy.float32(chi[0])
+                )
+                return {"chisq": chisq_val, "chisq_dof": dof}
         chi, dof = self.values(
             corr,
             numpy.array([snr_val]),
