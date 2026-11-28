@@ -371,6 +371,142 @@ class PR5ScalabilityTest(unittest.TestCase):
             self.assertNotIn("-0.00", html_text)
             self.assertIn("1.00", html_text)
 
+    def test_fit_sngls_over_multiparam_empty_window_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bank_hdf = os.path.join(tmpdir, "bank.hdf")
+            fit_hdf = os.path.join(tmpdir, "fit_bt.hdf")
+            out_hdf = os.path.join(tmpdir, "fit_op.hdf")
+
+            # Template 0 is isolated (>3 sigma from templates 1..3) with 0 triggers
+            mass1 = np.array([150.0, 20.0, 19.0, 18.0], dtype=np.float64)
+            mass2 = np.array([150.0, 20.0, 19.0, 18.0], dtype=np.float64)
+            spin1z = np.array([-0.9, 0.0, 0.05, 0.1], dtype=np.float64)
+            spin2z = np.array([-0.9, 0.0, 0.05, 0.1], dtype=np.float64)
+            with h5py.File(bank_hdf, "w") as hf:
+                hf["mass1"] = mass1
+                hf["mass2"] = mass2
+                hf["spin1z"] = spin1z
+                hf["spin2z"] = spin2z
+                hf["approximant"] = np.array([b"SEOBNRv4_ROM"] * 4)
+
+            with h5py.File(fit_hdf, "w") as hf:
+                hf.attrs["ifo"] = "H1"
+                hf.attrs["stat_threshold"] = 6.0
+                hf.attrs["analysis_time"] = 1000.0
+                hf["template_id"] = np.arange(4, dtype=np.int32)
+                hf["count_above_thresh"] = np.array([0, 5, 6, 7], dtype=np.int32)
+                hf["count_in_template"] = np.array([500, 500, 500, 500], dtype=np.int32)
+                hf["fit_coeff"] = np.array([-100.0, 2.5, 2.8, 3.0], dtype=np.float64)
+
+            script = os.path.join(
+                REPO_ROOT, "bin", "all_sky_search", "pycbc_fit_sngls_over_multiparam"
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = REPO_ROOT
+            subprocess.run(
+                [
+                    sys.executable,
+                    script,
+                    "--template-fit-file",
+                    fit_hdf,
+                    "--bank-file",
+                    bank_hdf,
+                    "--fit-param",
+                    "mchirp",
+                    "chi_eff",
+                    "eta",
+                    "--log-param",
+                    "True",
+                    "False",
+                    "False",
+                    "--smoothing-width",
+                    "0.20",
+                    "0.25",
+                    "0.08",
+                    "--smoothing-method",
+                    "distance_weighted",
+                    "--output-fits-by-template",
+                    "--output",
+                    out_hdf,
+                ],
+                check=True,
+                env=env,
+            )
+
+            with h5py.File(out_hdf, "r") as hf:
+                fc = hf["fit_coeff"][:]
+                cat = hf["count_above_thresh"][:]
+                self.assertTrue(np.all(np.isfinite(fc)))
+                self.assertTrue(np.all(fc > 0.0))
+                self.assertTrue(np.all(np.isfinite(cat)))
+                self.assertTrue(np.all(cat > 0.0))
+
+    def test_sngls_statmap_nan_stat_hierarchical_removal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sngls_hdf = os.path.join(tmpdir, "H1_sngls.hdf")
+            out_hdf = os.path.join(tmpdir, "H1_sngls_statmap.hdf")
+            n_bg = 25
+            with h5py.File(sngls_hdf, "w") as hf:
+                hf.attrs["ifos"] = "H1"
+                hf.attrs["pivot"] = "H1"
+                hf.attrs["fixed"] = "H1"
+                hf.attrs["foreground_time"] = 1e6
+                hf.attrs["timeslide_interval"] = 5.0
+                hf["segments/H1/start"] = np.array([1000.0], dtype=np.float64)
+                hf["segments/H1/end"] = np.array([1500.0], dtype=np.float64)
+                stats = np.concatenate(
+                    [np.array([30.0, np.nan]), np.linspace(1.0, 5.0, n_bg)]
+                )
+                n_tot = len(stats)
+                hf["stat"] = stats.astype(np.float32)
+                hf["timeslide_id"] = np.zeros(n_tot, dtype=np.int64)
+                hf["decimation_factor"] = np.ones(n_tot, dtype=np.int64)
+                hf["template_id"] = np.arange(n_tot, dtype=np.int32)
+                hf["H1/time"] = np.concatenate(
+                    [
+                        np.array([1010.0, 1050.0]),
+                        np.linspace(1100.0, 1480.0, n_bg),
+                    ]
+                ).astype(np.float64)
+                hf["H1/trigger_id"] = np.arange(n_tot, dtype=np.int64)
+
+            script = os.path.join(
+                REPO_ROOT, "bin", "all_sky_search", "pycbc_sngls_statmap"
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = REPO_ROOT
+            subprocess.run(
+                [
+                    sys.executable,
+                    script,
+                    "--sngls-files",
+                    sngls_hdf,
+                    "--ifos",
+                    "H1",
+                    "--cluster-window",
+                    "1.0",
+                    "--max-hierarchical-removal",
+                    "5",
+                    "--hierarchical-removal-against",
+                    "exclusive",
+                    "--hierarchical-removal-ifar-threshold",
+                    "0.000001",
+                    "--far-calculation-method",
+                    "H1:n_louder",
+                    "--output-file",
+                    out_hdf,
+                ],
+                check=True,
+                env=env,
+            )
+
+            with h5py.File(out_hdf, "r") as hf:
+                self.assertGreaterEqual(
+                    int(hf.attrs["hierarchical_removal_iterations"]), 1
+                )
+                self.assertIn("foreground/ifar", hf)
+                self.assertEqual(len(hf["foreground/ifar"][:]), n_bg + 2)
+
 
 if __name__ == "__main__":
     unittest.main()

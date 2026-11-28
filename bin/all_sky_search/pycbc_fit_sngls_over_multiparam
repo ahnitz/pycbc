@@ -78,9 +78,11 @@ def smooth_templates(nabove, invalphan, ntotal, template_idx, weights=None):
     ntotal_t_smoothed = numpy.average(ntotal[template_idx], weights=weights)
     invalphan_mean = numpy.average(invalphan[template_idx], weights=weights)
 
+    with numpy.errstate(divide="ignore", invalid="ignore"):
+        alpha_smoothed = nabove_t_smoothed / invalphan_mean
     return (
         nabove_t_smoothed,
-        nabove_t_smoothed / invalphan_mean,
+        alpha_smoothed,
         ntotal_t_smoothed,
     )
 
@@ -111,7 +113,10 @@ def smooth_n_closest(
     # Count number of templates required to gather total_trigs templates,
     # starting at closest
     ntcs = nabove[dist_sort].cumsum()
-    templates_required = numpy.searchsorted(ntcs, total_trigs) + 1
+    templates_required = min(
+        int(numpy.searchsorted(ntcs, total_trigs)) + 1,
+        len(dist_sort),
+    )
     logger.debug(
         "%d template(s) required to obtain %d(>%d) triggers",
         templates_required,
@@ -472,9 +477,9 @@ if len(parvals) == 1 and args.smoothing_method == "smooth_tophat":
     logger.info("Using efficient 1D tophat smoothing")
     sort = parvals[0].argsort()
     parvals_0 = parvals[0][sort]
-    ntotal = ntotal[sort]
-    nabove = nabove[sort]
-    invalphan = invalphan[sort]
+    ntotal_sort = ntotal[sort]
+    nabove_sort = nabove[sort]
+    invalphan_sort = invalphan[sort]
 
     # For each template, find the range of nearby templates which fall within
     # the chosen window.
@@ -484,16 +489,17 @@ if len(parvals) == 1 and args.smoothing_method == "smooth_tophat":
     del parvals_0
     # Precompute the sums so we can quickly look up differences between
     # templates
-    nasum = nabove.cumsum()
-    invsum = invalphan.cumsum()
-    ntsum = ntotal.cumsum()
+    nasum = nabove_sort.cumsum()
+    invsum = invalphan_sort.cumsum()
+    ntsum = ntotal_sort.cumsum()
     num = right - left
 
     logger.info("Smoothing ...")
-    smoothed_vals[:, 0] = (nasum[right] - nasum[left]) / num
-    invmean = (invsum[right] - invsum[left]) / num
-    smoothed_vals[:, 1] = smoothed_vals[:, 0] / invmean
-    smoothed_vals[:, 2] = (ntsum[right] - ntsum[left]) / num
+    with numpy.errstate(divide="ignore", invalid="ignore"):
+        smoothed_vals[:, 0] = (nasum[right] - nasum[left]) / num
+        invmean = (invsum[right] - invsum[left]) / num
+        smoothed_vals[:, 1] = smoothed_vals[:, 0] / invmean
+        smoothed_vals[:, 2] = (ntsum[right] - ntsum[left]) / num
 
 elif numpy.isfinite(_smooth_cut[args.smoothing_method]):
     c = _smooth_cut[args.smoothing_method]
@@ -555,6 +561,27 @@ else:
         d = dist(i, rang, parvals, args.smoothing_width)
         smoothed_vals[i, :] = smooth(
             nabove, invalphan, ntotal, d, args.smoothing_method, **kwarg_dict
+        )
+
+# Fall back to nearest templates with triggers when a truncated window is empty
+invalid_fit = (
+    (~numpy.isfinite(smoothed_vals[:, 0]))
+    | (smoothed_vals[:, 0] <= 0.0)
+    | (~numpy.isfinite(smoothed_vals[:, 1]))
+    | (smoothed_vals[:, 1] <= 0.0)
+)
+if numpy.any(invalid_fit) and nabove.sum() > 0.0 and numpy.any(invalphan > 0.0):
+    fallback_trigs = max(1, min(int(numpy.floor(nabove.sum())), 10))
+    logger.warning(
+        "%d template(s) had zero triggers or non-finite fit inside the "
+        "smoothing window; falling back to n_closest (total_trigs=%d)",
+        int(invalid_fit.sum()),
+        fallback_trigs,
+    )
+    for idx in numpy.flatnonzero(invalid_fit):
+        d_all = dist(idx, rang, parvals, args.smoothing_width)
+        smoothed_vals[idx, :] = smooth_n_closest(
+            nabove, invalphan, ntotal, d_all, total_trigs=fallback_trigs
         )
 
 logger.info("Writing output")

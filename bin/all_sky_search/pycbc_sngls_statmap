@@ -273,7 +273,19 @@ logger.info("Beginning hierarchical removal of foreground triggers")
 # Set an index to keep track of how many hierarchical removals we want to do.
 h_iterations = 0
 
-orig_fore_stat = fore_stat
+orig_fore_times = all_trigs.data[f"{ifo}/time"]
+orig_fore_trig_ids = all_trigs.data[f"{ifo}/trigger_id"]
+orig_fore_tpls = all_trigs.data["template_id"]
+orig_fore_lookup = {}
+for idx, key in enumerate(
+    zip(
+        orig_fore_times.tolist(),
+        orig_fore_trig_ids.tolist(),
+        orig_fore_tpls.tolist(),
+        strict=True,
+    )
+):
+    orig_fore_lookup.setdefault(key, idx)
 
 # Assign a new variable to keep track of whether we care about inclusive or
 # exclusive ifar depending on whether we want to remove hierarchically
@@ -330,10 +342,15 @@ while numpy.any(ifar_louder > hier_ifar_thresh_s):
 
     # Step 3: Remove that trigger from the list of zerolag triggers
 
-    # Find the index of the loud foreground trigger to remove next. And find
-    # the index in the list of original foreground triggers.
-    rm_trig_idx = numpy.where(all_trigs.stat[:] == fore_stat[max_stat_idx])[0][0]
-    orig_fore_idx = numpy.where(orig_fore_stat == fore_stat[max_stat_idx])[0][0]
+    # Find the index of the loud foreground trigger to remove next and its
+    # corresponding index in the original foreground triggers array.
+    rm_trig_idx = max_stat_idx
+    rm_key = (
+        float(all_trigs.data[f"{ifo}/time"][max_stat_idx]),
+        int(all_trigs.data[f"{ifo}/trigger_id"][max_stat_idx]),
+        int(all_trigs.data["template_id"][max_stat_idx]),
+    )
+    orig_fore_idx = orig_fore_lookup[rm_key]
 
     # Store any foreground trigger's information that we want to
     # hierarchically remove.
@@ -439,9 +456,15 @@ while numpy.any(ifar_louder > hier_ifar_thresh_s):
         f[f"foreground_h{h_iterations}/ifar"] = conv.sec_to_year(fg_ifar_exc)
         f[f"foreground_h{h_iterations}/fap"] = fap_exc
 
-        # Update ifar and fap for other foreground triggers
+        # Save trigger ids and map updated IFAR/FAP back to original foreground
+        # using unique trigger identity rather than float stat equality (NaN-safe).
+        tpl_ids = all_trigs.data["template_id"]
+        trig_id = all_trigs.data[f"{ifo}/trigger_id"]
+        trig_time = all_trigs.data[f"{ifo}/time"]
         for i in range(len(fg_ifar)):
-            orig_fore_idx = numpy.where(orig_fore_stat == fore_stat[i])[0][0]
+            orig_fore_idx = orig_fore_lookup[
+                (float(trig_time[i]), int(trig_id[i]), int(tpl_ids[i]))
+            ]
             f["foreground/ifar"][orig_fore_idx] = conv.sec_to_year(fg_ifar[i])
             f["foreground/fap"][orig_fore_idx] = fap[i]
 
@@ -449,9 +472,7 @@ while numpy.any(ifar_louder > hier_ifar_thresh_s):
         # These don't change with the iterations but should be written at every
         # level.
 
-        f[f"foreground_h{h_iterations}/template_id"] = all_trigs.data["template_id"]
-        trig_id = all_trigs.data[f"{ifo}/trigger_id"]
-        trig_time = all_trigs.data[f"{ifo}/time"]
+        f[f"foreground_h{h_iterations}/template_id"] = tpl_ids
         f[f"foreground_h{h_iterations}/{ifo}/time"] = trig_time
         f[f"foreground_h{h_iterations}/{ifo}/trigger_id"] = trig_id
     else:
